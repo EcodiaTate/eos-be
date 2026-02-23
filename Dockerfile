@@ -13,11 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python dependencies (stub package for layer caching)
 COPY pyproject.toml README.md ./
-RUN mkdir -p src/ecodiaos && touch src/ecodiaos/__init__.py
+RUN mkdir -p ecodiaos && touch ecodiaos/__init__.py
 RUN pip install --upgrade pip && pip install .
 
 # Copy real source and reinstall package (deps already cached)
-COPY src/ src/
+COPY ecodiaos/ ecodiaos/
 COPY config/ config/
 RUN pip install --no-deps --force-reinstall .
 
