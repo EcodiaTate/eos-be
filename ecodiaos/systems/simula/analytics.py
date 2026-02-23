@@ -27,6 +27,7 @@ import structlog
 
 from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.simula.types import (
+    CautionAdjustment,
     CategorySuccessRate,
     ChangeCategory,
     EvolutionAnalytics,
@@ -131,12 +132,27 @@ class EvolutionAnalyticsEngine:
         # Mean simulation risk
         mean_risk = total_risk_numeric / max(1, risk_count)
 
+        # Compute recent rollback rates (7-day window) per category
+        recent_rollback_rates: dict[str, float] = {}
+        cutoff = utc_now() - timedelta(days=_RECENT_WINDOW_DAYS)
+        for cat in ChangeCategory:
+            recent_records = [
+                r for r in records
+                if r.category == cat and r.created_at >= cutoff
+            ]
+            if recent_records:
+                recent_rolled_back = sum(1 for r in recent_records if r.rolled_back)
+                recent_rollback_rates[cat.value] = round(
+                    recent_rolled_back / len(recent_records), 3
+                )
+
         analytics = EvolutionAnalytics(
             category_rates=category_rates,
             total_proposals=total_proposals,
             evolution_velocity=round(velocity, 3),
             mean_simulation_risk=round(mean_risk, 3),
             rollback_rate=round(rollback_rate, 3),
+            recent_rollback_rates=recent_rollback_rates,
             last_updated=now,
         )
 
@@ -210,20 +226,69 @@ class EvolutionAnalyticsEngine:
         patterns.sort(key=lambda p: p["rollback_rate"], reverse=True)
         return patterns
 
-    def should_increase_caution(self, category: ChangeCategory) -> bool:
+    def should_increase_caution(self, category: ChangeCategory) -> CautionAdjustment:
         """
-        Synchronous check against cached analytics.
-        If recent rollback rate for this category exceeds the threshold,
-        recommend that simulation use stricter risk assessment.
+        Transparent caution adjustment analysis using cached analytics.
+        Evaluates multiple factors to determine if simulation should use
+        stricter risk thresholds for this category.
+
+        Factors considered:
+        - All-time rollback rate (indicates systemic issues)
+        - Recent 7-day rollback rate (responsive to recent trends)
+        - Data sufficiency (at least 3 proposals needed)
+
+        Returns a CautionAdjustment with full reasoning for observability.
         """
         if self._cached_analytics is None:
-            return False
+            return CautionAdjustment(
+                should_adjust=False,
+                magnitude=0.0,
+                factors={},
+                reasoning="No cached analytics available",
+            )
 
         rate = self._cached_analytics.category_rates.get(category.value)
         if rate is None or rate.total < 3:
-            return False  # not enough data to judge
+            return CautionAdjustment(
+                should_adjust=False,
+                magnitude=0.0,
+                factors={},
+                reasoning="Insufficient data (< 3 proposals)",
+            )
 
-        return rate.rollback_rate > _CAUTION_THRESHOLD
+        factors: dict[str, float] = {}
+
+        # Factor 1: All-time rollback rate
+        if rate.rollback_rate > _CAUTION_THRESHOLD:
+            factors["high_alltime_rollback_rate"] = min(
+                0.25, rate.rollback_rate * 0.5
+            )
+
+        # Factor 2: Recent 7-day rollback rate
+        recent_rate = self._cached_analytics.recent_rollback_rates.get(category.value, 0.0)
+        if recent_rate > 0.25:
+            factors["high_recent_rollback_rate"] = min(0.20, recent_rate * 0.4)
+
+        total_adjustment = sum(factors.values())
+
+        reasoning_parts = []
+        if factors:
+            reasoning_parts.append(
+                f"Category {category.value}: "
+                + ", ".join(f"{k}={v:.2f}" for k, v in factors.items())
+            )
+        reasoning_parts.append(
+            f"All-time: {rate.rollback_rate:.1%}, "
+            f"Recent (7d): {recent_rate:.1%}, "
+            f"Total: {rate.total} proposals"
+        )
+
+        return CautionAdjustment(
+            should_adjust=total_adjustment > 0.0,
+            magnitude=min(0.5, total_adjustment),
+            factors=factors,
+            reasoning=" | ".join(reasoning_parts),
+        )
 
     def invalidate_cache(self) -> None:
         """Force recomputation on next analytics request."""

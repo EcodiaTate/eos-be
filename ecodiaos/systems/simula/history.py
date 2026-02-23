@@ -54,6 +54,12 @@ class EvolutionHistoryManager:
                 applied_at: $applied_at,
                 rolled_back: $rolled_back,
                 rollback_reason: $rollback_reason,
+                simulation_episodes_tested: $simulation_episodes_tested,
+                counterfactual_regression_rate: $counterfactual_regression_rate,
+                dependency_blast_radius: $dependency_blast_radius,
+                constitutional_alignment: $constitutional_alignment,
+                resource_tokens_per_hour: $resource_tokens_per_hour,
+                caution_reasoning: $caution_reasoning,
                 created_at: $created_at
             })
             """,
@@ -69,6 +75,12 @@ class EvolutionHistoryManager:
                 "applied_at": record.applied_at.isoformat(),
                 "rolled_back": record.rolled_back,
                 "rollback_reason": record.rollback_reason,
+                "simulation_episodes_tested": record.simulation_episodes_tested,
+                "counterfactual_regression_rate": record.counterfactual_regression_rate,
+                "dependency_blast_radius": record.dependency_blast_radius,
+                "constitutional_alignment": record.constitutional_alignment,
+                "resource_tokens_per_hour": record.resource_tokens_per_hour,
+                "caution_reasoning": record.caution_reasoning,
                 "created_at": record.created_at.isoformat(),
             },
         )

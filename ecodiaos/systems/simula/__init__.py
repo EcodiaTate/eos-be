@@ -21,6 +21,7 @@ from ecodiaos.systems.simula.analytics import EvolutionAnalyticsEngine
 from ecodiaos.systems.simula.bridge import EvoSimulaBridge
 from ecodiaos.systems.simula.proposal_intelligence import ProposalIntelligence
 from ecodiaos.systems.simula.types import (
+    CautionAdjustment,
     CategorySuccessRate,
     ChangeCategory,
     ChangeSpec,
@@ -39,6 +40,8 @@ from ecodiaos.systems.simula.types import (
     ResourceCostEstimate,
     RiskLevel,
     SimulationResult,
+    TriageResult,
+    TriageStatus,
     FORBIDDEN,
     GOVERNANCE_REQUIRED,
     SELF_APPLICABLE,
@@ -63,6 +66,7 @@ __all__ = [
     "SimulationResult",
     # Enriched types
     "EnrichedSimulationResult",
+    "CautionAdjustment",
     "CounterfactualResult",
     "DependencyImpact",
     "ResourceCostEstimate",
@@ -71,6 +75,8 @@ __all__ = [
     "ProposalCluster",
     "CategorySuccessRate",
     "EvolutionAnalytics",
+    "TriageStatus",
+    "TriageResult",
     # Constants
     "FORBIDDEN",
     "GOVERNANCE_REQUIRED",

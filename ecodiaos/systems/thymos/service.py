@@ -199,6 +199,9 @@ class ThymosService:
         # Governor
         self._governor: HealingGovernor | None = None
 
+        # Cross-system references (wired post-init by main.py)
+        self._nova: Any = None  # NovaService — for injecting urgent repair goals
+
         # ── State ──
         self._active_incidents: dict[str, Incident] = {}
         self._incident_buffer: deque[Incident] = deque(maxlen=_INCIDENT_BUFFER_SIZE)
@@ -251,6 +254,11 @@ class ThymosService:
         if self._causal_analyzer is not None:
             self._causal_analyzer._health = health_monitor
         self._logger.info("health_monitor_wired_to_thymos")
+
+    def set_nova(self, nova: Any) -> None:
+        """Wire Nova so critical incidents generate urgent repair goals."""
+        self._nova = nova
+        self._logger.info("nova_wired_to_thymos")
 
     # ─── Lifecycle ─────────────────────────────────────────────────────
 
@@ -635,6 +643,10 @@ class ThymosService:
             latency_ms=f"{diagnosis_ms:.0f}",
         )
 
+        # ── Step 2b: Inject urgent goal for critical incidents ──
+        if incident.severity == IncidentSeverity.CRITICAL and self._nova is not None:
+            await self._inject_repair_goal(incident, diagnosis.repair_tier, resolved=False)
+
         # ── Step 3: Prescribe ──
         incident.repair_status = RepairStatus.PRESCRIBING
         repair = await self._prescriber.prescribe(incident, diagnosis)
@@ -718,6 +730,10 @@ class ThymosService:
 
             # ── Step 7: Learn ──
             await self._learn_from_success(incident, repair, diagnosis)
+
+            # ── Step 7b: Inject recovery monitoring goal for RESTART+ repairs ──
+            if repair.tier >= RepairTier.RESTART and self._nova is not None:
+                await self._inject_repair_goal(incident, repair.tier, resolved=True)
 
         else:
             # ── Rollback ──
@@ -1078,6 +1094,11 @@ class ThymosService:
         # Persist incident to Neo4j
         await self._persist_incident(incident)
 
+        # Feed success to Evo so the learning system can accumulate
+        # evidence about what repair strategies work
+        if self._evo is not None:
+            await self._feed_repair_to_evo(incident, repair, success=True)
+
     async def _learn_from_failure(
         self,
         incident: Incident,
@@ -1094,6 +1115,11 @@ class ThymosService:
 
         # Persist the failed incident for post-mortem
         await self._persist_incident(incident)
+
+        # Feed failure to Evo — failures are more salient than successes
+        # and drive hypothesis formation about system vulnerabilities
+        if self._evo is not None:
+            await self._feed_repair_to_evo(incident, repair, success=False)
 
     async def _persist_incident(self, incident: Incident) -> None:
         """Persist an incident to Neo4j for the causal knowledge graph."""
@@ -1135,6 +1161,105 @@ class ThymosService:
             )
         except Exception as exc:
             self._logger.debug("incident_persist_failed", error=str(exc))
+
+    # ─── Cross-System Feedback ─────────────────────────────────────────
+
+    async def _inject_repair_goal(
+        self,
+        incident: Incident,
+        repair_tier: RepairTier | None,
+        resolved: bool,
+    ) -> None:
+        """
+        Inject a self-repair goal into Nova's goal manager.
+
+        Pre-repair (resolved=False): high-urgency goal so Nova prioritises self-healing.
+        Post-repair (resolved=True): follow-up monitoring goal at lower urgency.
+        """
+        from ecodiaos.systems.nova.types import Goal, GoalSource, GoalStatus
+        from ecodiaos.primitives.common import new_id, DriveAlignmentVector
+
+        tier_name = repair_tier.name if repair_tier else "UNKNOWN"
+
+        if resolved:
+            desc = (
+                f"Monitor system recovery: {incident.source_system} "
+                f"after {tier_name} repair"
+            )
+            priority, urgency = 0.6, 0.4
+        else:
+            desc = (
+                f"Urgent: self-repair {incident.source_system} — "
+                f"{incident.incident_class.value} incident ({tier_name})"
+            )
+            priority, urgency = 0.9, 0.85
+
+        goal = Goal(
+            id=new_id(),
+            description=desc,
+            source=GoalSource.MAINTENANCE,
+            priority=priority,
+            urgency=urgency,
+            importance=0.7,
+            drive_alignment=DriveAlignmentVector(
+                coherence=0.8, care=0.1, growth=0.0, honesty=0.1,
+            ),
+            status=GoalStatus.ACTIVE,
+        )
+        try:
+            await self._nova.add_goal(goal)
+            self._logger.info(
+                "repair_goal_injected",
+                goal_id=goal.id,
+                incident_id=incident.id,
+                resolved=resolved,
+            )
+        except Exception as exc:
+            self._logger.warning("repair_goal_injection_failed", error=str(exc))
+
+    async def _feed_repair_to_evo(
+        self,
+        incident: Incident,
+        repair: RepairSpec,
+        success: bool,
+    ) -> None:
+        """
+        Feed a repair outcome to Evo as a learning episode.
+
+        Successful repairs teach the organism what works.
+        Failed repairs teach it what doesn't — and are more salient.
+        """
+        from ecodiaos.primitives.memory_trace import Episode
+        from ecodiaos.primitives.common import new_id, utc_now
+
+        outcome_text = "succeeded" if success else "failed"
+        episode = Episode(
+            id=new_id(),
+            source=f"thymos.repair_{outcome_text}",
+            raw_content=(
+                f"Repair {outcome_text}: {repair.action} on {repair.target_system}. "
+                f"Tier: {repair.tier.name}. "
+                f"Incident class: {incident.incident_class.value}. "
+                f"Root cause: {incident.root_cause_hypothesis or 'unknown'}"
+            ),
+            summary=(
+                f"Thymos {repair.tier.name} repair {outcome_text}: "
+                f"{repair.target_system}"
+            ),
+            salience_composite=0.6 if success else 0.8,
+            affect_valence=0.2 if success else -0.3,
+            timestamp=utc_now(),
+        )
+        try:
+            await self._evo.process_episode(episode)
+            self._logger.info(
+                "repair_outcome_fed_to_evo",
+                incident_id=incident.id,
+                success=success,
+                tier=repair.tier.name,
+            )
+        except Exception as exc:
+            self._logger.warning("evo_feed_failed", error=str(exc))
 
     # ─── Percept Broadcasting ────────────────────────────────────────
 

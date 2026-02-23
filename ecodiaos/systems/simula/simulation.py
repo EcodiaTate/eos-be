@@ -34,6 +34,7 @@ import structlog
 
 from ecodiaos.config import SimulaConfig
 from ecodiaos.systems.simula.types import (
+    CautionAdjustment,
     ChangeCategory,
     CounterfactualResult,
     DependencyImpact,
@@ -807,13 +808,19 @@ class ChangeSimulator:
         )
 
         # Dynamic caution adjustment from analytics history
-        if self._analytics is not None and self._analytics.should_increase_caution(proposal.category):
-            composite_risk = min(1.0, composite_risk + 0.15)
-            self._log.info(
-                "caution_increased",
-                category=proposal.category.value,
-                composite_risk=round(composite_risk, 3),
-            )
+        caution_adj: CautionAdjustment | None = None
+        if self._analytics is not None:
+            caution_adj = self._analytics.should_increase_caution(proposal.category)
+            if caution_adj.should_adjust:
+                composite_risk = min(1.0, composite_risk + caution_adj.magnitude)
+                self._log.info(
+                    "caution_increased",
+                    category=proposal.category.value,
+                    composite_risk=round(composite_risk, 3),
+                    magnitude=caution_adj.magnitude,
+                    factors=caution_adj.factors,
+                    reasoning=caution_adj.reasoning,
+                )
 
         # Map composite score to RiskLevel
         if composite_risk >= 0.75:
@@ -824,6 +831,24 @@ class ChangeSimulator:
             final_risk = RiskLevel.MODERATE
         else:
             final_risk = RiskLevel.LOW
+
+        # Emit decision audit log with all signal values and weights
+        self._log.info(
+            "simulation_decision_audit",
+            proposal_id=proposal.id,
+            category=proposal.category.value,
+            base_risk=f"{0.40 * base_risk_numeric:.3f} (0.40×{base_risk_numeric:.2f})",
+            counterfactual_risk=f"{0.20 * cf_regression_rate:.3f} (0.20×{cf_regression_rate:.2f})",
+            dependency_risk=f"{0.15 * min(1.0, total_risk_contribution):.3f} (0.15×{total_risk_contribution:.2f})",
+            resource_risk=f"{0.10 * resource_risk:.3f} (0.10×{resource_risk:.2f})",
+            alignment_risk=f"{0.15 * alignment_risk:.3f} (0.15×{alignment_risk:.2f})",
+            weighted_sum=round(composite_risk, 3),
+            caution_adjustment=caution_adj.magnitude if caution_adj and caution_adj.should_adjust else 0.0,
+            final_risk=final_risk.value,
+            episodes_tested=base_result.episodes_tested,
+            blast_radius=blast_radius,
+            constitutional_alignment=round(constitutional_alignment, 2),
+        )
 
         # Build summary
         summary_parts = [base_result.risk_summary]
@@ -857,6 +882,7 @@ class ChangeSimulator:
             constitutional_alignment=constitutional_alignment,
             counterfactual_regression_rate=round(cf_regression_rate, 3),
             dependency_blast_radius=blast_radius,
+            caution_adjustment=caution_adj,
         )
 
     # ─── Helpers ─────────────────────────────────────────────────────────────

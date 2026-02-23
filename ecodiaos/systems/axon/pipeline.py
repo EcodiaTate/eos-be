@@ -78,9 +78,13 @@ class ExecutionPipeline:
         self._instance_id = instance_id
         self._logger = logger.bind(system="axon.pipeline")
         self._nova: "NovaService | None" = None
+        self._atune = None  # AtuneService — for feeding outcomes as percepts
 
     def set_nova(self, nova: "NovaService") -> None:
         self._nova = nova
+
+    def set_atune(self, atune) -> None:
+        self._atune = atune
 
     async def execute(self, request: ExecutionRequest) -> AxonOutcome:
         """
@@ -333,6 +337,7 @@ class ExecutionPipeline:
         await asyncio.gather(
             self._audit.log(outcome, context),
             self._deliver_to_nova(outcome),
+            self._contribute_to_atune(outcome),
             return_exceptions=True,
         )
 
@@ -376,6 +381,41 @@ class ExecutionPipeline:
             attempts=3,
             error=str(last_error),
         )
+
+    async def _contribute_to_atune(self, outcome: AxonOutcome) -> None:
+        """
+        Feed the execution outcome into Atune's workspace as a self-perception.
+
+        The organism perceives its own actions: successes are routine (low salience),
+        failures are salient and demand attention.
+        """
+        if self._atune is None:
+            return
+
+        from ecodiaos.systems.atune.types import WorkspaceContribution
+
+        if outcome.success:
+            content = (
+                f"Action completed: {outcome.execution_id} "
+                f"({len(outcome.step_outcomes)} steps)"
+            )
+            priority = 0.25  # Routine — success is expected
+        else:
+            content = (
+                f"Action failed: {outcome.execution_id} — "
+                f"{outcome.failure_reason or 'unknown'}"
+            )
+            priority = 0.55  # Failure is salient and demands attention
+
+        try:
+            self._atune.contribute(WorkspaceContribution(
+                system="axon",
+                content=content,
+                priority=priority,
+                reason="action_outcome",
+            ))
+        except Exception as exc:
+            self._logger.debug("atune_contribution_failed", error=str(exc))
 
     def _fast_fail(
         self,

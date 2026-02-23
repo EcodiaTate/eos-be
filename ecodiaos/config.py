@@ -223,6 +223,55 @@ class ThymosConfig(BaseModel):
     memory_budget_mb: int = 256
 
 
+class OneirosConfig(BaseModel):
+    # Circadian rhythm
+    wake_duration_target_s: float = 79200.0     # 22 hours
+    sleep_duration_target_s: float = 7200.0     # 2 hours
+
+    # Sleep pressure
+    pressure_threshold: float = 0.70
+    pressure_critical: float = 0.95
+    max_wake_cycles: int = 528000
+
+    # Pressure weights
+    pressure_weight_cycles: float = 0.40
+    pressure_weight_affect: float = 0.25
+    pressure_weight_episodes: float = 0.20
+    pressure_weight_hypotheses: float = 0.15
+
+    # NREM
+    nrem_fraction: float = 0.40
+    max_episodes_per_nrem: int = 200
+    replay_batch_size: int = 10
+    salience_decay_factor: float = 0.85
+    salience_pruning_threshold: float = 0.05
+
+    # REM
+    rem_fraction: float = 0.40
+    max_dreams_per_rem: int = 50
+    dream_coherence_insight_threshold: float = 0.70
+    dream_coherence_fragment_threshold: float = 0.40
+    max_affect_traces_per_rem: int = 100
+    affect_dampening_factor: float = 0.50
+    max_threats_per_rem: int = 15
+    max_ethical_cases_per_rem: int = 10
+
+    # Lucid
+    lucid_fraction: float = 0.10
+    lucid_insight_threshold: float = 0.85
+    max_explorations_per_lucid: int = 10
+
+    # Sleep debt
+    debt_salience_noise_max: float = 0.15
+    debt_efe_precision_loss_max: float = 0.20
+    debt_expression_flatness_max: float = 0.25
+    debt_learning_rate_reduction_max: float = 0.30
+
+    # Transitions
+    hypnagogia_duration_s: float = 30.0
+    hypnopompia_duration_s: float = 30.0
+
+
 class FederationConfig(BaseModel):
     enabled: bool = False
     endpoint: str | None = None
@@ -374,6 +423,7 @@ class EcodiaOSConfig(BaseSettings):
     evo: EvoConfig = Field(default_factory=EvoConfig)
     simula: SimulaConfig = Field(default_factory=SimulaConfig)
     thymos: ThymosConfig = Field(default_factory=ThymosConfig)
+    oneiros: OneirosConfig = Field(default_factory=OneirosConfig)
     federation: FederationConfig = Field(default_factory=FederationConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 

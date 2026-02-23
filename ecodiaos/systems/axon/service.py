@@ -159,6 +159,18 @@ class AxonService:
         self._pipeline.set_nova(nova)
         self._logger.info("nova_wired", system="axon")
 
+    def set_atune(self, atune) -> None:
+        """
+        Wire Atune so execution outcomes become workspace percepts.
+
+        The organism should perceive its own actions — closing the
+        intention→execution→perception loop.
+        """
+        if self._pipeline is None:
+            raise RuntimeError("AxonService.initialize() must be called before set_atune()")
+        self._pipeline.set_atune(atune)
+        self._logger.info("atune_wired", system="axon")
+
     def configure_credentials(self, credentials: dict[str, str]) -> None:
         """
         Load credentials into the CredentialStore.

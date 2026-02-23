@@ -34,6 +34,7 @@ from ecodiaos.systems.evo.service import EvoService
 from ecodiaos.systems.simula.service import SimulaService
 from ecodiaos.systems.synapse.service import SynapseService
 from ecodiaos.systems.thymos.service import ThymosService
+from ecodiaos.systems.oneiros.service import OneirosService
 from ecodiaos.systems.federation.service import FederationService
 from ecodiaos.telemetry.logging import setup_logging
 from ecodiaos.telemetry.metrics import MetricCollector
@@ -159,6 +160,7 @@ async def lifespan(app: FastAPI):
     )
     await axon.initialize()
     axon.set_nova(nova)
+    axon.set_atune(atune)  # Loop 4: execution outcomes → workspace percepts
     app.state.axon = axon
 
     # Wire Axon into Nova's intent router so approved intents can execute
@@ -342,6 +344,8 @@ async def lifespan(app: FastAPI):
     app.state.evo = evo
     # Subscribe Evo to Atune workspace broadcasts (background learning)
     atune.subscribe(evo)
+    # Loop 2: supported hypotheses → epistemic exploration goals in Nova
+    evo.set_nova(nova)
 
     # ── 12. Initialize Simula (Self-Evolution) ────────────────
     import asyncio as _asyncio
@@ -394,10 +398,34 @@ async def lifespan(app: FastAPI):
     thymos.set_equor(equor)
     thymos.set_evo(evo)
     thymos.set_atune(atune)
+    thymos.set_nova(nova)  # Loop 1: critical incidents → urgent repair goals
     thymos.set_health_monitor(synapse._health)
     await thymos.initialize()
     synapse.register_system(thymos)
     app.state.thymos = thymos
+
+    # ── 13c. Initialize Oneiros — The Dream Engine ───────────────────
+    # Must come after Synapse, Thymos, and all cognitive systems.
+    # Oneiros subscribes to Synapse events (emergency wake on SYSTEM_FAILED)
+    # and cross-wires with Equor, Evo, Nova, Atune, Thymos, Memory.
+    oneiros = OneirosService(
+        config=config.oneiros,
+        synapse=synapse,
+        neo4j=neo4j_client,
+        llm=llm_client,
+        embed_fn=embedding_client,
+        metrics=metrics,
+    )
+    # Wire cross-system references
+    oneiros.set_equor(equor)
+    oneiros.set_evo(evo)
+    oneiros.set_nova(nova)
+    oneiros.set_atune(atune)
+    oneiros.set_thymos(thymos)
+    oneiros.set_memory(memory)
+    await oneiros.initialize()
+    synapse.register_system(oneiros)
+    app.state.oneiros = oneiros
 
     # ── 14. Start Alive WebSocket server ──────────────────────────
     from ecodiaos.systems.alive.ws_server import AliveWebSocketServer
@@ -436,8 +464,19 @@ async def lifespan(app: FastAPI):
     _inner_life_task: _aio_gen.Task | None = None
 
     async def _inner_life_loop() -> None:
-        """Periodic self-monitoring that feeds the workspace."""
+        """
+        Periodic self-monitoring that feeds the workspace.
+
+        The organism observes its own internal state across all subsystems:
+        affect, goals, immune health, learning progress, cognitive rhythm,
+        and sleep pressure. These self-observations enter the workspace
+        like any other percept — competing for broadcast and driving
+        the cognitive cycle even when no external input arrives.
+        """
         _il_logger = structlog.get_logger("ecodiaos.inner_life")
+        from ecodiaos.systems.atune.types import WorkspaceContribution
+        import random as _rnd
+
         cycle = 0
         while True:
             try:
@@ -447,8 +486,7 @@ async def lifespan(app: FastAPI):
                 affect = atune._affect_mgr.current
                 goals = nova.active_goal_summaries if nova._goal_manager else []
 
-                # ── Affect self-monitoring (every cycle) ──
-                # The organism notices its own emotional state
+                # ── Affect self-monitoring (every 2nd cycle = ~10s) ──
                 if cycle % 2 == 0:
                     affect_desc = (
                         f"I notice my current state: "
@@ -458,7 +496,6 @@ async def lifespan(app: FastAPI):
                         f"care_activation={affect.care_activation:.2f}, "
                         f"coherence_stress={affect.coherence_stress:.2f}"
                     )
-                    from ecodiaos.systems.atune.types import WorkspaceContribution
                     atune.contribute(WorkspaceContribution(
                         system="self_monitor",
                         content=affect_desc,
@@ -468,15 +505,73 @@ async def lifespan(app: FastAPI):
 
                 # ── Goal reflection (every 6th cycle = ~30s) ──
                 if cycle % 6 == 0 and goals:
-                    import random as _rnd
                     goal = _rnd.choice(goals)
-                    goal_desc = f"Reflecting on my active goal: I should be working toward something meaningful for my community"
+                    goal_text = goal.get("description", "unknown")[:100] if isinstance(goal, dict) else str(goal)[:100]
                     atune.contribute(WorkspaceContribution(
                         system="nova",
-                        content=goal_desc,
+                        content=f"Reflecting on my goal: {goal_text}",
                         priority=0.4,
                         reason="goal_reflection",
                     ))
+
+                # ── Synapse rhythm reflection (every 8th cycle = ~40s, offset 2) ──
+                if cycle % 8 == 2:
+                    try:
+                        rhythm = synapse.rhythm_snapshot
+                        coherence = synapse.coherence_snapshot
+                        rhythm_state = rhythm.state.value
+                        atune.contribute(WorkspaceContribution(
+                            system="synapse",
+                            content=(
+                                f"My cognitive rhythm is {rhythm_state} "
+                                f"(stability={rhythm.rhythm_stability:.0%}, "
+                                f"coherence={coherence.composite:.2f})"
+                            ),
+                            priority=0.25 + (0.2 if rhythm_state in ("stress", "deep_processing") else 0),
+                            reason="rhythm_self_observation",
+                        ))
+                    except Exception:
+                        pass  # Synapse may not have rhythm data yet
+
+                # ── Thymos immune reflection (every 8th cycle = ~40s, offset 4) ──
+                if cycle % 8 == 4:
+                    try:
+                        thymos_health = await thymos.health()
+                        healing_mode = thymos_health.get("healing_mode", "normal")
+                        active_count = thymos_health.get("active_incidents", 0)
+                        if active_count > 0 or healing_mode != "normal":
+                            atune.contribute(WorkspaceContribution(
+                                system="thymos",
+                                content=(
+                                    f"My immune system reports: "
+                                    f"{active_count} active incidents, "
+                                    f"healing mode: {healing_mode}"
+                                ),
+                                priority=0.4 + (0.2 if healing_mode != "normal" else 0),
+                                reason="immune_self_observation",
+                            ))
+                    except Exception:
+                        pass  # Thymos may not be fully initialised yet
+
+                # ── Evo learning reflection (every 10th cycle = ~50s) ──
+                if cycle % 10 == 5:
+                    try:
+                        evo_stats = evo.stats
+                        hyp_data = evo_stats.get("hypotheses", {})
+                        active_hyp = hyp_data.get("active", 0)
+                        supported_hyp = hyp_data.get("supported", 0)
+                        if active_hyp > 0:
+                            atune.contribute(WorkspaceContribution(
+                                system="evo",
+                                content=(
+                                    f"I'm tracking {active_hyp} hypotheses "
+                                    f"({supported_hyp} supported). Learning continues."
+                                ),
+                                priority=0.3,
+                                reason="learning_self_observation",
+                            ))
+                    except Exception:
+                        pass
 
                 # ── Curiosity prompt (every 12th cycle = ~60s) ──
                 if cycle % 12 == 0:
@@ -488,6 +583,22 @@ async def lifespan(app: FastAPI):
                             priority=0.3 + curiosity_level * 0.15,
                             reason="curiosity_prompt",
                         ))
+
+                # ── Oneiros sleep pressure reflection (every 20th cycle = ~100s) ──
+                if cycle % 20 == 10:
+                    try:
+                        oneiros_health = await oneiros.health()
+                        pressure = oneiros_health.get("sleep_pressure", 0)
+                        stage = oneiros_health.get("current_stage", "awake")
+                        if pressure > 0.3 or stage != "awake":
+                            atune.contribute(WorkspaceContribution(
+                                system="oneiros",
+                                content=f"Sleep pressure: {pressure:.0%}. Current stage: {stage}.",
+                                priority=0.3 + (0.15 if pressure > 0.6 else 0),
+                                reason="sleep_self_observation",
+                            ))
+                    except Exception:
+                        pass
 
                 _il_logger.debug("inner_life_tick", cycle=cycle)
             except _aio_gen.CancelledError:
@@ -900,6 +1011,7 @@ async def health():
     nova_health = await app.state.nova.health()
     synapse_health = await app.state.synapse.health() if hasattr(app.state, "synapse") else {"status": "not_initialized"}
     thymos_health = await app.state.thymos.health() if hasattr(app.state, "thymos") else {"status": "not_initialized"}
+    oneiros_health = await app.state.oneiros.health() if hasattr(app.state, "oneiros") else {"status": "not_initialized"}
     neo4j_health = await app.state.neo4j.health_check()
     tsdb_health = await app.state.tsdb.health_check()
     redis_health = await app.state.redis.health_check()
@@ -924,7 +1036,7 @@ async def health():
         "status": overall,
         "instance_id": app.state.config.instance_id,
         "instance_name": instance.name if instance else "unborn",
-        "phase": "11_federation",
+        "phase": "13_oneiros",
         "systems": {
             "memory": memory_health,
             "equor": equor_health,
@@ -948,6 +1060,7 @@ async def health():
             "voxis": voxis_health,
             "synapse": synapse_health,
             "thymos": thymos_health,
+            "oneiros": oneiros_health,
             "federation": federation_health,
         },
         "data_stores": {
@@ -1700,6 +1813,81 @@ async def get_thymos_homeostasis():
         "healing_mode": health_data.get("healing_mode", "normal"),
         "storm_activations": health_data.get("storm_activations", 0),
     }
+
+
+# ─── Oneiros (Dream Engine) ───────────────────────────────────────
+
+
+@app.get("/api/v1/oneiros/health")
+async def get_oneiros_health():
+    oneiros: OneirosService = app.state.oneiros
+    return await oneiros.health()
+
+
+@app.get("/api/v1/oneiros/stats")
+async def get_oneiros_stats():
+    oneiros: OneirosService = app.state.oneiros
+    return oneiros.stats
+
+
+@app.get("/api/v1/oneiros/dreams")
+async def get_oneiros_dreams(limit: int = 50):
+    oneiros: OneirosService = app.state.oneiros
+    dreams = list(oneiros._journal._dream_buffer)[-limit:]
+    return [
+        {
+            "id": d.id,
+            "dream_type": d.dream_type.value,
+            "coherence_score": round(d.coherence_score, 3),
+            "coherence_class": d.coherence_class.value,
+            "bridge_narrative": d.bridge_narrative,
+            "affect_valence": round(d.affect_valence, 3),
+            "affect_arousal": round(d.affect_arousal, 3),
+            "themes": d.themes,
+            "summary": d.summary,
+            "timestamp": d.timestamp.isoformat(),
+        }
+        for d in reversed(dreams)
+    ]
+
+
+@app.get("/api/v1/oneiros/insights")
+async def get_oneiros_insights(limit: int = 50):
+    oneiros: OneirosService = app.state.oneiros
+    all_insights = list(oneiros._journal._all_insights.values())
+    sorted_insights = sorted(all_insights, key=lambda i: i.created_at, reverse=True)[:limit]
+    return [
+        {
+            "id": i.id,
+            "insight_text": i.insight_text,
+            "coherence_score": round(i.coherence_score, 3),
+            "domain": i.domain,
+            "status": i.status.value,
+            "wake_applications": i.wake_applications,
+            "created_at": i.created_at.isoformat(),
+        }
+        for i in sorted_insights
+    ]
+
+
+@app.get("/api/v1/oneiros/sleep-cycles")
+async def get_oneiros_sleep_cycles(limit: int = 20):
+    oneiros: OneirosService = app.state.oneiros
+    cycles = list(oneiros._recent_cycles)[-limit:]
+    return [
+        {
+            "id": c.id,
+            "started_at": c.started_at.isoformat(),
+            "completed_at": c.completed_at.isoformat() if c.completed_at else None,
+            "quality": c.quality.value,
+            "episodes_replayed": c.episodes_replayed,
+            "dreams_generated": c.dreams_generated,
+            "insights_discovered": c.insights_discovered,
+            "pressure_before": round(c.pressure_before, 3),
+            "pressure_after": round(c.pressure_after, 3),
+        }
+        for c in reversed(cycles)
+    ]
 
 
 # ─── Phase 11: Federation Endpoints ─────────────────────────────

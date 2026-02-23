@@ -51,6 +51,7 @@ from ecodiaos.systems.evo.procedure_extractor import ProcedureExtractor
 from ecodiaos.systems.evo.self_model import SelfModelManager
 from ecodiaos.systems.evo.types import (
     ConsolidationResult,
+    HypothesisStatus,
     PatternCandidate,
     PatternContext,
     SelfModelStats,
@@ -97,6 +98,7 @@ class EvoService:
 
         # Cross-system references (wired post-init by main.py)
         self._atune: Any = None  # AtuneService — for pushing learned head weights
+        self._nova: Any = None   # NovaService — for generating epistemic goals from hypotheses
 
         # Sub-systems (built in initialize())
         self._hypothesis_engine: HypothesisEngine | None = None
@@ -243,12 +245,57 @@ class EvoService:
             try:
                 result = await self._hypothesis_engine.evaluate_evidence(h, episode)
                 self._total_evidence_evaluations += 1
+
+                # When a hypothesis crosses into SUPPORTED, generate an
+                # epistemic goal so Nova can actively explore the finding
+                if (
+                    result is not None
+                    and result.new_status == HypothesisStatus.SUPPORTED
+                    and self._nova is not None
+                ):
+                    await self._generate_goal_from_hypothesis(h)
+
             except Exception as exc:
                 self._logger.warning(
                     "evidence_evaluation_error",
                     hypothesis_id=h.id,
                     error=str(exc),
                 )
+
+    async def _generate_goal_from_hypothesis(self, hypothesis) -> None:
+        """
+        Convert a supported hypothesis into an epistemic exploration goal.
+
+        When Evo accumulates enough evidence to support a hypothesis, the
+        organism should actively explore and test it — not just passively wait.
+        """
+        from ecodiaos.systems.nova.types import Goal, GoalSource, GoalStatus
+        from ecodiaos.primitives.common import new_id, DriveAlignmentVector
+
+        goal = Goal(
+            id=new_id(),
+            description=(
+                f"Explore supported hypothesis: "
+                f"{hypothesis.statement[:120]}"
+            ),
+            source=GoalSource.EPISTEMIC,
+            priority=0.55,
+            urgency=0.3,
+            importance=0.6,
+            drive_alignment=DriveAlignmentVector(
+                coherence=0.3, care=0.0, growth=0.7, honesty=0.0,
+            ),
+            status=GoalStatus.ACTIVE,
+        )
+        try:
+            await self._nova.add_goal(goal)
+            self._logger.info(
+                "epistemic_goal_generated",
+                hypothesis_id=hypothesis.id,
+                goal_id=goal.id,
+            )
+        except Exception as exc:
+            self._logger.warning("epistemic_goal_failed", error=str(exc))
 
     # ─── Consolidation (Sleep Mode) ────────────────────────────────────────────
 
@@ -311,6 +358,11 @@ class EvoService:
         """Wire Atune so Evo can push learned head-weight adjustments."""
         self._atune = atune
         self._logger.info("atune_wired_to_evo")
+
+    def set_nova(self, nova: Any) -> None:
+        """Wire Nova so supported hypotheses generate epistemic exploration goals."""
+        self._nova = nova
+        self._logger.info("nova_wired_to_evo")
 
     # ─── Health ────────────────────────────────────────────────────────────────
 

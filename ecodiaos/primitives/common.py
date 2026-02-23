@@ -39,6 +39,7 @@ class SystemID(str, enum.Enum):
     SYNAPSE = "synapse"
     THYMOS = "thymos"
     FEDERATION = "federation"
+    ONEIROS = "oneiros"
     API = "api"
 
 

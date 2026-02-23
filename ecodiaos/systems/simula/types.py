@@ -67,6 +67,12 @@ class ImpactType(str, enum.Enum):
     NEUTRAL = "neutral"
 
 
+class TriageStatus(str, enum.Enum):
+    """Status of proposal triage (fast-path pre-simulation check)."""
+    TRIVIAL = "trivial"
+    REQUIRES_SIMULATION = "requires_simulation"
+
+
 # --- Models -----------------------------------------------------------------
 
 
@@ -141,6 +147,27 @@ class SimulationResult(EOSBaseModel):
     simulated_at: datetime = Field(default_factory=utc_now)
 
 
+class CautionAdjustment(EOSBaseModel):
+    """
+    Transparent caution adjustment logic explaining WHY a proposal's risk
+    was bumped. Returned by EvolutionAnalyticsEngine.should_increase_caution().
+    """
+
+    should_adjust: bool
+    magnitude: float  # 0.0-0.5 additive risk bump
+    factors: dict[str, float] = Field(default_factory=dict)  # {factor_name: contribution}
+    reasoning: str = ""
+
+
+class TriageResult(EOSBaseModel):
+    """Result of fast-path proposal triage (pre-simulation check)."""
+
+    status: TriageStatus
+    assumed_risk: RiskLevel | None = None
+    reason: str = ""
+    skip_simulation: bool = False
+
+
 class ProposalResult(EOSBaseModel):
     """Final outcome recorded once a proposal reaches a terminal state."""
 
@@ -211,6 +238,13 @@ class EvolutionRecord(Identified, Timestamped):
     applied_at: datetime = Field(default_factory=utc_now)
     rolled_back: bool = False
     rollback_reason: str = ""
+    # Simulation detail persisted for audit trail and learning
+    simulation_episodes_tested: int = 0
+    counterfactual_regression_rate: float = 0.0
+    dependency_blast_radius: int = 0
+    constitutional_alignment: float = 0.0
+    resource_tokens_per_hour: int = 0
+    caution_reasoning: str = ""
 
 
 class CodeChangeResult(EOSBaseModel):
@@ -289,6 +323,7 @@ class EnrichedSimulationResult(SimulationResult):
     constitutional_alignment: float = 0.0
     counterfactual_regression_rate: float = 0.0
     dependency_blast_radius: int = 0
+    caution_adjustment: CautionAdjustment | None = None
 
 
 # --- Bridge Models -----------------------------------------------------------
@@ -377,6 +412,7 @@ class EvolutionAnalytics(EOSBaseModel):
     evolution_velocity: float = 0.0  # proposals per day
     mean_simulation_risk: float = 0.0
     rollback_rate: float = 0.0
+    recent_rollback_rates: dict[str, float] = Field(default_factory=dict)  # per-category 7-day rate
     last_updated: datetime = Field(default_factory=utc_now)
 
 

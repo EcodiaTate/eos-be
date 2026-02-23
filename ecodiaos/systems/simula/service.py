@@ -56,6 +56,7 @@ from ecodiaos.systems.simula.types import (
     FORBIDDEN,
     GOVERNANCE_REQUIRED,
     ConfigVersion,
+    EnrichedSimulationResult,
     EvolutionAnalytics,
     EvolutionRecord,
     EvolutionProposal,
@@ -63,6 +64,8 @@ from ecodiaos.systems.simula.types import (
     ProposalStatus,
     RiskLevel,
     SimulationResult,
+    TriageResult,
+    TriageStatus,
 )
 from ecodiaos.primitives.common import new_id, utc_now
 
@@ -233,6 +236,55 @@ class SimulaService:
             current_version=self._current_version,
         )
 
+    # ─── Triage (Fast-Path Pre-Simulation) ─────────────────────────────────────
+
+    def _triage_proposal(self, proposal: EvolutionProposal) -> TriageResult:
+        """
+        Fast-path proposal check. If trivial, skip expensive simulation.
+        Trivial = budget tweaks <5% with sufficient data.
+
+        Returns TriageResult with skip_simulation=True for trivial cases.
+        """
+        if proposal.category.value != "adjust_budget":
+            return TriageResult(
+                status=TriageStatus.REQUIRES_SIMULATION,
+                skip_simulation=False,
+            )
+
+        spec = proposal.change_spec
+        if not spec.budget_new_value or spec.budget_old_value is None:
+            return TriageResult(
+                status=TriageStatus.REQUIRES_SIMULATION,
+                skip_simulation=False,
+            )
+
+        # Check delta < 5%
+        old_val = spec.budget_old_value
+        new_val = spec.budget_new_value
+        if old_val == 0.0:
+            delta_pct = 1.0  # Treat zero as 100% change
+        else:
+            delta_pct = abs(new_val - old_val) / abs(old_val)
+
+        if delta_pct < 0.05:
+            self._logger.info(
+                "proposal_triaged",
+                proposal_id=proposal.id,
+                status="trivial",
+                reason=f"Budget delta {delta_pct:.1%} < 5%",
+            )
+            return TriageResult(
+                status=TriageStatus.TRIVIAL,
+                assumed_risk=RiskLevel.LOW,
+                reason=f"Budget delta {delta_pct:.1%} < 5%",
+                skip_simulation=True,
+            )
+
+        return TriageResult(
+            status=TriageStatus.REQUIRES_SIMULATION,
+            skip_simulation=False,
+        )
+
     # ─── Main Pipeline ─────────────────────────────────────────────────────────
 
     async def process_proposal(self, proposal: EvolutionProposal) -> ProposalResult:
@@ -278,20 +330,37 @@ class SimulaService:
             self._active_proposals.pop(proposal.id, None)
             return ProposalResult(status=ProposalStatus.REJECTED, reason=reason)
 
-        # ── STEP 2: Simulate (deep multi-strategy) ─────────────────────────
-        proposal.status = ProposalStatus.SIMULATING
-        log.info("proposal_simulating")
+        # ── STEP 1.5: Triage (fast-path for trivial cases) ──────────────────
+        triage = self._triage_proposal(proposal)
+        if triage.skip_simulation:
+            # Build synthetic simulation result
+            proposal.simulation = SimulationResult(
+                episodes_tested=0,
+                risk_level=triage.assumed_risk or RiskLevel.LOW,
+                risk_summary=f"Triaged as trivial: {triage.reason}",
+                benefit_summary=proposal.expected_benefit,
+            )
+            log.info("proposal_triaged_skipping_simulation", reason=triage.reason)
+            # Skip STEP 2 (Simulate) and proceed directly to governance/apply
 
-        try:
-            simulation = await self._simulate_change(proposal)
-            proposal.simulation = simulation
-        except Exception as exc:
-            proposal.status = ProposalStatus.REJECTED
-            self._proposals_rejected += 1
-            reason = f"Simulation failed: {exc}"
-            log.error("simulation_error", error=str(exc))
-            self._active_proposals.pop(proposal.id, None)
-            return ProposalResult(status=ProposalStatus.REJECTED, reason=reason)
+        # ── STEP 2: Simulate (deep multi-strategy) ─────────────────────────
+        # Skip if already triaged (has synthetic simulation)
+        if proposal.simulation is None:
+            proposal.status = ProposalStatus.SIMULATING
+            log.info("proposal_simulating")
+
+            try:
+                simulation = await self._simulate_change(proposal)
+                proposal.simulation = simulation
+            except Exception as exc:
+                proposal.status = ProposalStatus.REJECTED
+                self._proposals_rejected += 1
+                reason = f"Simulation failed: {exc}"
+                log.error("simulation_error", error=str(exc))
+                self._active_proposals.pop(proposal.id, None)
+                return ProposalResult(status=ProposalStatus.REJECTED, reason=reason)
+        else:
+            simulation = proposal.simulation
 
         if simulation.risk_level == RiskLevel.UNACCEPTABLE:
             proposal.status = ProposalStatus.REJECTED
@@ -610,16 +679,13 @@ class SimulaService:
                 risk_summary = simulation.risk_summary
                 benefit_summary = simulation.benefit_summary
 
-                # Add counterfactual and alignment data if available
+                # Add counterfactual and alignment data if available (enriched simulation)
                 enrichment = []
-                if hasattr(simulation, "constitutional_alignment"):
-                    alignment = getattr(simulation, "constitutional_alignment", 0.0)
-                    if alignment != 0.0:
-                        enrichment.append(f"Constitutional alignment: {alignment:+.2f}")
-                if hasattr(simulation, "dependency_blast_radius"):
-                    blast = getattr(simulation, "dependency_blast_radius", 0)
-                    if blast > 0:
-                        enrichment.append(f"Blast radius: {blast} files")
+                if isinstance(simulation, EnrichedSimulationResult):
+                    if simulation.constitutional_alignment != 0.0:
+                        enrichment.append(f"Constitutional alignment: {simulation.constitutional_alignment:+.2f}")
+                    if simulation.dependency_blast_radius > 0:
+                        enrichment.append(f"Blast radius: {simulation.dependency_blast_radius} files")
                 if enrichment:
                     risk_summary = f"{risk_summary} [{'; '.join(enrichment)}]"
 
@@ -673,6 +739,27 @@ class SimulaService:
             else RiskLevel.LOW
         )
 
+        # Extract simulation detail fields if enriched simulation was performed
+        sim_detail = {
+            "simulation_episodes_tested": 0,
+            "counterfactual_regression_rate": 0.0,
+            "dependency_blast_radius": 0,
+            "constitutional_alignment": 0.0,
+            "resource_tokens_per_hour": 0,
+            "caution_reasoning": "",
+        }
+        if isinstance(proposal.simulation, EnrichedSimulationResult):
+            sim_detail["simulation_episodes_tested"] = proposal.simulation.episodes_tested
+            sim_detail["counterfactual_regression_rate"] = proposal.simulation.counterfactual_regression_rate
+            sim_detail["dependency_blast_radius"] = proposal.simulation.dependency_blast_radius
+            sim_detail["constitutional_alignment"] = proposal.simulation.constitutional_alignment
+            if proposal.simulation.resource_cost_estimate:
+                sim_detail["resource_tokens_per_hour"] = (
+                    proposal.simulation.resource_cost_estimate.estimated_additional_llm_tokens_per_hour
+                )
+            if proposal.simulation.caution_adjustment:
+                sim_detail["caution_reasoning"] = proposal.simulation.caution_adjustment.reasoning
+
         record = EvolutionRecord(
             proposal_id=proposal.id,
             category=proposal.category,
@@ -683,6 +770,7 @@ class SimulaService:
             simulation_risk=risk_level,
             rolled_back=rolled_back,
             rollback_reason=rollback_reason,
+            **sim_detail,
         )
 
         try:
