@@ -1,0 +1,22 @@
+# EcodiaOS — Local development overrides
+# Usage: ECODIAOS_CONFIG_PATH=config/local.yaml uvicorn ecodiaos.main:app --reload
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+neo4j:
+  uri: "bolt://localhost:7687"
+  username: "neo4j"
+  password: "ecodiaos_dev"
+  database: "neo4j"
+
+timescaledb:
+  host: "localhost"
+  port: 5432
+  database: "ecodiaos"
+  username: "ecodiaos"
+  password: "ecodiaos_dev"
+
+redis:
+  url: "redis://localhost:6379/0"

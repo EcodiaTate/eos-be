@@ -1,0 +1,114 @@
+# EcodiaOS — Default Runtime Configuration
+# Override via environment variables or instance-specific config files.
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  ws_port: 8001
+  federation_port: 8002
+  cors_origins: ["http://localhost:3000"]
+  api_key_header: "X-EOS-API-Key"
+
+neo4j:
+  # URI, password, and database are injected from environment variables:
+  #   ECODIAOS_NEO4J_URI       — e.g. neo4j+s://xxxx.databases.neo4j.io
+  #   ECODIAOS_NEO4J_PASSWORD  — Aura instance password
+  #   ECODIAOS_NEO4J_DATABASE  — defaults to "neo4j"
+  username: "neo4j"
+  max_connection_pool_size: 20
+
+timescaledb:
+  host: "timescaledb"
+  port: 5432
+  database: "ecodiaos"
+  schema: "public"
+  username: "ecodiaos"
+  # password from ECODIAOS_TSDB_PASSWORD env var
+  pool_size: 10
+
+redis:
+  url: "redis://redis:6379/0"
+  prefix: "eos"
+
+llm:
+  provider: "anthropic"
+  model: "claude-sonnet-4-20250514"
+  # api_key from ECODIAOS_LLM_API_KEY env var
+  fallback_provider: null
+  fallback_model: null
+  budgets:
+    atune:  { max_calls_per_hour: 120, max_tokens_per_hour: 60000 }
+    equor:  { max_calls_per_hour: 60,  max_tokens_per_hour: 30000 }
+    nova:   { max_calls_per_hour: 60,  max_tokens_per_hour: 120000 }
+    voxis:  { max_calls_per_hour: 120, max_tokens_per_hour: 120000 }
+    evo:    { max_calls_per_hour: 30,  max_tokens_per_hour: 60000 }
+    simula: { max_calls_per_hour: 5,   max_tokens_per_hour: 10000 }
+
+embedding:
+  strategy: "local"
+  local_model: "sentence-transformers/all-mpnet-base-v2"
+  local_device: "cpu"
+  dimension: 768
+  max_batch_size: 32
+  cache_embeddings: true
+  cache_ttl_seconds: 3600
+
+synapse:
+  cycle_period_ms: 150
+  min_cycle_period_ms: 80
+  max_cycle_period_ms: 500
+  health_check_interval_ms: 5000
+  health_failure_threshold: 3
+
+atune:
+  ignition_threshold: 0.3
+  workspace_buffer_size: 32
+  spontaneous_recall_base_probability: 0.02
+  max_percept_queue_size: 100
+
+nova:
+  max_active_goals: 20
+  fast_path_timeout_ms: 100
+  slow_path_timeout_ms: 5000
+  max_policies_per_deliberation: 5
+
+equor:
+  standard_review_timeout_ms: 500
+  critical_review_timeout_ms: 50
+  care_floor_multiplier: -0.3
+  honesty_floor_multiplier: -0.3
+
+axon:
+  max_actions_per_cycle: 5
+  max_api_calls_per_minute: 30
+  max_notifications_per_hour: 10
+  max_concurrent_executions: 3
+  total_timeout_per_cycle_ms: 30000
+
+voxis:
+  max_expression_length: 2000
+  min_expression_interval_minutes: 1
+  voice_synthesis_enabled: false
+
+evo:
+  consolidation_interval_hours: 6
+  consolidation_cycle_threshold: 10000
+  max_active_hypotheses: 50
+  max_parameter_delta_per_cycle: 0.03
+  min_evidence_for_integration: 10
+
+simula:
+  max_simulation_episodes: 200
+  regression_threshold_unacceptable: 0.10
+  regression_threshold_high: 0.05
+
+federation:
+  enabled: false
+  endpoint: null
+  tls_cert_path: null
+  tls_key_path: null
+  ca_cert_path: null
+
+logging:
+  level: "INFO"
+  format: "console"

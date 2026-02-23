@@ -1,0 +1,101 @@
+version: "3.9"
+
+services:
+  # ─── Core Service ───────────────────────────────────────────────
+  ecodiaos-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecodiaos-core
+    ports:
+      - "8000:8000"   # HTTP API
+      - "8001:8001"   # WebSocket (Alive telemetry)
+      # 8002 — Federation (disabled by default)
+    env_file: .env
+    environment:
+      - ECODIAOS_CONFIG_PATH=/app/config/default.yaml
+      - ECODIAOS_SEED_PATH=/app/config/seeds/example_seed.yaml
+    volumes:
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ecodiaos_network
+    restart: unless-stopped
+
+  # ─── Neo4j — hosted on Neo4j Aura (no local container) ─────────
+  # Connection configured via environment variables:
+  #   ECODIAOS_NEO4J_URI, ECODIAOS_NEO4J_PASSWORD, ECODIAOS_NEO4J_DATABASE
+
+  # ─── TimescaleDB (Telemetry) ────────────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: ecodiaos-timescaledb
+    environment:
+      - POSTGRES_DB=ecodiaos
+      - POSTGRES_USER=ecodiaos
+      - POSTGRES_PASSWORD=${ECODIAOS_TSDB_PASSWORD:-ecodiaos_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - tsdb_data:/var/lib/postgresql/data
+    networks:
+      - ecodiaos_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ecodiaos -d ecodiaos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ─── Redis (Ephemeral State) ────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ecodiaos-redis
+    command: >
+      redis-server
+      --requirepass ${ECODIAOS_REDIS_PASSWORD:-ecodiaos_dev}
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ecodiaos_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${ECODIAOS_REDIS_PASSWORD:-ecodiaos_dev}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ─── Frontend (Alive Visualization) ─────────────────────────────
+  ecodiaos-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ecodiaos-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://ecodiaos-core:8000
+      - NEXT_PUBLIC_WS_URL=ws://ecodiaos-core:8001
+    depends_on:
+      - ecodiaos-core
+    networks:
+      - ecodiaos_network
+    restart: unless-stopped
+
+volumes:
+  tsdb_data:
+  redis_data:
+
+networks:
+  ecodiaos_network:
+    driver: bridge
