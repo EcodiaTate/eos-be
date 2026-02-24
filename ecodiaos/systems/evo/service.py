@@ -99,6 +99,7 @@ class EvoService:
         # Cross-system references (wired post-init by main.py)
         self._atune: Any = None  # AtuneService — for pushing learned head weights
         self._nova: Any = None   # NovaService — for generating epistemic goals from hypotheses
+        self._voxis: Any = None  # VoxisService — for personality learning from expression outcomes
 
         # Sub-systems (built in initialize())
         self._hypothesis_engine: HypothesisEngine | None = None
@@ -364,6 +365,44 @@ class EvoService:
         self._nova = nova
         self._logger.info("nova_wired_to_evo")
 
+    def set_voxis(self, voxis: Any) -> None:
+        """Wire Voxis so Evo can push personality adjustments from expression outcomes."""
+        self._voxis = voxis
+        self._logger.info("voxis_wired_to_evo")
+
+    # ─── Thread Integration ────────────────────────────────────────────────────
+
+    def get_pending_candidates_snapshot(self) -> list[PatternCandidate]:
+        """
+        Return a snapshot of current pending pattern candidates.
+
+        Called by Thread every ~200 cycles to check for mature patterns
+        that should be crystallised into identity schemas. Does NOT
+        clear the candidates — that happens during hypothesis generation.
+        """
+        return list(self._pending_candidates)
+
+    def on_schema_formed(
+        self,
+        schema_id: str,
+        statement: str,
+        status: str,
+        source_patterns: list[str] | None = None,
+    ) -> None:
+        """
+        Callback from Thread when a pattern crystallises into an identity schema.
+
+        Closes the learning loop: Evo detects patterns → Thread forms schemas
+        → Evo knows the pattern was internalised as identity.
+        """
+        self._logger.info(
+            "schema_formed_notification",
+            schema_id=schema_id,
+            statement=statement[:80],
+            status=status,
+            source_patterns=source_patterns or [],
+        )
+
     # ─── Health ────────────────────────────────────────────────────────────────
 
     async def health(self) -> dict[str, Any]:
@@ -503,6 +542,11 @@ class EvoService:
             # the deltas and forward them so they actually take effect.
             self._push_atune_head_weights()
 
+            # Push learned personality adjustments to Voxis
+            # Evo tunes parameters like "voxis.personality.warmth" — extract
+            # the deltas and forward them so Voxis personality actually evolves.
+            self._push_voxis_personality()
+
             return result
         except Exception as exc:
             self._logger.error("consolidation_run_failed", error=str(exc))
@@ -545,6 +589,44 @@ class EvoService:
                 )
             except Exception:
                 self._logger.debug("atune_head_push_failed", exc_info=True)
+
+    def _push_voxis_personality(self) -> None:
+        """
+        Extract voxis.personality.* parameters from the tuner and push them to Voxis.
+
+        Evo learns personality adjustments like "voxis.personality.warmth" via
+        parameter hypotheses. The tuner stores the current values; Voxis needs
+        the deltas from defaults applied via update_personality().
+        """
+        if self._voxis is None or self._parameter_tuner is None:
+            return
+
+        from ecodiaos.systems.evo.types import PARAMETER_DEFAULTS
+
+        all_params = self._parameter_tuner.get_all_parameters()
+        personality_deltas: dict[str, float] = {}
+
+        for param_name, current_value in all_params.items():
+            if not param_name.startswith("voxis.personality."):
+                continue
+            # Extract dimension: "voxis.personality.warmth" → "warmth"
+            parts = param_name.split(".")
+            if len(parts) >= 3:
+                dimension = parts[2]
+                default_value = PARAMETER_DEFAULTS.get(param_name, current_value)
+                delta = current_value - default_value
+                if abs(delta) > 0.001:
+                    personality_deltas[dimension] = delta
+
+        if personality_deltas:
+            try:
+                self._voxis.update_personality(personality_deltas)
+                self._logger.info(
+                    "voxis_personality_pushed",
+                    dimensions={k: round(v, 4) for k, v in personality_deltas.items()},
+                )
+            except Exception:
+                self._logger.debug("voxis_personality_push_failed", exc_info=True)
 
     async def _consolidation_loop(self) -> None:
         """

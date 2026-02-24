@@ -75,6 +75,12 @@ class EquorService:
         self._drift_tracker = DriftTracker(window_size=config.drift_window_size)
         self._safe_mode = False
         self._total_reviews = 0
+        self._evo: Any = None  # Wired post-init for learning feedback from vetoes
+
+    def set_evo(self, evo: Any) -> None:
+        """Wire Evo so constitutional vetoes become learning episodes."""
+        self._evo = evo
+        logger.info("evo_wired_to_equor")
 
     # ─── Lifecycle ────────────────────────────────────────────────
 
@@ -126,6 +132,10 @@ class EquorService:
             # 6. Update drift tracking
             self._drift_tracker.record_decision(alignment, check.verdict.value)
             self._total_reviews += 1
+
+            # 6b. Feed blocked verdicts to Evo as negative learning episodes
+            if check.verdict == Verdict.BLOCKED and self._evo is not None:
+                await self._feed_veto_to_evo(intent, check)
 
             # 7. Check if drift report is due + promotion eligibility
             if self._total_reviews % self._config.drift_report_interval == 0:
@@ -355,6 +365,36 @@ class EquorService:
                 violations.append(row["name"])
 
         return violations
+
+    async def _feed_veto_to_evo(
+        self, intent: Intent, check: ConstitutionalCheck,
+    ) -> None:
+        """
+        Feed a constitutional veto to Evo as a learning episode.
+
+        The organism should learn from its constitutional failures — when Equor
+        blocks an intent, the violation becomes a negative-affect episode so Evo
+        can refine hypothesis about which intent patterns violate the constitution.
+        """
+        try:
+            from ecodiaos.primitives.memory_trace import Episode
+
+            episode = Episode(
+                source="equor.veto",
+                modality="internal",
+                raw_content=(
+                    f"Constitutional veto: {intent.goal.description[:200]}. "
+                    f"Reason: {check.reasoning[:300]}"
+                ),
+                summary=f"Blocked intent: {check.reasoning[:100]}",
+                salience_composite=0.7,  # Vetoes are important learning events
+                affect_valence=-0.3,
+                affect_arousal=0.4,
+            )
+            await self._evo.process_episode(episode)
+            logger.info("veto_fed_to_evo", intent_id=intent.id)
+        except Exception:
+            logger.debug("evo_veto_feed_failed", exc_info=True)
 
     async def _store_review_record(
         self,

@@ -1,19 +1,24 @@
 """
-EcodiaOS — Voxis Service
+EcodiaOS -- Voxis Service
 
-The expression and voice system — the organism's primary communicative interface.
+The expression and voice system -- the organism's primary communicative interface.
 
 VoxisService is the public API for all expression. It:
 - Implements BroadcastSubscriber to receive workspace broadcasts from Atune
 - Orchestrates the full 9-step expression pipeline via ContentRenderer
 - Manages conversation state via ConversationManager
 - Makes silence decisions via SilenceEngine
-- Reports expression feedback to Atune (closing the perception-action loop)
+- Queues suppressed expressions for deferred delivery via ExpressionQueue
+- Tracks expression diversity to prevent repetition
+- Correlates user responses to expressions for reception feedback
+- Tracks conversation dynamics for real-time style adaptation
+- Generates voice parameters for multimodal expression
+- Reports expression feedback to Atune/Evo (closing the perception-action loop)
 - Maintains the live personality vector (updated by Evo over time)
 
 Architecture note on async/sync:
   on_broadcast() is called by Atune's workspace synchronously during the
-  theta cycle. The silence decision is made synchronously (≤10ms). If speaking,
+  theta cycle. The silence decision is made synchronously (<=10ms). If speaking,
   the full expression pipeline is spawned as an asyncio task so it never
   blocks the workspace cycle. Expressions are delivered asynchronously.
 """
@@ -21,7 +26,7 @@ Architecture note on async/sync:
 from __future__ import annotations
 
 import asyncio
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 
@@ -35,7 +40,11 @@ from ecodiaos.systems.memory.service import MemoryService
 from ecodiaos.systems.voxis.affect_colouring import AffectColouringEngine
 from ecodiaos.systems.voxis.audience import AudienceProfiler
 from ecodiaos.systems.voxis.conversation import ConversationManager
+from ecodiaos.systems.voxis.diversity import DiversityTracker
+from ecodiaos.systems.voxis.dynamics import ConversationDynamicsEngine
+from ecodiaos.systems.voxis.expression_queue import ExpressionQueue
 from ecodiaos.systems.voxis.personality import PersonalityEngine
+from ecodiaos.systems.voxis.reception import ReceptionEngine
 from ecodiaos.systems.voxis.renderer import ContentRenderer
 from ecodiaos.systems.voxis.silence import SilenceEngine
 from ecodiaos.systems.voxis.types import (
@@ -46,12 +55,23 @@ from ecodiaos.systems.voxis.types import (
     ExpressionTrigger,
     ReceptionEstimate,
     SilenceContext,
+    VoiceParams,
 )
+from ecodiaos.systems.voxis.voice import VoiceEngine
+
+if TYPE_CHECKING:
+    from ecodiaos.systems.atune.types import WorkspaceBroadcast
 
 logger = structlog.get_logger()
 
 # Type alias for expression delivery callback
 ExpressionCallback = Callable[[Expression], None]
+
+# How often to drain the expression queue (seconds)
+_QUEUE_DRAIN_INTERVAL_SECONDS = 30.0
+
+# How often to expire unanswered reception tracking (seconds)
+_RECEPTION_EXPIRE_INTERVAL_SECONDS = 60.0
 
 
 class VoxisService:
@@ -59,14 +79,14 @@ class VoxisService:
     Expression and voice system.
 
     Dependencies:
-        memory  — for personality loading, instance name, memory retrieval
-        redis   — for conversation state persistence
-        llm     — for expression generation and conversation summarisation
-        config  — VoxisConfig
+        memory  -- for personality loading, instance name, memory retrieval
+        redis   -- for conversation state persistence
+        llm     -- for expression generation and conversation summarisation
+        config  -- VoxisConfig
 
     Lifecycle:
-        initialize()  — load personality from Memory, set up sub-components
-        shutdown()    — flush any queued state
+        initialize()  -- load personality from Memory, set up sub-components
+        shutdown()    -- flush any queued state, cancel background loops
     """
 
     system_id: str = "voxis"
@@ -84,7 +104,7 @@ class VoxisService:
         self._config = config
         self._logger = logger.bind(system="voxis")
 
-        # Sub-components — initialised in initialize()
+        # Sub-components -- initialised in initialize()
         self._personality_engine: PersonalityEngine | None = None
         self._affect_engine = AffectColouringEngine()
         self._audience_profiler = AudienceProfiler()
@@ -94,7 +114,17 @@ class VoxisService:
         self._conversation_manager: ConversationManager | None = None
         self._renderer: ContentRenderer | None = None
 
-        # Instance metadata — loaded in initialize()
+        # New sub-components -- expression queue, diversity, reception, dynamics, voice
+        self._expression_queue = ExpressionQueue(
+            max_size=20,
+            delivery_threshold=0.3,
+        )
+        self._diversity_tracker = DiversityTracker()
+        self._reception_engine = ReceptionEngine()
+        self._dynamics_engine = ConversationDynamicsEngine()
+        self._voice_engine = VoiceEngine()
+
+        # Instance metadata -- loaded in initialize()
         self._instance_name: str = "EOS"
         self._drive_weights: dict[str, float] = {
             "coherence": 1.0,
@@ -112,23 +142,37 @@ class VoxisService:
         # Affect state before the last expression (for affect delta tracking)
         self._affect_before_expression: AffectState | None = None
 
-        # Background task tracking — prevents fire-and-forget error loss
+        # Current affect (updated on each expression; used by queue drain)
+        self._current_affect: AffectState = AffectState.neutral()
+
+        # Thread integration -- narrative identity context
+        self._thread: Any = None
+
+        # Background task tracking -- prevents fire-and-forget error loss
         self._background_tasks: set[asyncio.Task] = set()
         self._background_task_failures: int = 0
+
+        # Periodic background loop handles
+        self._queue_drain_task: asyncio.Task | None = None
+        self._reception_expire_task: asyncio.Task | None = None
 
         # Observability counters
         self._total_expressions: int = 0
         self._total_silence: int = 0
         self._total_speak: int = 0
+        self._total_queued: int = 0
+        self._total_queue_delivered: int = 0
         self._honesty_rejections: int = 0
+        self._diversity_rejections: int = 0
         self._expressions_by_trigger: dict[str, int] = {}
         self._expressions_by_channel: dict[str, int] = {}
 
-    # ─── Lifecycle ────────────────────────────────────────────────
+    # --- Lifecycle --------------------------------------------------------
 
     async def initialize(self) -> None:
         """
-        Load personality vector from Memory, build sub-components.
+        Load personality vector from Memory, build sub-components,
+        and start background loops (queue drain, reception expiry).
         Called during application startup after Memory is ready.
         """
         self._logger.info("voxis_initializing")
@@ -138,7 +182,7 @@ class VoxisService:
         instance = await self._memory.get_self()
         if instance is not None:
             self._instance_name = instance.name
-            # Load personality from Self node — stored as personality_json (dict)
+            # Load personality from Self node -- stored as personality_json (dict)
             # or personality_vector (ordered list of 9 floats from birth)
             raw_json = getattr(instance, "personality_json", None)
             raw_vector = getattr(instance, "personality_vector", None)
@@ -153,9 +197,6 @@ class VoxisService:
                 except Exception:
                     self._logger.warning("personality_json_load_failed", exc_info=True)
             elif raw_vector and isinstance(raw_vector, list) and len(raw_vector) >= 9:
-                # Birth stores personality as an ordered list of 9 floats:
-                # [warmth, directness, verbosity, formality, curiosity_expression,
-                #  humour, empathy_expression, confidence_display, metaphor_use]
                 _KEYS = [
                     "warmth", "directness", "verbosity", "formality",
                     "curiosity_expression", "humour", "empathy_expression",
@@ -193,6 +234,10 @@ class VoxisService:
 
         self._personality_engine = PersonalityEngine(personality_vector)
 
+        # Wire voice engine with instance's base voice
+        voice_id = getattr(instance, "voice_id", "") if instance else ""
+        self._voice_engine = VoiceEngine(base_voice=voice_id)
+
         self._conversation_manager = ConversationManager(
             redis=self._redis,
             llm=self._llm,
@@ -212,6 +257,16 @@ class VoxisService:
             max_expression_length=self._config.max_expression_length,
         )
 
+        # Start background loops
+        self._queue_drain_task = self._spawn_tracked_task(
+            self._queue_drain_loop(),
+            name="voxis_queue_drain",
+        )
+        self._reception_expire_task = self._spawn_tracked_task(
+            self._reception_expire_loop(),
+            name="voxis_reception_expire",
+        )
+
         self._logger.info(
             "voxis_initialized",
             instance_name=self._instance_name,
@@ -219,22 +274,31 @@ class VoxisService:
         )
 
     async def shutdown(self) -> None:
-        """Graceful shutdown — nothing stateful to flush beyond what Redis persists."""
+        """Graceful shutdown -- cancel background loops, log final metrics."""
+        # Cancel background loops
+        if self._queue_drain_task and not self._queue_drain_task.done():
+            self._queue_drain_task.cancel()
+        if self._reception_expire_task and not self._reception_expire_task.done():
+            self._reception_expire_task.cancel()
+
         self._logger.info(
             "voxis_shutdown",
             total_expressions=self._total_expressions,
             total_silence=self._total_silence,
+            total_queued=self._total_queued,
+            total_queue_delivered=self._total_queue_delivered,
+            diversity_rejections=self._diversity_rejections,
         )
 
-    # ─── BroadcastSubscriber Interface ───────────────────────────
+    # --- BroadcastSubscriber Interface ------------------------------------
 
     async def on_broadcast(self, broadcast: object) -> None:
         """
         Called by Atune when the workspace broadcasts a percept.
 
-        The silence decision is made synchronously (≤10ms).
-        If speaking, the expression pipeline is spawned as a background task
-        so this method returns quickly and never blocks the theta cycle.
+        The silence decision is made synchronously (<=10ms).
+        If speaking, the expression pipeline is spawned as a background task.
+        If silenced with queue=True, the intent is queued for deferred delivery.
         """
         if self._renderer is None:
             return
@@ -260,7 +324,7 @@ class VoxisService:
             urgency=float(getattr(broadcast, "salience", type("", (), {"composite": 0.5})()).composite),
         )
 
-        # Silence decision — synchronous, fast
+        # Silence decision -- synchronous, fast
         silence_ctx = SilenceContext(
             trigger=intent.trigger,
             minutes_since_last_expression=self._silence_engine.minutes_since_last_expression,
@@ -272,15 +336,23 @@ class VoxisService:
 
         if not decision.speak:
             self._total_silence += 1
+            # Queue for deferred delivery if the silence engine said to queue
+            if decision.queue:
+                self._expression_queue.enqueue(intent, affect)
+                self._total_queued += 1
             return
 
         # Spawn expression pipeline as background task
-        asyncio.create_task(
+        self._spawn_tracked_task(
             self._express_background(intent, affect),
             name=f"voxis_express_{intent.id}",
         )
 
-    # ─── Primary Expression API ───────────────────────────────────
+    async def receive_broadcast(self, broadcast: "WorkspaceBroadcast") -> None:
+        """BroadcastSubscriber protocol -- delegates to on_broadcast()."""
+        await self.on_broadcast(broadcast)
+
+    # --- Primary Expression API -------------------------------------------
 
     async def express(
         self,
@@ -300,6 +372,7 @@ class VoxisService:
         Called by:
         - Nova (deliberate communicative intents)
         - API endpoints (chat/message)
+        - Queue drain (deferred expressions)
         - Test harness
 
         Returns the completed Expression (also delivers via registered callbacks).
@@ -308,6 +381,7 @@ class VoxisService:
         assert self._conversation_manager is not None
 
         current_affect = affect or AffectState.neutral()
+        self._current_affect = current_affect
 
         # Capture affect before expression for delta tracking
         self._affect_before_expression = current_affect
@@ -329,6 +403,19 @@ class VoxisService:
                 trigger=trigger.value,
                 reason=decision.reason,
             )
+            # Queue for later if the silence engine said to
+            if decision.queue:
+                intent = ExpressionIntent(
+                    trigger=trigger,
+                    content_to_express=content,
+                    conversation_id=conversation_id,
+                    addressee_id=addressee_id,
+                    intent_id=intent_id,
+                    insight_value=insight_value,
+                    urgency=urgency,
+                )
+                self._expression_queue.enqueue(intent, current_affect)
+                self._total_queued += 1
             return Expression(
                 is_silence=True,
                 silence_reason=decision.reason,
@@ -345,7 +432,7 @@ class VoxisService:
         conv_state = await self._conversation_manager.get_or_create(conversation_id)
         conversation_history = await self._conversation_manager.prepare_context(conv_state)
 
-        # Build audience profile
+        # Build audience profile (now with learned model data)
         audience = await self._build_audience_profile(
             addressee_id=addressee_id,
             addressee_name=addressee_name,
@@ -367,6 +454,27 @@ class VoxisService:
         # Retrieve relevant memories (best-effort, non-blocking with timeout)
         relevant_memories = await self._retrieve_relevant_memories(content, current_affect)
 
+        # Inject Thread identity context (P1.6 + P2.9)
+        if self._thread is not None:
+            try:
+                identity_ctx = self._thread.get_identity_context()
+                if identity_ctx:
+                    relevant_memories.insert(0, f"Identity: {identity_ctx}")
+            except Exception:
+                pass  # Thread context is best-effort
+
+        # Get conversation dynamics for real-time style adaptation
+        dynamics = self._dynamics_engine.get_dynamics(conv_state.conversation_id)
+
+        # Check diversity before rendering
+        diversity_score = self._diversity_tracker.score(content)
+        diversity_instruction: str | None = None
+        if diversity_score.is_repetitive:
+            diversity_instruction = self._diversity_tracker.build_diversity_instruction(
+                diversity_score
+            )
+            self._diversity_rejections += 1
+
         # Build full context
         context = ExpressionContext(
             instance_name=self._instance_name,
@@ -378,8 +486,22 @@ class VoxisService:
             intent=intent,
         )
 
-        # Render
-        expression = await self._renderer.render(intent, context, self._drive_weights)
+        # Render (with diversity instruction and dynamics applied)
+        expression = await self._renderer.render(
+            intent,
+            context,
+            self._drive_weights,
+            diversity_instruction=diversity_instruction,
+            dynamics=dynamics,
+        )
+
+        # Generate voice parameters for multimodal delivery
+        voice_params = self._voice_engine.derive(
+            personality=self._personality_engine.current,  # type: ignore[union-attr]
+            affect=current_affect,
+            strategy_register=expression.strategy.register if expression.strategy else "neutral",
+            urgency=urgency,
+        )
 
         # Post-render: update state
         self._silence_engine.record_expression()
@@ -394,6 +516,20 @@ class VoxisService:
         if expression.generation_trace and not expression.generation_trace.honesty_check_passed:
             self._honesty_rejections += 1
 
+        # Record expression in diversity tracker
+        self._diversity_tracker.record(
+            expression.content or "",
+            trigger=trigger.value,
+        )
+
+        # Record expression in conversation dynamics engine
+        self._dynamics_engine.record_turn(
+            conversation_id=conv_state.conversation_id,
+            role="assistant",
+            text=expression.content or "",
+            affect_valence=current_affect.valence,
+        )
+
         # Append EOS side of exchange to conversation
         await self._conversation_manager.append_message(
             state=conv_state,
@@ -402,10 +538,27 @@ class VoxisService:
             affect_valence=current_affect.valence,
         )
 
+        # Track expression for reception feedback (response correlation)
+        self._reception_engine.track_expression(
+            expression_id=expression.id,
+            conversation_id=conv_state.conversation_id,
+            content_summary=expression.content[:200] if expression.content else "",
+            strategy_register=expression.strategy.register if expression.strategy else "neutral",
+            personality_warmth=self._personality_engine.current.warmth if self._personality_engine else 0.0,
+            affect_before_valence=self._affect_before_expression.valence if self._affect_before_expression else 0.0,
+            trigger=trigger.value,
+        )
+
         # Async: update topics (tracked, not fire-and-forget)
         self._spawn_tracked_task(
             self._update_topics_async(conv_state),
             name=f"voxis_topics_{conv_state.conversation_id}",
+        )
+
+        # Store expression as a Memory episode (the organism remembers what it said)
+        self._spawn_tracked_task(
+            self._store_expression_as_episode(expression, trigger),
+            name=f"voxis_mem_{expression.id[:8]}",
         )
 
         # Deliver via callbacks (WebSocket handlers etc.)
@@ -415,7 +568,7 @@ class VoxisService:
             except Exception:
                 self._logger.warning("expression_callback_failed", exc_info=True)
 
-        # Generate ExpressionFeedback for Evo personality learning loop
+        # Generate initial ExpressionFeedback (will be enriched by reception engine)
         feedback = ExpressionFeedback(
             expression_id=expression.id,
             trigger=trigger.value,
@@ -449,10 +602,17 @@ class VoxisService:
     ) -> str:
         """
         Record a user message into the conversation state.
-        Returns the conversation_id (for use in the response call).
+
+        Also:
+        - Correlates with pending expressions for reception feedback
+        - Updates audience profiler's learned model
+        - Tracks conversation dynamics
+        - Returns the conversation_id (for use in the response call).
         """
         assert self._conversation_manager is not None
         conv_state = await self._conversation_manager.get_or_create(conversation_id)
+
+        # Record in conversation manager
         updated = await self._conversation_manager.append_message(
             state=conv_state,
             role="user",
@@ -460,9 +620,47 @@ class VoxisService:
             speaker_id=speaker_id,
             affect_valence=affect_valence,
         )
+
+        # Update audience profiler's learned model
+        if speaker_id:
+            self._audience_profiler.observe_user_message(speaker_id, message)
+
+        # Track conversation dynamics
+        self._dynamics_engine.record_turn(
+            conversation_id=updated.conversation_id,
+            role="user",
+            text=message,
+            affect_valence=affect_valence or 0.0,
+        )
+
+        # Correlate with pending expressions for reception feedback
+        enriched_feedback = self._reception_engine.correlate_response(
+            conversation_id=updated.conversation_id,
+            response_text=message,
+            response_affect_valence=affect_valence,
+        )
+
+        if enriched_feedback:
+            # Update audience profiler with satisfaction signal
+            if speaker_id:
+                self._audience_profiler.observe_reception(
+                    individual_id=speaker_id,
+                    register_used=enriched_feedback.strategy_register,
+                    formatting_used="prose",  # TODO: track from strategy
+                    expression_length=enriched_feedback.user_response_length,
+                    satisfaction=enriched_feedback.inferred_reception.satisfaction,
+                )
+
+            # Re-dispatch enriched feedback to Evo and other listeners
+            for fb_cb in self._feedback_callbacks:
+                try:
+                    fb_cb(enriched_feedback)
+                except Exception:
+                    self._logger.debug("enriched_feedback_callback_failed", exc_info=True)
+
         return updated.conversation_id
 
-    # ─── Personality Update (called by Evo) ──────────────────────
+    # --- Personality Update (called by Evo) -------------------------------
 
     def update_personality(self, delta: dict[str, float]) -> PersonalityVector:
         """
@@ -479,12 +677,17 @@ class VoxisService:
         )
         return new_vector
 
-    # ─── Observability ────────────────────────────────────────────
+    # --- Observability ----------------------------------------------------
 
     @property
     def current_personality(self) -> PersonalityVector:
         assert self._personality_engine is not None
         return self._personality_engine.current
+
+    def set_thread(self, thread: Any) -> None:
+        """Wire Thread for narrative identity context injection."""
+        self._thread = thread
+        logger.info("thread_wired_to_voxis")
 
     def register_expression_callback(self, callback: ExpressionCallback) -> None:
         """Register a callback to be called with every delivered expression."""
@@ -501,7 +704,7 @@ class VoxisService:
         self._feedback_callbacks.append(callback)
 
     async def health(self) -> dict:
-        """Health check — returns current metrics snapshot."""
+        """Health check -- returns current metrics snapshot."""
         total_decisions = self._total_speak + self._total_silence
         silence_rate = self._total_silence / max(1, total_decisions)
 
@@ -511,6 +714,7 @@ class VoxisService:
             "total_expressions": self._total_expressions,
             "silence_rate": round(silence_rate, 4),
             "honesty_rejections": self._honesty_rejections,
+            "diversity_rejections": self._diversity_rejections,
             "expressions_by_trigger": dict(self._expressions_by_trigger),
             "expressions_by_channel": dict(self._expressions_by_channel),
             "personality": {
@@ -520,9 +724,13 @@ class VoxisService:
                 "empathy_expression": round(self.current_personality.empathy_expression, 3),
                 "curiosity_expression": round(self.current_personality.curiosity_expression, 3),
             },
+            "queue": self._expression_queue.metrics(),
+            "diversity": self._diversity_tracker.metrics(),
+            "reception": self._reception_engine.metrics(),
+            "dynamics": self._dynamics_engine.metrics(),
         }
 
-    # ─── Private Helpers ──────────────────────────────────────────
+    # --- Private Helpers --------------------------------------------------
 
     async def _express_background(
         self,
@@ -541,6 +749,46 @@ class VoxisService:
         except Exception:
             self._logger.error("background_expression_failed", exc_info=True)
 
+    async def _queue_drain_loop(self) -> None:
+        """
+        Periodic background loop that delivers queued expressions
+        when silence conditions clear.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_QUEUE_DRAIN_INTERVAL_SECONDS)
+                deliverable = self._expression_queue.drain(max_items=2)
+                for item in deliverable:
+                    self._total_queue_delivered += 1
+                    self._spawn_tracked_task(
+                        self._express_background(item.intent, item.affect_snapshot),
+                        name=f"voxis_queued_{item.intent.id[:8]}",
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self._logger.warning("queue_drain_failed", exc_info=True)
+
+    async def _reception_expire_loop(self) -> None:
+        """
+        Periodic background loop that expires unanswered expressions
+        and dispatches no-response feedback to Evo.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_RECEPTION_EXPIRE_INTERVAL_SECONDS)
+                expired = self._reception_engine.expire_unanswered()
+                for feedback in expired:
+                    for fb_cb in self._feedback_callbacks:
+                        try:
+                            fb_cb(feedback)
+                        except Exception:
+                            self._logger.debug("expired_feedback_dispatch_failed", exc_info=True)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self._logger.warning("reception_expire_failed", exc_info=True)
+
     async def _build_audience_profile(
         self,
         addressee_id: str | None,
@@ -553,24 +801,21 @@ class VoxisService:
 
         if addressee_id:
             try:
-                # Retrieve entity-level facts about this individual from Memory
-                # The retrieve call is best-effort; we fall back to defaults on failure
                 result = await asyncio.wait_for(
                     self._memory.retrieve(
                         query_text=f"individual person entity {addressee_id}",
                         max_results=5,
                     ),
-                    timeout=0.1,  # Hard 100ms timeout — don't block expression for this
+                    timeout=0.1,
                 )
                 for trace in result.traces:
                     for entity in result.entities:
                         if entity.get("name") == addressee_id or entity.get("id") == addressee_id:
-                            # Extract known facts
                             props = entity.get("properties", {})
                             for k, v in props.items():
                                 memory_facts.append({"type": k, "value": v})
             except (asyncio.TimeoutError, Exception):
-                pass  # Fall back to profile built from conversation context alone
+                pass
 
         return self._audience_profiler.build_profile(
             addressee_id=addressee_id,
@@ -602,7 +847,7 @@ class VoxisService:
         except (asyncio.TimeoutError, Exception):
             return []
 
-    def _spawn_tracked_task(self, coro, name: str = "") -> asyncio.Task:
+    def _spawn_tracked_task(self, coro, name: str = "") -> asyncio.Task:  # type: ignore[type-arg]
         """
         Spawn a background task with lifecycle tracking.
 
@@ -616,7 +861,7 @@ class VoxisService:
         task.add_done_callback(self._on_background_task_done)
         return task
 
-    def _on_background_task_done(self, task: asyncio.Task) -> None:
+    def _on_background_task_done(self, task: asyncio.Task) -> None:  # type: ignore[type-arg]
         """Callback when a background task completes."""
         self._background_tasks.discard(task)
         if task.cancelled():
@@ -639,3 +884,34 @@ class VoxisService:
                 await self._conversation_manager.update_topics(conv_state, topics)  # type: ignore[arg-type]
         except Exception:
             self._logger.debug("topic_update_failed", exc_info=True)
+
+    async def _store_expression_as_episode(
+        self, expression: Expression, trigger: ExpressionTrigger,
+    ) -> None:
+        """
+        Store a delivered expression as a Memory episode.
+
+        The organism remembers what it said -- closing the expression->memory loop.
+        Without this, Voxis generates speech that vanishes from the organism's
+        episodic history. Past expressions can't inform future decisions.
+        """
+        if self._memory is None:
+            return
+        try:
+            from ecodiaos.systems.memory.episodic import store_episode
+            from ecodiaos.primitives.memory_trace import Episode
+
+            episode = Episode(
+                source=f"voxis.expression:{trigger.value}",
+                modality="text",
+                raw_content=expression.content[:2000] if expression.content else "",
+                summary=f"I said: {expression.content[:200]}" if expression.content else "",
+                salience_composite=0.3,
+                affect_valence=0.0,
+            )
+            await store_episode(self._memory._neo4j, episode)
+            self._logger.debug(
+                "expression_stored_as_episode", expression_id=expression.id,
+            )
+        except Exception:
+            self._logger.debug("expression_episode_storage_failed", exc_info=True)

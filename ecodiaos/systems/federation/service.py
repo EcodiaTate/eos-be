@@ -104,6 +104,7 @@ class FederationService:
         self._instance_id = instance_id
         self._logger = logger.bind(system="federation")
         self._initialized: bool = False
+        self._atune: Any = None  # Wired post-init for perception of federated knowledge
 
         # Sub-systems (built in initialize())
         self._identity: IdentityManager | None = None
@@ -119,6 +120,11 @@ class FederationService:
         # Interaction history (for audit, limited ring buffer)
         self._interaction_history: list[FederationInteraction] = []
         self._max_history: int = 1000
+
+    def set_atune(self, atune: Any) -> None:
+        """Wire Atune so federated knowledge becomes perceived input."""
+        self._atune = atune
+        self._logger.info("atune_wired_to_federation")
 
     # ─── Lifecycle ──────────────────────────────────────────────────
 
@@ -535,6 +541,10 @@ class FederationService:
                 self._trust.update_trust(link, interaction)
             self._record_interaction(interaction)
 
+            # Feed received knowledge to Atune as a perceived input
+            if response.granted and response.knowledge and self._atune is not None:
+                await self._inject_federated_percept(response.knowledge, link)
+
         return response
 
     # ─── Coordinated Action ─────────────────────────────────────────
@@ -739,6 +749,37 @@ class FederationService:
         self._interaction_history.append(interaction)
         if len(self._interaction_history) > self._max_history:
             self._interaction_history = self._interaction_history[-self._max_history:]
+
+    async def _inject_federated_percept(self, knowledge_items: list, link: Any) -> None:
+        """
+        Inject federated knowledge into Atune as perceived input.
+
+        The organism should perceive knowledge from its peers — otherwise
+        federation data stops at Memory and never enters the cognitive cycle.
+        """
+        try:
+            from ecodiaos.systems.atune.types import InputChannel, RawInput
+
+            summaries: list[str] = []
+            for item in knowledge_items[:3]:  # Cap at 3 to avoid flooding
+                content = getattr(item, "content", "") or getattr(item, "summary", "")
+                if content:
+                    summaries.append(str(content)[:200])
+            if not summaries:
+                return
+
+            raw = RawInput(
+                data=(
+                    f"Knowledge from {getattr(link, 'remote_name', 'peer')}: "
+                    f"{'; '.join(summaries)}"
+                ),
+                channel_id=f"federation:{getattr(link, 'id', 'unknown')}",
+                metadata={"source_instance": getattr(link, "remote_instance_id", "")},
+            )
+            await self._atune.ingest(raw, InputChannel.FEDERATION_MSG)
+            self._logger.debug("federated_knowledge_injected_to_atune")
+        except Exception:
+            self._logger.debug("federation_atune_ingest_failed", exc_info=True)
 
     async def _persist_links(self) -> None:
         """Persist link state to Redis (primary) with local file fallback."""

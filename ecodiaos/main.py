@@ -31,6 +31,7 @@ from ecodiaos.systems.voxis.types import ExpressionTrigger
 from ecodiaos.systems.nova.service import NovaService
 from ecodiaos.systems.axon.service import AxonService
 from ecodiaos.systems.evo.service import EvoService
+from ecodiaos.systems.thread.service import ThreadService
 from ecodiaos.systems.simula.service import SimulaService
 from ecodiaos.systems.synapse.service import SynapseService
 from ecodiaos.systems.thymos.service import ThymosService
@@ -346,6 +347,28 @@ async def lifespan(app: FastAPI):
     atune.subscribe(evo)
     # Loop 2: supported hypotheses → epistemic exploration goals in Nova
     evo.set_nova(nova)
+    # Loop 7: personality learning from expression outcomes
+    evo.set_voxis(voxis)
+    # Loop 6: workspace broadcasts → spontaneous expression
+    atune.subscribe(voxis)
+    # Loop 8: constitutional vetoes → learning episodes
+    equor.set_evo(evo)
+
+    # ── 11b. Initialize Thread (Narrative Identity) ────────────
+    thread = ThreadService(
+        memory=memory,
+        instance_name=config.instance_id,
+    )
+    await thread.initialize()
+    # Wire cross-system references for 29D fingerprint aggregation
+    thread.set_voxis(voxis)
+    thread.set_equor(equor)
+    thread.set_atune(atune)
+    thread.set_evo(evo)
+    thread.set_nova(nova)
+    # Wire Thread into Voxis for identity context injection (P1.6 + P2.9)
+    voxis.set_thread(thread)
+    app.state.thread = thread
 
     # ── 12. Initialize Simula (Self-Evolution) ────────────────
     import asyncio as _asyncio
@@ -377,11 +400,18 @@ async def lifespan(app: FastAPI):
     synapse.register_system(nova)
     synapse.register_system(axon)
     synapse.register_system(evo)
+    synapse.register_system(thread)
 
     # Start the heartbeat and health monitoring
     await synapse.start_clock()
     await synapse.start_health_monitor()
     app.state.synapse = synapse
+
+    # Loop 10: rhythm state → Nova drive weight adaptation
+    from ecodiaos.systems.synapse.types import SynapseEventType
+    synapse.event_bus.subscribe(
+        SynapseEventType.RHYTHM_STATE_CHANGED, nova.on_rhythm_change,
+    )
 
     # ── 13b. Initialize Thymos — The Immune System ─────────────────
     # Must come after Synapse so it can subscribe to health events.
@@ -449,6 +479,8 @@ async def lifespan(app: FastAPI):
     )
     await federation.initialize()
     app.state.federation = federation
+    # Loop 9: federated knowledge → perceived input
+    federation.set_atune(atune)
 
     if config.federation.enabled:
         # Register with Synapse for health monitoring
@@ -600,6 +632,115 @@ async def lifespan(app: FastAPI):
                     except Exception:
                         pass
 
+                # ── Axon activity reflection (every 8th cycle, offset 6 = ~40s) ──
+                if cycle % 8 == 6:
+                    try:
+                        axon_stats = axon.stats
+                        total_exec = axon_stats.get("total_executions", 0)
+                        success_exec = axon_stats.get("successful_executions", 0)
+                        if total_exec > 0:
+                            effectiveness = (
+                                "I am effective."
+                                if success_exec > total_exec * 0.7
+                                else "Some actions are failing — I should be more careful."
+                            )
+                            atune.contribute(WorkspaceContribution(
+                                system="axon",
+                                content=(
+                                    f"I have executed {total_exec} actions, "
+                                    f"{success_exec} succeeded. {effectiveness}"
+                                ),
+                                priority=0.3,
+                                reason="action_self_observation",
+                            ))
+                    except Exception:
+                        pass
+
+                # ── Voxis expression reflection (every 12th cycle, offset 8 = ~60s) ──
+                if cycle % 12 == 8:
+                    try:
+                        speak_count = getattr(voxis, "_total_speak", 0)
+                        silence_count = getattr(voxis, "_total_silence", 0)
+                        if speak_count + silence_count > 0:
+                            balance = (
+                                "I listen more than I speak."
+                                if silence_count > speak_count
+                                else "I am actively communicating."
+                            )
+                            atune.contribute(WorkspaceContribution(
+                                system="voxis",
+                                content=(
+                                    f"I have spoken {speak_count} times and chosen "
+                                    f"silence {silence_count} times. {balance}"
+                                ),
+                                priority=0.25,
+                                reason="expression_self_observation",
+                            ))
+                    except Exception:
+                        pass
+
+                # ── Federation link reflection (every 20th cycle, offset 15 = ~100s) ──
+                if cycle % 20 == 15:
+                    try:
+                        fed_health = await federation.health()
+                        link_count = fed_health.get("active_links", 0)
+                        if link_count > 0:
+                            atune.contribute(WorkspaceContribution(
+                                system="federation",
+                                content=(
+                                    f"I have {link_count} active federation "
+                                    f"link{'s' if link_count != 1 else ''}. "
+                                    f"I am part of a community of organisms."
+                                ),
+                                priority=0.25,
+                                reason="federation_self_observation",
+                            ))
+                    except Exception:
+                        pass
+
+                # ── Equor constitutional reflection (every 12th cycle, offset 4 = ~60s) ──
+                if cycle % 12 == 4:
+                    try:
+                        total_reviews = getattr(equor, "_total_reviews", 0)
+                        if total_reviews > 0:
+                            atune.contribute(WorkspaceContribution(
+                                system="equor",
+                                content=(
+                                    f"My constitutional compass has reviewed "
+                                    f"{total_reviews} intents. "
+                                    f"I remain aligned with my drives."
+                                ),
+                                priority=0.25,
+                                reason="constitutional_self_observation",
+                            ))
+                    except Exception:
+                        pass
+
+                # ── Thread narrative identity cycle (every cycle) ──
+                # Thread.on_cycle handles its own staggering internally:
+                #   Every 100 cycles: fingerprint
+                #   Every 200 cycles: Evo pattern check
+                #   Every 1000 cycles: schema conflict scan
+                #   Every 5000 cycles: life story synthesis
+                try:
+                    await thread.on_cycle(cycle)
+                except Exception:
+                    pass
+
+                # ── Thread identity reflection (every 20th cycle, offset 5 = ~100s) ──
+                if cycle % 20 == 5:
+                    try:
+                        identity_ctx = thread.get_identity_context()
+                        if identity_ctx:
+                            atune.contribute(WorkspaceContribution(
+                                system="thread",
+                                content=f"My narrative identity: {identity_ctx}",
+                                priority=0.3,
+                                reason="identity_self_observation",
+                            ))
+                    except Exception:
+                        pass
+
                 _il_logger.debug("inner_life_tick", cycle=cycle)
             except _aio_gen.CancelledError:
                 _il_logger.info("inner_life_stopped")
@@ -636,6 +777,7 @@ async def lifespan(app: FastAPI):
     await thymos.shutdown()
     await synapse.stop()
     await simula.shutdown()
+    await thread.shutdown()
     await evo.shutdown()
     await axon.shutdown()
     await nova.shutdown()
@@ -1012,6 +1154,7 @@ async def health():
     synapse_health = await app.state.synapse.health() if hasattr(app.state, "synapse") else {"status": "not_initialized"}
     thymos_health = await app.state.thymos.health() if hasattr(app.state, "thymos") else {"status": "not_initialized"}
     oneiros_health = await app.state.oneiros.health() if hasattr(app.state, "oneiros") else {"status": "not_initialized"}
+    thread_health = await app.state.thread.health() if hasattr(app.state, "thread") else {"status": "not_initialized"}
     neo4j_health = await app.state.neo4j.health_check()
     tsdb_health = await app.state.tsdb.health_check()
     redis_health = await app.state.redis.health_check()
@@ -1061,6 +1204,7 @@ async def health():
             "synapse": synapse_health,
             "thymos": thymos_health,
             "oneiros": oneiros_health,
+            "thread": thread_health,
             "federation": federation_health,
         },
         "data_stores": {
@@ -1380,11 +1524,20 @@ async def chat_message(body: dict):
             },
         )
 
+    # Include Thread identity context in response (P2.9)
+    identity_context = ""
+    if hasattr(app.state, "thread"):
+        try:
+            identity_context = app.state.thread.get_identity_context()
+        except Exception:
+            pass
+
     response: dict = {
         "expression_id": expression.id,
         "conversation_id": expression.conversation_id,
         "content": expression.content,
         "is_silence": expression.is_silence,
+        "identity_context": identity_context,
     }
 
     if expression.is_silence:
@@ -1491,6 +1644,140 @@ async def get_evo_parameters():
     """Get all current Evo-tuned parameter values."""
     evo: EvoService = app.state.evo
     return evo.get_all_parameters()
+
+
+# ─── Thread: Narrative Identity Endpoints ──────────────────────────
+
+
+@app.get("/api/v1/thread/who-am-i")
+async def thread_who_am_i():
+    """The organism's current identity summary — who it thinks it is."""
+    thread: ThreadService = app.state.thread
+    return thread.who_am_i()
+
+
+@app.get("/api/v1/thread/health")
+async def thread_health_endpoint():
+    """Thread system health and identity metrics."""
+    thread: ThreadService = app.state.thread
+    return await thread.health()
+
+
+@app.get("/api/v1/thread/commitments")
+async def thread_commitments():
+    """All identity commitments — constitutional and emergent."""
+    thread: ThreadService = app.state.thread
+    return [
+        {
+            "id": c.id,
+            "type": c.type.value,
+            "statement": c.statement,
+            "strength": c.strength.value,
+            "drive_source": c.drive_source,
+            "fidelity": round(c.fidelity, 3),
+            "test_count": c.test_count,
+            "created_at": c.created_at.isoformat(),
+        }
+        for c in thread._commitments
+    ]
+
+
+@app.get("/api/v1/thread/schemas")
+async def thread_schemas():
+    """All identity schemas — the organism's self-understanding."""
+    thread: ThreadService = app.state.thread
+    return [
+        {
+            "id": s.id,
+            "statement": s.statement,
+            "status": s.status.value,
+            "confidence": round(s.confidence, 3),
+            "evidence_ratio": round(s.evidence_ratio, 3),
+            "created_at": s.created_at.isoformat(),
+        }
+        for s in thread._schemas
+    ]
+
+
+@app.get("/api/v1/thread/fingerprints")
+async def thread_fingerprints():
+    """Recent identity fingerprints (29D snapshots over time)."""
+    thread: ThreadService = app.state.thread
+    return [
+        {
+            "id": fp.id,
+            "cycle_number": fp.cycle_number,
+            "personality": fp.personality,
+            "drive_alignment": fp.drive_alignment,
+            "affect": fp.affect,
+            "goal_profile": fp.goal_profile,
+            "interaction_profile": fp.interaction_profile,
+            "created_at": fp.created_at.isoformat(),
+        }
+        for fp in thread._fingerprints[-50:]  # Last 50
+    ]
+
+
+@app.get("/api/v1/thread/chapters")
+async def thread_chapters():
+    """Narrative chapters — the organism's life phases."""
+    thread: ThreadService = app.state.thread
+    return [
+        {
+            "id": ch.id,
+            "title": ch.title,
+            "theme": ch.theme,
+            "status": ch.status.value,
+            "opened_at_cycle": ch.opened_at_cycle,
+            "closed_at_cycle": ch.closed_at_cycle,
+            "summary": ch.summary,
+            "created_at": ch.created_at.isoformat(),
+        }
+        for ch in thread._chapters
+    ]
+
+
+@app.get("/api/v1/thread/past-self")
+async def thread_past_self(cycle: int = 0):
+    """
+    View the organism's identity at a past point in time.
+    Query param: cycle=N (0 = earliest available).
+    """
+    thread: ThreadService = app.state.thread
+    return thread.get_past_self(cycle_reference=cycle)
+
+
+@app.get("/api/v1/thread/life-story")
+async def thread_life_story():
+    """The organism's latest autobiographical synthesis."""
+    thread: ThreadService = app.state.thread
+    if thread._life_story is None:
+        return {"status": "not_yet_synthesised", "message": "Life story not yet generated"}
+    return thread._life_story.model_dump()
+
+
+@app.get("/api/v1/thread/conflicts")
+async def thread_conflicts():
+    """Detected schema conflicts — contradictions in self-understanding."""
+    thread: ThreadService = app.state.thread
+    return [
+        {
+            "id": c.id,
+            "schema_a_statement": c.schema_a_statement,
+            "schema_b_statement": c.schema_b_statement,
+            "cosine_similarity": c.cosine_similarity,
+            "resolved": c.resolved,
+            "created_at": c.created_at.isoformat(),
+        }
+        for c in thread._conflicts
+    ]
+
+
+@app.get("/api/v1/thread/identity-context")
+async def thread_identity_context():
+    """Brief identity context string (injected into Voxis expressions)."""
+    thread: ThreadService = app.state.thread
+    return {"context": thread.get_identity_context()}
 
 
 # ─── Phase 8: Simula Endpoints ────────────────────────────────────

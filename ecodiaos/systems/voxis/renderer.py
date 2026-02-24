@@ -357,6 +357,8 @@ class ContentRenderer:
         intent: ExpressionIntent,
         context: ExpressionContext,
         drive_weights: dict[str, float] | None = None,
+        diversity_instruction: str | None = None,
+        dynamics: object | None = None,
     ) -> Expression:
         """
         Execute the full 9-step expression pipeline.
@@ -364,12 +366,16 @@ class ContentRenderer:
         Returns a complete Expression with generation trace.
         drive_weights defaults to equal weights {coherence,care,growth,honesty} = 1.0
         if not supplied (e.g. when Equor is not yet fully wired).
+
+        Optional:
+        - diversity_instruction: injected when DiversityTracker flags repetition
+        - dynamics: ConversationDynamics from ConversationDynamicsEngine
         """
         t_start = time.monotonic()
         weights = drive_weights or {"coherence": 1.0, "care": 1.0, "growth": 1.0, "honesty": 1.0}
 
         # ── Step 1: Intent Analysis ───────────────────────────────
-        # Already encoded in ExpressionIntent — extract key parameters
+        # Already encoded in ExpressionIntent -- extract key parameters
         context_type = _infer_context_type(intent.trigger)
         urgency = intent.urgency
 
@@ -397,6 +403,13 @@ class ContentRenderer:
         strategy = self._affect.apply(strategy, context.affect)
         # ── Step 6c: Audience Adaptation ─────────────────────────
         strategy = self._audience.adapt(strategy, audience)
+
+        # ── Step 6d: Conversation Dynamics Adaptation ────────────
+        # Applied after audience -- dynamics can override based on real-time
+        # conversational signals (repair mode, style convergence, etc.)
+        if dynamics is not None:
+            from ecodiaos.systems.voxis.dynamics import ConversationDynamicsEngine
+            strategy = ConversationDynamicsEngine().apply_dynamics(strategy, dynamics)  # type: ignore[arg-type]
 
         # ── Step 7: Content Generation ────────────────────────────
         temperature = _compute_temperature(strategy, context.affect, self._base_temp)
@@ -428,6 +441,10 @@ class ContentRenderer:
                 filtered_history.append(m)
         if extra_system:
             system_prompt = system_prompt + "\n\n" + "\n\n".join(extra_system)
+
+        # Inject diversity instruction if DiversityTracker flagged repetition
+        if diversity_instruction:
+            system_prompt = system_prompt + "\n\n" + diversity_instruction
 
         messages: list[Message] = [
             *[Message(role=m["role"], content=m["content"]) for m in filtered_history],

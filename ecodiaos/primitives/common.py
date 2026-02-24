@@ -40,6 +40,7 @@ class SystemID(str, enum.Enum):
     THYMOS = "thymos"
     FEDERATION = "federation"
     ONEIROS = "oneiros"
+    THREAD = "thread"
     API = "api"
 
 

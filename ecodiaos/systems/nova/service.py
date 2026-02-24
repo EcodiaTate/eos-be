@@ -117,6 +117,10 @@ class NovaService:
         # Callback to push goal updates to Atune
         self._goal_sync_callback: Any = None  # Set via set_goal_sync_callback()
 
+        # Rhythm-adaptive state (updated by Synapse event bus)
+        self._rhythm_state: str = "normal"
+        self._rhythm_drive_modulation: dict[str, float] = {}
+
         # Observability counters
         self._total_broadcasts: int = 0
         self._total_fast_path: int = 0
@@ -432,6 +436,54 @@ class NovaService:
     def set_goal_sync_callback(self, callback: Any) -> None:
         """Wire a callback that pushes active goal summaries to Atune."""
         self._goal_sync_callback = callback
+
+    async def on_rhythm_change(self, event: Any) -> None:
+        """
+        Synapse event bus callback: adapt drive weights when rhythm changes.
+
+        Rhythm modulation naturally shifts goal priorities by altering the
+        drive_resonance component of priority computation:
+          - STRESS: boost coherence (focus on what matters, shed low-priority)
+          - FLOW: boost growth (extend creative focus, don't context-switch)
+          - BOREDOM: boost growth + care (seek novelty, help others)
+          - DEEP_PROCESSING: boost coherence strongly (lock focus)
+        """
+        try:
+            new_state = event.data.get("to", "normal")
+            old_state = self._rhythm_state
+            if new_state == old_state:
+                return
+            self._rhythm_state = new_state
+
+            # Drive weight modulation per rhythm state
+            modulations = {
+                "stress": {"coherence": 1.4, "care": 0.8, "growth": 0.6, "honesty": 1.0},
+                "flow": {"coherence": 1.0, "care": 0.9, "growth": 1.4, "honesty": 1.0},
+                "boredom": {"coherence": 0.8, "care": 1.2, "growth": 1.3, "honesty": 1.0},
+                "deep_processing": {
+                    "coherence": 1.5, "care": 0.7, "growth": 0.8, "honesty": 1.0,
+                },
+                "idle": {"coherence": 1.0, "care": 1.1, "growth": 1.1, "honesty": 1.0},
+            }
+            self._rhythm_drive_modulation = modulations.get(new_state, {})
+
+            # Apply modulation to the deliberation engine's drive weights
+            if self._deliberation_engine is not None and self._rhythm_drive_modulation:
+                base = {"coherence": 1.0, "care": 1.0, "growth": 1.0, "honesty": 1.0}
+                modulated = {
+                    k: base[k] * self._rhythm_drive_modulation.get(k, 1.0)
+                    for k in base
+                }
+                self._deliberation_engine.update_drive_weights(modulated)
+
+            self._logger.info(
+                "rhythm_adaptation_applied",
+                from_state=old_state,
+                to_state=new_state,
+                drive_modulation=self._rhythm_drive_modulation,
+            )
+        except Exception:
+            self._logger.debug("rhythm_adaptation_failed", exc_info=True)
 
     @property
     def active_goal_summaries(self) -> list[ActiveGoalSummary]:
