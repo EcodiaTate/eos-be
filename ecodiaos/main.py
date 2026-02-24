@@ -989,7 +989,7 @@ app = FastAPI(
 # CORS for frontend
 _cors_origins = [
     "http://localhost:3000",
-    "https://ecodiaos-frontend-oeipavsn4a-ts.a.run.app",
+    "https://ecodiaos-frontend-929871567697.australia-southeast1.run.app",
 ]
 # Allow additional origins via env var (comma-separated)
 _extra_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "")
