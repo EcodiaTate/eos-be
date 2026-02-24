@@ -14,8 +14,10 @@ steps:
       - '${_IMAGE}'
 
   # Deploy to Cloud Run
-  - name: 'gcr.io/cloud-builders/run'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
     args:
+      - 'run'
       - 'deploy'
       - '${_SERVICE_NAME}'
       - '--image'
