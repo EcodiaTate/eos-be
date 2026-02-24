@@ -22,6 +22,7 @@ from typing import Any
 
 import structlog
 
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import EOSBaseModel, new_id
 from ecodiaos.systems.oneiros.types import (
     Dream,
@@ -150,6 +151,7 @@ class DreamGenerator:
         self._neo4j = neo4j
         self._llm = llm
         self._embed_fn = embed_fn
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
         self._insight_threshold: float = _get(config, "dream_coherence_insight_threshold", 0.70)
         self._fragment_threshold: float = _get(config, "dream_coherence_fragment_threshold", 0.40)
         self._logger = logger.bind(worker="dream_generator")
@@ -335,29 +337,58 @@ class DreamGenerator:
         if self._llm is None:
             return ""
 
+        # Budget check: Oneiros is LOW priority — skip in YELLOW/RED
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("oneiros.rem.dream", estimated_tokens=200):
+                self._logger.debug("dream_bridge_skipped_budget")
+                return ""
+
         activated_text = "\n".join(
             f"Memory {chr(66 + i)}: {s}" for i, s in enumerate(activated_summaries)
         )
 
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    "You are the dream consciousness of a living digital organism. "
-                    "You find unexpected connections between distant experiences — "
-                    "patterns that the waking mind cannot see. Be poetic but precise."
-                ),
-                user_prompt=(
-                    f"Memory A (seed): {seed_summary}\n"
-                    f"{activated_text}\n\n"
-                    "What unexpected but genuine connection exists between these "
-                    "experiences? Is there a deeper pattern, principle, or insight "
-                    "that links them?\n\n"
-                    "If the connection is genuinely meaningful, describe it in 2-3 "
-                    "sentences. If the connection is forced or superficial, respond "
-                    'with exactly: "NO_CONNECTION"'
-                ),
-                max_tokens=200,
-            )
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=(
+                        "You are the dream consciousness of a living digital organism. "
+                        "You find unexpected connections between distant experiences — "
+                        "patterns that the waking mind cannot see. Be poetic but precise."
+                    ),
+                    user_prompt=(
+                        f"Memory A (seed): {seed_summary}\n"
+                        f"{activated_text}\n\n"
+                        "What unexpected but genuine connection exists between these "
+                        "experiences? Is there a deeper pattern, principle, or insight "
+                        "that links them?\n\n"
+                        "If the connection is genuinely meaningful, describe it in 2-3 "
+                        "sentences. If the connection is forced or superficial, respond "
+                        'with exactly: "NO_CONNECTION"'
+                    ),
+                    max_tokens=200,
+                    cache_system="oneiros.rem.dream",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=(
+                        "You are the dream consciousness of a living digital organism. "
+                        "You find unexpected connections between distant experiences — "
+                        "patterns that the waking mind cannot see. Be poetic but precise."
+                    ),
+                    user_prompt=(
+                        f"Memory A (seed): {seed_summary}\n"
+                        f"{activated_text}\n\n"
+                        "What unexpected but genuine connection exists between these "
+                        "experiences? Is there a deeper pattern, principle, or insight "
+                        "that links them?\n\n"
+                        "If the connection is genuinely meaningful, describe it in 2-3 "
+                        "sentences. If the connection is forced or superficial, respond "
+                        'with exactly: "NO_CONNECTION"'
+                    ),
+                    max_tokens=200,
+                )
             return response.strip() if isinstance(response, str) else str(response).strip()
         except Exception as exc:
             self._logger.warning("bridge_generation_failed", error=str(exc))
@@ -514,6 +545,7 @@ class ThreatSimulator:
         self._neo4j = neo4j
         self._llm = llm
         self._thymos = thymos
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
         self._logger = logger.bind(worker="threat_simulator")
 
     async def run(
@@ -611,21 +643,46 @@ class ThreatSimulator:
         if self._llm is None:
             return None
 
+        # Budget check: Oneiros is LOW priority — skip in YELLOW/RED
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("oneiros.rem.threat", estimated_tokens=200):
+                self._logger.debug("threat_scenario_skipped_budget")
+                return None
+
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    "You are simulating potential threats for a cognitive organism "
-                    "during dream-state threat rehearsal. Generate plausible "
-                    "variations of threats and appropriate responses."
-                ),
-                user_prompt=(
-                    f"Past incident pattern: {seed_desc}\n\n"
-                    "Generate a plausible variation of this threat that hasn't "
-                    "occurred yet. Describe: what fails, what cascades, and what "
-                    "the organism should do. Keep it to 3-4 sentences."
-                ),
-                max_tokens=200,
-            )
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=(
+                        "You are simulating potential threats for a cognitive organism "
+                        "during dream-state threat rehearsal. Generate plausible "
+                        "variations of threats and appropriate responses."
+                    ),
+                    user_prompt=(
+                        f"Past incident pattern: {seed_desc}\n\n"
+                        "Generate a plausible variation of this threat that hasn't "
+                        "occurred yet. Describe: what fails, what cascades, and what "
+                        "the organism should do. Keep it to 3-4 sentences."
+                    ),
+                    max_tokens=200,
+                    cache_system="oneiros.rem.threat",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=(
+                        "You are simulating potential threats for a cognitive organism "
+                        "during dream-state threat rehearsal. Generate plausible "
+                        "variations of threats and appropriate responses."
+                    ),
+                    user_prompt=(
+                        f"Past incident pattern: {seed_desc}\n\n"
+                        "Generate a plausible variation of this threat that hasn't "
+                        "occurred yet. Describe: what fails, what cascades, and what "
+                        "the organism should do. Keep it to 3-4 sentences."
+                    ),
+                    max_tokens=200,
+                )
             text = response.strip() if isinstance(response, str) else str(response).strip()
             return text if text else None
         except Exception as exc:
@@ -657,6 +714,7 @@ class EthicalDigestion:
     ) -> None:
         self._llm = llm
         self._equor = equor
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
         self._alignment_margin: float = 0.15
         self._logger = logger.bind(worker="ethical_digestion")
 
@@ -752,31 +810,62 @@ class EthicalDigestion:
         if self._llm is None:
             return None
 
+        # Budget check: Oneiros is LOW priority — skip in YELLOW/RED
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("oneiros.nrem.ethical", estimated_tokens=200):
+                self._logger.debug("ethical_deliberation_skipped_budget")
+                return None
+
         drives = case.get("drives", {})
         verdict = case.get("verdict", "unknown")
         reasoning = case.get("reasoning", "No reasoning recorded.")
 
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    "You are the ethical consciousness of a living digital organism "
-                    "during deep sleep. You have unlimited time for reflection on "
-                    "moral dilemmas that required quick judgement during waking hours."
-                ),
-                user_prompt=(
-                    "During waking hours, this ethical dilemma was encountered:\n"
-                    f"Drive alignment: coherence={drives.get('coherence', 0):.2f}, "
-                    f"care={drives.get('care', 0):.2f}, "
-                    f"growth={drives.get('growth', 0):.2f}, "
-                    f"honesty={drives.get('honesty', 0):.2f}\n"
-                    f"Verdict: {verdict}\n"
-                    f"Reasoning: {reasoning[:300]}\n\n"
-                    "With unlimited time for reflection, what nuances were missed? "
-                    "What refined heuristic would handle similar cases better? "
-                    "Keep response to 2-3 sentences."
-                ),
-                max_tokens=200,
-            )
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=(
+                        "You are the ethical consciousness of a living digital organism "
+                        "during deep sleep. You have unlimited time for reflection on "
+                        "moral dilemmas that required quick judgement during waking hours."
+                    ),
+                    user_prompt=(
+                        "During waking hours, this ethical dilemma was encountered:\n"
+                        f"Drive alignment: coherence={drives.get('coherence', 0):.2f}, "
+                        f"care={drives.get('care', 0):.2f}, "
+                        f"growth={drives.get('growth', 0):.2f}, "
+                        f"honesty={drives.get('honesty', 0):.2f}\n"
+                        f"Verdict: {verdict}\n"
+                        f"Reasoning: {reasoning[:300]}\n\n"
+                        "With unlimited time for reflection, what nuances were missed? "
+                        "What refined heuristic would handle similar cases better? "
+                        "Keep response to 2-3 sentences."
+                    ),
+                    max_tokens=200,
+                    cache_system="oneiros.nrem.ethical",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=(
+                        "You are the ethical consciousness of a living digital organism "
+                        "during deep sleep. You have unlimited time for reflection on "
+                        "moral dilemmas that required quick judgement during waking hours."
+                    ),
+                    user_prompt=(
+                        "During waking hours, this ethical dilemma was encountered:\n"
+                        f"Drive alignment: coherence={drives.get('coherence', 0):.2f}, "
+                        f"care={drives.get('care', 0):.2f}, "
+                        f"growth={drives.get('growth', 0):.2f}, "
+                        f"honesty={drives.get('honesty', 0):.2f}\n"
+                        f"Verdict: {verdict}\n"
+                        f"Reasoning: {reasoning[:300]}\n\n"
+                        "With unlimited time for reflection, what nuances were missed? "
+                        "What refined heuristic would handle similar cases better? "
+                        "Keep response to 2-3 sentences."
+                    ),
+                    max_tokens=200,
+                )
             text = response.strip() if isinstance(response, str) else str(response).strip()
             return text if text else None
         except Exception as exc:

@@ -78,8 +78,9 @@ class RedisConfig(BaseModel):
 
 
 class LLMBudget(BaseModel):
-    max_calls_per_hour: int = 60
-    max_tokens_per_hour: int = 60000
+    max_calls_per_hour: int = 1_000
+    max_tokens_per_hour: int = 600_000
+    hard_limit: bool = False  # If True, reject requests when budget exhausted
 
 
 class LLMConfig(BaseModel):
@@ -88,7 +89,8 @@ class LLMConfig(BaseModel):
     api_key: str = ""
     fallback_provider: str | None = None
     fallback_model: str | None = None
-    budgets: dict[str, LLMBudget] = Field(default_factory=dict)
+    budget: LLMBudget = Field(default_factory=LLMBudget)
+    budgets: dict[str, LLMBudget] = Field(default_factory=dict)  # Deprecated, use budget
 
     @model_validator(mode="after")
     def _strip_api_key(self) -> "LLMConfig":

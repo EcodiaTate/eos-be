@@ -288,6 +288,8 @@ class AnalyseExecutor(Executor):
 
     def set_llm(self, llm: Any) -> None:
         self._llm = llm
+        from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
 
     async def validate_params(self, params: dict) -> ValidationResult:
         if not params.get("topic"):
@@ -325,8 +327,41 @@ class AnalyseExecutor(Executor):
 
         try:
             prompt = _build_analysis_prompt(topic, question, context_data, depth)
-            response = await self._llm.complete(prompt=prompt, max_tokens=1000)
-            analysis = response.text if hasattr(response, "text") else str(response)
+
+            # Budget check: skip analysis in RED tier
+            if getattr(self, "_optimized", False):
+                from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
+                assert isinstance(self._llm, OptimizedLLMProvider)
+                if not self._llm.should_use_llm("axon.observation", estimated_tokens=1000):
+                    return ExecutionResult(
+                        success=True,
+                        data={
+                            "analysis": f"[Budget exhausted] Analysis of '{topic}' deferred.",
+                            "topic": topic,
+                        },
+                        new_observations=[
+                            f"Analysis of '{topic}' deferred due to budget constraints."
+                        ],
+                    )
+
+            # Use evaluate() for optimized path (standard LLM interface), fall back to complete()
+            if getattr(self, "_optimized", False):
+                from ecodiaos.clients.llm import Message
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=(
+                        "You are EOS — a community care organism. "
+                        "Be honest about uncertainty."
+                    ),
+                    messages=[Message("user", prompt)],
+                    max_tokens=1000,
+                    temperature=0.3,
+                    cache_system="axon.observation",
+                    cache_method="analyse",
+                )
+                analysis = response.text
+            else:
+                response = await self._llm.complete(prompt=prompt, max_tokens=1000)
+                analysis = response.text if hasattr(response, "text") else str(response)
 
             return ExecutionResult(
                 success=True,

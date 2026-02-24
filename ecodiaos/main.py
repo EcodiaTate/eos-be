@@ -19,9 +19,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from ecodiaos.clients.embedding import create_embedding_client
 from ecodiaos.clients.llm import create_llm_provider
 from ecodiaos.clients.neo4j import Neo4jClient
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
+from ecodiaos.clients.prompt_cache import PromptCache
 from ecodiaos.clients.redis import RedisClient
 from ecodiaos.clients.timescaledb import TimescaleDBClient
+from ecodiaos.clients.token_budget import TokenBudget
 from ecodiaos.config import EcodiaOSConfig, load_config, load_seed
+from ecodiaos.telemetry.llm_metrics import LLMMetricsCollector
 from ecodiaos.systems.memory.service import MemoryService
 from ecodiaos.systems.equor.service import EquorService
 from ecodiaos.systems.atune.service import AtuneService, AtuneConfig
@@ -81,8 +85,44 @@ async def lifespan(app: FastAPI):
     app.state.redis = redis_client
 
     # ── 4. Initialize LLM and embedding clients ───────────────
-    llm_client = create_llm_provider(config.llm)
+    # Create base LLM provider
+    raw_llm = create_llm_provider(config.llm)
+
+    # Create optimization infrastructure
+    token_budget = TokenBudget(
+        max_tokens_per_hour=config.llm.budget.max_tokens_per_hour,
+        max_calls_per_hour=config.llm.budget.max_calls_per_hour,
+        hard_limit=config.llm.budget.hard_limit,
+    )
+    app.state.token_budget = token_budget
+
+    llm_metrics = LLMMetricsCollector()
+    app.state.llm_metrics = llm_metrics
+
+    # Create prompt cache (requires Redis, graceful degradation if unavailable)
+    prompt_cache: PromptCache | None = None
+    try:
+        prompt_cache = PromptCache(redis_client=redis_client._client, prefix="eos:llmcache")
+        logger.info("prompt_cache_initialized")
+    except Exception as exc:
+        logger.warning("prompt_cache_init_failed", error=str(exc))
+
+    # Wrap the LLM provider with optimization layer
+    llm_client = OptimizedLLMProvider(
+        inner=raw_llm,
+        cache=prompt_cache,
+        budget=token_budget,
+        metrics=llm_metrics,
+    )
     app.state.llm = llm_client
+    app.state.raw_llm = raw_llm  # Keep reference for systems that need unwrapped access
+
+    logger.info(
+        "llm_optimization_active",
+        budget_tokens_per_hour=config.llm.budget.max_tokens_per_hour,
+        budget_calls_per_hour=config.llm.budget.max_calls_per_hour,
+        cache_enabled=prompt_cache is not None,
+    )
 
     embedding_client = create_embedding_client(config.embedding)
     app.state.embedding = embedding_client
@@ -1106,7 +1146,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         path = request.url.path
 
         # Public endpoints — no auth required
-        if path in ("/health", "/docs", "/openapi.json", "/redoc"):
+        if path in ("/health", "/docs", "/openapi.json", "/redoc", "/api/v1/admin/llm/metrics", "/api/v1/admin/llm/summary"):
             return await call_next(request)
         # Federation identity is public (used during link establishment)
         if path == "/api/v1/federation/identity":
@@ -1213,6 +1253,46 @@ async def health():
             "redis": redis_health,
         },
     }
+
+
+@app.get("/api/v1/admin/llm/metrics")
+async def get_llm_metrics():
+    """
+    LLM cost optimization dashboard.
+
+    Returns token spend, cache hit rate, budget tier, latency,
+    and per-system breakdowns.
+    """
+    llm_metrics: LLMMetricsCollector = app.state.llm_metrics
+    token_budget: TokenBudget = app.state.token_budget
+    llm: OptimizedLLMProvider = app.state.llm
+
+    dashboard = llm_metrics.get_dashboard_data()
+    budget_status = token_budget.get_status()
+    cache_stats = llm.cache.get_stats() if llm.cache else {"hit_rate": 0.0}
+
+    return {
+        "status": "ok",
+        "budget": {
+            "tier": budget_status.tier.value,
+            "tokens_used": budget_status.tokens_used,
+            "tokens_remaining": budget_status.tokens_remaining,
+            "calls_made": budget_status.calls_made,
+            "calls_remaining": budget_status.calls_remaining,
+            "burn_rate_tokens_per_sec": round(budget_status.tokens_per_sec, 2),
+            "hours_until_exhausted": round(budget_status.hours_until_exhausted, 2),
+            "warning": budget_status.warning_message,
+        },
+        "cache": cache_stats,
+        "dashboard": dashboard,
+    }
+
+
+@app.get("/api/v1/admin/llm/summary")
+async def get_llm_summary():
+    """Human-readable LLM cost summary."""
+    llm_metrics: LLMMetricsCollector = app.state.llm_metrics
+    return {"summary": llm_metrics.summary()}
 
 
 @app.get("/api/v1/admin/instance")

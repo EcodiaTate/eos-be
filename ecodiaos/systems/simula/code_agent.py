@@ -52,6 +52,7 @@ from ecodiaos.clients.llm import (
     ToolDefinition,
     ToolResult,
 )
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.systems.simula.types import (
     ChangeCategory,
     CodeChangeResult,
@@ -476,6 +477,8 @@ class SimulaCodeAgent:
         self._logger = logger.bind(system="simula.code_agent")
         self._files_written: list[str] = []
         self._total_tokens_used: int = 0
+        # Optimization: detect optimized provider for budget checks + metrics tagging
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
 
     async def implement(self, proposal: EvolutionProposal) -> CodeChangeResult:
         """
@@ -514,17 +517,42 @@ class SimulaCodeAgent:
             tools_available=len(SIMULA_AGENT_TOOLS),
         )
 
+        # Budget gate: code agent is STANDARD priority — skip in RED tier
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("simula.code_agent", estimated_tokens=8000):
+                self._logger.warning(
+                    "code_agent_skipped_budget",
+                    proposal_id=proposal.id,
+                    tier=self._llm.get_budget_tier().value,
+                )
+                return CodeChangeResult(
+                    success=False,
+                    files_written=[],
+                    error="LLM budget exhausted (RED tier) — code agent skipped.",
+                )
+
         while turns < self._max_turns:
             turns += 1
 
             try:
-                response = await self._llm.generate_with_tools(
-                    system_prompt=system_prompt,
-                    messages=messages,
-                    tools=SIMULA_AGENT_TOOLS,
-                    max_tokens=8192,
-                    temperature=0.2,
-                )
+                if self._optimized:
+                    response = await self._llm.generate_with_tools(  # type: ignore[call-arg]
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        tools=SIMULA_AGENT_TOOLS,
+                        max_tokens=8192,
+                        temperature=0.2,
+                        cache_system="simula.code_agent",
+                    )
+                else:
+                    response = await self._llm.generate_with_tools(
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        tools=SIMULA_AGENT_TOOLS,
+                        max_tokens=8192,
+                        temperature=0.2,
+                    )
             except Exception as exc:
                 self._logger.error("llm_call_failed", turn=turns, error=str(exc))
                 return CodeChangeResult(

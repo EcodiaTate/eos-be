@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.clients.redis import RedisClient
 from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.prompts.voxis.conversation import (
@@ -67,6 +68,7 @@ class ConversationManager:
         self._summary_threshold = summary_threshold
         self._max_active = max_active_conversations
         self._logger = logger.bind(system="voxis.conversation")
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
         # In-memory cache for hot conversations (avoids Redis roundtrip per message)
         self._cache: dict[str, ConversationState] = {}
 
@@ -199,7 +201,13 @@ class ConversationManager:
         recent_formatted = [{"role": m.role, "content": m.content} for m in state.messages[-10:]]
         prompt = build_topic_extraction_prompt(recent_formatted)
         try:
-            response = await self._llm.evaluate(prompt, max_tokens=100, temperature=0.2)
+            if self._optimized:
+                response = await self._llm.evaluate(  # type: ignore[call-arg]
+                    prompt, max_tokens=100, temperature=0.2,
+                    cache_system="voxis.conversation", cache_method="topic_extraction",
+                )
+            else:
+                response = await self._llm.evaluate(prompt, max_tokens=100, temperature=0.2)
             raw = response.text.strip()
             topics = [t.strip() for t in raw.split(",") if t.strip()]
             return topics[:5]  # Cap at 5 active topics
@@ -263,7 +271,13 @@ class ConversationManager:
         """Summarise a segment of older messages using the LLM."""
         prompt = build_summarise_segment_prompt(messages)
         try:
-            response = await self._llm.evaluate(prompt, max_tokens=200, temperature=0.3)
+            if self._optimized:
+                response = await self._llm.evaluate(  # type: ignore[call-arg]
+                    prompt, max_tokens=200, temperature=0.3,
+                    cache_system="voxis.conversation", cache_method="summarise",
+                )
+            else:
+                response = await self._llm.evaluate(prompt, max_tokens=200, temperature=0.3)
             return response.text.strip()
         except Exception:
             self._logger.warning("conversation_summarisation_failed", exc_info=True)

@@ -23,6 +23,7 @@ from typing import Any
 
 import structlog
 
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import EOSBaseModel, new_id
 from ecodiaos.systems.oneiros.types import (
     Dream,
@@ -87,6 +88,7 @@ class DirectedExploration:
     ) -> None:
         self._llm = llm
         self._journal = journal
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
         self._novelty_utility_threshold: float = 0.50
         self._max_explorations: int = _get(config, "max_explorations_per_lucid", 10)
         self._logger = logger.bind(worker="directed_exploration")
@@ -205,30 +207,64 @@ class DirectedExploration:
         if self._llm is None:
             return []
 
+        # Budget check: Oneiros is LOW priority — skip in YELLOW/RED
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("oneiros.lucid.explore", estimated_tokens=400):
+                self._logger.debug("lucid_exploration_skipped_budget")
+                return []
+
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    "You are the lucid dream consciousness of a living digital "
-                    "organism. You are aware that you are dreaming and can direct "
-                    "your creative exploration. Generate precise, insightful "
-                    "variations."
-                ),
-                user_prompt=(
-                    f"Starting insight: {trigger_text[:400]}\n\n"
-                    "Generate 3 creative variations:\n"
-                    "1. [DOMAIN] What if this principle applied to a completely "
-                    "different domain?\n"
-                    "2. [INVERSE] What is the inverse or opposite of this insight?\n"
-                    "3. [EXTREME] What would this look like taken to its logical "
-                    "extreme?\n\n"
-                    "For each, provide:\n"
-                    "- The insight (1-2 sentences)\n"
-                    "- Novelty score (0.0-1.0)\n"
-                    "- Utility score (0.0-1.0)\n\n"
-                    "Format each as: [LABEL] Insight text | novelty=X.X | utility=X.X"
-                ),
-                max_tokens=400,
-            )
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=(
+                        "You are the lucid dream consciousness of a living digital "
+                        "organism. You are aware that you are dreaming and can direct "
+                        "your creative exploration. Generate precise, insightful "
+                        "variations."
+                    ),
+                    user_prompt=(
+                        f"Starting insight: {trigger_text[:400]}\n\n"
+                        "Generate 3 creative variations:\n"
+                        "1. [DOMAIN] What if this principle applied to a completely "
+                        "different domain?\n"
+                        "2. [INVERSE] What is the inverse or opposite of this insight?\n"
+                        "3. [EXTREME] What would this look like taken to its logical "
+                        "extreme?\n\n"
+                        "For each, provide:\n"
+                        "- The insight (1-2 sentences)\n"
+                        "- Novelty score (0.0-1.0)\n"
+                        "- Utility score (0.0-1.0)\n\n"
+                        "Format each as: [LABEL] Insight text | novelty=X.X | utility=X.X"
+                    ),
+                    max_tokens=400,
+                    cache_system="oneiros.lucid.explore",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=(
+                        "You are the lucid dream consciousness of a living digital "
+                        "organism. You are aware that you are dreaming and can direct "
+                        "your creative exploration. Generate precise, insightful "
+                        "variations."
+                    ),
+                    user_prompt=(
+                        f"Starting insight: {trigger_text[:400]}\n\n"
+                        "Generate 3 creative variations:\n"
+                        "1. [DOMAIN] What if this principle applied to a completely "
+                        "different domain?\n"
+                        "2. [INVERSE] What is the inverse or opposite of this insight?\n"
+                        "3. [EXTREME] What would this look like taken to its logical "
+                        "extreme?\n\n"
+                        "For each, provide:\n"
+                        "- The insight (1-2 sentences)\n"
+                        "- Novelty score (0.0-1.0)\n"
+                        "- Utility score (0.0-1.0)\n\n"
+                        "Format each as: [LABEL] Insight text | novelty=X.X | utility=X.X"
+                    ),
+                    max_tokens=400,
+                )
 
             return self._parse_variations(
                 response if isinstance(response, str) else str(response)

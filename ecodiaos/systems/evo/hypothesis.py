@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.primitives.memory_trace import Episode
 from ecodiaos.systems.evo.types import (
@@ -86,6 +87,7 @@ class HypothesisEngine:
         self._instance_name = instance_name
         self._memory = memory
         self._logger = logger.bind(system="evo.hypothesis")
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
 
         # In-memory hypothesis registry (also persisted to Memory graph)
         self._active: dict[str, Hypothesis] = {}
@@ -128,14 +130,32 @@ class HypothesisEngine:
             max_hypotheses=_MAX_PER_BATCH,
         )
 
+        # Budget check: skip hypothesis generation in YELLOW/RED (low priority)
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("evo.hypothesis", estimated_tokens=1200):
+                self._logger.info("hypothesis_generation_skipped_budget")
+                return []
+
         try:
-            response = await self._llm.generate(
-                system_prompt=_SYSTEM_PROMPT,
-                messages=[Message("user", prompt)],
-                max_tokens=1200,
-                temperature=0.5,
-                output_format="json",
-            )
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=_SYSTEM_PROMPT,
+                    messages=[Message("user", prompt)],
+                    max_tokens=1200,
+                    temperature=0.5,
+                    output_format="json",
+                    cache_system="evo.hypothesis",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=_SYSTEM_PROMPT,
+                    messages=[Message("user", prompt)],
+                    max_tokens=1200,
+                    temperature=0.5,
+                    output_format="json",
+                )
             raw = _parse_json_safe(response.text)
         except Exception as exc:
             self._logger.error("hypothesis_generation_failed", error=str(exc))
@@ -180,12 +200,33 @@ class HypothesisEngine:
         """
         prompt = _build_evidence_prompt(hypothesis, episode)
 
+        # Budget check: skip evidence evaluation in YELLOW/RED
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("evo.evidence", estimated_tokens=300):
+                return EvidenceResult(
+                    hypothesis_id=hypothesis.id,
+                    episode_id=episode.id,
+                    direction=EvidenceDirection.NEUTRAL,
+                    strength=0.0,
+                    reasoning="Skipped — budget constraints",
+                )
+
         try:
-            response = await self._llm.evaluate(
-                prompt=prompt,
-                max_tokens=300,
-                temperature=0.3,
-            )
+            if self._optimized:
+                response = await self._llm.evaluate(  # type: ignore[call-arg]
+                    prompt=prompt,
+                    max_tokens=300,
+                    temperature=0.3,
+                    cache_system="evo.evidence",
+                    cache_method="evaluate",
+                )
+            else:
+                response = await self._llm.evaluate(
+                    prompt=prompt,
+                    max_tokens=300,
+                    temperature=0.3,
+                )
             raw = _parse_json_safe(response.text)
         except Exception as exc:
             self._logger.error(

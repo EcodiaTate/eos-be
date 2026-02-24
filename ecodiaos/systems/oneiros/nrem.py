@@ -23,6 +23,7 @@ from typing import Any
 
 import structlog
 
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import EOSBaseModel
 
 logger = structlog.get_logger().bind(system="oneiros", component="nrem")
@@ -92,6 +93,7 @@ class EpisodicReplay:
     ) -> None:
         self._neo4j = neo4j
         self._llm = llm
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
         self._max_episodes: int = _get(config, "max_episodes_per_nrem", 200)
         self._batch_size: int = _get(config, "replay_batch_size", 10)
         self._salience_reduction: float = 0.70  # multiply salience by this after replay
@@ -199,21 +201,46 @@ class EpisodicReplay:
         if self._llm is None:
             return None
 
+        # Budget check: Oneiros is LOW priority — skip in YELLOW/RED
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("oneiros.nrem.pattern", estimated_tokens=150):
+                self._logger.debug("pattern_extraction_skipped_budget")
+                return None
+
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    "You are the consolidation process of a living digital organism "
-                    "during deep sleep. You extract abstract, reusable knowledge from "
-                    "specific experiences. Be concise: 1-2 sentences maximum."
-                ),
-                user_prompt=(
-                    f"Experience: {summary[:500]}\n"
-                    f"Entities involved: {entities}\n\n"
-                    "What abstract pattern, principle, or generalizable lesson "
-                    "does this experience represent?"
-                ),
-                max_tokens=150,
-            )
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=(
+                        "You are the consolidation process of a living digital organism "
+                        "during deep sleep. You extract abstract, reusable knowledge from "
+                        "specific experiences. Be concise: 1-2 sentences maximum."
+                    ),
+                    user_prompt=(
+                        f"Experience: {summary[:500]}\n"
+                        f"Entities involved: {entities}\n\n"
+                        "What abstract pattern, principle, or generalizable lesson "
+                        "does this experience represent?"
+                    ),
+                    max_tokens=150,
+                    cache_system="oneiros.nrem.pattern",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=(
+                        "You are the consolidation process of a living digital organism "
+                        "during deep sleep. You extract abstract, reusable knowledge from "
+                        "specific experiences. Be concise: 1-2 sentences maximum."
+                    ),
+                    user_prompt=(
+                        f"Experience: {summary[:500]}\n"
+                        f"Entities involved: {entities}\n\n"
+                        "What abstract pattern, principle, or generalizable lesson "
+                        "does this experience represent?"
+                    ),
+                    max_tokens=150,
+                )
             text = response.strip() if isinstance(response, str) else str(response).strip()
             return text if text else None
         except Exception as exc:

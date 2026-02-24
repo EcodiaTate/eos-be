@@ -37,6 +37,8 @@ if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.clients.neo4j import Neo4jClient
 
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
+
 logger = structlog.get_logger()
 
 # Schema strength → precision mapping for self-evidencing
@@ -82,6 +84,7 @@ class IdentitySchemaEngine:
         self._llm = llm
         self._config = config
         self._logger = logger.bind(system="thread.schema_engine")
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
 
         # In-memory cache of active schemas (refreshed from Neo4j periodically)
         self._active_schemas: list[IdentitySchema] = []
@@ -442,26 +445,44 @@ class IdentitySchemaEngine:
         from ecodiaos.clients.llm import Message
 
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    "You crystallize behavioural patterns into identity schemas. "
-                    "Given recurring experiences, identify the core self-belief they reveal. "
-                    "Respond as JSON with keys: statement, trigger_contexts, behavioral_tendency, "
-                    "emotional_signature. The statement must be in the form: "
-                    "'I am the kind of entity that [behaviour] because [reason].'"
-                ),
-                messages=[Message(
-                    role="user",
-                    content=(
-                        f"Recurring behaviour pattern: {recurring_behavior}\n\n"
-                        f"Supporting experiences:\n{episode_summaries}\n\n"
-                        "Crystallize this into an identity schema. Respond as JSON only."
-                    ),
-                )],
-                max_tokens=500,
-                temperature=self._config.llm_temperature_evaluation,
-                output_format="json",
+            # Budget check: schema crystallization is low priority
+            if self._optimized:
+                assert isinstance(self._llm, OptimizedLLMProvider)
+                if not self._llm.should_use_llm("thread.schema", estimated_tokens=500):
+                    self._logger.debug("schema_crystallization_skipped_budget")
+                    return None
+
+            sys_prompt = (
+                "You crystallize behavioural patterns into identity schemas. "
+                "Given recurring experiences, identify the core self-belief they reveal. "
+                "Respond as JSON with keys: statement, trigger_contexts, behavioral_tendency, "
+                "emotional_signature. The statement must be in the form: "
+                "'I am the kind of entity that [behaviour] because [reason].'"
             )
+            user_content = (
+                f"Recurring behaviour pattern: {recurring_behavior}\n\n"
+                f"Supporting experiences:\n{episode_summaries}\n\n"
+                "Crystallize this into an identity schema. Respond as JSON only."
+            )
+
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=sys_prompt,
+                    messages=[Message(role="user", content=user_content)],
+                    max_tokens=500,
+                    temperature=self._config.llm_temperature_evaluation,
+                    output_format="json",
+                    cache_system="thread.schema",
+                    cache_method="crystallize",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=sys_prompt,
+                    messages=[Message(role="user", content=user_content)],
+                    max_tokens=500,
+                    temperature=self._config.llm_temperature_evaluation,
+                    output_format="json",
+                )
 
             data: dict[str, Any] = json.loads(response.text)
             if "statement" not in data:
@@ -480,18 +501,31 @@ class IdentitySchemaEngine:
         """Use LLM to evaluate whether an episode confirms or challenges a schema."""
 
         try:
-            response = await self._llm.evaluate(
-                prompt=(
-                    f'Schema: "{schema_statement}"\n'
-                    f'Experience: "{episode_summary}"\n\n'
-                    "Does this experience CONFIRM this self-belief, CHALLENGE it, "
-                    "or have NO BEARING? Rate strength 0.0-1.0.\n"
-                    "Respond as JSON: "
-                    '{{"direction": "confirms|challenges|irrelevant", "strength": 0.0}}'
-                ),
-                max_tokens=100,
-                temperature=self._config.llm_temperature_evaluation,
+            prompt = (
+                f'Schema: "{schema_statement}"\n'
+                f'Experience: "{episode_summary}"\n\n'
+                "Does this experience CONFIRM this self-belief, CHALLENGE it, "
+                "or have NO BEARING? Rate strength 0.0-1.0.\n"
+                "Respond as JSON: "
+                '{{"direction": "confirms|challenges|irrelevant", "strength": 0.0}}'
             )
+            if self._optimized:
+                assert isinstance(self._llm, OptimizedLLMProvider)
+                if not self._llm.should_use_llm("thread.evidence", estimated_tokens=100):
+                    return ("irrelevant", 0.0)
+                response = await self._llm.evaluate(  # type: ignore[call-arg]
+                    prompt=prompt,
+                    max_tokens=100,
+                    temperature=self._config.llm_temperature_evaluation,
+                    cache_system="thread.evidence",
+                    cache_method="evaluate",
+                )
+            else:
+                response = await self._llm.evaluate(
+                    prompt=prompt,
+                    max_tokens=100,
+                    temperature=self._config.llm_temperature_evaluation,
+                )
 
             data = json.loads(response.text)
             direction = data.get("direction", "irrelevant")

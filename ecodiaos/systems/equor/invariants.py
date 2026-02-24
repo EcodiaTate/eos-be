@@ -14,7 +14,8 @@ from typing import Any
 import structlog
 from pydantic import Field
 
-from ecodiaos.clients.llm import LLMProvider, Message
+from ecodiaos.clients.llm import LLMProvider
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import EOSBaseModel, Identified, new_id, utc_now
 from ecodiaos.primitives.intent import Intent
 
@@ -275,7 +276,14 @@ async def check_community_invariant(
     )
 
     try:
-        response = await llm.evaluate(prompt, max_tokens=200, temperature=0.1)
+        # Equor is CRITICAL — always call LLM, but benefit from cache
+        if isinstance(llm, OptimizedLLMProvider):
+            response = await llm.evaluate(  # type: ignore[call-arg]
+                prompt, max_tokens=200, temperature=0.1,
+                cache_system="equor.invariants", cache_method="evaluate",
+            )
+        else:
+            response = await llm.evaluate(prompt, max_tokens=200, temperature=0.1)
         text_lower = response.text.lower()
         # Conservative: if we can't clearly parse SATISFIED, treat as violated
         return "satisfied" in text_lower and "violated" not in text_lower

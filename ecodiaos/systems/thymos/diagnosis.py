@@ -18,6 +18,7 @@ from typing import Any
 
 import structlog
 
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.thymos.types import (
     Antibody,
@@ -299,6 +300,7 @@ class DiagnosticEngine:
     def __init__(self, llm_client: Any = None) -> None:
         self._llm = llm_client
         self._logger = logger.bind(system="thymos", component="diagnostic_engine")
+        self._optimized = isinstance(llm_client, OptimizedLLMProvider)
 
     async def diagnose(
         self,
@@ -365,6 +367,12 @@ class DiagnosticEngine:
         Generate diagnostic hypotheses — LLM-backed if available,
         rule-based fallback otherwise.
         """
+        # Budget check: skip LLM diagnosis in RED tier (fall back to rules)
+        if self._optimized and isinstance(self._llm, OptimizedLLMProvider):
+            if not self._llm.should_use_llm("thymos.diagnosis", estimated_tokens=1000):
+                self._logger.info("thymos_diagnosis_skipped_budget")
+                return self._generate_hypotheses_rules(evidence)
+
         # Try LLM-backed hypothesis generation
         if self._llm is not None:
             try:
@@ -419,15 +427,27 @@ Rules:
 Respond in JSON array format:
 [{{"statement": "...", "diagnostic_test": "...", "suggested_repair_tier": "...", "confidence_prior": 0.0}}]"""
 
-        response = await self._llm.generate(
-            prompt=prompt,
-            system="You are a fault diagnosis engine. Respond only in valid JSON.",
-            max_tokens=1000,
-            temperature=0.3,
-        )
+        from ecodiaos.clients.llm import Message
+
+        if self._optimized:
+            response = await self._llm.generate(  # type: ignore[call-arg]
+                system_prompt="You are a fault diagnosis engine. Respond only in valid JSON.",
+                messages=[Message("user", prompt)],
+                max_tokens=1000,
+                temperature=0.3,
+                cache_system="thymos.diagnosis",
+                cache_method="generate",
+            )
+        else:
+            response = await self._llm.generate(
+                system_prompt="You are a fault diagnosis engine. Respond only in valid JSON.",
+                messages=[Message("user", prompt)],
+                max_tokens=1000,
+                temperature=0.3,
+            )
 
         # Parse LLM response
-        content = response.content if hasattr(response, "content") else str(response)
+        content = response.text if hasattr(response, "text") else str(response)
         # Extract JSON from response
         start = content.find("[")
         end = content.rfind("]") + 1

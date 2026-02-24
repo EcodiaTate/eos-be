@@ -20,6 +20,7 @@ import httpx
 import structlog
 
 from ecodiaos.config import LLMConfig
+from ecodiaos.clients.token_budget import TokenBudget, BudgetTier
 
 logger = structlog.get_logger()
 
@@ -175,8 +176,14 @@ class LLMProvider(ABC):
 class AnthropicProvider(LLMProvider):
     """Claude API provider with retry and exponential backoff."""
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "claude-sonnet-4-20250514",
+        token_budget: TokenBudget | None = None,
+    ) -> None:
         self._model = model
+        self._budget = token_budget
         # Strip whitespace/newlines — GCP Secret Manager can inject trailing \r\n
         clean_key = api_key.strip()
         self._client = httpx.AsyncClient(
@@ -265,11 +272,22 @@ class AnthropicProvider(LLMProvider):
             if block.get("type") == "text":
                 text += block.get("text", "")
 
+        input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        output_tokens = data.get("usage", {}).get("output_tokens", 0)
+
+        # Charge the token budget if configured
+        if self._budget:
+            self._budget.charge(
+                tokens=input_tokens + output_tokens,
+                calls=1,
+                system="anthropic_generate",
+            )
+
         return LLMResponse(
             text=text,
             model=data.get("model", self._model),
-            input_tokens=data.get("usage", {}).get("input_tokens", 0),
-            output_tokens=data.get("usage", {}).get("output_tokens", 0),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             finish_reason=data.get("stop_reason", "stop"),
         )
 
@@ -318,13 +336,24 @@ class AnthropicProvider(LLMProvider):
                     input=block.get("input", {}),
                 ))
 
+        input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        output_tokens = data.get("usage", {}).get("output_tokens", 0)
+
+        # Charge the token budget if configured
+        if self._budget:
+            self._budget.charge(
+                tokens=input_tokens + output_tokens,
+                calls=1,
+                system="anthropic_tools",
+            )
+
         return ToolAwareResponse(
             text=text,
             tool_calls=tool_calls,
             stop_reason=data.get("stop_reason", "end_turn"),
             model=data.get("model", self._model),
-            input_tokens=data.get("usage", {}).get("input_tokens", 0),
-            output_tokens=data.get("usage", {}).get("output_tokens", 0),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     async def close(self) -> None:
@@ -667,10 +696,17 @@ class OpenAIProvider(LLMProvider):
         await self._client.aclose()
 
 
-def create_llm_provider(config: LLMConfig) -> LLMProvider:
+def create_llm_provider(
+    config: LLMConfig,
+    token_budget: TokenBudget | None = None,
+) -> LLMProvider:
     """Factory to create the configured LLM provider."""
     if config.provider == "anthropic":
-        return AnthropicProvider(api_key=config.api_key, model=config.model)
+        return AnthropicProvider(
+            api_key=config.api_key,
+            model=config.model,
+            token_budget=token_budget,
+        )
     elif config.provider == "openai":
         return OpenAIProvider(api_key=config.api_key, model=config.model)
     elif config.provider == "ollama":

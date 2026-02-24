@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.primitives.memory_trace import Episode
 from ecodiaos.systems.evo.types import (
@@ -67,6 +68,7 @@ class ProcedureExtractor:
         self._llm = llm
         self._memory = memory
         self._logger = logger.bind(system="evo.procedure_extractor")
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
         self._extracted_this_cycle: int = 0
         self._total_extracted: int = 0
 
@@ -115,14 +117,32 @@ class ProcedureExtractor:
             examples=examples,
         )
 
+        # Budget check: skip procedure extraction in YELLOW/RED (low priority)
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("evo.procedure", estimated_tokens=1000):
+                self._logger.info("procedure_extraction_skipped_budget")
+                return None
+
         try:
-            response = await self._llm.generate(
-                system_prompt=_SYSTEM_PROMPT,
-                messages=[Message("user", prompt)],
-                max_tokens=1000,
-                temperature=0.3,
-                output_format="json",
-            )
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=_SYSTEM_PROMPT,
+                    messages=[Message("user", prompt)],
+                    max_tokens=1000,
+                    temperature=0.3,
+                    output_format="json",
+                    cache_system="evo.procedure",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=_SYSTEM_PROMPT,
+                    messages=[Message("user", prompt)],
+                    max_tokens=1000,
+                    temperature=0.3,
+                    output_format="json",
+                )
             raw = _parse_json_safe(response.text)
         except Exception as exc:
             self._logger.error("procedure_extraction_llm_failed", error=str(exc))

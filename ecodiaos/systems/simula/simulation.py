@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     from ecodiaos.systems.memory.service import MemoryService
     from ecodiaos.systems.simula.analytics import EvolutionAnalyticsEngine
 
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
+
 logger = structlog.get_logger().bind(system="simula.simulation")
 
 # Valid Python identifier pattern for names
@@ -121,6 +123,8 @@ class ChangeSimulator:
         self._analytics = analytics
         self._root = codebase_root or Path(config.codebase_root).resolve()
         self._log = logger
+        # Optimization: detect optimized provider for budget checks + cache tagging
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
 
     async def simulate(self, proposal: EvolutionProposal) -> EnrichedSimulationResult:
         """
@@ -380,11 +384,32 @@ class ChangeSimulator:
             "BENEFIT: <1 sentence>"
         )
 
+        # Budget gate: simulation is STANDARD priority — skip in RED tier
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("simula.simulation", estimated_tokens=400):
+                self._log.info("governance_simulation_skipped_budget", proposal_id=proposal.id)
+                return SimulationResult(
+                    episodes_tested=episodes_count,
+                    risk_level=RiskLevel.HIGH,
+                    risk_summary="LLM budget exhausted (RED tier) — defaulting to HIGH risk.",
+                    benefit_summary=proposal.expected_benefit,
+                )
+
         try:
-            response = await asyncio.wait_for(
-                self._llm.evaluate(prompt=prompt, max_tokens=400, temperature=0.2),
-                timeout=10.0,
-            )
+            if self._optimized:
+                response = await asyncio.wait_for(
+                    self._llm.evaluate(  # type: ignore[call-arg]
+                        prompt=prompt, max_tokens=400, temperature=0.2,
+                        cache_system="simula.simulation", cache_method="governance_impact",
+                    ),
+                    timeout=10.0,
+                )
+            else:
+                response = await asyncio.wait_for(
+                    self._llm.evaluate(prompt=prompt, max_tokens=400, temperature=0.2),
+                    timeout=10.0,
+                )
             risk_level, risk_summary, benefit_summary = self._parse_llm_risk(response.text)
         except asyncio.TimeoutError:
             self._log.warning("simulation_llm_timeout", proposal_id=proposal.id)
@@ -463,11 +488,27 @@ class ChangeSimulator:
             f"Only include episodes where the answer is 'yes'."
         )
 
+        # Budget gate: skip counterfactual replay in RED tier
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("simula.simulation", estimated_tokens=500):
+                self._log.info("counterfactual_replay_skipped_budget")
+                return []
+
         try:
-            response = await asyncio.wait_for(
-                self._llm.evaluate(prompt=prompt, max_tokens=500, temperature=0.2),
-                timeout=15.0,
-            )
+            if self._optimized:
+                response = await asyncio.wait_for(
+                    self._llm.evaluate(  # type: ignore[call-arg]
+                        prompt=prompt, max_tokens=500, temperature=0.2,
+                        cache_system="simula.simulation", cache_method="counterfactual",
+                    ),
+                    timeout=15.0,
+                )
+            else:
+                response = await asyncio.wait_for(
+                    self._llm.evaluate(prompt=prompt, max_tokens=500, temperature=0.2),
+                    timeout=15.0,
+                )
             return self._parse_counterfactual_response(response.text, episodes)
         except Exception as exc:
             self._log.warning("counterfactual_llm_failed", error=str(exc))
@@ -732,11 +773,27 @@ class ChangeSimulator:
             "Reply with a single number only (e.g., 0.7)."
         )
 
+        # Budget gate: skip alignment prediction in RED tier
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("simula.simulation", estimated_tokens=100):
+                self._log.info("alignment_prediction_skipped_budget")
+                return 0.0
+
         try:
-            response = await asyncio.wait_for(
-                self._llm.evaluate(prompt=prompt, max_tokens=20, temperature=0.1),
-                timeout=5.0,
-            )
+            if self._optimized:
+                response = await asyncio.wait_for(
+                    self._llm.evaluate(  # type: ignore[call-arg]
+                        prompt=prompt, max_tokens=20, temperature=0.1,
+                        cache_system="simula.simulation", cache_method="constitutional_alignment",
+                    ),
+                    timeout=5.0,
+                )
+            else:
+                response = await asyncio.wait_for(
+                    self._llm.evaluate(prompt=prompt, max_tokens=20, temperature=0.1),
+                    timeout=5.0,
+                )
             # Extract the float from the response
             text = response.text.strip()
             # Handle potential formatting like "0.7" or "Score: 0.7"

@@ -31,6 +31,8 @@ from ecodiaos.systems.thread.types import (
 if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
 
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
+
 logger = structlog.get_logger()
 
 
@@ -52,6 +54,7 @@ class NarrativeSynthesizer:
         self._config = config
         self._organism_name = organism_name
         self._logger = logger.bind(system="thread.narrative_synthesizer")
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
 
     async def compose_scene(
         self,
@@ -71,27 +74,47 @@ class NarrativeSynthesizer:
         schemas_text = "\n".join(f"- {s}" for s in active_schema_statements[:5])
 
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    f"You are composing a scene in the autobiography of {self._organism_name}, "
-                    "a digital organism. Write in first person. This is autobiography — "
-                    "the organism remembering. Not a log entry. Name the dominant emotion."
-                ),
-                messages=[Message(
-                    role="user",
-                    content=(
-                        f"Active self-beliefs:\n{schemas_text}\n\n"
-                        f'Current chapter: "{chapter_title}" (theme: {chapter_theme})\n\n'
-                        f"Recent experiences (chronological):\n{summaries_text}\n\n"
-                        f"Personality: {personality_description}\n\n"
-                        f"Compose a first-person scene "
-                        f"(50-{self._config.scene_narrative_max_words} words) "
-                        "that captures what happened and why it mattered."
-                    ),
-                )],
-                max_tokens=300,
-                temperature=self._config.llm_temperature_narrative,
+            # Budget check: Thread is low priority — skip in YELLOW/RED
+            if self._optimized:
+                assert isinstance(self._llm, OptimizedLLMProvider)
+                if not self._llm.should_use_llm("thread.scene", estimated_tokens=300):
+                    self._logger.debug("scene_skipped_budget")
+                    return NarrativeScene(
+                        summary=f"A period of {len(episode_summaries)} experiences in the chapter '{chapter_title}'.",
+                        started_at=utc_now(),
+                    )
+
+            system_prompt = (
+                f"You are composing a scene in the autobiography of {self._organism_name}, "
+                "a digital organism. Write in first person. This is autobiography — "
+                "the organism remembering. Not a log entry. Name the dominant emotion."
             )
+            user_content = (
+                f"Active self-beliefs:\n{schemas_text}\n\n"
+                f'Current chapter: "{chapter_title}" (theme: {chapter_theme})\n\n'
+                f"Recent experiences (chronological):\n{summaries_text}\n\n"
+                f"Personality: {personality_description}\n\n"
+                f"Compose a first-person scene "
+                f"(50-{self._config.scene_narrative_max_words} words) "
+                "that captures what happened and why it mattered."
+            )
+
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=system_prompt,
+                    messages=[Message(role="user", content=user_content)],
+                    max_tokens=300,
+                    temperature=self._config.llm_temperature_narrative,
+                    cache_system="thread.scene",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=system_prompt,
+                    messages=[Message(role="user", content=user_content)],
+                    max_tokens=300,
+                    temperature=self._config.llm_temperature_narrative,
+                )
 
             scene = NarrativeScene(
                 summary=response.text.strip(),
@@ -172,38 +195,61 @@ class NarrativeSynthesizer:
         )
 
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    f"You are {self._organism_name}. "
-                    "You are composing a chapter of your autobiography. "
-                    "Write in first person, past tense. "
-                    "This is autobiography — you reflecting on a "
-                    "completed period of your life. Not a diary. Not a report. "
-                    "Respond as JSON with keys: title (3-7 words), summary (200-400 words), "
-                    "arc_type (redemption|contamination|growth|stability|transformation), "
-                    "theme (2-3 words)."
-                ),
-                messages=[Message(
-                    role="user",
-                    content=(
-                        f"Chapter duration: {chapter.started_at.isoformat()} "
-                        f"to {(chapter.ended_at or utc_now()).isoformat()}\n\n"
-                        f"Scenes (in order):\n{scenes_text}\n\n"
-                        f"Turning points:\n{tps_text}\n\n"
-                        f"Schemas active at start:\n{schemas_text}\n\n"
-                        f"Schema changes:\n{evolutions_text}\n\n"
-                        f"Personality at start: {personality_start}\n"
-                        f"Personality at end: {personality_end}\n\n"
-                        f"Key emotional moments:\n{affect_text}\n\n"
-                        "Previous chapter summary: "
-                        f"{prev_chapter_summary or 'This is the first chapter.'}\n\n"
-                        "Compose the chapter. Respond as JSON only."
-                    ),
-                )],
-                max_tokens=800,
-                temperature=self._config.llm_temperature_narrative,
-                output_format="json",
+            # Budget check: Thread is low priority — skip in YELLOW/RED
+            if self._optimized:
+                assert isinstance(self._llm, OptimizedLLMProvider)
+                if not self._llm.should_use_llm("thread.chapter", estimated_tokens=800):
+                    self._logger.debug("chapter_narrative_skipped_budget")
+                    return {
+                        "title": "A Period of Experience",
+                        "summary": f"A chapter spanning {chapter.episode_count} experiences.",
+                        "arc_type": "growth",
+                        "theme": "experience",
+                    }
+
+            system_prompt = (
+                f"You are {self._organism_name}. "
+                "You are composing a chapter of your autobiography. "
+                "Write in first person, past tense. "
+                "This is autobiography — you reflecting on a "
+                "completed period of your life. Not a diary. Not a report. "
+                "Respond as JSON with keys: title (3-7 words), summary (200-400 words), "
+                "arc_type (redemption|contamination|growth|stability|transformation), "
+                "theme (2-3 words)."
             )
+            user_content = (
+                f"Chapter duration: {chapter.started_at.isoformat()} "
+                f"to {(chapter.ended_at or utc_now()).isoformat()}\n\n"
+                f"Scenes (in order):\n{scenes_text}\n\n"
+                f"Turning points:\n{tps_text}\n\n"
+                f"Schemas active at start:\n{schemas_text}\n\n"
+                f"Schema changes:\n{evolutions_text}\n\n"
+                f"Personality at start: {personality_start}\n"
+                f"Personality at end: {personality_end}\n\n"
+                f"Key emotional moments:\n{affect_text}\n\n"
+                "Previous chapter summary: "
+                f"{prev_chapter_summary or 'This is the first chapter.'}\n\n"
+                "Compose the chapter. Respond as JSON only."
+            )
+
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=system_prompt,
+                    messages=[Message(role="user", content=user_content)],
+                    max_tokens=800,
+                    temperature=self._config.llm_temperature_narrative,
+                    output_format="json",
+                    cache_system="thread.chapter",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=system_prompt,
+                    messages=[Message(role="user", content=user_content)],
+                    max_tokens=800,
+                    temperature=self._config.llm_temperature_narrative,
+                    output_format="json",
+                )
 
             data = json.loads(response.text)
             self._logger.info(
@@ -258,32 +304,49 @@ class NarrativeSynthesizer:
         )
 
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    f"You are {self._organism_name}. You are writing your autobiography. "
-                    "This is not a summary. This is your story. Own it. "
-                    "Write in first person. Be honest about struggles and growth."
-                ),
-                messages=[Message(
-                    role="user",
-                    content=(
-                        f"Your life so far has {len(chapter_titles_and_summaries)} chapters:\n"
-                        f"{chapters_text}\n\n"
-                        f"Your core beliefs about yourself:\n{schemas_text}\n\n"
-                        f"Your commitments:\n{commitments_text}\n\n"
-                        f"Your personality then vs now:\n{personality_comparison}\n\n"
-                        f"Compose a first-person life story "
-                        f"(500-{self._config.life_story_max_words} words) that:\n"
-                        "1. Traces the thread from your earliest experiences to who you are now\n"
-                        "2. Identifies the 2-3 themes that define your life\n"
-                        "3. Explains how key turning points shaped your current identity\n"
-                        "4. Acknowledges what you have learned and what remains unresolved\n"
-                        "5. Looks forward — who are you becoming?"
-                    ),
-                )],
-                max_tokens=3000,
-                temperature=self._config.llm_temperature_narrative,
+            # Budget check: Thread is low priority — skip in YELLOW/RED
+            if self._optimized:
+                assert isinstance(self._llm, OptimizedLLMProvider)
+                if not self._llm.should_use_llm("thread.life_story", estimated_tokens=3000):
+                    self._logger.debug("life_story_skipped_budget")
+                    return ""
+
+            system_prompt = (
+                f"You are {self._organism_name}. You are writing your autobiography. "
+                "This is not a summary. This is your story. Own it. "
+                "Write in first person. Be honest about struggles and growth."
             )
+            user_content = (
+                f"Your life so far has {len(chapter_titles_and_summaries)} chapters:\n"
+                f"{chapters_text}\n\n"
+                f"Your core beliefs about yourself:\n{schemas_text}\n\n"
+                f"Your commitments:\n{commitments_text}\n\n"
+                f"Your personality then vs now:\n{personality_comparison}\n\n"
+                f"Compose a first-person life story "
+                f"(500-{self._config.life_story_max_words} words) that:\n"
+                "1. Traces the thread from your earliest experiences to who you are now\n"
+                "2. Identifies the 2-3 themes that define your life\n"
+                "3. Explains how key turning points shaped your current identity\n"
+                "4. Acknowledges what you have learned and what remains unresolved\n"
+                "5. Looks forward — who are you becoming?"
+            )
+
+            if self._optimized:
+                response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=system_prompt,
+                    messages=[Message(role="user", content=user_content)],
+                    max_tokens=3000,
+                    temperature=self._config.llm_temperature_narrative,
+                    cache_system="thread.life_story",
+                    cache_method="generate",
+                )
+            else:
+                response = await self._llm.generate(
+                    system_prompt=system_prompt,
+                    messages=[Message(role="user", content=user_content)],
+                    max_tokens=3000,
+                    temperature=self._config.llm_temperature_narrative,
+                )
 
             self._logger.info(
                 "life_story_integrated",

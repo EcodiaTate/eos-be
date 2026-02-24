@@ -32,12 +32,15 @@ import time
 import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
+from ecodiaos.clients.output_validator import OutputValidator
 from ecodiaos.primitives.affect import AffectState
 from ecodiaos.prompts.nova.policy import (
     build_epistemic_value_prompt,
     build_pragmatic_value_prompt,
     summarise_beliefs,
 )
+from ecodiaos.systems.nova.efe_heuristics import EFEHeuristics
 from ecodiaos.systems.nova.policy_generator import DO_NOTHING_EFE, make_do_nothing_policy
 from ecodiaos.systems.nova.types import (
     BeliefState,
@@ -82,6 +85,10 @@ class EFEEvaluator:
         self._weights = weights or EFEWeights()
         self._use_llm = use_llm_estimation
         self._logger = logger.bind(system="nova.efe_evaluator")
+        # Optimization: detect if we have the optimized provider for budget/cache
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
+        self._heuristics = EFEHeuristics()
+        self._validator = OutputValidator()
 
     @property
     def weights(self) -> EFEWeights:
@@ -124,13 +131,29 @@ class EFEEvaluator:
             return score
 
         # ── Pragmatic value ──
-        if self._use_llm:
+        # Budget-aware: check if we should use LLM or fall back to heuristics
+        use_llm_pragmatic = self._use_llm
+        use_llm_epistemic = self._use_llm
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("nova.efe.pragmatic", estimated_tokens=200):
+                use_llm_pragmatic = False
+                self._heuristics.log_heuristic_fallback(
+                    "nova.efe.pragmatic", "budget_exhausted", policy.type if hasattr(policy, 'type') else "unknown"
+                )
+            if not self._llm.should_use_llm("nova.efe.epistemic", estimated_tokens=150):
+                use_llm_epistemic = False
+                self._heuristics.log_heuristic_fallback(
+                    "nova.efe.epistemic", "budget_exhausted", policy.type if hasattr(policy, 'type') else "unknown"
+                )
+
+        if use_llm_pragmatic:
             pragmatic = await self._estimate_pragmatic_llm(policy, goal, beliefs)
         else:
             pragmatic = _estimate_pragmatic_heuristic(policy, goal)
 
         # ── Epistemic value ──
-        if self._use_llm:
+        if use_llm_epistemic:
             epistemic = await self._estimate_epistemic_llm(policy, beliefs)
         else:
             epistemic = _estimate_epistemic_heuristic(policy, beliefs)
@@ -236,7 +259,7 @@ class EFEEvaluator:
         goal: Goal,
         beliefs: BeliefState,
     ) -> PragmaticEstimate:
-        """LLM-based pragmatic value estimation."""
+        """LLM-based pragmatic value estimation with caching and validation."""
         steps_desc = " → ".join(s.description for s in policy.steps) or "No steps specified"
         prompt = build_pragmatic_value_prompt(
             policy_name=policy.name,
@@ -247,9 +270,23 @@ class EFEEvaluator:
             beliefs_summary=summarise_beliefs(beliefs, max_entities=3),
         )
         try:
-            response = await self._llm.evaluate(prompt, max_tokens=200, temperature=0.2)
-            data = _parse_json_response(response.text)
-            if data:
+            # Use cache-tagged evaluate if optimized provider is available
+            if self._optimized:
+                response = await self._llm.evaluate(  # type: ignore[call-arg]
+                    prompt, max_tokens=200, temperature=0.2,
+                    cache_system="nova.efe.pragmatic", cache_method="evaluate",
+                )
+            else:
+                response = await self._llm.evaluate(prompt, max_tokens=200, temperature=0.2)
+
+            # Use output validator for robust JSON extraction
+            data = self._validator.extract_json(response.text)
+            if data and isinstance(data, dict):
+                data = self._validator.auto_fix_dict(
+                    data,
+                    required_keys=["success_probability", "confidence", "reasoning"],
+                    defaults={"success_probability": 0.5, "confidence": 0.5, "reasoning": ""},
+                )
                 return PragmaticEstimate(
                     score=float(data.get("success_probability", 0.5)),
                     success_probability=float(data.get("success_probability", 0.5)),
@@ -265,7 +302,7 @@ class EFEEvaluator:
         policy: Policy,
         beliefs: BeliefState,
     ) -> EpistemicEstimate:
-        """LLM-based epistemic value estimation."""
+        """LLM-based epistemic value estimation with caching and validation."""
         steps_desc = " → ".join(s.description for s in policy.steps)
         known_uncertainties = _identify_uncertain_domains(beliefs)
         prompt = build_epistemic_value_prompt(
@@ -275,9 +312,23 @@ class EFEEvaluator:
             known_uncertainties=known_uncertainties,
         )
         try:
-            response = await self._llm.evaluate(prompt, max_tokens=150, temperature=0.2)
-            data = _parse_json_response(response.text)
-            if data:
+            # Use cache-tagged evaluate if optimized provider is available
+            if self._optimized:
+                response = await self._llm.evaluate(  # type: ignore[call-arg]
+                    prompt, max_tokens=150, temperature=0.2,
+                    cache_system="nova.efe.epistemic", cache_method="evaluate",
+                )
+            else:
+                response = await self._llm.evaluate(prompt, max_tokens=150, temperature=0.2)
+
+            # Use output validator for robust JSON extraction
+            data = self._validator.extract_json(response.text)
+            if data and isinstance(data, dict):
+                data = self._validator.auto_fix_dict(
+                    data,
+                    required_keys=["info_gain", "uncertainties_addressed", "novelty"],
+                    defaults={"info_gain": 0.3, "uncertainties_addressed": 0, "novelty": 0.2},
+                )
                 return EpistemicEstimate(
                     score=float(data.get("info_gain", 0.3)),
                     uncertainties_addressed=int(data.get("uncertainties_addressed", 0)),

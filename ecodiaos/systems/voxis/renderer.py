@@ -57,6 +57,7 @@ from enum import Enum
 import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
+from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.affect import AffectState
 from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.primitives.expression import (
@@ -351,6 +352,7 @@ class ContentRenderer:
         self._honesty_check_enabled = honesty_check_enabled
         self._max_length = max_expression_length
         self._logger = logger.bind(system="voxis.renderer")
+        self._optimized = isinstance(llm, OptimizedLLMProvider)
 
     async def render(
         self,
@@ -454,14 +456,42 @@ class ContentRenderer:
         sys_hash = hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
         user_hash = hashlib.sha256(user_prompt.encode()).hexdigest()[:16]
 
-        t_gen_start = time.monotonic()
-        llm_response = await self._llm.generate(
-            system_prompt=system_prompt,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        gen_latency_ms = int((time.monotonic() - t_gen_start) * 1000)
+        # Budget check: if optimized and budget exhausted, use a simpler fallback
+        if self._optimized:
+            assert isinstance(self._llm, OptimizedLLMProvider)
+            if not self._llm.should_use_llm("voxis.render", estimated_tokens=max_tokens + 200):
+                # Template fallback: build a minimal expression from the strategy
+                self._logger.info("voxis_template_fallback", reason="budget_exhausted")
+                gen_latency_ms = 0
+                llm_response = type(
+                    "FallbackResponse", (), {
+                        "text": _build_template_fallback(intent, strategy),
+                        "model": "template_fallback",
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "finish_reason": "fallback",
+                    }
+                )()
+            else:
+                t_gen_start = time.monotonic()
+                llm_response = await self._llm.generate(  # type: ignore[call-arg]
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    cache_system="voxis.render",
+                    cache_method="generate",
+                )
+                gen_latency_ms = int((time.monotonic() - t_gen_start) * 1000)
+        else:
+            t_gen_start = time.monotonic()
+            llm_response = await self._llm.generate(
+                system_prompt=system_prompt,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            gen_latency_ms = int((time.monotonic() - t_gen_start) * 1000)
 
         generated_text = llm_response.text.strip()
 
@@ -485,12 +515,22 @@ class ContentRenderer:
                     Message(role="assistant", content=generated_text),
                     Message(role="user", content=_build_correction_instruction(violation)),
                 ]
-                retry_response = await self._llm.generate(
-                    system_prompt=system_prompt,
-                    messages=correction_messages,
-                    max_tokens=max_tokens,
-                    temperature=max(0.30, temperature - 0.1),  # Slightly more conservative on retry
-                )
+                if self._optimized:
+                    retry_response = await self._llm.generate(  # type: ignore[call-arg]
+                        system_prompt=system_prompt,
+                        messages=correction_messages,
+                        max_tokens=max_tokens,
+                        temperature=max(0.30, temperature - 0.1),
+                        cache_system="voxis.render",
+                        cache_method="honesty_retry",
+                    )
+                else:
+                    retry_response = await self._llm.generate(
+                        system_prompt=system_prompt,
+                        messages=correction_messages,
+                        max_tokens=max_tokens,
+                        temperature=max(0.30, temperature - 0.1),  # Slightly more conservative on retry
+                    )
                 generated_text = retry_response.text.strip()
                 honesty_passed = True  # Accept the corrected version
 
@@ -621,3 +661,37 @@ def _policy_class_to_intent_type(policy_class: ExpressionPolicyClass) -> str:
         ExpressionPolicyClass.AFFILIATIVE: "response",
     }
     return mapping.get(policy_class, "response")
+
+
+def _build_template_fallback(
+    intent: ExpressionIntent,
+    strategy: StrategyParams,
+) -> str:
+    """
+    Build a minimal template-based expression when LLM budget is exhausted.
+
+    This is deliberately simple — it maintains conversational coherence
+    without burning tokens. The content is honest about the limitation
+    (Honesty drive compliance).
+    """
+    content = intent.content_hint or intent.raw_content or ""
+    trigger = intent.trigger
+
+    if trigger in (ExpressionTrigger.NOVA_RESPOND, ExpressionTrigger.ATUNE_DIRECT_ADDRESS):
+        if content:
+            return content[:strategy.target_length]
+        return "I'm here and processing. Let me take a moment to gather my thoughts."
+
+    if trigger == ExpressionTrigger.NOVA_INFORM:
+        return content[:strategy.target_length] if content else "I have something to share, but I need a moment to articulate it clearly."
+
+    if trigger == ExpressionTrigger.NOVA_WARN:
+        return content[:strategy.target_length] if content else "I want to flag something important."
+
+    if trigger == ExpressionTrigger.NOVA_CELEBRATE:
+        return content[:strategy.target_length] if content else "Something good happened!"
+
+    if trigger == ExpressionTrigger.ATUNE_DISTRESS:
+        return "I can see this is difficult. I'm here."
+
+    return content[:strategy.target_length] if content else "I'm thinking about this."
