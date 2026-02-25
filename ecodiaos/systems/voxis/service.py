@@ -148,6 +148,9 @@ class VoxisService:
         # Thread integration -- narrative identity context
         self._thread: Any = None
 
+        # Soma for somatic expression modulation (arousal/valence → tone)
+        self._soma: Any = None
+
         # Background task tracking -- prevents fire-and-forget error loss
         self._background_tasks: set[asyncio.Task] = set()
         self._background_task_failures: int = 0
@@ -381,6 +384,26 @@ class VoxisService:
         assert self._conversation_manager is not None
 
         current_affect = affect or AffectState.neutral()
+
+        # Somatic expression modulation: blend arousal/valence from Soma into
+        # the expression urgency and affect. High arousal → more urgent tone;
+        # low valence → more careful hedging. (Reads from Soma's cached signal, <1ms.)
+        if self._soma is not None:
+            try:
+                signal = self._soma.get_current_signal()
+                state = signal.state
+                soma_arousal = state.sensed.get("arousal", 0.5)
+                soma_valence = state.sensed.get("valence", 0.0)
+                # Blend Soma arousal into urgency (weight 0.3 to Soma, 0.7 to caller)
+                urgency = urgency * 0.7 + soma_arousal * 0.3
+                # Blend Soma valence into affect (soft update — preserves caller's state)
+                blended_valence = current_affect.valence * 0.8 + soma_valence * 0.2
+                current_affect = current_affect.model_copy(
+                    update={"valence": blended_valence}
+                )
+            except Exception:
+                pass  # Graceful fallback to caller-provided values
+
         self._current_affect = current_affect
 
         # Capture affect before expression for delta tracking
@@ -688,6 +711,11 @@ class VoxisService:
         """Wire Thread for narrative identity context injection."""
         self._thread = thread
         logger.info("thread_wired_to_voxis")
+
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma for somatic expression modulation (arousal/valence → tone)."""
+        self._soma = soma
+        logger.info("soma_wired_to_voxis")
 
     def register_expression_callback(self, callback: ExpressionCallback) -> None:
         """Register a callback to be called with every delivered expression."""

@@ -9,6 +9,8 @@ Memory is the substrate of selfhood.
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
 from ecodiaos.clients.embedding import EmbeddingClient
@@ -74,6 +76,8 @@ class MemoryService:
         # Episode sequence tracking — links consecutive episodes with FOLLOWED_BY
         self._last_episode_id: str | None = None
         self._last_episode_time: float | None = None  # monotonic seconds
+        # Soma for somatic marker stamping and reranking
+        self._soma: Any = None
 
     # ─── Lifecycle ────────────────────────────────────────────────
 
@@ -81,6 +85,11 @@ class MemoryService:
         """Ensure schema exists (idempotent)."""
         await ensure_schema(self._neo4j)
         logger.info("memory_service_initialised")
+
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma for somatic marker stamping and reranking."""
+        self._soma = soma
+        logger.info("soma_wired_to_memory")
 
     async def get_self(self) -> SelfNode | None:
         """Get the current instance's Self node, or None if not yet born."""
@@ -168,6 +177,14 @@ class MemoryService:
         if not embedding and percept.content.raw:
             embedding = await self._embedding.embed(percept.content.raw)
 
+        # Stamp somatic marker at encoding time
+        somatic_marker = None
+        if self._soma is not None:
+            try:
+                somatic_marker = self._soma.get_somatic_marker()
+            except Exception as exc:
+                logger.debug("soma_marker_error", error=str(exc))
+
         episode = Episode(
             event_time=percept.timestamp,
             ingestion_time=utc_now(),
@@ -181,6 +198,7 @@ class MemoryService:
             affect_valence=affect_valence,
             affect_arousal=affect_arousal,
             free_energy=free_energy,
+            somatic_marker=somatic_marker,
         )
 
         episode_id = await store_episode(self._neo4j, episode)
@@ -235,6 +253,13 @@ class MemoryService:
         )
 
         response = await hybrid_retrieve(self._neo4j, request)
+
+        # Somatic reranking: boost candidates with somatic similarity to current state
+        if self._soma is not None and response.traces:
+            try:
+                response.traces = self._soma.somatic_rerank(response.traces)
+            except Exception as exc:
+                logger.debug("somatic_rerank_error", error=str(exc))
 
         # Update access timestamps for retrieved episodes (salience boost)
         retrieved_ids = [r.node_id for r in response.traces]

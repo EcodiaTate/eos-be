@@ -225,6 +225,37 @@ class ThymosConfig(BaseModel):
     memory_budget_mb: int = 256
 
 
+class SomaConfig(BaseModel):
+    """Configuration for Soma — the interoceptive predictive substrate."""
+
+    # Master on/off
+    cycle_enabled: bool = True
+    # Phase-space update frequency (every N theta cycles)
+    phase_space_update_interval: int = 100
+    # Trajectory ring buffer size (~150s at 150ms/tick)
+    trajectory_buffer_size: int = 1000
+    # EWM smoothing span for velocity estimation
+    prediction_ewm_span: int = 20
+    # EMA smoothing for setpoint context transitions
+    setpoint_adaptation_alpha: float = 0.05
+    # Urgency threshold for Nova allostatic deliberation
+    urgency_threshold: float = 0.3
+    # Minimum dwell cycles to declare a new attractor
+    attractor_min_dwell_cycles: int = 50
+    # Enable bifurcation boundary detection
+    bifurcation_detection_enabled: bool = True
+    # Maximum discoverable attractors
+    max_attractors: int = 20
+    # Enable somatic marker stamping on memory traces
+    somatic_marker_enabled: bool = True
+    # Maximum salience boost from somatic similarity
+    somatic_rerank_boost: float = 0.3
+    # Enable developmental stage gating
+    developmental_gating_enabled: bool = True
+    # Boot developmental stage
+    initial_stage: str = "reflexive"
+
+
 class OneirosConfig(BaseModel):
     # Circadian rhythm
     wake_duration_target_s: float = 79200.0     # 22 hours
@@ -426,6 +457,7 @@ class EcodiaOSConfig(BaseSettings):
     simula: SimulaConfig = Field(default_factory=SimulaConfig)
     thymos: ThymosConfig = Field(default_factory=ThymosConfig)
     oneiros: OneirosConfig = Field(default_factory=OneirosConfig)
+    soma: SomaConfig = Field(default_factory=SomaConfig)
     federation: FederationConfig = Field(default_factory=FederationConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 

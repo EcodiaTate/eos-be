@@ -40,6 +40,7 @@ from ecodiaos.systems.simula.service import SimulaService
 from ecodiaos.systems.synapse.service import SynapseService
 from ecodiaos.systems.thymos.service import ThymosService
 from ecodiaos.systems.oneiros.service import OneirosService
+from ecodiaos.systems.soma.service import SomaService
 from ecodiaos.systems.federation.service import FederationService
 from ecodiaos.telemetry.logging import setup_logging
 from ecodiaos.telemetry.metrics import MetricCollector
@@ -496,6 +497,33 @@ async def lifespan(app: FastAPI):
     await oneiros.initialize()
     synapse.register_system(oneiros)
     app.state.oneiros = oneiros
+
+    # ── 13d. Initialize Soma — The Interoceptive Substrate ──────────
+    # Must come after Synapse, Atune, Nova, Thymos, Equor, Oneiros.
+    # Soma reads from all systems to compose interoceptive state and
+    # emits AllostaticSignal consumed by Atune, Nova, Voxis, Evo, etc.
+    soma = SomaService(config=config.soma)
+    # Wire interoceptor system references
+    soma.set_atune(atune)
+    soma.set_synapse(synapse)
+    soma.set_nova(nova)
+    soma.set_thymos(thymos)
+    soma.set_equor(equor)
+    # Wire token budget for energy sensing
+    if hasattr(synapse, "_resources"):
+        soma.set_token_budget(synapse._resources)
+    await soma.initialize()
+    # Wire Soma into systems for allostatic signal reading
+    atune.set_soma(soma)    # Atune uses precision_weights for affect modulation
+    synapse.set_soma(soma)  # Synapse wires Soma into clock (step 0)
+    nova.set_soma(soma)     # Nova: allostatic deliberation trigger on urgency > 0.7
+    memory.set_soma(soma)   # Memory: somatic marker stamping on write, reranking on read
+    evo.set_soma(soma)      # Evo: curiosity modulation, dynamics matrix update
+    oneiros.set_soma(soma)  # Oneiros: sleep pressure from energy errors, REM counterfactuals
+    thymos.set_soma(soma)   # Thymos: integrity precision gating in process_incident
+    voxis.set_soma(soma)    # Voxis: arousal/valence expression modulation
+    synapse.register_system(soma)
+    app.state.soma = soma
 
     # ── 14. Start Alive WebSocket server ──────────────────────────
     from ecodiaos.systems.alive.ws_server import AliveWebSocketServer
@@ -2487,4 +2515,117 @@ async def get_federation_trust(link_id: str):
         "successful_interactions": link.successful_interactions,
         "failed_interactions": link.failed_interactions,
         "violation_count": link.violation_count,
+    }
+
+
+# ── Soma (Interoceptive Predictive Substrate) ──────────────────────
+
+
+@app.get("/api/v1/soma/health")
+async def get_soma_health():
+    """Soma system health report."""
+    soma: SomaService = app.state.soma
+    return await soma.health()
+
+
+@app.get("/api/v1/soma/state")
+async def get_soma_state():
+    """Current interoceptive state — the organism's felt sense of its own viability."""
+    soma: SomaService = app.state.soma
+    state = soma.get_current_state()
+    if state is None:
+        return {"status": "no_state", "message": "Soma has not completed a cycle yet"}
+    return {
+        "sensed": {d.value: round(v, 4) for d, v in state.sensed.items()},
+        "setpoints": {d.value: round(v, 4) for d, v in state.setpoints.items()},
+        "errors_moment": {
+            d.value: round(v, 4)
+            for d, v in state.errors.get("moment", {}).items()
+        },
+        "error_rates": {d.value: round(v, 4) for d, v in state.error_rates.items()},
+        "urgency": round(state.urgency, 4),
+        "dominant_error": state.dominant_error.value,
+        "max_error_magnitude": round(state.max_error_magnitude, 4),
+        "temporal_dissonance": {d.value: round(v, 4) for d, v in state.temporal_dissonance.items()},
+        "timestamp": state.timestamp.isoformat(),
+    }
+
+
+@app.get("/api/v1/soma/signal")
+async def get_soma_signal():
+    """Current allostatic signal — the output all other systems consume."""
+    soma: SomaService = app.state.soma
+    signal = soma.get_current_signal()
+    return {
+        "urgency": round(signal.urgency, 4),
+        "dominant_error": signal.dominant_error.value,
+        "dominant_error_magnitude": round(signal.dominant_error_magnitude, 4),
+        "dominant_error_rate": round(signal.dominant_error_rate, 4),
+        "precision_weights": {d.value: round(v, 4) for d, v in signal.precision_weights.items()},
+        "max_temporal_dissonance": round(signal.max_temporal_dissonance, 4),
+        "dissonant_dimension": signal.dissonant_dimension.value if signal.dissonant_dimension else None,
+        "nearest_attractor": signal.nearest_attractor,
+        "distance_to_bifurcation": signal.distance_to_bifurcation,
+        "trajectory_heading": signal.trajectory_heading,
+        "energy_burn_rate": round(signal.energy_burn_rate, 4),
+        "predicted_energy_exhaustion_s": signal.predicted_energy_exhaustion_s,
+        "cycle_number": signal.cycle_number,
+        "timestamp": signal.timestamp.isoformat(),
+    }
+
+
+@app.get("/api/v1/soma/phase-space")
+async def get_soma_phase_space():
+    """Phase-space navigation — attractors, bifurcations, trajectory heading."""
+    soma: SomaService = app.state.soma
+    position = soma.get_phase_position()
+    attractors = soma._phase_space.attractors
+    bifurcations = soma._phase_space.bifurcations
+    return {
+        "position": position,
+        "attractors": [
+            {
+                "label": a.label,
+                "center": {d.value: round(v, 4) for d, v in a.center.items()},
+                "basin_radius": round(a.basin_radius, 4),
+                "stability": round(a.stability, 4),
+                "valence": round(a.valence, 4),
+                "visits": a.visits,
+                "mean_dwell_time_s": round(a.mean_dwell_time_s, 2),
+            }
+            for a in attractors
+        ],
+        "bifurcations": [
+            {
+                "label": b.label,
+                "pre_regime": b.pre_regime,
+                "post_regime": b.post_regime,
+                "crossing_count": b.crossing_count,
+            }
+            for b in bifurcations
+        ],
+    }
+
+
+@app.get("/api/v1/soma/developmental")
+async def get_soma_developmental():
+    """Developmental stage and maturation progress."""
+    soma: SomaService = app.state.soma
+    stage = soma.get_developmental_stage()
+    return {
+        "stage": stage.value,
+        "cycle_count": soma.cycle_count,
+        "capabilities": soma._developmental.capabilities,
+        "available_horizons": soma._temporal_depth.available_horizons,
+    }
+
+
+@app.get("/api/v1/soma/errors")
+async def get_soma_errors():
+    """Allostatic errors per horizon per dimension."""
+    soma: SomaService = app.state.soma
+    errors = soma.get_errors()
+    return {
+        horizon: {d.value: round(v, 4) for d, v in dims.items()}
+        for horizon, dims in errors.items()
     }

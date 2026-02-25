@@ -100,6 +100,7 @@ class EvoService:
         self._atune: Any = None  # AtuneService — for pushing learned head weights
         self._nova: Any = None   # NovaService — for generating epistemic goals from hypotheses
         self._voxis: Any = None  # VoxisService — for personality learning from expression outcomes
+        self._soma: Any = None   # SomaService — for curiosity modulation and dynamics update
 
         # Sub-systems (built in initialize())
         self._hypothesis_engine: HypothesisEngine | None = None
@@ -215,8 +216,24 @@ class EvoService:
             episode = _broadcast_to_episode(broadcast)
             await self._scan_episode_online(episode)
 
+            # Curiosity-modulated hypothesis generation interval
+            # High curiosity → generate hypotheses more aggressively
+            curiosity_multiplier = 1.0
+            if self._soma is not None:
+                try:
+                    signal = self._soma.get_current_signal()
+                    curiosity_drive = signal.state.sensed.get("curiosity_drive", 0.5)
+                    # Scale: 0.5 drive = 1.0x, 1.0 drive = 1.5x (generate earlier)
+                    curiosity_multiplier = 0.5 + curiosity_drive * 1.0
+                except Exception:
+                    pass
+
+            effective_interval = max(
+                10, int(_HYPOTHESIS_GENERATION_INTERVAL / curiosity_multiplier)
+            )
+
             # Periodically generate hypotheses from accumulated patterns
-            if self._total_broadcasts % _HYPOTHESIS_GENERATION_INTERVAL == 0:
+            if self._total_broadcasts % effective_interval == 0:
                 asyncio.create_task(
                     self._generate_hypotheses_safe(),
                     name="evo_hypothesis_generation",
@@ -369,6 +386,11 @@ class EvoService:
         """Wire Voxis so Evo can push personality adjustments from expression outcomes."""
         self._voxis = voxis
         self._logger.info("voxis_wired_to_evo")
+
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma for curiosity modulation and dynamics learning."""
+        self._soma = soma
+        self._logger.info("soma_wired_to_evo")
 
     # ─── Thread Integration ────────────────────────────────────────────────────
 
@@ -547,6 +569,10 @@ class EvoService:
             # the deltas and forward them so Voxis personality actually evolves.
             self._push_voxis_personality()
 
+            # If Evo discovered systematic mis-predictions in interoceptive
+            # transitions during consolidation, update Soma's dynamics matrix
+            self._push_soma_dynamics_update(result)
+
             return result
         except Exception as exc:
             self._logger.error("consolidation_run_failed", error=str(exc))
@@ -627,6 +653,40 @@ class EvoService:
                 )
             except Exception:
                 self._logger.debug("voxis_personality_push_failed", exc_info=True)
+
+    def _push_soma_dynamics_update(self, result: ConsolidationResult) -> None:
+        """
+        If consolidation found systematic mis-predictions in interoceptive transitions,
+        update Soma's dynamics matrix to refine the 9x9 cross-dimension coupling.
+
+        Extracts soma.dynamics.* parameters from the tuner and pushes the
+        updated coupling matrix to Soma for improved allostatic prediction.
+        """
+        if self._soma is None or self._parameter_tuner is None:
+            return
+
+        from ecodiaos.systems.evo.types import PARAMETER_DEFAULTS
+
+        all_params = self._parameter_tuner.get_all_parameters()
+        dynamics_updates: dict[str, float] = {}
+
+        for param_name, current_value in all_params.items():
+            if not param_name.startswith("soma.dynamics."):
+                continue
+            default_value = PARAMETER_DEFAULTS.get(param_name, current_value)
+            delta = current_value - default_value
+            if abs(delta) > 0.005:
+                dynamics_updates[param_name] = current_value
+
+        if dynamics_updates:
+            try:
+                self._soma.update_dynamics_matrix(dynamics_updates)
+                self._logger.info(
+                    "soma_dynamics_pushed",
+                    updated_entries=len(dynamics_updates),
+                )
+            except Exception:
+                self._logger.debug("soma_dynamics_push_failed", exc_info=True)
 
     async def _consolidation_loop(self) -> None:
         """

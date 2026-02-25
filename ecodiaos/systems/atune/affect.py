@@ -121,6 +121,7 @@ class AffectManager:
         percept: Percept | None,
         prediction_error: PredictionError | None,
         system_load: SystemLoad,
+        precision_weights: dict[str, float] | None = None,
     ) -> AffectState:
         """
         Produce a new :class:`AffectState` from the current inputs.
@@ -128,8 +129,12 @@ class AffectManager:
         Each dimension is updated with an inertia coefficient so the state
         cannot jump wildly between cycles. The mood baseline is updated
         separately at a much slower rate.
+
+        Soma's precision_weights modulate inertia: higher precision → trust current
+        value more (increase inertia), lower precision → adapt faster (decrease inertia).
         """
         cur = self._current
+        precision_weights = precision_weights or {}
 
         # ── Valence (positive / negative) ────────────────────────────
         if percept is not None:
@@ -144,6 +149,13 @@ class AffectManager:
             else:
                 # Positive: 88% inertia (decays faster toward neutral)
                 inertia = 0.88
+
+            # Apply Soma precision modulation: higher precision → more inertia
+            # precision_weights maps InteroceptiveDimension (e.g. "valence") to 0-1 confidence
+            valence_precision = precision_weights.get("valence", 1.0)
+            # Adjust inertia: 1.0 precision = base inertia, 0.0 = fully adaptive
+            inertia = inertia * valence_precision + (1.0 - valence_precision) * 0.5
+
             new_valence = cur.valence * inertia + reactive_valence * (1.0 - inertia)
 
             # Emotional memory: record high-arousal events
@@ -166,7 +178,10 @@ class AffectManager:
             new_arousal = min(1.0, cur.arousal + prediction_error.magnitude * 0.1)
         else:
             # Decay toward mood baseline arousal
-            new_arousal = cur.arousal * 0.94 + self._mood_arousal * 0.06
+            arousal_precision = precision_weights.get("arousal", 1.0)
+            # Higher precision → more inertia (trust current arousal more)
+            arousal_inertia = 0.94 * arousal_precision + 0.6 * (1.0 - arousal_precision)
+            new_arousal = cur.arousal * arousal_inertia + self._mood_arousal * (1.0 - arousal_inertia)
 
         # System load increases arousal
         new_arousal = min(1.0, new_arousal + system_load.cpu_utilisation * 0.05)

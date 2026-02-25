@@ -66,6 +66,9 @@ class CognitiveClock:
         self._config = config
         self._logger = logger.bind(component="clock")
 
+        # System references (wired later by SynapseService)
+        self._soma = None  # Soma service (step 0 of theta cycle)
+
         # Timing state
         self._base_period_ms: float = float(config.cycle_period_ms)
         self._min_period_ms: float = float(config.min_cycle_period_ms)
@@ -161,6 +164,10 @@ class CognitiveClock:
         """Register the per-cycle callback (set by SynapseService)."""
         self._on_cycle = callback
 
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma service (step 0 of theta cycle)."""
+        self._soma = soma
+
     # ─── State ───────────────────────────────────────────────────────
 
     @property
@@ -211,6 +218,19 @@ class CognitiveClock:
             t0 = time.monotonic()
 
             try:
+                # 0. RUN SOMA FIRST (step 0 of theta cycle)
+                # Soma produces the AllostaticSignal that all downstream systems read.
+                if self._soma is not None:
+                    try:
+                        await self._soma.run_cycle()
+                    except Exception as soma_exc:
+                        self._logger.error(
+                            "soma_cycle_error",
+                            cycle=self._cycle_count,
+                            error=str(soma_exc),
+                        )
+                        # Continue gracefully — Atune runs with default signal
+
                 # 1. Read current arousal from the organism's affect state
                 self._update_arousal()
 

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -129,6 +129,8 @@ class DeliberationEngine:
         affect: AffectState,
         belief_delta_is_conflicting: bool = False,
         memory_traces: list[dict] | None = None,
+        allostatic_mode: bool = False,
+        allostatic_error_dim: Any = None,
     ) -> tuple[Intent | None, DecisionRecord]:
         """
         Main deliberation entry point.
@@ -147,6 +149,7 @@ class DeliberationEngine:
                 return await self._deliberate_inner(
                     broadcast, belief_state, affect,
                     belief_delta_is_conflicting, memory_traces, start,
+                    allostatic_mode, allostatic_error_dim,
                 )
         except asyncio.TimeoutError:
             elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -166,6 +169,8 @@ class DeliberationEngine:
         belief_delta_is_conflicting: bool,
         memory_traces: list[dict] | None,
         start: float,
+        allostatic_mode: bool = False,
+        allostatic_error_dim: Any = None,
     ) -> tuple[Intent | None, DecisionRecord]:
         """Inner deliberation logic, called within the end-to-end timeout."""
         # Recompute goal priorities before deliberating
@@ -174,6 +179,14 @@ class DeliberationEngine:
             drive_weights=self._drive_weights,
         )
         self._goals.recompute_priorities(priority_ctx)
+
+        # When allostatic urgency is high, reorder goals to prioritise those
+        # addressing the dominant error dimension (e.g. energy depletion → rest goals)
+        if allostatic_mode and allostatic_error_dim is not None:
+            self._reorder_goals_for_allostatic_mode(
+                active_goals=self._goals.active_goals,
+                error_dimension=allostatic_error_dim,
+            )
 
         # Assess situation to determine path
         assessment = self._assess_situation(
@@ -216,6 +229,51 @@ class DeliberationEngine:
             latency_ms=elapsed_ms,
         )
         return intent, record
+
+    # ─── Allostatic Goal Reordering ───────────────────────────────
+
+    def _reorder_goals_for_allostatic_mode(
+        self,
+        active_goals: list[Any],
+        error_dimension: Any,
+    ) -> None:
+        """
+        Reorder active goals so those addressing the dominant allostatic error
+        dimension are prioritised. Called when Soma urgency > threshold.
+
+        Dimension→keyword mapping: ENERGY→rest/recover, SOCIAL_CHARGE→engage,
+        COHERENCE→clarify, INTEGRITY→honest, AROUSAL→calm, TEMPORAL_PRESSURE→urgent.
+        """
+        _dim_keywords: dict[str, list[str]] = {
+            "energy": ["rest", "recover", "sleep", "recharge", "restore"],
+            "social_charge": ["engage", "connect", "communicate", "respond", "interact"],
+            "coherence": ["clarify", "understand", "learn", "resolve", "explore"],
+            "integrity": ["honest", "truthful", "authentic", "correct", "admit"],
+            "arousal": ["calm", "settle", "ground", "stabilise", "slow"],
+            "temporal_pressure": ["urgent", "immediate", "now", "quickly", "deadline"],
+            "valence": ["positive", "good", "help", "care", "support"],
+            "confidence": ["verify", "confirm", "check", "validate", "test"],
+            "curiosity_drive": ["explore", "discover", "learn", "investigate", "try"],
+        }
+        dim_str = str(error_dimension).lower()
+        keywords = _dim_keywords.get(dim_str, [])
+        if not keywords:
+            return
+
+        def _allostatic_weight(goal: Any) -> float:
+            description = getattr(goal, "description", "").lower()
+            if any(kw in description for kw in keywords):
+                return 1.0
+            return 0.0
+
+        # Stable sort: allostatic matches float to top, original order preserved otherwise
+        active_goals.sort(key=lambda g: (1.0 - _allostatic_weight(g), -getattr(g, "priority", 0.5)))
+
+        self._logger.debug(
+            "allostatic_goal_reorder",
+            error_dimension=dim_str,
+            top_goal=(active_goals[0].description[:60] if active_goals else "none"),
+        )
 
     # ─── Situation Assessment ─────────────────────────────────────
 

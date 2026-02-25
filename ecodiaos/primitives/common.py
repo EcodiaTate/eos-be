@@ -41,6 +41,7 @@ class SystemID(str, enum.Enum):
     FEDERATION = "federation"
     ONEIROS = "oneiros"
     THREAD = "thread"
+    SOMA = "soma"
     API = "api"
 
 

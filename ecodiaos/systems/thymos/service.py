@@ -166,6 +166,7 @@ class ThymosService:
         self._evo: Any = None       # EvoService — error pattern learning
         self._atune: Any = None     # AtuneService — incident-as-percept
         self._health_monitor: HealthMonitor | None = None  # Synapse health records
+        self._soma: Any = None      # SomaService — integrity precision gating
 
         # ── Sub-systems (built in initialize()) ──
         # Sentinels
@@ -259,6 +260,11 @@ class ThymosService:
         """Wire Nova so critical incidents generate urgent repair goals."""
         self._nova = nova
         self._logger.info("nova_wired_to_thymos")
+
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma for integrity-based constitutional health gating."""
+        self._soma = soma
+        self._logger.info("soma_wired_to_thymos")
 
     # ─── Lifecycle ─────────────────────────────────────────────────────
 
@@ -646,6 +652,29 @@ class ThymosService:
         # ── Step 2b: Inject urgent goal for critical incidents ──
         if incident.severity == IncidentSeverity.CRITICAL and self._nova is not None:
             await self._inject_repair_goal(incident, diagnosis.repair_tier, resolved=False)
+
+        # ── Step 2c: Integrity precision gating (Soma) ──
+        # When Soma reports high integrity precision (body is well-calibrated on its
+        # constitutional state), amplify constitutional health weighting in diagnosis.
+        # This makes Thymos prefer less-invasive repairs when the organism "feels" its
+        # integrity clearly — high trust in the self-model → respect constitutional signals.
+        if self._soma is not None:
+            try:
+                signal = self._soma.get_current_signal()
+                precision_weights = signal.precision_weights
+                integrity_precision = precision_weights.get("integrity", 1.0)
+                if integrity_precision > 0.7:
+                    # Boost diagnosis confidence slightly — we trust the assessment
+                    boosted_confidence = min(1.0, diagnosis.confidence * 1.15)
+                    diagnosis = diagnosis.model_copy(update={"confidence": boosted_confidence})
+                    self._logger.debug(
+                        "integrity_precision_gating_applied",
+                        integrity_precision=round(integrity_precision, 3),
+                        confidence_before=round(diagnosis.confidence / 1.15, 3),
+                        confidence_after=round(boosted_confidence, 3),
+                    )
+            except Exception as exc:
+                self._logger.debug("soma_integrity_gating_error", error=str(exc))
 
         # ── Step 3: Prescribe ──
         incident.repair_status = RepairStatus.PRESCRIBING

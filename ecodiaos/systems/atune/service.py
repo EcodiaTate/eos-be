@@ -136,6 +136,7 @@ class AtuneService:
         self._llm_client = llm_client
         self._belief_state = belief_state
         self._memory_service = memory_service  # Full MemoryService for entity storage
+        self._soma = None  # Soma service for allostatic signal reading
 
         # Sub-components
         self._workspace = GlobalWorkspace(
@@ -304,7 +305,17 @@ class AtuneService:
                 peek_percept = top.content
                 peek_pe = top.prediction_error
 
-        await self._affect_mgr.update(peek_percept, peek_pe, load)
+        # Get precision weights from Soma (if available)
+        precision_weights = {}
+        if self._soma is not None:
+            try:
+                signal = self._soma.get_current_signal()
+                if signal is not None:
+                    precision_weights = signal.precision_weights
+            except Exception:
+                pass  # Fall back to uniform if Soma unavailable
+
+        await self._affect_mgr.update(peek_percept, peek_pe, load, precision_weights)
 
         # ── Coherence stress → threshold modulation ────────────────────
         # High coherence stress means beliefs conflict with percepts.
@@ -549,6 +560,10 @@ class AtuneService:
 
     def set_cache_community_vocabulary(self, vocab: set[str]) -> None:
         self._cache.community_vocabulary = vocab
+
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma service for allostatic signal reading."""
+        self._soma = soma
 
     # ------------------------------------------------------------------
     # Read-only accessors

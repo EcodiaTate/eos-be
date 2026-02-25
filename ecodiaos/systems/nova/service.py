@@ -117,6 +117,9 @@ class NovaService:
         # Callback to push goal updates to Atune
         self._goal_sync_callback: Any = None  # Set via set_goal_sync_callback()
 
+        # Soma for allostatic signal reading
+        self._soma: Any = None
+
         # Rhythm-adaptive state (updated by Synapse event bus)
         self._rhythm_state: str = "normal"
         self._rhythm_drive_modulation: dict[str, float] = {}
@@ -201,6 +204,11 @@ class NovaService:
             drive_weights=self._drive_weights,
         )
 
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma service for allostatic urgency-based deliberation."""
+        self._soma = soma
+        self._logger.info("soma_wired_to_nova")
+
     def set_axon(self, axon: "AxonService") -> None:
         """
         Wire Axon into Nova's intent router after both are initialised.
@@ -254,6 +262,18 @@ class NovaService:
         # ── Retrieve relevant memories (best-effort, non-blocking) ──
         memory_traces = await self._retrieve_relevant_memories_safe(broadcast)
 
+        # ── Check for allostatic urgency (soma read from cache, <1ms) ──
+        allostatic_mode = False
+        dominant_error_dim = None
+        if self._soma is not None:
+            try:
+                signal = self._soma.get_current_signal()
+                if signal.urgency > self._soma.urgency_threshold:
+                    allostatic_mode = True
+                    dominant_error_dim = signal.dominant_error
+            except Exception as exc:
+                self._logger.debug("soma_urgency_check_error", error=str(exc))
+
         # ── Deliberate (≤5000ms total) ──
         intent, record = await self._deliberation_engine.deliberate(
             broadcast=broadcast,
@@ -261,6 +281,8 @@ class NovaService:
             affect=broadcast.affect,
             belief_delta_is_conflicting=delta.involves_belief_conflict(),
             memory_traces=memory_traces,
+            allostatic_mode=allostatic_mode,
+            allostatic_error_dim=dominant_error_dim,
         )
 
         # ── Update observability ──

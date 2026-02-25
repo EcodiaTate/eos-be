@@ -98,6 +98,7 @@ class OneirosService:
         self._atune: Any = None
         self._thymos: Any = None
         self._memory: Any = None
+        self._soma: Any = None
 
         # Core subsystems
         self._clock = CircadianClock(config)
@@ -177,6 +178,10 @@ class OneirosService:
     def set_memory(self, memory: Any) -> None:
         self._memory = memory
 
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma for sleep pressure from energy errors and counterfactual REM replay."""
+        self._soma = soma
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     async def initialize(self) -> None:
@@ -244,6 +249,22 @@ class OneirosService:
                     engine = self._evo._hypothesis_engine
                     count = len(getattr(engine, "_hypotheses", {}))
                     self._clock.record_hypothesis_count(count)
+            except Exception:
+                pass
+
+        # Augment sleep pressure from allostatic energy errors
+        # Large negative energy error (metabolic depletion) → higher sleep urgency
+        # We record it as an affect trace (high arousal + negative valence) so the
+        # circadian pressure model picks it up through its affect residue source.
+        if self._soma is not None:
+            try:
+                signal = self._soma.get_current_signal()
+                errors = signal.state.errors.get("immediate", {})
+                energy_error = errors.get("energy", 0.0)
+                if energy_error < -0.3:
+                    # Translate energy depletion → high-affect trace (valence=-0.8, arousal=0.5)
+                    depletion_valence = max(-1.0, energy_error * 2.0)  # -0.3 → -0.6, -0.5 → -1.0
+                    self._clock.record_affect_trace(depletion_valence, 0.5)
             except Exception:
                 pass
 
@@ -550,6 +571,11 @@ class OneirosService:
                 for dream in ethical_result.dreams:
                     await self._journal.record_dream(dream)
 
+            # Soma counterfactual replay: replay near-miss decision episodes
+            # through Soma's simulation to discover alternative trajectories
+            if self._soma is not None and self._nova is not None:
+                await self._run_soma_counterfactuals_safe(cycle_id)
+
         except Exception as exc:
             self._logger.error("rem_error", error=str(exc))
 
@@ -574,6 +600,50 @@ class OneirosService:
         self._stage_controller.advance(rem_budget_s)
 
         return result
+
+    async def _run_soma_counterfactuals_safe(self, cycle_id: str) -> None:
+        """
+        During REM, replay near-miss decision episodes through Soma's counterfactual
+        simulation. Discovers alternative trajectories for learning what could have
+        gone better — closing the somatic feedback loop with decision-making.
+        """
+        try:
+            near_miss_records = list(getattr(self._nova, "_decision_records", []))
+            # Only process records that represent actual decisions (not do-nothing)
+            candidates = [
+                r for r in near_miss_records[-20:]
+                if getattr(r, "intent_dispatched", False)
+            ]
+            if not candidates:
+                return
+
+            for decision_record in candidates[:5]:  # Max 5 per REM cycle
+                try:
+                    decision_id = getattr(decision_record, "broadcast_id", new_id())
+                    counterfactual = await self._soma.generate_counterfactual(
+                        decision_id=decision_id,
+                        actual_trajectory=getattr(decision_record, "path", "unknown"),
+                        alternative_description=(
+                            f"Alternative decision for broadcast {decision_id[:8]}"
+                        ),
+                        alternative_initial_impact={
+                            "energy": -0.1,
+                            "valence": 0.05,
+                            "coherence": 0.1,
+                        },
+                        num_steps=10,
+                    )
+                    if counterfactual is not None:
+                        self._logger.debug(
+                            "counterfactual_generated",
+                            cycle_id=cycle_id,
+                            decision_id=decision_id[:8],
+                        )
+                except Exception as exc:
+                    self._logger.debug("counterfactual_error", error=str(exc))
+
+        except Exception as exc:
+            self._logger.debug("soma_counterfactuals_safe_error", error=str(exc))
 
     async def _run_lucid(self, cycle_id: str) -> LucidResult:
         """Run lucid dreaming workers."""

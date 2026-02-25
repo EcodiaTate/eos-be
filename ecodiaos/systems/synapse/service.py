@@ -129,6 +129,10 @@ class SynapseService:
         self._initialized = True
         self._logger.info("synapse_initialized")
 
+    def set_soma(self, soma: Any) -> None:
+        """Wire Soma service into the clock (step 0 of theta cycle)."""
+        self._clock.set_soma(soma)
+
     def register_system(self, system: Any) -> None:
         """
         Register a cognitive system for health monitoring and degradation.
