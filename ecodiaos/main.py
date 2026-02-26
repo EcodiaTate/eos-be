@@ -1743,8 +1743,20 @@ async def trigger_consolidation():
     evo: EvoService = app.state.evo
     result = await evo.run_consolidation()
     if result is None:
-        return {"status": "skipped", "reason": "Already running or not initialized"}
-    return result.model_dump()
+        return {
+            "status": "skipped",
+            "duration_ms": 0,
+            "hypotheses_evaluated": 0,
+            "hypotheses_integrated": 0,
+            "procedures_extracted": 0,
+            "parameters_adjusted": 0,
+            "total_parameter_delta": 0.0,
+        }
+
+    # Get the result as dict and add status field
+    result_dict = result.model_dump()
+    result_dict["status"] = "completed"
+    return result_dict
 
 
 @app.get("/api/v1/evo/parameters")
