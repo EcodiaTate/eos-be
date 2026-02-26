@@ -48,6 +48,10 @@ class Episode(Identified):
     access_count: int = 0
     free_energy: float = 0.0
 
+    # Somatic marker — 19D interoceptive snapshot at encoding time (Soma §0.5)
+    somatic_marker: Any | None = None
+    somatic_vector: list[float] | None = None
+
 
 class Entity(Identified):
     """A persistent concept in the knowledge graph."""
@@ -155,6 +159,10 @@ class MemoryTrace(Identified):
     ingestion_time: datetime = Field(default_factory=utc_now)
     consolidation_level: int = ConsolidationLevel.RAW
 
+    # Somatic marker — 19D interoceptive snapshot at encoding time (Soma §0.5)
+    somatic_marker: Any | None = None
+    somatic_vector: list[float] | None = None
+
 
 # ─── Retrieval Request/Response ───────────────────────────────────
 
@@ -183,8 +191,12 @@ class RetrievalResult(EOSBaseModel):
     bm25_score: float | None = None
     graph_score: float | None = None
     salience: float = 0.0
+    salience_score: float = 0.0  # Alias used by somatic reranking
     unified_score: float = 0.0
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # Somatic marker vector for reranking (19D: 9 sensed + 9 errors + 1 PE)
+    somatic_vector: list[float] | None = None
 
 
 class MemoryRetrievalResponse(EOSBaseModel):

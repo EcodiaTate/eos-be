@@ -177,11 +177,14 @@ class MemoryService:
         if not embedding and percept.content.raw:
             embedding = await self._embedding.embed(percept.content.raw)
 
-        # Stamp somatic marker at encoding time
+        # Stamp somatic marker at encoding time (Soma §0.5)
         somatic_marker = None
+        somatic_vector: list[float] | None = None
         if self._soma is not None:
             try:
                 somatic_marker = self._soma.get_somatic_marker()
+                if somatic_marker is not None and hasattr(somatic_marker, "to_vector"):
+                    somatic_vector = somatic_marker.to_vector()
             except Exception as exc:
                 logger.debug("soma_marker_error", error=str(exc))
 
@@ -199,6 +202,7 @@ class MemoryService:
             affect_arousal=affect_arousal,
             free_energy=free_energy,
             somatic_marker=somatic_marker,
+            somatic_vector=somatic_vector,
         )
 
         episode_id = await store_episode(self._neo4j, episode)
@@ -255,9 +259,12 @@ class MemoryService:
         response = await hybrid_retrieve(self._neo4j, request)
 
         # Somatic reranking: boost candidates with somatic similarity to current state
+        # somatic_rerank modifies salience_score; sync back to unified_score
         if self._soma is not None and response.traces:
             try:
                 response.traces = self._soma.somatic_rerank(response.traces)
+                for trace in response.traces:
+                    trace.unified_score = trace.salience_score
             except Exception as exc:
                 logger.debug("somatic_rerank_error", error=str(exc))
 

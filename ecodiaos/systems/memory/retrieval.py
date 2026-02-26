@@ -39,6 +39,7 @@ async def _vector_search(
         YIELD node, score
         RETURN node.id AS id, node.summary AS content,
                node.salience_composite AS salience,
+               node.somatic_vector AS somatic_vector,
                score AS vector_score,
                'episode' AS node_type
         """,
@@ -52,6 +53,8 @@ async def _vector_search(
             content=r.get("content", ""),
             vector_score=r.get("vector_score"),
             salience=r.get("salience", 0.0),
+            salience_score=r.get("salience", 0.0),
+            somatic_vector=r.get("somatic_vector"),
         )
         for r in results
     ]
@@ -75,6 +78,7 @@ async def _bm25_search(
         YIELD node, score
         RETURN node.id AS id, node.summary AS content,
                node.salience_composite AS salience,
+               node.somatic_vector AS somatic_vector,
                score AS bm25_score,
                'episode' AS node_type
         LIMIT $limit
@@ -89,6 +93,8 @@ async def _bm25_search(
             content=r.get("content", ""),
             bm25_score=r.get("bm25_score"),
             salience=r.get("salience", 0.0),
+            salience_score=r.get("salience", 0.0),
+            somatic_vector=r.get("somatic_vector"),
         )
         for r in results
     ]
@@ -127,6 +133,7 @@ async def _graph_traverse(
         MATCH (entity)<-[:MENTIONS]-(ep:Episode)
         RETURN DISTINCT ep.id AS id, ep.summary AS content,
                ep.salience_composite AS salience,
+               ep.somatic_vector AS somatic_vector,
                entity_score AS graph_score,
                'episode' AS node_type,
                1 AS hop
@@ -145,6 +152,8 @@ async def _graph_traverse(
             content=r.get("content", ""),
             graph_score=r.get("graph_score", 0.0),
             salience=r.get("salience", 0.0),
+            salience_score=r.get("salience", 0.0),
+            somatic_vector=r.get("somatic_vector"),
         )
 
     # Hop 2: Entity → RELATES_TO → Entity2 → MENTIONS → Episode (semantic neighbours)
@@ -160,6 +169,7 @@ async def _graph_traverse(
                 MATCH (neighbour)<-[:MENTIONS]-(ep:Episode)
                 RETURN DISTINCT ep.id AS id, ep.summary AS content,
                        ep.salience_composite AS salience,
+                       ep.somatic_vector AS somatic_vector,
                        entity_score * 0.8 * rel.strength AS graph_score,
                        'episode' AS node_type,
                        2 AS hop
@@ -177,6 +187,8 @@ async def _graph_traverse(
                         content=r.get("content", ""),
                         graph_score=r.get("graph_score", 0.0),
                         salience=r.get("salience", 0.0),
+                        salience_score=r.get("salience", 0.0),
+                        somatic_vector=r.get("somatic_vector"),
                     )
         except Exception:
             pass  # Semantic hop is best-effort
@@ -194,6 +206,7 @@ async def _graph_traverse(
                 MATCH (sibling)<-[:MENTIONS]-(ep:Episode)
                 RETURN DISTINCT ep.id AS id, ep.summary AS content,
                        ep.salience_composite AS salience,
+                       ep.somatic_vector AS somatic_vector,
                        entity_score * 0.65 AS graph_score,
                        'episode' AS node_type,
                        3 AS hop
@@ -211,6 +224,8 @@ async def _graph_traverse(
                         content=r.get("content", ""),
                         graph_score=r.get("graph_score", 0.0),
                         salience=r.get("salience", 0.0),
+                        salience_score=r.get("salience", 0.0),
+                        somatic_vector=r.get("somatic_vector"),
                     )
         except Exception:
             pass  # Community hop is best-effort
@@ -226,6 +241,7 @@ async def _graph_traverse(
                 WHERE fb.causal_strength > 0.2
                 RETURN DISTINCT neighbour.id AS id, neighbour.summary AS content,
                        neighbour.salience_composite AS salience,
+                       neighbour.somatic_vector AS somatic_vector,
                        fb.causal_strength * 0.6 AS graph_score,
                        'episode' AS node_type,
                        3 AS hop
@@ -243,6 +259,8 @@ async def _graph_traverse(
                         content=r.get("content", ""),
                         graph_score=r.get("graph_score", 0.0),
                         salience=r.get("salience", 0.0),
+                        salience_score=r.get("salience", 0.0),
+                        somatic_vector=r.get("somatic_vector"),
                     )
         except Exception:
             pass  # Temporal hop is best-effort
@@ -290,6 +308,9 @@ def _merge_deduplicate(
                     existing.bm25_score = r.bm25_score
                 if r.graph_score and not existing.graph_score:
                     existing.graph_score = r.graph_score
+                # Carry somatic vector forward if missing
+                if r.somatic_vector and not existing.somatic_vector:
+                    existing.somatic_vector = r.somatic_vector
             else:
                 seen[r.node_id] = r
 
@@ -335,6 +356,8 @@ async def hybrid_retrieve(
 
     for result in all_results:
         result.unified_score = _compute_unified_score(result, request.temporal_bias)
+        # Sync salience_score for somatic reranking (reads salience_score attribute)
+        result.salience_score = result.unified_score
 
     # Filter and rank
     ranked = sorted(all_results, key=lambda r: r.unified_score, reverse=True)

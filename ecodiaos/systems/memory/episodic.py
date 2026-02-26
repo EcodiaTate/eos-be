@@ -25,7 +25,28 @@ async def store_episode(
     """
     Store a new episode in the knowledge graph.
     Target: ≤50ms (just node creation; extraction is async).
+
+    If a somatic_marker is present (from Soma §0.5), its 19D vector
+    is stored as ``somatic_vector`` for cosine-similarity reranking
+    and the full marker dict is stored as ``somatic_marker_json``.
     """
+    # Flatten somatic marker to 19D vector + JSON for persistence
+    somatic_vector: list[float] | None = None
+    somatic_marker_json: str | None = None
+    if episode.somatic_marker is not None:
+        try:
+            if hasattr(episode.somatic_marker, "to_vector"):
+                somatic_vector = episode.somatic_marker.to_vector()
+            elif episode.somatic_vector is not None:
+                somatic_vector = episode.somatic_vector
+            somatic_marker_json = json.dumps(
+                episode.somatic_marker.model_dump()
+                if hasattr(episode.somatic_marker, "model_dump")
+                else str(episode.somatic_marker)
+            )
+        except Exception:
+            logger.debug("somatic_marker_serialise_failed", exc_info=True)
+
     await neo4j.execute_write(
         """
         CREATE (e:Episode {
@@ -46,7 +67,9 @@ async def store_episode(
             consolidation_level: $consolidation_level,
             last_accessed: datetime($last_accessed),
             access_count: 0,
-            free_energy: $free_energy
+            free_energy: $free_energy,
+            somatic_vector: $somatic_vector,
+            somatic_marker_json: $somatic_marker_json
         })
         """,
         {
@@ -67,6 +90,8 @@ async def store_episode(
             "consolidation_level": episode.consolidation_level,
             "last_accessed": episode.last_accessed.isoformat(),
             "free_energy": episode.free_energy,
+            "somatic_vector": somatic_vector,
+            "somatic_marker_json": somatic_marker_json,
         },
     )
 

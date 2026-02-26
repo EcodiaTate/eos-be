@@ -2,15 +2,24 @@
 EcodiaOS -- Simula Health Checker
 
 After a change is applied, the health checker verifies the codebase
-is still functional. Three checks run in sequence:
+is still functional. Five check phases run in sequence:
   1. Syntax check -- ast.parse() on all written Python files
   2. Import check -- attempt to import the affected module
   3. Unit tests -- run pytest on the affected system's test directory
+  4. Formal verification (Stage 2) -- Dafny + Z3 + static analysis
+  5. Lean 4 proof verification (Stage 4A) -- DeepSeek-Prover-V2 pattern
 
-If any check fails, Simula rolls back the change. The goal is to never
-leave EOS in a broken state.
+If any blocking check fails, Simula rolls back the change. The goal is
+to never leave EOS in a broken state.
 
-Target: health check completes <=5s (as part of the <=5s change application budget).
+Phase 4 (formal verification) runs with independent timeout budgets:
+  - Dafny: blocking for triggerable categories (MODIFY_CONTRACT, ADD_SYSTEM_CAPABILITY)
+  - Z3: advisory by default; graduates to blocking in Stage 3 (z3_blocking=True)
+  - Static analysis: blocking for ERROR-severity findings
+
+Phase 5 (Lean 4) runs for categories that require proof-level assurance:
+  - Blocking when lean_blocking=True (default for high-risk categories)
+  - Advisory otherwise; proved lemmas are stored in the proof library
 """
 
 from __future__ import annotations
@@ -18,27 +27,68 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib.util
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
 
 from ecodiaos.systems.simula.types import HealthCheckResult
+from ecodiaos.systems.simula.verification.types import (
+    LEAN_PROOF_CATEGORIES,
+    DafnyVerificationResult,
+    FormalVerificationResult,
+    InvariantVerificationResult,
+    LeanVerificationResult,
+)
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.systems.simula.types import EvolutionProposal
+    from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
+    from ecodiaos.systems.simula.verification.lean_bridge import LeanBridge
+    from ecodiaos.systems.simula.verification.static_analysis import StaticAnalysisBridge
+    from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge
 
 logger = structlog.get_logger().bind(system="simula.health")
 
 
 class HealthChecker:
     """
-    Verifies post-apply codebase health via syntax, import, and test checks.
-    Any failure triggers rollback.
+    Verifies post-apply codebase health via syntax, import, test,
+    and formal verification checks. Any blocking failure triggers rollback.
     """
 
-    def __init__(self, codebase_root: Path, test_command: str = "pytest") -> None:
+    def __init__(
+        self,
+        codebase_root: Path,
+        test_command: str = "pytest",
+        dafny_bridge: DafnyBridge | None = None,
+        z3_bridge: Z3Bridge | None = None,
+        static_analysis_bridge: StaticAnalysisBridge | None = None,
+        llm: LLMProvider | None = None,
+        z3_blocking: bool = False,
+        # Stage 4A: Lean 4 proof verification
+        lean_bridge: LeanBridge | None = None,
+        lean_blocking: bool = True,
+    ) -> None:
         self._root = codebase_root
         self._test_command = test_command
+        self._dafny = dafny_bridge
+        self._z3 = z3_bridge
+        self._static_analysis = static_analysis_bridge
+        self._llm = llm
+        self._z3_blocking = z3_blocking  # Stage 3: Z3 graduates to blocking
+        # Stage 4A: Lean 4
+        self._lean = lean_bridge
+        self._lean_blocking = lean_blocking
         self._log = logger
 
-    async def check(self, files_written: list[str]) -> HealthCheckResult:
+    async def check(
+        self,
+        files_written: list[str],
+        proposal: EvolutionProposal | None = None,
+    ) -> HealthCheckResult:
         """""""""
         Run all health checks in sequence.  Returns on first failure.
         """""""""
@@ -65,6 +115,64 @@ class HealthChecker:
                 issues=[f"Test suite failed:\n{test_output[:1000]}"],
             )
         self._log.info("health_tests_passed")
+
+        # 4. Formal verification (Stage 2) — runs with independent timeout
+        formal_result = await self._run_formal_verification(
+            files_written, proposal,
+        )
+        if formal_result is not None:
+            if not formal_result.passed and formal_result.blocking_issues:
+                self._log.warning(
+                    "health_formal_verification_failed",
+                    blocking=formal_result.blocking_issues,
+                )
+                return HealthCheckResult(
+                    healthy=False,
+                    issues=[
+                        f"Formal verification failed: {issue}"
+                        for issue in formal_result.blocking_issues
+                    ],
+                    formal_verification=formal_result,
+                )
+            if formal_result.advisory_issues:
+                self._log.info(
+                    "health_formal_verification_advisory",
+                    advisory=formal_result.advisory_issues,
+                )
+            self._log.info("health_formal_verification_passed")
+
+        # 5. Lean 4 proof verification (Stage 4A) — runs for proof-eligible categories
+        lean_result = await self._run_lean_verification(
+            files_written, proposal,
+        )
+        if lean_result is not None:
+            if lean_result.status.value == "failed" and self._lean_blocking:
+                self._log.warning(
+                    "health_lean_verification_failed",
+                    status=lean_result.status.value,
+                    attempts=len(lean_result.attempts),
+                )
+                return HealthCheckResult(
+                    healthy=False,
+                    issues=[
+                        f"Lean 4 proof verification failed after {len(lean_result.attempts)} attempts"
+                    ],
+                    formal_verification=formal_result,
+                    lean_verification=lean_result,
+                )
+            self._log.info(
+                "health_lean_verification_complete",
+                status=lean_result.status.value,
+                proven_lemmas=len(lean_result.proven_lemmas),
+                copilot_rate=f"{lean_result.copilot_automation_rate:.0%}",
+            )
+
+        if formal_result is not None or lean_result is not None:
+            return HealthCheckResult(
+                healthy=True,
+                formal_verification=formal_result,
+                lean_verification=lean_result,
+            )
 
         return HealthCheckResult(healthy=True)
 
@@ -207,4 +315,321 @@ class HealthChecker:
                 return str(test_path)
             return None
         except Exception:
+            return None
+
+    # ── Stage 2: Formal Verification Phase ────────────────────────────────────
+
+    async def _run_formal_verification(
+        self,
+        files_written: list[str],
+        proposal: EvolutionProposal | None,
+    ) -> FormalVerificationResult | None:
+        """
+        Run Dafny, Z3, and static analysis in parallel.
+
+        Returns None if no verification bridges are configured.
+        Returns FormalVerificationResult with pass/fail and issues.
+        """
+        from ecodiaos.systems.simula.verification.types import (
+            DAFNY_TRIGGERABLE_CATEGORIES,
+            FormalVerificationResult,
+        )
+
+        if not any([self._dafny, self._z3, self._static_analysis]):
+            return None
+
+        start = time.monotonic()
+        blocking_issues: list[str] = []
+        advisory_issues: list[str] = []
+        dafny_result = None
+        z3_result = None
+        static_result = None
+
+        # Build parallel tasks
+        tasks: dict[str, asyncio.Task[object]] = {}
+
+        # Dafny: run for triggerable categories only
+        if (
+            self._dafny is not None
+            and self._llm is not None
+            and proposal is not None
+            and proposal.category in DAFNY_TRIGGERABLE_CATEGORIES
+        ):
+            tasks["dafny"] = asyncio.create_task(
+                self._run_dafny_verification(proposal),
+            )
+
+        # Z3: run for all proposals when enabled
+        if (
+            self._z3 is not None
+            and self._llm is not None
+            and proposal is not None
+        ):
+            tasks["z3"] = asyncio.create_task(
+                self._run_z3_verification(proposal, files_written),
+            )
+
+        # Static analysis: run for all Python files
+        if self._static_analysis is not None:
+            tasks["static"] = asyncio.create_task(
+                self._static_analysis.run_all(files_written),
+            )
+
+        if not tasks:
+            return None
+
+        # Await all tasks
+        results = await asyncio.gather(
+            *tasks.values(), return_exceptions=True,
+        )
+        task_results = dict(zip(tasks.keys(), results))
+
+        # Process Dafny result
+        if "dafny" in task_results:
+            from ecodiaos.systems.simula.verification.types import (
+                DafnyVerificationResult,
+                DafnyVerificationStatus,
+            )
+            raw = task_results["dafny"]
+            if isinstance(raw, DafnyVerificationResult):
+                dafny_result = raw
+                if raw.status != DafnyVerificationStatus.VERIFIED:
+                    msg = f"Dafny verification {raw.status.value}: {raw.error_summary}"
+                    blocking_issues.append(msg)
+            elif isinstance(raw, Exception):
+                self._log.warning("dafny_exception", error=str(raw))
+                advisory_issues.append(f"Dafny verification error: {raw}")
+
+        # Process Z3 result
+        if "z3" in task_results:
+            from ecodiaos.systems.simula.verification.types import (
+                InvariantVerificationResult,
+                InvariantVerificationStatus,
+            )
+            raw = task_results["z3"]
+            if isinstance(raw, InvariantVerificationResult):
+                z3_result = raw
+                if self._z3_blocking:
+                    # Stage 3: Z3 graduates to blocking — invalid invariants fail the check
+                    invalid_count = sum(
+                        1 for i in raw.discovered_invariants
+                        if i.status == InvariantVerificationStatus.INVALID
+                    )
+                    if invalid_count > 0:
+                        blocking_issues.append(
+                            f"Z3 found {invalid_count} invalid invariants (blocking mode)"
+                        )
+                    if raw.valid_invariants:
+                        advisory_issues.append(
+                            f"Z3 discovered {len(raw.valid_invariants)} valid invariants"
+                        )
+                else:
+                    # Advisory mode (Stage 2 default)
+                    if raw.valid_invariants:
+                        advisory_issues.append(
+                            f"Z3 discovered {len(raw.valid_invariants)} valid invariants"
+                        )
+            elif isinstance(raw, Exception):
+                self._log.warning("z3_exception", error=str(raw))
+
+        # Process static analysis result
+        if "static" in task_results:
+            from ecodiaos.systems.simula.verification.types import (
+                StaticAnalysisResult,
+                StaticAnalysisSeverity,
+            )
+            raw = task_results["static"]
+            if isinstance(raw, StaticAnalysisResult):
+                static_result = raw
+                if raw.error_count > 0:
+                    blocking_issues.append(
+                        f"Static analysis found {raw.error_count} ERROR-severity issues"
+                    )
+                if raw.warning_count > 0:
+                    advisory_issues.append(
+                        f"Static analysis found {raw.warning_count} warnings"
+                    )
+            elif isinstance(raw, Exception):
+                self._log.warning("static_analysis_exception", error=str(raw))
+
+        passed = len(blocking_issues) == 0
+        total_time_ms = int((time.monotonic() - start) * 1000)
+
+        return FormalVerificationResult(
+            dafny=dafny_result,
+            z3=z3_result,
+            static_analysis=static_result,
+            passed=passed,
+            blocking_issues=blocking_issues,
+            advisory_issues=advisory_issues,
+            total_verification_time_ms=total_time_ms,
+        )
+
+    async def _run_dafny_verification(
+        self, proposal: EvolutionProposal,
+    ) -> DafnyVerificationResult:
+        """Run Dafny Clover loop for the proposal."""
+        from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
+        from ecodiaos.systems.simula.verification.templates import get_template
+        from ecodiaos.systems.simula.verification.types import (
+            DafnyVerificationResult,
+            DafnyVerificationStatus,
+        )
+
+        assert self._dafny is not None
+        assert self._llm is not None
+
+        # Check Dafny availability
+        if not await self._dafny.check_available():
+            self._log.info("dafny_not_available_skipping")
+            return DafnyVerificationResult(
+                status=DafnyVerificationStatus.SKIPPED,
+                error_summary="Dafny binary not available",
+            )
+
+        # Get template if available
+        template = get_template(proposal.category.value)
+
+        # Build context from the change spec
+        python_source = ""
+        function_name = ""
+        context = proposal.description
+        if proposal.change_spec:
+            context = proposal.change_spec.description
+            function_name = proposal.change_spec.target_system
+
+        return await self._dafny.run_clover_loop(
+            llm=self._llm,
+            python_source=python_source,
+            function_name=function_name,
+            context=context,
+            template=template,
+        )
+
+    async def _run_z3_verification(
+        self,
+        proposal: EvolutionProposal,
+        files_written: list[str],
+    ) -> InvariantVerificationResult:
+        """Run Z3 invariant discovery for the proposal."""
+        from ecodiaos.systems.simula.verification.types import (
+            InvariantVerificationResult,
+            InvariantVerificationStatus,
+        )
+
+        assert self._z3 is not None
+        assert self._llm is not None
+
+        # Gather Python source from written files for invariant discovery
+        python_source_parts: list[str] = []
+        target_functions: list[str] = []
+        for filepath in files_written:
+            if not filepath.endswith(".py"):
+                continue
+            full = self._root / filepath
+            if full.is_file():
+                try:
+                    content = full.read_text(encoding="utf-8")
+                    python_source_parts.append(
+                        f"# --- {filepath} ---\n{content}"
+                    )
+                    # Extract function names for targeting
+                    import ast as _ast
+                    try:
+                        tree = _ast.parse(content)
+                        for node in _ast.walk(tree):
+                            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                                target_functions.append(node.name)
+                    except SyntaxError:
+                        pass
+                except Exception:
+                    continue
+
+        if not python_source_parts:
+            return InvariantVerificationResult(
+                status=InvariantVerificationStatus.SKIPPED,
+                error_summary="No Python source to analyze",
+            )
+
+        python_source = "\n\n".join(python_source_parts)
+        domain_context = proposal.description
+        if proposal.change_spec:
+            domain_context = proposal.change_spec.description
+
+        return await self._z3.run_discovery_loop(
+            llm=self._llm,
+            python_source=python_source,
+            target_functions=target_functions[:10],  # Limit to top 10
+            domain_context=domain_context,
+        )
+
+    # ── Stage 4A: Lean 4 Proof Verification Phase ─────────────────────────────
+
+    async def _run_lean_verification(
+        self,
+        files_written: list[str],
+        proposal: EvolutionProposal | None,
+    ) -> LeanVerificationResult | None:
+        """
+        Run Lean 4 proof generation for proposals in proof-eligible categories.
+
+        Returns None if Lean bridge is not configured or proposal is not eligible.
+        Returns LeanVerificationResult with proof status and discovered lemmas.
+        """
+        if self._lean is None or self._llm is None or proposal is None:
+            return None
+
+        # Only run Lean proofs for categories that warrant formal proof
+        if proposal.category not in LEAN_PROOF_CATEGORIES:
+            return None
+
+        # Check Lean 4 availability
+        if not await self._lean.check_available():
+            self._log.info("lean_not_available_skipping")
+            from ecodiaos.systems.simula.verification.types import LeanProofStatus
+            return LeanVerificationResult(
+                status=LeanProofStatus.SKIPPED,
+            )
+
+        # Build proof context from the proposal
+        python_source_parts: list[str] = []
+        for filepath in files_written:
+            if not filepath.endswith(".py"):
+                continue
+            full = self._root / filepath
+            if full.is_file():
+                try:
+                    content = full.read_text(encoding="utf-8")
+                    python_source_parts.append(
+                        f"# --- {filepath} ---\n{content}"
+                    )
+                except Exception:
+                    continue
+
+        python_source = "\n\n".join(python_source_parts)
+        domain_context = proposal.description
+        if proposal.change_spec:
+            domain_context = proposal.change_spec.additional_context or proposal.description
+
+        function_name = ""
+        if proposal.change_spec:
+            function_name = getattr(proposal.change_spec, "target_system", "") or ""
+
+        try:
+            result = await self._lean.generate_proof(
+                llm=self._llm,
+                python_source=python_source,
+                function_name=function_name,
+                context=domain_context,
+                proposal_id=proposal.id,
+            )
+            return result
+        except asyncio.TimeoutError:
+            self._log.warning("lean_verification_timeout", proposal_id=proposal.id)
+            from ecodiaos.systems.simula.verification.types import LeanProofStatus
+            return LeanVerificationResult(
+                status=LeanProofStatus.TIMEOUT,
+            )
+        except Exception as exc:
+            self._log.warning("lean_verification_error", error=str(exc))
             return None

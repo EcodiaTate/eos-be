@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from ecodiaos.systems.memory.service import MemoryService
     from ecodiaos.systems.simula.analytics import EvolutionAnalyticsEngine
 
+from ecodiaos.clients.context_compression import ContextCompressor
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 
 logger = structlog.get_logger().bind(system="simula.simulation")
@@ -125,6 +126,11 @@ class ChangeSimulator:
         self._log = logger
         # Optimization: detect optimized provider for budget checks + cache tagging
         self._optimized = isinstance(llm, OptimizedLLMProvider)
+        # KVzip compression for large counterfactual replay prompts
+        self._compressor = ContextCompressor(
+            prune_ratio=config.kv_compression_ratio,
+            enabled=config.kv_compression_enabled,
+        )
 
     async def simulate(self, proposal: EvolutionProposal) -> EnrichedSimulationResult:
         """
@@ -476,6 +482,12 @@ class ChangeSimulator:
 
         spec = proposal.change_spec
         change_desc = self._describe_additive_change(proposal)
+
+        # KVzip: compress episode summaries when batch is large to reduce tokens.
+        # Truncate individual episode summaries more aggressively if many episodes.
+        max_summary_chars = 150 if len(episode_summaries) <= 15 else 80
+        if max_summary_chars < 150:
+            episode_summaries = [s[:max_summary_chars] for s in episode_summaries]
 
         prompt = (
             f"EcodiaOS is considering adding a new capability:\n{change_desc}\n\n"

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -51,16 +52,24 @@ class LLMResponse:
         input_tokens: int = 0,
         output_tokens: int = 0,
         finish_reason: str = "stop",
+        reasoning_tokens: int = 0,
+        reasoning_content: str = "",
     ) -> None:
         self.text = text
         self.model = model
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.finish_reason = finish_reason
+        self.reasoning_tokens = reasoning_tokens
+        self.reasoning_content = reasoning_content
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return self.input_tokens + self.output_tokens + self.reasoning_tokens
+
+    @property
+    def used_extended_thinking(self) -> bool:
+        return self.reasoning_tokens > 0
 
 
 @dataclass
@@ -171,6 +180,47 @@ class LLMProvider(ABC):
     async def close(self) -> None:
         """Clean up resources."""
         ...
+
+    async def generate_with_thinking(
+        self,
+        system_prompt: str,
+        messages: list[Message],
+        max_tokens: int = 4096,
+        reasoning_budget: int = 16384,
+    ) -> LLMResponse:
+        """
+        Extended-thinking generation. Models like o3/deepseek-r1 produce
+        a chain-of-thought reasoning trace before the final answer.
+
+        Default implementation falls back to standard generate() for
+        providers that don't support extended thinking natively.
+        """
+        return await self.generate(
+            system_prompt=system_prompt,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.3,
+        )
+
+    async def generate_with_thinking_and_tools(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition],
+        max_tokens: int = 4096,
+        reasoning_budget: int = 16384,
+    ) -> ToolAwareResponse:
+        """
+        Extended-thinking generation with tool use.
+        Default falls back to standard generate_with_tools().
+        """
+        return await self.generate_with_tools(
+            system_prompt=system_prompt,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=0.3,
+        )
 
 
 class AnthropicProvider(LLMProvider):
@@ -696,6 +746,447 @@ class OpenAIProvider(LLMProvider):
         await self._client.aclose()
 
 
+class ExtendedThinkingProvider(LLMProvider):
+    """
+    Extended-thinking model provider for reasoning-intensive tasks.
+
+    Wraps OpenAI-compatible APIs (o3, deepseek-r1) that support
+    a reasoning_effort / max_completion_tokens parameter to produce
+    chain-of-thought traces before the final answer.
+
+    The reasoning trace is captured and returned in LLMResponse.reasoning_content
+    so downstream systems can audit the thought process.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "o3",
+        base_url: str = "https://api.openai.com/v1",
+        default_reasoning_budget: int = 16384,
+    ) -> None:
+        self._model = model
+        self._default_reasoning_budget = default_reasoning_budget
+        clean_key = api_key.strip()
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            headers={
+                "Authorization": f"Bearer {clean_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=120.0,  # Thinking models can take longer
+        )
+
+    async def _post_with_retry(
+        self, path: str, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST with exponential backoff on retryable status codes."""
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = await self._client.post(path, json=payload)
+                if response.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES:
+                    delay = _BASE_DELAY_S * (2 ** attempt)
+                    retry_after = response.headers.get("retry-after")
+                    if retry_after:
+                        try:
+                            delay = max(delay, float(retry_after))
+                        except ValueError:
+                            pass
+                    logger.warning(
+                        "thinking_model_retrying",
+                        status=response.status_code,
+                        attempt=attempt + 1,
+                        delay_s=round(delay, 1),
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except httpx.TimeoutException as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    delay = _BASE_DELAY_S * (2 ** attempt)
+                    logger.warning(
+                        "thinking_model_timeout_retrying",
+                        attempt=attempt + 1,
+                        delay_s=round(delay, 1),
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except httpx.HTTPStatusError as exc:
+                body = ""
+                try:
+                    body = exc.response.text[:500]
+                except Exception:
+                    pass
+                raise httpx.HTTPStatusError(
+                    message=f"{exc.response.status_code}: {body}",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
+        raise last_exc or RuntimeError("Thinking model request failed after retries")
+
+    async def generate(
+        self,
+        system_prompt: str,
+        messages: list[Message],
+        max_tokens: int = 2000,
+        temperature: float = 0.7,
+        output_format: str | None = None,
+    ) -> LLMResponse:
+        """Standard generation — delegates to generate_with_thinking with default budget."""
+        return await self.generate_with_thinking(
+            system_prompt=system_prompt,
+            messages=messages,
+            max_tokens=max_tokens,
+            reasoning_budget=self._default_reasoning_budget,
+        )
+
+    async def evaluate(
+        self,
+        prompt: str,
+        max_tokens: int = 500,
+        temperature: float = 0.3,
+    ) -> LLMResponse:
+        return await self.generate_with_thinking(
+            system_prompt="You are an evaluator. Be precise and concise.",
+            messages=[Message("user", prompt)],
+            max_tokens=max_tokens,
+            reasoning_budget=self._default_reasoning_budget // 2,
+        )
+
+    async def generate_with_thinking(
+        self,
+        system_prompt: str,
+        messages: list[Message],
+        max_tokens: int = 4096,
+        reasoning_budget: int = 16384,
+    ) -> LLMResponse:
+        """
+        Extended-thinking generation via OpenAI-compatible API.
+
+        For o3-class models: uses max_completion_tokens and reasoning_effort.
+        For deepseek-r1: the model auto-reasons; we capture the reasoning prefix.
+        """
+        all_messages: list[dict[str, str]] = []
+        if system_prompt:
+            all_messages.append({"role": "system", "content": system_prompt})
+        for m in messages:
+            content = m.content if m.content else " "
+            all_messages.append({"role": m.role, "content": content})
+
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": all_messages,
+            "max_completion_tokens": max_tokens + reasoning_budget,
+        }
+
+        # o3/o4 models support reasoning_effort parameter
+        if self._model.startswith("o"):
+            if reasoning_budget >= 16384:
+                payload["reasoning_effort"] = "high"
+            elif reasoning_budget >= 4096:
+                payload["reasoning_effort"] = "medium"
+            else:
+                payload["reasoning_effort"] = "low"
+
+        data = await self._post_with_retry("/chat/completions", payload)
+
+        choices = data.get("choices", [])
+        message = choices[0].get("message", {}) if choices else {}
+        text = message.get("content", "") or ""
+        usage = data.get("usage", {})
+
+        # Extract reasoning tokens from completion_tokens_details
+        completion_details = usage.get("completion_tokens_details", {})
+        reasoning_tokens = completion_details.get("reasoning_tokens", 0)
+
+        # Some models include reasoning in a separate field
+        reasoning_content = message.get("reasoning_content", "")
+
+        logger.info(
+            "thinking_model_response",
+            model=self._model,
+            reasoning_tokens=reasoning_tokens,
+            output_tokens=usage.get("completion_tokens", 0),
+            input_tokens=usage.get("prompt_tokens", 0),
+        )
+
+        return LLMResponse(
+            text=text,
+            model=data.get("model", self._model),
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+            finish_reason=choices[0].get("finish_reason", "stop") if choices else "stop",
+            reasoning_tokens=reasoning_tokens,
+            reasoning_content=reasoning_content,
+        )
+
+    async def generate_with_tools(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition],
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+    ) -> ToolAwareResponse:
+        """Extended-thinking with tool use via OpenAI-compatible API."""
+        return await self.generate_with_thinking_and_tools(
+            system_prompt=system_prompt,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            reasoning_budget=self._default_reasoning_budget,
+        )
+
+    async def generate_with_thinking_and_tools(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition],
+        max_tokens: int = 4096,
+        reasoning_budget: int = 16384,
+    ) -> ToolAwareResponse:
+        """Tool-use generation with extended thinking."""
+        all_messages: list[dict[str, Any]] = []
+        if system_prompt:
+            all_messages.append({"role": "system", "content": system_prompt})
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            parts.append(block.get("text", ""))
+                        elif block.get("type") == "tool_result":
+                            parts.append(f"[Tool result: {block.get('content', '')}]")
+                    elif isinstance(block, str):
+                        parts.append(block)
+                content = "\n".join(parts) or " "
+            all_messages.append({"role": role, "content": content or " "})
+
+        openai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
+            }
+            for t in tools
+        ]
+
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": all_messages,
+            "tools": openai_tools,
+            "max_completion_tokens": max_tokens + reasoning_budget,
+        }
+
+        if self._model.startswith("o"):
+            if reasoning_budget >= 16384:
+                payload["reasoning_effort"] = "high"
+            elif reasoning_budget >= 4096:
+                payload["reasoning_effort"] = "medium"
+            else:
+                payload["reasoning_effort"] = "low"
+
+        data = await self._post_with_retry("/chat/completions", payload)
+
+        choices = data.get("choices", [])
+        choice = choices[0] if choices else {}
+        message = choice.get("message", {})
+        text = message.get("content", "") or ""
+        usage = data.get("usage", {})
+
+        tool_calls: list[ToolCall] = []
+        for tc in message.get("tool_calls", []):
+            fn = tc.get("function", {})
+            try:
+                args = _json.loads(fn.get("arguments", "{}"))
+            except _json.JSONDecodeError:
+                args = {}
+            tool_calls.append(ToolCall(
+                id=tc.get("id", ""),
+                name=fn.get("name", ""),
+                input=args,
+            ))
+
+        stop_reason = choice.get("finish_reason", "stop")
+        if stop_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif stop_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = "end_turn"
+
+        return ToolAwareResponse(
+            text=text,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            model=data.get("model", self._model),
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+class BedrockProvider(LLMProvider):
+    """AWS Bedrock Claude provider."""
+
+    def __init__(
+        self,
+        model: str = "anthropic.claude-3-5-haiku-20241022-v1:0",
+        region: str = "us-east-1",
+        token_budget: TokenBudget | None = None,
+    ) -> None:
+        """
+        Initialize Bedrock provider. Uses AWS SDK credentials from environment:
+        AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional).
+        Region defaults to us-east-1; override with AWS_REGION env var.
+        """
+        self._model = model
+        self._region = region or os.environ.get("AWS_REGION", "us-east-1")
+        self._budget = token_budget
+
+        # Import boto3 here to avoid hard dependency if not using Bedrock
+        try:
+            import boto3
+        except ImportError:
+            raise ImportError("boto3 required for Bedrock provider. Install with: pip install boto3")
+
+        self._client = boto3.client("bedrock-runtime", region_name=self._region)
+
+    async def generate(
+        self,
+        system_prompt: str,
+        messages: list[Message],
+        max_tokens: int = 2000,
+        temperature: float = 0.7,
+        output_format: str | None = None,
+    ) -> LLMResponse:
+        payload = {
+            "modelId": self._model,
+            "messages": [m.to_dict() for m in messages],
+            "system": system_prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        # Bedrock InvokeModel is synchronous; wrap in thread pool
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._client.invoke_model(body=_json.dumps(payload).encode())
+        )
+
+        response_body = _json.loads(response["body"].read())
+
+        text = ""
+        for block in response_body.get("content", []):
+            if block.get("type") == "text":
+                text += block.get("text", "")
+
+        input_tokens = response_body.get("usage", {}).get("input_tokens", 0)
+        output_tokens = response_body.get("usage", {}).get("output_tokens", 0)
+
+        if self._budget:
+            self._budget.charge(
+                tokens=input_tokens + output_tokens,
+                calls=1,
+                system="bedrock_generate",
+            )
+
+        return LLMResponse(
+            text=text,
+            model=self._model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            finish_reason=response_body.get("stop_reason", "stop"),
+        )
+
+    async def evaluate(
+        self,
+        prompt: str,
+        max_tokens: int = 500,
+        temperature: float = 0.3,
+    ) -> LLMResponse:
+        return await self.generate(
+            system_prompt="You are an evaluator. Be precise and concise.",
+            messages=[Message("user", prompt)],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    async def generate_with_tools(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition],
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+    ) -> ToolAwareResponse:
+        payload = {
+            "modelId": self._model,
+            "messages": messages,
+            "system": system_prompt,
+            "tools": [t.to_dict() for t in tools],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._client.invoke_model(body=_json.dumps(payload).encode())
+        )
+
+        response_body = _json.loads(response["body"].read())
+
+        text = ""
+        tool_calls: list[ToolCall] = []
+        for block in response_body.get("content", []):
+            if block.get("type") == "text":
+                text += block.get("text", "")
+            elif block.get("type") == "tool_use":
+                tool_calls.append(ToolCall(
+                    id=block["id"],
+                    name=block["name"],
+                    input=block.get("input", {}),
+                ))
+
+        input_tokens = response_body.get("usage", {}).get("input_tokens", 0)
+        output_tokens = response_body.get("usage", {}).get("output_tokens", 0)
+
+        if self._budget:
+            self._budget.charge(
+                tokens=input_tokens + output_tokens,
+                calls=1,
+                system="bedrock_tools",
+            )
+
+        return ToolAwareResponse(
+            text=text,
+            tool_calls=tool_calls,
+            stop_reason=response_body.get("stop_reason", "end_turn"),
+            model=self._model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    async def close(self) -> None:
+        # Boto3 doesn't need explicit close for synchronous client
+        pass
+
+
 def create_llm_provider(
     config: LLMConfig,
     token_budget: TokenBudget | None = None,
@@ -707,9 +1198,34 @@ def create_llm_provider(
             model=config.model,
             token_budget=token_budget,
         )
+    elif config.provider == "bedrock":
+        return BedrockProvider(
+            model=config.model,
+            token_budget=token_budget,
+        )
     elif config.provider == "openai":
         return OpenAIProvider(api_key=config.api_key, model=config.model)
     elif config.provider == "ollama":
         return OllamaProvider(model=config.model)
     else:
         raise ValueError(f"Unknown LLM provider: {config.provider}")
+
+
+def create_thinking_provider(
+    api_key: str,
+    model: str = "o3",
+    provider: str = "openai",
+    reasoning_budget: int = 16384,
+) -> ExtendedThinkingProvider:
+    """Factory to create an extended-thinking model provider."""
+    base_urls: dict[str, str] = {
+        "openai": "https://api.openai.com/v1",
+        "deepseek": "https://api.deepseek.com/v1",
+    }
+    base_url = base_urls.get(provider, "https://api.openai.com/v1")
+    return ExtendedThinkingProvider(
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        default_reasoning_budget=reasoning_budget,
+    )

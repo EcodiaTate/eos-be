@@ -17,6 +17,7 @@ LLM used only when >5 proposals need semantic deduplication (~300 tokens).
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -31,6 +32,7 @@ from ecodiaos.systems.simula.types import (
 )
 
 if TYPE_CHECKING:
+    from ecodiaos.clients.embedding import EmbeddingClient
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.simula.analytics import EvolutionAnalyticsEngine
     from ecodiaos.systems.simula.history import EvolutionHistoryManager
@@ -74,16 +76,34 @@ class ProposalIntelligence:
 
     Provides deduplication, prioritization, dependency analysis,
     and cost estimation — all optimized for minimal token usage.
+
+    Stage 1B upgrade: Tier 3 dedup now uses voyage-code-3 embeddings
+    for cosine similarity instead of LLM-based text comparison.
+    This is both cheaper (no LLM tokens) and more precise.
     """
+
+    # Cosine similarity threshold for embedding-based dedup
+    _EMBEDDING_DEDUP_THRESHOLD: float = 0.85
 
     def __init__(
         self,
         llm: LLMProvider | None = None,
         analytics: EvolutionAnalyticsEngine | None = None,
+        embedding_client: EmbeddingClient | None = None,
     ) -> None:
         self._llm = llm
         self._analytics = analytics
+        self._embeddings = embedding_client
         self._log = logger
+        # Dedup precision tracking (Stage 1B.5)
+        self._dedup_stats = {
+            "tier1_matches": 0,
+            "tier2_matches": 0,
+            "tier3_embedding_matches": 0,
+            "tier3_llm_fallback_matches": 0,
+            "embedding_dedup_calls": 0,
+            "embedding_dedup_latency_ms": 0.0,
+        }
 
     # ─── Prioritization ──────────────────────────────────────────────────────
 
@@ -227,24 +247,116 @@ class ProposalIntelligence:
                 merge_recommendation=f"Same category and affected systems: {key}",
             ))
 
-        # Tier 3: LLM-based similarity (expensive, only for many proposals)
+        # Tier 3: Embedding-based semantic similarity (preferred) or LLM fallback
         still_unclustered = [p for p in proposals if p.id not in clustered_ids]
-        if len(still_unclustered) >= _LLM_DEDUP_THRESHOLD and self._llm is not None:
-            llm_clusters = await self._llm_deduplicate(still_unclustered)
-            clusters.extend(llm_clusters)
+        if len(still_unclustered) >= _LLM_DEDUP_THRESHOLD:
+            if self._embeddings is not None:
+                # Stage 1B: voyage-code-3 cosine similarity — cheaper and more precise
+                embedding_clusters = await self._embedding_deduplicate(still_unclustered)
+                clusters.extend(embedding_clusters)
+            elif self._llm is not None:
+                # Fallback: LLM-based semantic comparison (~300 tokens)
+                llm_clusters = await self._llm_deduplicate(still_unclustered)
+                clusters.extend(llm_clusters)
 
         if clusters:
             self._log.info(
                 "dedup_complete",
                 clusters=len(clusters),
                 total_duplicates=sum(len(c.member_ids) for c in clusters),
+                dedup_stats=self._dedup_stats,
             )
+        return clusters
+
+    async def _embedding_deduplicate(
+        self, proposals: list[EvolutionProposal],
+    ) -> list[ProposalCluster]:
+        """
+        Stage 1B: Embedding-based semantic dedup using voyage-code-3.
+
+        Embeds all proposal descriptions, then finds pairs with cosine
+        similarity above the threshold. Groups them into clusters.
+
+        Zero LLM tokens. Cost: ~0.001 per proposal via Voyage API.
+        """
+        from ecodiaos.clients.embedding import cosine_similarity
+
+        assert self._embeddings is not None
+        self._dedup_stats["embedding_dedup_calls"] += 1
+        t_start = time.monotonic()
+
+        # Build description texts for embedding
+        texts = [
+            f"{p.category.value}: {p.description[:200]}"
+            for p in proposals[:20]  # Cap at 20 to control API cost
+        ]
+
+        try:
+            import asyncio
+            embeddings = await asyncio.wait_for(
+                self._embeddings.embed_batch(texts),
+                timeout=10.0,
+            )
+        except Exception as exc:
+            self._log.warning("embedding_dedup_failed", error=str(exc))
+            self._dedup_stats["embedding_dedup_latency_ms"] += (
+                (time.monotonic() - t_start) * 1000
+            )
+            return []
+
+        # Pairwise cosine similarity — find clusters above threshold
+        clusters: list[ProposalCluster] = []
+        clustered: set[int] = set()
+
+        for i in range(len(embeddings)):
+            if i in clustered:
+                continue
+            group = [i]
+            for j in range(i + 1, len(embeddings)):
+                if j in clustered:
+                    continue
+                sim = cosine_similarity(embeddings[i], embeddings[j])
+                if sim >= self._EMBEDDING_DEDUP_THRESHOLD:
+                    group.append(j)
+                    clustered.add(j)
+
+            if len(group) >= 2:
+                clustered.add(i)
+                member_ids = [proposals[idx].id for idx in group]
+                similarities = []
+                for idx in group:
+                    if idx == group[0]:
+                        similarities.append(1.0)
+                    else:
+                        sim = cosine_similarity(embeddings[group[0]], embeddings[idx])
+                        similarities.append(round(sim, 3))
+
+                clusters.append(ProposalCluster(
+                    representative_id=member_ids[0],
+                    member_ids=member_ids,
+                    similarity_scores=similarities,
+                    merge_recommendation=(
+                        f"Embedding similarity ≥{self._EMBEDDING_DEDUP_THRESHOLD} "
+                        f"(voyage-code-3)"
+                    ),
+                ))
+                self._dedup_stats["tier3_embedding_matches"] += len(group)
+
+        latency_ms = (time.monotonic() - t_start) * 1000
+        self._dedup_stats["embedding_dedup_latency_ms"] += latency_ms
+
+        self._log.info(
+            "embedding_dedup_complete",
+            proposals_checked=len(proposals),
+            clusters_found=len(clusters),
+            latency_ms=round(latency_ms, 1),
+        )
         return clusters
 
     async def _llm_deduplicate(
         self, proposals: list[EvolutionProposal],
     ) -> list[ProposalCluster]:
-        """LLM-based semantic similarity check. ~300 tokens."""
+        """LLM-based semantic similarity check (fallback). ~300 tokens."""
         descriptions = "\n".join(
             f"{i+1}. [{p.id[:8]}] {p.category.value}: {p.description[:100]}"
             for i, p in enumerate(proposals[:10])
@@ -271,7 +383,6 @@ class ProposalIntelligence:
                 line = line.strip()
                 if line.upper() == "NONE" or "GROUP" not in line.upper():
                     continue
-                # Parse "GROUP: 1, 3 (similar feature additions)"
                 try:
                     _, nums_part = line.split(":", 1)
                     reason_start = nums_part.find("(")
@@ -281,7 +392,9 @@ class ProposalIntelligence:
                     else:
                         reason = ""
 
-                    indices = [int(n.strip()) - 1 for n in nums_part.split(",") if n.strip().isdigit()]
+                    indices = [
+                        int(n.strip()) - 1 for n in nums_part.split(",") if n.strip().isdigit()
+                    ]
                     valid = [i for i in indices if 0 <= i < len(proposals)]
                     if len(valid) >= 2:
                         members = [proposals[i].id for i in valid]
@@ -291,6 +404,7 @@ class ProposalIntelligence:
                             similarity_scores=[0.6] * len(members),
                             merge_recommendation=reason or "LLM-detected similarity",
                         ))
+                        self._dedup_stats["tier3_llm_fallback_matches"] += len(valid)
                 except (ValueError, IndexError):
                     continue
 
@@ -396,6 +510,10 @@ class ProposalIntelligence:
         return round(base_cost, 2)
 
     # ─── Duplicate Detection Helper ──────────────────────────────────────────
+
+    def get_dedup_stats(self) -> dict[str, Any]:
+        """Return dedup precision benchmarking stats (Stage 1B.5)."""
+        return dict(self._dedup_stats)
 
     def is_duplicate(
         self,

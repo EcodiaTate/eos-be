@@ -245,6 +245,70 @@ class EvolutionRecord(Identified, Timestamped):
     constitutional_alignment: float = 0.0
     resource_tokens_per_hour: int = 0
     caution_reasoning: str = ""
+    # Stage 2: Formal verification metadata
+    formal_verification_status: str = ""  # "verified"|"failed"|"skipped"|""
+    discovered_invariants_count: int = 0
+    dafny_rounds: int = 0
+    static_analysis_findings: int = 0
+    # Stage 4A: Lean 4 proof metadata
+    lean_proof_status: str = ""  # "proved"|"failed"|"timeout"|"skipped"|""
+    lean_proof_rounds: int = 0
+    lean_proven_lemmas_count: int = 0
+    lean_copilot_automation_rate: float = 0.0
+    lean_library_lemmas_reused: int = 0
+    # Stage 4B: GRPO fine-tuning metadata
+    grpo_model_used: str = ""  # "" = base model, else fine-tuned model id
+    grpo_ab_group: str = ""  # "base"|"finetuned"|""
+    # Stage 4C: Diffusion repair metadata
+    diffusion_repair_used: bool = False
+    diffusion_repair_status: str = ""  # "repaired"|"partial"|"failed"|"skipped"|""
+    diffusion_repair_steps: int = 0
+    diffusion_improvement_rate: float = 0.0
+    # Stage 5A: Neurosymbolic synthesis metadata
+    synthesis_strategy_used: str = ""  # "hysynth"|"sketch_solve"|"chopchop"|"cegis_fallback"|""
+    synthesis_status: str = ""  # "synthesized"|"partial"|"failed"|"timeout"|"skipped"|""
+    synthesis_speedup_vs_baseline: float = 0.0
+    synthesis_candidates_explored: int = 0
+    # Stage 5B: Neural repair metadata
+    repair_agent_used: bool = False
+    repair_agent_status: str = ""  # "repaired"|"partial"|"failed"|"timeout"|"skipped"|"budget_exceeded"|""
+    repair_attempts: int = 0
+    repair_cost_usd: float = 0.0
+    # Stage 5C: Orchestration metadata
+    orchestration_used: bool = False
+    orchestration_dag_nodes: int = 0
+    orchestration_agents_used: int = 0
+    orchestration_parallel_stages: int = 0
+    # Stage 5D: Causal debugging metadata
+    causal_debug_used: bool = False
+    causal_root_cause: str = ""
+    causal_confidence: float = 0.0
+    causal_interventions: int = 0
+    # Stage 5E: Issue resolution metadata
+    issue_resolution_used: bool = False
+    issue_autonomy_level: str = ""  # "lint"|"dependency"|"test_fix"|"logic_bug"|""
+    issue_abstained: bool = False
+    # Stage 6A: Cryptographic auditability metadata
+    hash_chain_hash: str = ""  # SHA-256 chain hash for this record
+    hash_chain_position: int = 0  # position in the hash chain
+    content_credentials_signed: int = 0  # number of files signed with C2PA
+    governance_credential_status: str = ""  # "valid"|"revoked"|"expired"|"unverified"|""
+    # Stage 6B: Co-evolution metadata
+    coevolution_hard_negatives_mined: int = 0
+    coevolution_adversarial_tests: int = 0
+    coevolution_bugs_found: int = 0
+    # Stage 6C: Formal spec generation metadata
+    formal_specs_generated: int = 0
+    formal_spec_coverage_percent: float = 0.0
+    tla_plus_states_explored: int = 0
+    # Stage 6D: E-graph metadata
+    egraph_used: bool = False
+    egraph_status: str = ""  # "saturated"|"partial"|"timeout"|"failed"|"skipped"|""
+    egraph_rules_applied: int = 0
+    # Stage 6E: Symbolic execution metadata
+    symbolic_execution_used: bool = False
+    symbolic_properties_proved: int = 0
+    symbolic_counterexamples: int = 0
 
 
 class CodeChangeResult(EOSBaseModel):
@@ -257,6 +321,36 @@ class CodeChangeResult(EOSBaseModel):
     lint_passed: bool = True
     tests_passed: bool = True
     test_output: str = ""
+    # Stage 1A: Extended-thinking model metrics
+    used_extended_thinking: bool = False
+    reasoning_tokens: int = 0
+    # Stage 1C: KVzip context compression metrics
+    kv_compression_ratio: float = 0.0  # 0.0 = no savings, 1.0 = maximum
+    kv_messages_compressed: int = 0
+    kv_original_tokens: int = 0
+    kv_compressed_tokens: int = 0
+    # Stage 2C: Static analysis metrics
+    static_analysis_findings: int = 0
+    static_analysis_fix_iterations: int = 0
+    # Stage 2D: AgentCoder metrics
+    agent_coder_iterations: int = 0
+    test_designer_test_count: int = 0
+    # Stage 4B: GRPO model routing metrics
+    grpo_model_used: str = ""
+    grpo_ab_group: str = ""  # "base"|"finetuned"|""
+    # Stage 4C: Diffusion repair metrics
+    diffusion_repair_attempted: bool = False
+    diffusion_repair_succeeded: bool = False
+    # Stage 5A: Synthesis metrics
+    synthesis_strategy: str = ""  # "hysynth"|"sketch_solve"|"chopchop"|"cegis_fallback"|""
+    synthesis_speedup: float = 0.0
+    # Stage 5B: Repair metrics
+    repair_attempted: bool = False
+    repair_succeeded: bool = False
+    repair_cost_usd: float = 0.0
+    # Stage 5C: Orchestration metrics
+    orchestration_used: bool = False
+    orchestration_agents: int = 0
 
 
 class HealthCheckResult(EOSBaseModel):
@@ -265,6 +359,14 @@ class HealthCheckResult(EOSBaseModel):
     healthy: bool
     issues: list[str] = Field(default_factory=list)
     checked_at: datetime = Field(default_factory=utc_now)
+    # Stage 2: Formal verification result (attached when verification runs)
+    formal_verification: object | None = None  # FormalVerificationResult
+    # Stage 4A: Lean 4 proof verification result (attached when Lean verification runs)
+    lean_verification: object | None = None  # LeanVerificationResult
+    # Stage 5D: Causal debugging result (attached when causal debug runs)
+    causal_diagnosis: object | None = None  # CausalDiagnosis
+    # Stage 6: Formal guarantees result (attached when Stage 6 checks run)
+    formal_guarantees: object | None = None  # FormalGuaranteesResult
 
 
 # --- Enriched Simulation Models ----------------------------------------------

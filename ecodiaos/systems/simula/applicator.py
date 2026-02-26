@@ -33,9 +33,13 @@ from ecodiaos.systems.simula.types import (
 )
 
 if TYPE_CHECKING:
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.systems.simula.agents.test_designer import TestDesignerAgent
+    from ecodiaos.systems.simula.agents.test_executor import TestExecutorAgent
     from ecodiaos.systems.simula.code_agent import SimulaCodeAgent
     from ecodiaos.systems.simula.health import HealthChecker
     from ecodiaos.systems.simula.rollback import RollbackManager
+    from ecodiaos.systems.simula.verification.static_analysis import StaticAnalysisBridge
 
 logger = structlog.get_logger()
 
@@ -59,11 +63,22 @@ class ChangeApplicator:
         rollback_manager: RollbackManager,
         health_checker: HealthChecker,
         codebase_root: Path,
+        # Stage 2D: AgentCoder pipeline
+        test_designer: TestDesignerAgent | None = None,
+        test_executor: TestExecutorAgent | None = None,
+        static_analysis_bridge: StaticAnalysisBridge | None = None,
+        agent_coder_enabled: bool = False,
+        agent_coder_max_iterations: int = 3,
     ) -> None:
         self._agent = code_agent
         self._rollback = rollback_manager
         self._health = health_checker
         self._root = codebase_root
+        self._test_designer = test_designer
+        self._test_executor = test_executor
+        self._static_bridge = static_analysis_bridge
+        self._agent_coder_enabled = agent_coder_enabled
+        self._agent_coder_max_iterations = agent_coder_max_iterations
         self._logger = logger.bind(system="simula.applicator")
 
     async def apply(
@@ -74,6 +89,9 @@ class ChangeApplicator:
 
         The snapshot is needed by SimulaService for rollback if the
         post-application health check fails.
+
+        Routes through the AgentCoder 3-agent pipeline when enabled,
+        otherwise uses the standard code agent.
         """
         self._logger.info(
             "applying_change",
@@ -83,6 +101,8 @@ class ChangeApplicator:
 
         if proposal.category == ChangeCategory.ADJUST_BUDGET:
             return await self._apply_budget(proposal)
+        elif self._agent_coder_enabled and self._test_designer and self._test_executor:
+            return await self._apply_via_agent_coder(proposal)
         else:
             return await self._apply_via_code_agent(proposal)
 
@@ -171,6 +191,147 @@ class ChangeApplicator:
             await self._rollback.restore(snapshot)
 
         return result, snapshot
+
+    # ── Stage 2D: AgentCoder 3-Agent Pipeline ─────────────────────────────────
+
+    async def _apply_via_agent_coder(
+        self, proposal: EvolutionProposal,
+    ) -> tuple[CodeChangeResult, ConfigSnapshot]:
+        """
+        Apply via the AgentCoder pipeline:
+          1. TestDesigner generates tests from proposal spec (no code seen)
+          2. CodeAgent implements the change (with test writing disabled)
+          3. TestExecutor runs the designed tests against the implementation
+          4. If failures → feed back to CodeAgent → iterate
+
+        This adversarial separation produces higher-quality code by testing
+        the specification rather than the implementation.
+        """
+        from ecodiaos.systems.simula.agents.test_executor import TestExecutorAgent
+        from ecodiaos.systems.simula.verification.types import (
+            AgentCoderIterationResult,
+            AgentCoderResult,
+        )
+
+        assert self._test_designer is not None
+        assert self._test_executor is not None
+
+        affected_dirs = _infer_affected_paths(proposal, self._root)
+        snapshot = await self._rollback.snapshot(
+            proposal_id=proposal.id,
+            paths=affected_dirs,
+        )
+
+        log = self._logger.bind(
+            proposal_id=proposal.id,
+            pipeline="agent_coder",
+        )
+
+        # Step 1: TestDesigner generates tests
+        log.info("agent_coder_designing_tests")
+        test_design = await self._test_designer.design_tests(proposal)
+
+        if not test_design.test_files:
+            log.warning("agent_coder_no_tests_designed")
+            # Fall back to standard code agent
+            return await self._apply_via_code_agent(proposal)
+
+        log.info(
+            "agent_coder_tests_designed",
+            test_files=len(test_design.test_files),
+            test_count=test_design.test_count,
+        )
+
+        iterations: list[AgentCoderIterationResult] = []
+        final_result: CodeChangeResult | None = None
+
+        for iteration_num in range(1, self._agent_coder_max_iterations + 1):
+            log.info("agent_coder_iteration", iteration=iteration_num)
+
+            # Step 2: CodeAgent implements (test writing disabled)
+            code_result = await self._agent.implement(
+                proposal, skip_test_writing=True,
+            )
+            final_result = code_result
+
+            if not code_result.success:
+                log.warning(
+                    "agent_coder_code_failed",
+                    iteration=iteration_num,
+                    error=code_result.error,
+                )
+                iterations.append(AgentCoderIterationResult(
+                    iteration=iteration_num,
+                    test_design=test_design if iteration_num == 1 else None,
+                    code_generation_success=False,
+                    code_generation_files=code_result.files_written,
+                ))
+                break
+
+            # Step 3: TestExecutor runs tests
+            test_result = await self._test_executor.execute_tests(
+                test_design.test_files,
+            )
+
+            iter_result = AgentCoderIterationResult(
+                iteration=iteration_num,
+                test_design=test_design if iteration_num == 1 else None,
+                code_generation_success=True,
+                code_generation_files=code_result.files_written,
+                test_execution=test_result,
+                all_tests_passed=(
+                    test_result.failed == 0 and test_result.errors == 0
+                ),
+            )
+            iterations.append(iter_result)
+
+            log.info(
+                "agent_coder_test_results",
+                iteration=iteration_num,
+                passed=test_result.passed,
+                failed=test_result.failed,
+                errors=test_result.errors,
+            )
+
+            if iter_result.all_tests_passed:
+                log.info("agent_coder_converged", iterations=iteration_num)
+                break
+
+            # Step 4: Not all tests passed — feed failures back
+            if iteration_num < self._agent_coder_max_iterations:
+                feedback = TestExecutorAgent.format_failures_for_feedback(
+                    test_result,
+                )
+                log.info("agent_coder_feeding_back", feedback_len=len(feedback))
+                # Attach feedback to proposal for next iteration
+                proposal._agent_coder_feedback = feedback  # type: ignore[attr-defined]
+
+        # Compute aggregate result
+        converged = bool(iterations and iterations[-1].all_tests_passed)
+        final_pass_rate = 0.0
+        if iterations and iterations[-1].test_execution:
+            te = iterations[-1].test_execution
+            if te.total > 0:
+                final_pass_rate = te.passed / te.total
+
+        agent_coder_result = AgentCoderResult(
+            iterations=iterations,
+            total_iterations=len(iterations),
+            final_pass_rate=final_pass_rate,
+            converged=converged,
+        )
+
+        # Attach to code result for downstream recording
+        if final_result is not None:
+            final_result.agent_coder_iterations = len(iterations)
+            final_result.test_designer_test_count = test_design.test_count
+
+        if final_result is None or not final_result.success:
+            await self._rollback.restore(snapshot)
+
+        return final_result or CodeChangeResult(
+            success=False, error="AgentCoder pipeline produced no result",
+        ), snapshot
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

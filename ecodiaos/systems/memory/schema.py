@@ -84,6 +84,16 @@ VECTOR_INDEXES = [
         `vector.similarity_function`: 'cosine'
     }}
     """,
+    # Somatic marker vector index — 19D (9 sensed + 9 errors + 1 PE)
+    # for state-congruent recall reranking (Soma §0.5)
+    """
+    CREATE VECTOR INDEX episode_somatic IF NOT EXISTS
+    FOR (e:Episode) ON (e.somatic_vector)
+    OPTIONS {indexConfig: {
+        `vector.dimensions`: 19,
+        `vector.similarity_function`: 'cosine'
+    }}
+    """,
 ]
 
 

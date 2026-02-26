@@ -45,7 +45,14 @@ from typing import Any, Callable
 
 import structlog
 
+from ecodiaos.clients.context_compression import ContextCompressor
+from ecodiaos.clients.embedding import (
+    EmbeddingClient,
+    VoyageEmbeddingClient,
+    cosine_similarity,
+)
 from ecodiaos.clients.llm import (
+    ExtendedThinkingProvider,
     LLMProvider,
     ToolAwareResponse,
     ToolCall,
@@ -57,6 +64,8 @@ from ecodiaos.systems.simula.types import (
     ChangeCategory,
     CodeChangeResult,
     EvolutionProposal,
+    GOVERNANCE_REQUIRED,
+    RiskLevel,
 )
 
 logger = structlog.get_logger()
@@ -470,25 +479,108 @@ class SimulaCodeAgent:
         llm: LLMProvider,
         codebase_root: Path,
         max_turns: int = 20,
+        thinking_provider: ExtendedThinkingProvider | None = None,
+        thinking_budget_tokens: int = 16384,
+        embedding_client: EmbeddingClient | None = None,
+        kv_compression_ratio: float = 0.3,
+        kv_compression_enabled: bool = True,
+        # Stage 2C: Static analysis post-generation gate
+        static_analysis_bridge: object | None = None,
+        static_analysis_max_fix_iterations: int = 3,
     ) -> None:
         self._llm = llm
+        self._thinking_llm = thinking_provider
+        self._thinking_budget = thinking_budget_tokens
+        self._embedding = embedding_client
         self._root = codebase_root.resolve()
         self._max_turns = max_turns
         self._logger = logger.bind(system="simula.code_agent")
         self._files_written: list[str] = []
         self._total_tokens_used: int = 0
+        self._reasoning_tokens_used: int = 0
+        self._used_extended_thinking: bool = False
         # Optimization: detect optimized provider for budget checks + metrics tagging
         self._optimized = isinstance(llm, OptimizedLLMProvider)
+        # Embedding cache for semantic find_similar (lazy-built)
+        self._code_index: dict[str, list[float]] | None = None
+        self._code_index_lock = asyncio.Lock()
+        # KVzip context compression — prunes old tool results to reduce token usage
+        self._compressor = ContextCompressor(
+            prune_ratio=kv_compression_ratio,
+            enabled=kv_compression_enabled,
+        )
+        # Stage 2C: Static analysis post-generation gate
+        self._static_bridge = static_analysis_bridge
+        self._static_fix_max_iterations = static_analysis_max_fix_iterations
+        # Stage 3C: LILO library prompt (set by SimulaService before each generate call)
+        self._lilo_prompt: str = ""
+        # Stage 4A: Proof library prompt (set by SimulaService before each generate call)
+        self._proof_library_prompt: str = ""
+        # Stage 4B: GRPO fine-tuned model ID (set by SimulaService for A/B routing)
+        self._grpo_model_id: str = ""
 
-    async def implement(self, proposal: EvolutionProposal) -> CodeChangeResult:
+    def _should_use_extended_thinking(self, proposal: EvolutionProposal) -> bool:
+        """
+        Budget guard: route to extended-thinking model ONLY when:
+          - RiskLevel >= HIGH (from simulation result), OR
+          - Category is in GOVERNANCE_REQUIRED
+
+        This prevents wasting expensive reasoning tokens on routine additive changes.
+        """
+        if self._thinking_llm is None:
+            return False
+
+        # Category-based routing: governance-required changes always get deep reasoning
+        if proposal.category in GOVERNANCE_REQUIRED:
+            return True
+
+        # Risk-based routing: high-risk proposals get extended thinking
+        if proposal.simulation is not None:
+            if proposal.simulation.risk_level in (RiskLevel.HIGH, RiskLevel.UNACCEPTABLE):
+                return True
+
+        return False
+
+    async def implement(
+        self,
+        proposal: EvolutionProposal,
+        skip_test_writing: bool = False,
+    ) -> CodeChangeResult:
         """
         Main entry point. Runs the agentic loop to implement the proposal.
+
+        Routes to the extended-thinking model (o3/deepseek-r1) when the proposal
+        is governance-required or high-risk, falling back to the standard model
+        for routine additive changes. This budget guard ensures expensive reasoning
+        tokens are only consumed when the change warrants deep analysis.
+
+        Args:
+            proposal: The evolution proposal to implement.
+            skip_test_writing: If True, instructs the LLM to NOT write test files.
+                Used in the AgentCoder pipeline where tests are handled by
+                the TestDesigner agent separately.
+
         Returns CodeChangeResult with all files written and outcome.
         """
         self._files_written = []
         self._total_tokens_used = 0
+        self._reasoning_tokens_used = 0
+
+        # Determine model routing based on risk level and category
+        use_thinking = self._should_use_extended_thinking(proposal)
+        active_llm = self._thinking_llm if use_thinking else self._llm
+        self._used_extended_thinking = use_thinking
 
         system_prompt = self._build_system_prompt(proposal)
+
+        # Stage 2D: When AgentCoder pipeline is active, disable test writing
+        if skip_test_writing:
+            system_prompt += (
+                "\n\n## IMPORTANT: Test Writing Disabled\n"
+                "Do NOT write test files. Tests are handled by a separate "
+                "TestDesigner agent. Focus ONLY on the implementation code. "
+                "Do not create any files under tests/."
+            )
 
         # Prepend a planning instruction to encourage multi-file reasoning
         messages: list[dict[str, Any]] = [
@@ -515,10 +607,12 @@ class SimulaCodeAgent:
             category=proposal.category.value,
             max_turns=self._max_turns,
             tools_available=len(SIMULA_AGENT_TOOLS),
+            extended_thinking=use_thinking,
+            model_type="thinking" if use_thinking else "standard",
         )
 
         # Budget gate: code agent is STANDARD priority — skip in RED tier
-        if self._optimized:
+        if self._optimized and not use_thinking:
             assert isinstance(self._llm, OptimizedLLMProvider)
             if not self._llm.should_use_llm("simula.code_agent", estimated_tokens=8000):
                 self._logger.warning(
@@ -535,8 +629,22 @@ class SimulaCodeAgent:
         while turns < self._max_turns:
             turns += 1
 
+            # KVzip: compress context before each LLM call (after turn 3
+            # when tool results start accumulating). The compressor prunes
+            # old tool results while preserving the recent sliding window.
+            if turns > 3:
+                messages = self._compressor.compress(messages)
+
             try:
-                if self._optimized:
+                if use_thinking and isinstance(active_llm, ExtendedThinkingProvider):
+                    response = await active_llm.generate_with_thinking_and_tools(
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        tools=SIMULA_AGENT_TOOLS,
+                        max_tokens=8192,
+                        reasoning_budget=self._thinking_budget,
+                    )
+                elif self._optimized and not use_thinking:
                     response = await self._llm.generate_with_tools(  # type: ignore[call-arg]
                         system_prompt=system_prompt,
                         messages=messages,
@@ -546,7 +654,7 @@ class SimulaCodeAgent:
                         cache_system="simula.code_agent",
                     )
                 else:
-                    response = await self._llm.generate_with_tools(
+                    response = await active_llm.generate_with_tools(
                         system_prompt=system_prompt,
                         messages=messages,
                         tools=SIMULA_AGENT_TOOLS,
@@ -609,18 +717,101 @@ class SimulaCodeAgent:
                 files_written=len(self._files_written),
                 total_tokens=self._total_tokens_used,
             )
+            cm = self._compressor.metrics
             return CodeChangeResult(
                 success=len(self._files_written) > 0,
                 files_written=self._files_written,
                 summary=last_text[:500] if last_text else "Max turns exceeded",
                 error="Max turns exceeded without completion signal",
+                kv_compression_ratio=cm.compression_ratio,
+                kv_messages_compressed=cm.messages_compressed,
+                kv_original_tokens=cm.original_tokens,
+                kv_compressed_tokens=cm.compressed_tokens,
             )
 
-        return CodeChangeResult(
+        # ── Stage 2C: Static analysis post-generation gate ────────────────────
+        static_fix_iterations = 0
+        sa_result = None
+        if self._files_written and self._static_bridge is not None:
+            sa_result = await self._static_bridge.run_all(self._files_written)
+            if sa_result.error_count > 0:
+                from ecodiaos.systems.simula.verification.static_analysis import (
+                    StaticAnalysisBridge,
+                )
+                feedback_text = StaticAnalysisBridge.format_findings_for_feedback(
+                    sa_result,
+                )
+                # Feed findings back to LLM for one fix iteration
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Static analysis found {sa_result.error_count} ERROR-severity issues "
+                        f"in your written files. Fix them:\n\n{feedback_text}"
+                    ),
+                })
+                # Run one more tool-use turn to fix
+                for fix_turn in range(self._static_fix_max_iterations):
+                    static_fix_iterations += 1
+                    try:
+                        response = await active_llm.generate_with_tools(
+                            system_prompt=system_prompt,
+                            messages=messages,
+                            tools=SIMULA_AGENT_TOOLS,
+                            max_tokens=8192,
+                            temperature=0.2,
+                        )
+                        self._total_tokens_used += getattr(response, "total_tokens", 0)
+                        last_text = response.text
+
+                        if response.has_tool_calls:
+                            # Execute tool calls
+                            assistant_content_fix: list[dict[str, Any]] = []
+                            if response.text:
+                                assistant_content_fix.append({"type": "text", "text": response.text})
+                            for tc in response.tool_calls:
+                                assistant_content_fix.append({
+                                    "type": "tool_use", "id": tc.id,
+                                    "name": tc.name, "input": tc.input,
+                                })
+                            messages.append({"role": "assistant", "content": assistant_content_fix})
+                            tool_results_fix: list[dict[str, Any]] = []
+                            for tc in response.tool_calls:
+                                result = await self._execute_tool(tc)
+                                tool_results_fix.append(result.to_anthropic_dict())
+                            messages.append({"role": "user", "content": tool_results_fix})
+                        else:
+                            break
+                    except Exception as exc:
+                        self._logger.warning("static_fix_llm_error", error=str(exc))
+                        break
+
+                # Re-run static analysis to see if fixes worked
+                sa_result = await self._static_bridge.run_all(self._files_written)
+                self._logger.info(
+                    "static_analysis_post_fix",
+                    errors_remaining=sa_result.error_count,
+                    fix_iterations=static_fix_iterations,
+                )
+
+        cm = self._compressor.metrics
+        result = CodeChangeResult(
             success=len(self._files_written) > 0,
             files_written=self._files_written,
             summary=last_text[:1000] if last_text else "Change implemented",
+            used_extended_thinking=self._used_extended_thinking,
+            reasoning_tokens=self._reasoning_tokens_used,
+            kv_compression_ratio=cm.compression_ratio,
+            kv_messages_compressed=cm.messages_compressed,
+            kv_original_tokens=cm.original_tokens,
+            kv_compressed_tokens=cm.compressed_tokens,
+            static_analysis_findings=(
+                sa_result.error_count + sa_result.warning_count
+                if self._static_bridge is not None and sa_result is not None
+                else 0
+            ),
+            static_analysis_fix_iterations=static_fix_iterations,
         )
+        return result
 
     # ─── Tool Dispatch ───────────────────────────────────────────────────────
 
@@ -966,11 +1157,107 @@ class SimulaCodeAgent:
         except Exception as exc:
             return ToolResult(tc.id, f"Read error: {exc}", True)
 
+    async def _build_code_index(self) -> dict[str, list[float]]:
+        """
+        Lazy-build a semantic index of Python files in the codebase.
+
+        Embeds the first ~500 chars of each Python file (module docstring +
+        imports + top-level definitions) to create a searchable code index.
+        Cached for the lifetime of this agent instance.
+        """
+        async with self._code_index_lock:
+            if self._code_index is not None:
+                return self._code_index
+
+            if self._embedding is None:
+                self._code_index = {}
+                return self._code_index
+
+            # Collect Python files (skip __pycache__, .venv, tests, migrations)
+            skip_dirs = {"__pycache__", ".venv", "venv", "node_modules", ".git", "migrations"}
+            py_files: list[tuple[str, str]] = []  # (rel_path, summary_text)
+
+            for py_file in self._root.rglob("*.py"):
+                # Skip excluded directories
+                if any(part in skip_dirs for part in py_file.parts):
+                    continue
+                rel = str(py_file.relative_to(self._root)).replace("\\", "/")
+                try:
+                    content = py_file.read_text(encoding="utf-8")
+                    # Take module-level summary: docstring + first 500 chars
+                    summary = f"File: {rel}\n{content[:500]}"
+                    py_files.append((rel, summary))
+                except Exception:
+                    continue
+
+            if not py_files:
+                self._code_index = {}
+                return self._code_index
+
+            # Embed in batches
+            paths = [p for p, _ in py_files]
+            texts = [t for _, t in py_files]
+
+            try:
+                embeddings = await self._embedding.embed_batch(texts)
+                self._code_index = dict(zip(paths, embeddings))
+                self._logger.info(
+                    "code_index_built",
+                    files_indexed=len(self._code_index),
+                )
+            except Exception as exc:
+                self._logger.warning("code_index_build_failed", error=str(exc))
+                self._code_index = {}
+
+            return self._code_index
+
+    async def _semantic_find_similar(
+        self, description: str, top_k: int = 5, threshold: float = 0.4
+    ) -> list[tuple[str, float]]:
+        """
+        Find files semantically similar to the description using embeddings.
+
+        Returns list of (rel_path, similarity_score) sorted by score descending.
+        Uses embed_query() for Voyage clients (query-optimized) or embed() otherwise.
+        """
+        if self._embedding is None:
+            return []
+
+        code_index = await self._build_code_index()
+        if not code_index:
+            return []
+
+        # Embed the query — use query-optimized encoding for Voyage
+        try:
+            if isinstance(self._embedding, VoyageEmbeddingClient):
+                query_vec = await self._embedding.embed_query(description)
+            else:
+                query_vec = await self._embedding.embed(description)
+        except Exception as exc:
+            self._logger.warning("semantic_search_embed_failed", error=str(exc))
+            return []
+
+        # Compute similarities and rank
+        scored: list[tuple[str, float]] = []
+        for path, doc_vec in code_index.items():
+            sim = cosine_similarity(query_vec, doc_vec)
+            if sim >= threshold:
+                scored.append((path, sim))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
+
     async def _tool_find_similar(self, tc: ToolCall) -> ToolResult:
-        """Find existing implementations similar to what needs to be built."""
+        """Find existing implementations similar to what needs to be built.
+
+        Two-tier search:
+          1. Keyword matching against _SIMILAR_CODE_MAP (fast, exact)
+          2. Semantic embedding search via voyage-code-3 (deep, fuzzy)
+        Falls back from tier 1 → tier 2 when keywords don't match.
+        """
         description = tc.input.get("description", "").lower()
 
-        # Find matching paths from the keyword map
+        # ── Tier 1: Keyword matching ─────────────────────────────────────────
         matched_paths: list[str] = []
         for keyword, paths in _SIMILAR_CODE_MAP.items():
             if keyword in description:
@@ -978,7 +1265,6 @@ class SimulaCodeAgent:
                 break
 
         if not matched_paths:
-            # Fallback: search for the first noun in the description
             words = description.split()
             for word in words:
                 if len(word) > 3:
@@ -989,15 +1275,29 @@ class SimulaCodeAgent:
                 if matched_paths:
                     break
 
+        # ── Tier 2: Semantic embedding search ────────────────────────────────
+        semantic_paths: list[tuple[str, float]] = []
+        if not matched_paths and self._embedding is not None:
+            semantic_paths = await self._semantic_find_similar(description)
+            matched_paths = [p for p, _ in semantic_paths]
+
         if not matched_paths:
             return ToolResult(
                 tc.id,
                 "No similar implementations found. Try search_code with a specific pattern.",
             )
 
-        # Read the first matching file/directory
+        # ── Read matched files ───────────────────────────────────────────────
         results: list[str] = []
         chars_remaining = 4000
+
+        # If semantic search was used, prepend similarity scores
+        if semantic_paths:
+            score_header = "Semantic similarity results:\n" + "\n".join(
+                f"  {p} (score: {s:.3f})" for p, s in semantic_paths
+            )
+            results.append(score_header)
+            chars_remaining -= len(score_header)
 
         for rel_path in matched_paths:
             if chars_remaining <= 0:
@@ -1012,7 +1312,6 @@ class SimulaCodeAgent:
                 except Exception:
                     continue
             elif target.is_dir():
-                # List the directory and read the first non-init Python file
                 try:
                     py_files = sorted(target.glob("*.py"))
                     file_list = ", ".join(f.name for f in py_files)
@@ -1027,7 +1326,7 @@ class SimulaCodeAgent:
                         rel = str(py_file.relative_to(self._root))
                         results.append(f"\n=== {rel} (exemplar) ===\n{chunk}")
                         chars_remaining -= len(results[-1])
-                        break  # One exemplar is enough
+                        break
                 except Exception:
                     continue
 
@@ -1068,7 +1367,7 @@ class SimulaCodeAgent:
             codebase_root=self._root,
         )
 
-        return _SYSTEM_PROMPT_TEMPLATE.format(
+        prompt = _SYSTEM_PROMPT_TEMPLATE.format(
             category=proposal.category.value,
             description=proposal.description,
             expected_benefit=proposal.expected_benefit,
@@ -1077,3 +1376,13 @@ class SimulaCodeAgent:
             forbidden_paths="\n".join(f"- {p}" for p in FORBIDDEN_WRITE_PATHS),
             architecture_context=architecture_context,
         )
+
+        # Stage 3C: Append LILO library abstractions if available
+        if self._lilo_prompt:
+            prompt += f"\n\n{self._lilo_prompt}"
+
+        # Stage 4A: Append proof library context if available
+        if self._proof_library_prompt:
+            prompt += self._proof_library_prompt
+
+        return prompt

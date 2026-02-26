@@ -39,6 +39,7 @@ from ecodiaos.systems.simula.types import (
 if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.memory.service import MemoryService
+    from ecodiaos.systems.simula.retrieval.swe_grep import SweGrepRetriever
 
 logger = structlog.get_logger().bind(system="simula.bridge")
 
@@ -73,7 +74,12 @@ class EvoSimulaBridge:
     ) -> None:
         self._llm = llm
         self._memory = memory
+        self._swe_grep: SweGrepRetriever | None = None
         self._log = logger
+
+    def set_swe_grep(self, retriever: SweGrepRetriever) -> None:
+        """Inject SWE-grep retriever (called by SimulaService after init)."""
+        self._swe_grep = retriever
 
     async def translate_proposal(
         self,
@@ -123,12 +129,36 @@ class EvoSimulaBridge:
         )
         enriched.inferred_category = category
 
-        # 3. Build formal ChangeSpec
+        # 2.5 (Stage 3B): SWE-grep retrieval for bridge context
+        retrieval_context = ""
+        if self._swe_grep is not None:
+            try:
+                swe_result = await self._swe_grep.retrieve_for_bridge(
+                    description=evo_description,
+                    category=category.value,
+                    mutation_target=mutation_target,
+                )
+                if swe_result.contexts:
+                    retrieval_context = "\n".join(
+                        f"[{c.context_type}:{c.source}] {c.content[:200]}"
+                        for c in swe_result.contexts[:5]
+                    )
+                    self._log.info(
+                        "bridge_swe_grep_complete",
+                        contexts=len(swe_result.contexts),
+                        hops=swe_result.total_hops,
+                        time_ms=swe_result.total_time_ms,
+                    )
+            except Exception as exc:
+                self._log.warning("bridge_swe_grep_failed", error=str(exc))
+
+        # 3. Build formal ChangeSpec (enriched with SWE-grep context)
         change_spec = await self._build_change_spec(
             category=category,
             description=evo_description,
             mutation_target=mutation_target,
             evidence_summaries=hypothesis_statements[:5],
+            retrieval_context=retrieval_context,
         )
         enriched.inferred_change_spec = change_spec
 
@@ -234,22 +264,30 @@ class EvoSimulaBridge:
         description: str,
         mutation_target: str,
         evidence_summaries: list[str],
+        retrieval_context: str = "",
     ) -> ChangeSpec:
         """
         Build a formal ChangeSpec via LLM-assisted reasoning.
         Single call with structured output. ~500 tokens.
+        Stage 3B: enriched with SWE-grep retrieval context when available.
         """
         evidence_text = "\n".join(f"- {s[:150]}" for s in evidence_summaries) or "none"
 
         # Category-specific field instructions
         field_instructions = self._get_field_instructions(category)
 
+        # Stage 3B: Include codebase context from SWE-grep retrieval
+        context_section = ""
+        if retrieval_context:
+            context_section = f"\nCodebase context (retrieved via SWE-grep):\n{retrieval_context}\n"
+
         prompt = (
             "You are constructing a formal change specification for EcodiaOS.\n\n"
             f"Category: {category.value}\n"
             f"Description: {description[:300]}\n"
             f"Target: {mutation_target}\n"
-            f"Evidence:\n{evidence_text}\n\n"
+            f"Evidence:\n{evidence_text}\n"
+            f"{context_section}\n"
             f"Required fields for {category.value}:\n{field_instructions}\n\n"
             "Reply as key=value pairs, one per line. Example:\n"
             "executor_name=email_sender\n"

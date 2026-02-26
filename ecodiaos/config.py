@@ -101,9 +101,10 @@ class LLMConfig(BaseModel):
 
 
 class EmbeddingConfig(BaseModel):
-    strategy: str = "local"  # "local" | "api" | "sidecar"
+    strategy: str = "local"  # "local" | "api" | "sidecar" | "mock"
     local_model: str = "sentence-transformers/all-mpnet-base-v2"
     local_device: str = "cpu"
+    sidecar_url: str | None = None
     dimension: int = 768
     max_batch_size: int = 32
     cache_embeddings: bool = True
@@ -201,6 +202,151 @@ class SimulaConfig(BaseModel):
     max_code_agent_turns: int = 20
     test_command: str = "pytest"
     auto_apply_self_applicable: bool = True
+    # Stage 1A: Extended-thinking model for governance-required and high-risk proposals
+    thinking_model: str = "o3"
+    thinking_model_provider: str = "openai"
+    thinking_model_api_key: str = ""
+    thinking_budget_tokens: int = 16384  # max reasoning tokens for extended thinking
+    # Stage 1B: Code embeddings for semantic similarity
+    embedding_model: str = "voyage-code-3"
+    embedding_api_key: str = ""
+    # Stage 1C: KV cache compression
+    kv_compression_ratio: float = 0.3  # prune ratio for KVzip (0.0 = no pruning, 1.0 = max)
+    kv_compression_enabled: bool = True
+    # Stage 2A: Dafny formal verification (Clover pattern)
+    dafny_enabled: bool = False  # requires Dafny binary on PATH
+    dafny_binary_path: str = "dafny"
+    dafny_verify_timeout_s: float = 30.0
+    dafny_max_clover_rounds: int = 8
+    dafny_blocking: bool = True  # Dafny failure blocks triggerable categories
+    # Stage 2B: Z3 invariant discovery
+    z3_enabled: bool = False  # requires z3-solver pip package
+    z3_check_timeout_ms: int = 5000
+    z3_max_discovery_rounds: int = 6
+    z3_blocking: bool = False  # advisory by default, graduates to blocking
+    # Stage 2C: Static analysis gates
+    static_analysis_enabled: bool = True  # on by default (pip packages)
+    static_analysis_max_fix_iterations: int = 3
+    static_analysis_blocking: bool = True  # ERROR findings block proposals
+    # Stage 2D: AgentCoder (separated test/code/execute pipeline)
+    agent_coder_enabled: bool = False  # opt-in 3-agent pipeline
+    agent_coder_max_iterations: int = 3
+    agent_coder_test_timeout_s: float = 60.0
+    # Stage 3A: Salsa Incremental Verification
+    incremental_verification_enabled: bool = True  # dependency-aware memoization
+    incremental_hot_ttl_seconds: int = 3600  # Redis hot cache TTL (1 hour)
+    # Stage 3B: SWE-grep Agentic Retrieval
+    swe_grep_enabled: bool = True  # multi-hop code search for bridge + code agent
+    swe_grep_max_hops: int = 4  # serial retrieval turns (4 × 8 parallel tools)
+    # Stage 3C: LILO Library Learning
+    lilo_enabled: bool = True  # abstraction extraction from successful proposals
+    lilo_max_library_size: int = 200  # cap on :LibraryAbstraction nodes
+    lilo_consolidation_interval_proposals: int = 10  # consolidate every N applied proposals
+    # Stage 4A: Lean 4 Proof Generation (DeepSeek-Prover-V2 pattern)
+    lean_enabled: bool = False  # requires Lean 4 + Mathlib on PATH
+    lean_binary_path: str = "lean"  # path to Lean 4 binary
+    lean_project_path: str = ""  # path to lakefile.lean project (for Mathlib deps)
+    lean_verify_timeout_s: float = 60.0  # per-proof verification timeout
+    lean_max_attempts: int = 5  # max proof generation attempts
+    lean_blocking: bool = True  # Lean failure blocks for proof-requiring categories
+    lean_copilot_enabled: bool = True  # use Lean Copilot for tactic automation
+    lean_dojo_enabled: bool = True  # use LeanDojo for proof search and retrieval
+    lean_proof_library_max_size: int = 500  # cap on :ProvenLemma nodes in Neo4j
+    # Stage 4B: GRPO Domain Fine-Tuning
+    grpo_enabled: bool = False  # opt-in self-improvement training loop
+    grpo_base_model: str = "deepseek-coder-7b"  # 7B base model for fine-tuning
+    grpo_min_training_examples: int = 100  # minimum examples before first SFT
+    grpo_sft_epochs: int = 3  # supervised fine-tuning epochs
+    grpo_rollouts_per_example: int = 2  # 2-rollout contrastive (matches 16-rollout)
+    grpo_batch_size: int = 8  # training batch size
+    grpo_learning_rate: float = 2e-5  # fine-tuning learning rate
+    grpo_retrain_interval_proposals: int = 50  # retrain every N applied proposals
+    grpo_gpu_ids: list[int] = Field(default_factory=lambda: [0])  # GPU allocation
+    grpo_use_finetuned: bool = False  # route code agent to fine-tuned model
+    grpo_ab_test_fraction: float = 0.2  # fraction of proposals routed to fine-tuned
+    # Stage 4C: Diffusion-Based Code Repair
+    diffusion_repair_enabled: bool = False  # opt-in last-mile repair agent
+    diffusion_model: str = "diffucoder-7b"  # diffusion model ID
+    diffusion_max_denoise_steps: int = 10  # maximum denoising iterations
+    diffusion_timeout_s: float = 120.0  # total repair timeout
+    diffusion_sketch_first: bool = False  # True = skeleton mode, False = iterative denoise
+    diffusion_handoff_after_failures: int = 2  # hand off to diffusion after N code agent failures
+    # Stage 5A: Neurosymbolic Synthesis (beyond CEGIS)
+    synthesis_enabled: bool = False  # opt-in neurosymbolic synthesis routing
+    hysynth_enabled: bool = True  # probabilistic CFG-guided search (within synthesis)
+    hysynth_max_candidates: int = 200  # max candidate programs per synthesis
+    hysynth_beam_width: int = 10  # beam search width for bottom-up enumeration
+    hysynth_timeout_s: float = 60.0  # per-synthesis timeout
+    sketch_synthesis_enabled: bool = True  # LLM sketch + symbolic hole-filling
+    sketch_max_holes: int = 20  # max holes per template
+    sketch_solver_timeout_ms: int = 5000  # Z3/constraint solver timeout per hole
+    chopchop_enabled: bool = True  # type-directed constrained generation
+    chopchop_chunk_size_lines: int = 10  # lines per constrained generation chunk
+    chopchop_max_retries: int = 3  # retries per chunk on constraint violation
+    chopchop_timeout_s: float = 90.0  # total timeout
+    # Stage 5B: Neural Program Repair (SRepair pattern)
+    repair_agent_enabled: bool = False  # opt-in FSM-guided repair
+    repair_diagnosis_model: str = "claude-opus-4-6"  # reasoning model for root cause
+    repair_generation_model: str = "claude-sonnet-4-20250514"  # code model for fix gen
+    repair_max_retries: int = 3  # max repair attempts per failure
+    repair_cost_budget_usd: float = 0.10  # hard cap per repair attempt
+    repair_timeout_s: float = 180.0  # total repair timeout
+    repair_use_similar_fixes: bool = True  # query Neo4j for similar past repairs
+    # Stage 5C: Multi-Agent Orchestration
+    orchestration_enabled: bool = False  # opt-in multi-agent pipeline
+    orchestration_max_agents_per_stage: int = 2  # per "overcrowding" finding
+    orchestration_multi_file_threshold: int = 3  # files >= this triggers orchestrator
+    orchestration_max_dag_nodes: int = 50  # cap on task decomposition DAG size
+    orchestration_timeout_s: float = 300.0  # total orchestration timeout
+    # Stage 5D: Causal Debugging
+    causal_debugging_enabled: bool = False  # opt-in causal analysis on failure
+    causal_max_interventions: int = 5  # max interventional queries per diagnosis
+    causal_fault_injection_enabled: bool = False  # active causal learning (staging only)
+    causal_timeout_s: float = 60.0  # per-diagnosis timeout
+    # Stage 5E: Autonomous Issue Resolution
+    issue_resolution_enabled: bool = False  # opt-in autonomous resolution
+    issue_max_autonomy_level: str = "test_fix"  # lint|dependency|test_fix|logic_bug
+    issue_abstention_confidence_threshold: float = 0.8  # below this, abstain
+    issue_perf_regression_enabled: bool = True  # detect perf regressions post-apply
+    issue_security_scan_enabled: bool = True  # enhanced security scanning
+    issue_degradation_window_hours: int = 24  # monitor window for subtle degradation
+    # Stage 6A: Cryptographic Auditability
+    hash_chain_enabled: bool = False  # SHA-256 hash chains on EvolutionRecord nodes
+    c2pa_enabled: bool = False  # C2PA content credentials for code provenance
+    c2pa_signing_key_path: str = ""  # path to Ed25519 private key for signing
+    c2pa_issuer_name: str = "EcodiaOS Simula"  # issuer name in C2PA manifests
+    verifiable_credentials_enabled: bool = False  # tamper-evident governance approval chain
+    credential_verification_timeout_s: float = 10.0  # timeout for credential verification
+    regulatory_framework: str = ""  # ""|"finance_sox"|"healthcare_hipaa"|"defense_cmmc"|"general_audit"
+    # Stage 6B: Co-Evolving Agents
+    coevolution_enabled: bool = False  # autonomous hard negative mining + adversarial testing
+    hard_negative_mining_interval_proposals: int = 10  # mine every N applied proposals
+    adversarial_test_generation_enabled: bool = False  # LLM generates edge-case tests
+    adversarial_max_tests_per_cycle: int = 20  # cap on adversarial tests per cycle
+    coevolution_idle_compute_enabled: bool = False  # run adversarial generation on idle cycles
+    # Stage 6C: Formal Spec Generation
+    formal_spec_generation_enabled: bool = False  # auto-generate Dafny/TLA+/Alloy specs
+    dafny_spec_generation_enabled: bool = True  # Dafny spec gen (within formal_spec_generation)
+    dafny_bench_coverage_target: float = 0.96  # DafnyBench 96% coverage target
+    tla_plus_enabled: bool = False  # TLA+ specs for distributed interactions
+    tla_plus_binary_path: str = "tlc"  # path to TLC model checker binary
+    tla_plus_model_check_timeout_s: float = 120.0  # per-model-check timeout
+    alloy_enabled: bool = False  # Alloy for property checking on system invariants
+    alloy_binary_path: str = "alloy"  # path to Alloy analyzer binary
+    alloy_scope: int = 10  # Alloy scope (bound on universe size)
+    self_spec_dsl_enabled: bool = False  # LLMs invent task-specific DSLs
+    # Stage 6D: Equality Saturation (E-graphs)
+    egraph_enabled: bool = False  # e-graph refactoring with semantic equivalence
+    egraph_max_iterations: int = 1000  # max saturation iterations
+    egraph_timeout_s: float = 30.0  # per-equivalence-check timeout
+    egraph_blocking: bool = False  # advisory by default, equivalence failures don't block
+    # Stage 6E: Hybrid Symbolic Execution
+    symbolic_execution_enabled: bool = False  # Z3 SMT for mission-critical logic proofs
+    symbolic_execution_timeout_ms: int = 10000  # Z3 per-property timeout
+    symbolic_execution_blocking: bool = True  # proved properties are hard guarantees
+    symbolic_execution_domains: list[str] = Field(
+        default_factory=lambda: ["budget_calculation", "risk_scoring"],
+    )  # domains to target for symbolic execution
 
 
 class ThymosConfig(BaseModel):
@@ -520,6 +666,18 @@ def load_config(config_path: str | Path | None = None) -> EcodiaOSConfig:
         raw.setdefault("llm", {})["model"] = llm_model
     if instance_id := os.environ.get("ECODIAOS_INSTANCE_ID"):
         raw["instance_id"] = instance_id
+    # Simula Stage 1 config
+    if thinking_key := os.environ.get("ECODIAOS_SIMULA__THINKING_MODEL_API_KEY"):
+        raw.setdefault("simula", {})["thinking_model_api_key"] = thinking_key
+    if embedding_key := os.environ.get("ECODIAOS_SIMULA__EMBEDDING_API_KEY"):
+        raw.setdefault("simula", {})["embedding_api_key"] = embedding_key
+    # Simula Stage 4 config
+    if lean_path := os.environ.get("ECODIAOS_SIMULA__LEAN_PROJECT_PATH"):
+        raw.setdefault("simula", {})["lean_project_path"] = lean_path
+    if grpo_gpus := os.environ.get("ECODIAOS_SIMULA__GRPO_GPU_IDS"):
+        raw.setdefault("simula", {})["grpo_gpu_ids"] = [
+            int(g.strip()) for g in grpo_gpus.split(",") if g.strip()
+        ]
 
     return EcodiaOSConfig(**raw)
 
