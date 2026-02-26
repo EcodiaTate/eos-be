@@ -32,20 +32,19 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.primitives.common import new_id, utc_now
+from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.thread.types import (
+    FINGERPRINT_DIMS,
     ChapterStatus,
     Commitment,
     CommitmentStrength,
     CommitmentType,
-    FINGERPRINT_DIMS,
     IdentityFingerprint,
     IdentitySchema,
     LifeStorySnapshot,
     NarrativeChapter,
     SchemaConflict,
     SchemaStatus,
-    ThreadHealthSnapshot,
 )
 
 if TYPE_CHECKING:
@@ -353,7 +352,7 @@ class ThreadService:
         # Compute embedding for conflict detection
         if self._memory is not None:
             try:
-                embedding = await self._memory.embed_text(schema.statement)
+                embedding = await self._memory.embed_text(schema.statement)  # type: ignore[attr-defined]
                 schema.embedding = embedding
             except Exception:
                 self._logger.debug("schema_embedding_failed", exc_info=True)
@@ -577,13 +576,13 @@ class ThreadService:
         """
         pattern_type = getattr(candidate, "type", None)
         elements = getattr(candidate, "elements", [])
-        metadata = getattr(candidate, "metadata", {})
+        getattr(candidate, "metadata", {})
         count = getattr(candidate, "count", 0)
 
         if not elements:
             return ""
 
-        type_val = pattern_type.value if hasattr(pattern_type, "value") else str(pattern_type)
+        type_val = pattern_type.value if hasattr(pattern_type, "value") else str(pattern_type)  # type: ignore[union-attr]
 
         if type_val == "affect_pattern":
             stimulus = elements[0] if elements else "certain situations"
@@ -724,7 +723,7 @@ class ThreadService:
                 ):
                     continue
 
-                cos_sim = _cosine_similarity(a.embedding, b.embedding)
+                cos_sim = _cosine_similarity(a.embedding or [], b.embedding or [])
                 if cos_sim < _CONFLICT_COSINE_THRESHOLD:
                     conflict = SchemaConflict(
                         schema_a_id=a.id,
@@ -909,7 +908,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if len(a) != len(b) or not a:
         return 0.0
 
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))
 

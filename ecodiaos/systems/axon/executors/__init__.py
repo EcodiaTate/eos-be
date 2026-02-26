@@ -15,6 +15,8 @@ Import build_default_registry() to get a fully-populated ExecutorRegistry.
 
 from __future__ import annotations
 
+from typing import Any
+
 from ecodiaos.systems.axon.executors.communication import (
     NotificationExecutor,
     PostMessageExecutor,
@@ -70,9 +72,9 @@ __all__ = [
 
 
 def build_default_registry(
-    memory=None,
-    voxis=None,
-    redis_client=None,
+    memory: Any = None,
+    voxis: Any = None,
+    redis_client: Any = None,
 ) -> ExecutorRegistry:
     """
     Build and return a fully-populated ExecutorRegistry with all built-in executors.

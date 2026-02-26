@@ -20,7 +20,6 @@ from pydantic import Field
 
 from ecodiaos.primitives.common import EOSBaseModel, Identified, utc_now
 
-
 # ─── Trust Levels ─────────────────────────────────────────────────
 
 
@@ -40,7 +39,7 @@ class TrustLevel(int, enum.Enum):
     ALLY = 4          # Deep trust. Can share most knowledge and delegate actions.
 
 
-class FederationLinkStatus(str, enum.Enum):
+class FederationLinkStatus(enum.StrEnum):
     """Status of a federation link."""
 
     ACTIVE = "active"
@@ -49,7 +48,7 @@ class FederationLinkStatus(str, enum.Enum):
     PENDING = "pending"
 
 
-class ViolationType(str, enum.Enum):
+class ViolationType(enum.StrEnum):
     """Categories of trust violations in federation interactions."""
 
     PRIVACY_BREACH = "privacy_breach"       # Shared individual data without consent
@@ -59,7 +58,7 @@ class ViolationType(str, enum.Enum):
     RESOURCE_ABUSE = "resource_abuse"       # Excessive/unreasonable requests
 
 
-class InteractionOutcome(str, enum.Enum):
+class InteractionOutcome(enum.StrEnum):
     """Outcome of a federation interaction."""
 
     SUCCESSFUL = "successful"
@@ -160,7 +159,7 @@ class FederationInteraction(Identified):
 # ─── Knowledge Exchange ─────────────────────────────────────────
 
 
-class KnowledgeType(str, enum.Enum):
+class KnowledgeType(enum.StrEnum):
     """Types of knowledge that can be exchanged between instances."""
 
     PUBLIC_ENTITIES = "public_entities"
@@ -172,7 +171,7 @@ class KnowledgeType(str, enum.Enum):
     SCHEMA_STRUCTURES = "schema_structures"
 
 
-class PrivacyLevel(str, enum.Enum):
+class PrivacyLevel(enum.StrEnum):
     """Privacy classification of knowledge items."""
 
     PUBLIC = "public"               # Freely shareable

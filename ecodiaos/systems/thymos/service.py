@@ -39,6 +39,7 @@ Interface:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import time
 from collections import deque
@@ -71,15 +72,12 @@ from ecodiaos.systems.thymos.triage import (
 )
 from ecodiaos.systems.thymos.types import (
     Diagnosis,
-    HealingMode,
     Incident,
     IncidentClass,
     IncidentSeverity,
     RepairSpec,
     RepairStatus,
     RepairTier,
-    ThymosHealthSnapshot,
-    ValidationResult,
 )
 
 if TYPE_CHECKING:
@@ -343,10 +341,8 @@ class ThymosService:
         for task in (self._sentinel_task, self._homeostasis_task):
             if task is not None and not task.done():
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
 
         self._sentinel_task = None
         self._homeostasis_task = None
@@ -1205,8 +1201,8 @@ class ThymosService:
         Pre-repair (resolved=False): high-urgency goal so Nova prioritises self-healing.
         Post-repair (resolved=True): follow-up monitoring goal at lower urgency.
         """
+        from ecodiaos.primitives.common import DriveAlignmentVector, new_id
         from ecodiaos.systems.nova.types import Goal, GoalSource, GoalStatus
-        from ecodiaos.primitives.common import new_id, DriveAlignmentVector
 
         tier_name = repair_tier.name if repair_tier else "UNKNOWN"
 
@@ -1258,8 +1254,8 @@ class ThymosService:
         Successful repairs teach the organism what works.
         Failed repairs teach it what doesn't — and are more salient.
         """
-        from ecodiaos.primitives.memory_trace import Episode
         from ecodiaos.primitives.common import new_id, utc_now
+        from ecodiaos.primitives.memory_trace import Episode
 
         outcome_text = "succeeded" if success else "failed"
         episode = Episode(
@@ -1277,7 +1273,7 @@ class ThymosService:
             ),
             salience_composite=0.6 if success else 0.8,
             affect_valence=0.2 if success else -0.3,
-            timestamp=utc_now(),
+            event_time=utc_now(),
         )
         try:
             await self._evo.process_episode(episode)
@@ -1617,6 +1613,11 @@ class ThymosService:
         """Emit a metric if the collector is available."""
         if self._metrics is not None:
             try:
-                self._metrics.record(name, value, tags=tags or {})
+                self._metrics.record(  # type: ignore[unused-coroutine]
+                    system="thymos",
+                    metric=name,
+                    value=value,
+                    labels=tags,
+                )
             except Exception:
                 pass  # Telemetry failures must never affect immune function

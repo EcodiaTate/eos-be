@@ -11,8 +11,8 @@ Target: 97.72 % root-cause precision (AID benchmark).
 
 from __future__ import annotations
 
-import enum
 from datetime import datetime
+import enum
 
 from pydantic import Field
 
@@ -22,7 +22,7 @@ from ecodiaos.primitives.common import EOSBaseModel, utc_now
 # ── Enums ────────────────────────────────────────────────────────────────────
 
 
-class CausalNodeKind(str, enum.Enum):
+class CausalNodeKind(enum.StrEnum):
     """Kind of node in the causal DAG."""
 
     FUNCTION = "function"
@@ -32,7 +32,7 @@ class CausalNodeKind(str, enum.Enum):
     CONFIG = "config"
 
 
-class CausalEdgeKind(str, enum.Enum):
+class CausalEdgeKind(enum.StrEnum):
     """Kind of edge (relationship) in the causal DAG."""
 
     CALLS = "calls"
@@ -42,7 +42,7 @@ class CausalEdgeKind(str, enum.Enum):
     MUTATES = "mutates"
 
 
-class InterventionKind(str, enum.Enum):
+class InterventionKind(enum.StrEnum):
     """Type of causal intervention used during AID reasoning."""
 
     MOCK = "mock"

@@ -22,6 +22,7 @@ happens in Equor. Axon just does it.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from ecodiaos.systems.axon.types import (
     ExecutionContext,
@@ -52,7 +53,7 @@ class Executor(ABC):
     @abstractmethod
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         """
@@ -65,7 +66,7 @@ class Executor(ABC):
         ...
 
     @abstractmethod
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         """
         Validate that params are sufficient and well-formed for this executor.
 

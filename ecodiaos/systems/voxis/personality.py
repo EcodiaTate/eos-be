@@ -11,10 +11,14 @@ biases shaped by experience. Evo proposes adjustments; this engine applies them.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import structlog
 
 from ecodiaos.primitives.expression import PersonalityVector
-from ecodiaos.systems.voxis.types import StrategyParams
+
+if TYPE_CHECKING:
+    from ecodiaos.systems.voxis.types import StrategyParams
 
 logger = structlog.get_logger()
 
@@ -157,9 +161,7 @@ class PersonalityEngine:
                 clamped = max(-MAX_PERSONALITY_DELTA, min(MAX_PERSONALITY_DELTA, delta[dim]))
                 new_val = current_val + clamped
                 # Keep all dimensions within valid range [-1, 1] (humour: [0, 1])
-                if dim == "humour":
-                    new_val = max(0.0, min(1.0, new_val))
-                elif dim == "metaphor_use":
+                if dim == "humour" or dim == "metaphor_use":
                     new_val = max(0.0, min(1.0, new_val))
                 else:
                     new_val = max(-1.0, min(1.0, new_val))
@@ -188,7 +190,7 @@ class PersonalityEngine:
         self._personality.vocabulary_affinities[word] = new_val
 
     @classmethod
-    def from_seed(cls, seed_personality: dict[str, float]) -> "PersonalityEngine":
+    def from_seed(cls, seed_personality: dict[str, float]) -> PersonalityEngine:
         """Create a fresh PersonalityEngine from seed configuration values."""
-        vector = PersonalityVector(**seed_personality)
+        vector = PersonalityVector.model_validate(seed_personality)
         return cls(vector)

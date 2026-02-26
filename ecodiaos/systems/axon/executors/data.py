@@ -62,13 +62,13 @@ class CreateRecordExecutor(Executor):
     max_duration_ms = 3000
     rate_limit = RateLimit.per_minute(20)
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.executor.create_record")
         # Track created record IDs for rollback
         self._created: dict[str, str] = {}  # execution_id → record_id
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("record_type"):
             return ValidationResult.fail("record_type is required")
         if not params.get("data"):
@@ -82,14 +82,14 @@ class CreateRecordExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         record_type = params["record_type"]
         data = dict(params["data"])
         title = params.get("title", data.get("title", f"New {record_type}"))
-        tags = list(params.get("tags", []))
-        related_to = list(params.get("related_to", []))
+        list(params.get("tags", []))
+        list(params.get("related_to", []))
 
         self._logger.info(
             "create_record_execute",
@@ -140,7 +140,7 @@ class CreateRecordExecutor(Executor):
 
         if self._memory is not None:
             try:
-                await self._memory.delete_entity(record_id)
+                await self._memory.delete_entity(record_id)  # type: ignore[attr-defined]
                 del self._created[execution_id]
                 return RollbackResult(
                     success=True,
@@ -174,13 +174,13 @@ class UpdateRecordExecutor(Executor):
     max_duration_ms = 3000
     rate_limit = RateLimit.per_minute(30)
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.executor.update_record")
         # Track previous states for rollback: execution_id → (record_id, previous_data)
-        self._previous_states: dict[str, tuple[str, dict]] = {}
+        self._previous_states: dict[str, tuple[str, dict[str, Any]]] = {}
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("record_id"):
             return ValidationResult.fail("record_id is required")
         if not params.get("updates"):
@@ -191,7 +191,7 @@ class UpdateRecordExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         record_id = params["record_id"]
@@ -208,11 +208,11 @@ class UpdateRecordExecutor(Executor):
         if self._memory is not None:
             try:
                 # Snapshot previous state for rollback
-                previous = await self._memory.get_entity(record_id)
+                previous = await self._memory.get_entity(record_id)  # type: ignore[attr-defined]
                 if previous:
                     self._previous_states[context.execution_id] = (record_id, dict(previous))
 
-                await self._memory.update_entity(
+                await self._memory.update_entity(  # type: ignore[attr-defined]
                     entity_id=record_id,
                     properties=updates,
                     merge=merge,
@@ -246,7 +246,7 @@ class UpdateRecordExecutor(Executor):
         record_id, previous_data = previous
         if self._memory is not None:
             try:
-                await self._memory.update_entity(
+                await self._memory.update_entity(  # type: ignore[attr-defined]
                     entity_id=record_id,
                     properties=previous_data,
                     merge=False,
@@ -291,12 +291,12 @@ class ScheduleExecutor(Executor):
     max_duration_ms = 3000
     rate_limit = RateLimit.per_hour(50)
 
-    def __init__(self, redis_client=None) -> None:
+    def __init__(self, redis_client: Any = None) -> None:
         self._redis = redis_client
         self._logger = logger.bind(system="axon.executor.schedule_event")
         self._scheduled: dict[str, str] = {}  # execution_id → event_id
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("title"):
             return ValidationResult.fail("title is required")
         if not params.get("scheduled_at"):
@@ -317,11 +317,11 @@ class ScheduleExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
-        from datetime import datetime
         import json as _json
+        from datetime import datetime
 
         title = params["title"]
         scheduled_at = str(params["scheduled_at"])
@@ -439,12 +439,12 @@ class ReminderExecutor(Executor):
     max_duration_ms = 2000
     rate_limit = RateLimit.per_hour(30)
 
-    def __init__(self, redis_client=None) -> None:
+    def __init__(self, redis_client: Any = None) -> None:
         self._redis = redis_client
         self._logger = logger.bind(system="axon.executor.set_reminder")
         self._reminders: dict[str, str] = {}  # execution_id → reminder_id
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("message"):
             return ValidationResult.fail("message is required")
         if not params.get("remind_at"):
@@ -458,11 +458,12 @@ class ReminderExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
-        from datetime import datetime
         import json as _json
+        from datetime import datetime
+
         from ecodiaos.primitives.common import new_id
 
         message = params["message"]

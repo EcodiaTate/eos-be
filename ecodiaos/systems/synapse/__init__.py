@@ -28,8 +28,8 @@ from ecodiaos.systems.synapse.types import (
     SynapseEvent,
     SynapseEventType,
     SystemBudget,
-    SystemHeartbeat,
     SystemHealthRecord,
+    SystemHeartbeat,
     SystemStatus,
 )
 

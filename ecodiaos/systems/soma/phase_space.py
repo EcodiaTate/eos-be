@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Any, Optional
+from typing import Any
 
 import structlog
 
@@ -54,8 +54,8 @@ class PhaseSpaceModel:
         self._detection_enabled = detection_enabled
 
         # Navigation state
-        self._current_attractor: Optional[Attractor] = None
-        self._previous_attractor: Optional[Attractor] = None
+        self._current_attractor: Attractor | None = None
+        self._previous_attractor: Attractor | None = None
         self._dwell_cycles: int = 0
         self._trajectory_heading: str = "transient"
         self._previous_distance: float = float("inf")
@@ -89,7 +89,7 @@ class PhaseSpaceModel:
         return list(self._bifurcations)
 
     @property
-    def current_attractor(self) -> Optional[Attractor]:
+    def current_attractor(self) -> Attractor | None:
         return self._current_attractor
 
     @property
@@ -103,9 +103,9 @@ class PhaseSpaceModel:
     def snapshot(self) -> PhaseSpaceSnapshot:
         """Get current navigation state as a snapshot."""
         nearest_dist = float("inf")
-        nearest_label: Optional[str] = None
+        nearest_label: str | None = None
         bif_dist = float("inf")
-        bif_time: Optional[float] = None
+        bif_time: float | None = None
 
         if self._current_attractor is not None:
             nearest_label = self._current_attractor.label
@@ -212,12 +212,12 @@ class PhaseSpaceModel:
 
     def _find_nearest(
         self, state: dict[InteroceptiveDimension, float],
-    ) -> tuple[Optional[Attractor], float]:
+    ) -> tuple[Attractor | None, float]:
         """Find the nearest attractor and its distance."""
         if not self._attractors:
             return None, float("inf")
 
-        nearest: Optional[Attractor] = None
+        nearest: Attractor | None = None
         min_dist = float("inf")
 
         for attractor in self._attractors:
@@ -228,7 +228,7 @@ class PhaseSpaceModel:
 
         return nearest, min_dist
 
-    def _find_nearest_label(self) -> Optional[str]:
+    def _find_nearest_label(self) -> str | None:
         if not self._attractors:
             return None
         return self._attractors[0].label  # Placeholder if no state available

@@ -233,7 +233,7 @@ class ReceptionEngine:
         - Satisfaction: composite of above
         """
         resp_len = len(response_text)
-        resp_lower = response_text.lower()
+        response_text.lower()
 
         # ── Understood ──────────────────────────────────────────
         understood = 0.5  # Baseline: unknown
@@ -309,7 +309,7 @@ class ReceptionEngine:
         if not queue:
             return
 
-        before = len(queue)
+        len(queue)
         while queue and queue[0].is_expired:
             queue.popleft()
             self._total_expired += 1

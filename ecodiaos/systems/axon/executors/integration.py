@@ -98,7 +98,7 @@ class APICallExecutor(Executor):
     def __init__(self) -> None:
         self._logger = logger.bind(system="axon.executor.call_api")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         url_error = _validate_url(params.get("url", ""))
         if url_error:
             return ValidationResult.fail(url_error, url=url_error)
@@ -118,7 +118,7 @@ class APICallExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         url = params["url"]
@@ -156,9 +156,8 @@ class APICallExecutor(Executor):
 
         try:
             import asyncio
-            import json as _json
             try:
-                import aiohttp
+                import aiohttp  # noqa: F401
                 result = await _call_with_aiohttp(
                     url=url,
                     method=method,
@@ -201,12 +200,13 @@ async def _call_with_aiohttp(
     url: str,
     method: str,
     body: Any,
-    headers: dict,
+    headers: dict[str, Any],
     timeout_s: float,
     response_field: str | None,
-) -> dict:
-    import aiohttp
+) -> dict[str, Any]:
     import json as _json
+
+    import aiohttp
 
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -247,12 +247,12 @@ def _call_with_urllib(
     url: str,
     method: str,
     body: Any,
-    headers: dict,
+    headers: dict[str, Any],
     timeout_s: float,
-) -> dict:
+) -> dict[str, Any]:
     import json as _json
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     data = None
     if body is not None:
@@ -276,7 +276,7 @@ def _call_with_urllib(
         return {"status_code": e.code, "body": str(e.reason), "content_type": "", "url": url}
 
 
-def _summarise_response(result: dict, url: str, method: str) -> str:
+def _summarise_response(result: dict[str, Any], url: str, method: str) -> str:
     status = result.get("status_code", "?")
     body = result.get("body", "")
     if isinstance(body, dict):
@@ -318,7 +318,7 @@ class WebhookExecutor(Executor):
     def __init__(self) -> None:
         self._logger = logger.bind(system="axon.executor.webhook")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("webhook_key"):
             return ValidationResult.fail("webhook_key is required")
         if not params.get("payload"):
@@ -332,12 +332,12 @@ class WebhookExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
-        import json as _json
         import hashlib
         import hmac as _hmac
+        import json as _json
 
         webhook_key = params["webhook_key"]
         payload = dict(params["payload"])

@@ -7,8 +7,8 @@ Uses EOSBaseModel for consistency with the rest of EOS.
 
 from __future__ import annotations
 
-import enum
 from datetime import datetime
+import enum
 
 from pydantic import Field, field_validator
 
@@ -18,14 +18,14 @@ from ecodiaos.primitives.common import EOSBaseModel, new_id, utc_now
 # ── Enums ────────────────────────────────────────────────────────────────────
 
 
-class TargetType(str, enum.Enum):
+class TargetType(enum.StrEnum):
     """Whether the hunt target is internal EOS or an external repository."""
 
     INTERNAL_EOS = "internal_eos"
     EXTERNAL_REPO = "external_repo"
 
 
-class AttackSurfaceType(str, enum.Enum):
+class AttackSurfaceType(enum.StrEnum):
     """Classification of an exploitable entry point."""
 
     API_ENDPOINT = "api_endpoint"
@@ -42,7 +42,7 @@ class AttackSurfaceType(str, enum.Enum):
     DESERIALIZATION = "deserialization"
 
 
-class VulnerabilitySeverity(str, enum.Enum):
+class VulnerabilitySeverity(enum.StrEnum):
     """CVSS-aligned severity classification."""
 
     LOW = "low"
@@ -51,7 +51,7 @@ class VulnerabilitySeverity(str, enum.Enum):
     CRITICAL = "critical"
 
 
-class VulnerabilityClass(str, enum.Enum):
+class VulnerabilityClass(enum.StrEnum):
     """Common vulnerability taxonomy (OWASP-aligned)."""
 
     BROKEN_AUTH = "broken_authentication"
@@ -220,3 +220,71 @@ class HunterConfig(EOSBaseModel):
             if not target.strip():
                 raise ValueError("Authorized target cannot be an empty string")
         return v
+
+
+# ── Phase 6: Autonomous Remediation Types ─────────────────────────────────────
+
+
+class RemediationStatus(enum.StrEnum):
+    """Terminal outcome of a remediation attempt."""
+
+    PATCHED = "patched"
+    PATCH_UNVERIFIED = "patch_unverified"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    SKIPPED = "skipped"
+
+
+class RemediationAttempt(EOSBaseModel):
+    """One attempt at generating and verifying a patch for a vulnerability."""
+
+    attempt_number: int = 0
+    patch_diff: str = Field(
+        default="",
+        description="Unified diff of the generated patch",
+    )
+    patched_code: str = Field(
+        default="",
+        description="Complete patched source code",
+    )
+    repair_status: str = Field(
+        default="",
+        description="Status from the underlying RepairAgent (repaired/failed/etc.)",
+    )
+    verification_result: str = Field(
+        default="",
+        description="UNSAT = vulnerability eliminated, SAT = still exploitable",
+    )
+    vulnerability_eliminated: bool = False
+    cost_usd: float = 0.0
+    duration_ms: int = 0
+    error: str = ""
+
+
+class RemediationResult(EOSBaseModel):
+    """Aggregate result of attempting to remediate a single vulnerability."""
+
+    id: str = Field(default_factory=new_id)
+    vulnerability_id: str = Field(
+        ...,
+        description="ID of the VulnerabilityReport being remediated",
+    )
+    status: RemediationStatus = RemediationStatus.SKIPPED
+    attempts: list[RemediationAttempt] = Field(default_factory=list)
+    total_attempts: int = 0
+    successful_attempt: int | None = Field(
+        default=None,
+        description="Which attempt succeeded (0-indexed), None if no success",
+    )
+    final_patch_diff: str = Field(
+        default="",
+        description="The verified patch diff (empty if remediation failed)",
+    )
+    final_patched_code: str = Field(
+        default="",
+        description="The verified patched source code",
+    )
+    total_cost_usd: float = 0.0
+    total_duration_ms: int = 0
+    remediated_at: datetime = Field(default_factory=utc_now)

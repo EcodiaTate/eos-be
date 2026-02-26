@@ -25,14 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.systems.axon.audit import AuditLogger
-from ecodiaos.systems.axon.credentials import CredentialStore
-from ecodiaos.systems.axon.registry import ExecutorRegistry
-from ecodiaos.systems.axon.safety import BudgetTracker, CircuitBreaker, RateLimiter
 from ecodiaos.systems.axon.types import (
     AxonOutcome,
     ExecutionContext,
@@ -45,8 +41,11 @@ from ecodiaos.systems.axon.types import (
 )
 
 if TYPE_CHECKING:
+    from ecodiaos.systems.axon.audit import AuditLogger
+    from ecodiaos.systems.axon.credentials import CredentialStore
+    from ecodiaos.systems.axon.registry import ExecutorRegistry
+    from ecodiaos.systems.axon.safety import BudgetTracker, CircuitBreaker, RateLimiter
     from ecodiaos.systems.nova.service import NovaService
-    from ecodiaos.systems.nova.types import IntentOutcome
 
 logger = structlog.get_logger()
 
@@ -77,13 +76,13 @@ class ExecutionPipeline:
         self._audit = audit_logger
         self._instance_id = instance_id
         self._logger = logger.bind(system="axon.pipeline")
-        self._nova: "NovaService | None" = None
+        self._nova: NovaService | None = None
         self._atune = None  # AtuneService — for feeding outcomes as percepts
 
-    def set_nova(self, nova: "NovaService") -> None:
+    def set_nova(self, nova: NovaService) -> None:
         self._nova = nova
 
-    def set_atune(self, atune) -> None:
+    def set_atune(self, atune: Any) -> None:
         self._atune = atune
 
     async def execute(self, request: ExecutionRequest) -> AxonOutcome:
@@ -187,7 +186,6 @@ class ExecutionPipeline:
                 )
 
         # ── STAGE 5: Context assembly ─────────────────────────────
-        from ecodiaos.primitives.affect import AffectState
         credentials = await self._credential_store.get_for_intent(intent)
         context = ExecutionContext(
             execution_id=execution_id,
@@ -451,8 +449,8 @@ class ExecutionPipeline:
 
 
 async def _run_step_with_timeout(
-    executor,
-    params: dict,
+    executor: Any,
+    params: dict[str, Any],
     context: ExecutionContext,
     timeout_ms: int,
 ) -> ExecutionResult:
@@ -462,7 +460,7 @@ async def _run_step_with_timeout(
             executor.execute(params, context),
             timeout=timeout_ms / 1000,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return ExecutionResult(
             success=False,
             error=f"Step timed out after {timeout_ms}ms",

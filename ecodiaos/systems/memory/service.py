@@ -9,16 +9,15 @@ Memory is the substrate of selfhood.
 
 from __future__ import annotations
 
-from typing import Any
+import contextlib
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.embedding import EmbeddingClient
-from ecodiaos.clients.neo4j import Neo4jClient
-from ecodiaos.config import SeedConfig
 from ecodiaos.primitives import (
     AffectState,
     Entity,
+    EntityType,
     Episode,
     MemoryRetrievalRequest,
     MemoryRetrievalResponse,
@@ -26,15 +25,12 @@ from ecodiaos.primitives import (
     Percept,
     SelfNode,
     SemanticRelation,
-    new_id,
     utc_now,
 )
 from ecodiaos.systems.memory.birth import birth_instance
 from ecodiaos.systems.memory.consolidation import run_consolidation
 from ecodiaos.systems.memory.episodic import (
     count_episodes,
-    get_episode,
-    get_recent_episodes,
     link_episode_sequence,
     store_episode,
     update_access,
@@ -46,11 +42,14 @@ from ecodiaos.systems.memory.semantic import (
     create_entity,
     create_or_strengthen_relation,
     find_similar_entity,
-    get_entity,
-    get_entity_neighbours,
     link_episode_to_entity,
     merge_into_entity,
 )
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.embedding import EmbeddingClient
+    from ecodiaos.clients.neo4j import Neo4jClient
+    from ecodiaos.config import SeedConfig
 
 logger = structlog.get_logger()
 
@@ -120,10 +119,8 @@ class MemoryService:
         if raw_pjson:
             if isinstance(raw_pjson, str):
                 import json
-                try:
+                with contextlib.suppress(json.JSONDecodeError, TypeError):
                     personality_json = json.loads(raw_pjson)
-                except (json.JSONDecodeError, TypeError):
-                    pass
             elif isinstance(raw_pjson, dict):
                 personality_json = raw_pjson
 
@@ -141,7 +138,7 @@ class MemoryService:
             total_communities=data.get("total_communities", 0),
         )
 
-    async def birth(self, seed: SeedConfig, instance_id: str) -> dict:
+    async def birth(self, seed: SeedConfig, instance_id: str) -> dict[str, Any]:
         """Birth a new instance from a seed configuration."""
         result = await birth_instance(
             self._neo4j, self._embedding, seed, instance_id,
@@ -300,7 +297,7 @@ class MemoryService:
         # Create new
         entity = Entity(
             name=name,
-            type=entity_type,
+            type=EntityType(entity_type) if entity_type else EntityType.CONCEPT,
             description=description,
             embedding=embedding,
         )
@@ -317,7 +314,7 @@ class MemoryService:
 
     # ─── State Queries ────────────────────────────────────────────
 
-    async def get_constitution(self) -> dict | None:
+    async def get_constitution(self) -> dict[str, Any] | None:
         """Get the current constitutional state."""
         results = await self._neo4j.execute_read(
             """
@@ -327,7 +324,7 @@ class MemoryService:
         )
         return results[0]["c"] if results else None
 
-    async def get_core_entities(self) -> list[dict]:
+    async def get_core_entities(self) -> list[dict[str, Any]]:
         """Get all entities marked as core to the instance's identity."""
         return await self._neo4j.execute_read(
             """
@@ -368,13 +365,13 @@ class MemoryService:
 
     # ─── Consolidation ────────────────────────────────────────────
 
-    async def consolidate(self) -> dict:
+    async def consolidate(self) -> dict[str, Any]:
         """Run the consolidation pipeline (memory sleep cycle)."""
         return await run_consolidation(self._neo4j)
 
     # ─── Stats ────────────────────────────────────────────────────
 
-    async def stats(self) -> dict:
+    async def stats(self) -> dict[str, Any]:
         """Get graph statistics."""
         ep_count = await count_episodes(self._neo4j)
         ent_count = await count_entities(self._neo4j)
@@ -385,7 +382,7 @@ class MemoryService:
 
     # ─── Health ───────────────────────────────────────────────────
 
-    async def health(self) -> dict:
+    async def health(self) -> dict[str, Any]:
         """Health check for the memory system (must complete within 2s)."""
         neo4j_health = await self._neo4j.health_check()
         return {

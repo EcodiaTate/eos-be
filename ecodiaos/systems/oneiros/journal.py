@@ -668,7 +668,7 @@ class DreamJournal:
             for theme, count in theme_counts.items()
             if count >= min_count
         ]
-        results.sort(key=lambda x: x["count"], reverse=True)
+        results.sort(key=lambda x: int(str(x["count"])), reverse=True)
         return results
 
     def _stats_from_memory(self) -> dict[str, Any]:

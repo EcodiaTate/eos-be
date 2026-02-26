@@ -208,7 +208,7 @@ class CausalDebugger:
             seen_files.add(file_path)
 
             full_path = self._root / file_path
-            if not full_path.exists() or not full_path.suffix == ".py":
+            if not full_path.exists() or full_path.suffix != ".py":
                 continue
 
             try:
@@ -420,7 +420,7 @@ class CausalDebugger:
             diff_summary=f"Modified files: {', '.join(files_written)}",
         )
 
-        response = await self._llm.complete(
+        response = await self._llm.complete(  # type: ignore[attr-defined]
             system="You are a causal reasoning expert. Answer precisely.",
             messages=[Message(role="user", content=prompt)],
             max_tokens=512,
@@ -534,13 +534,13 @@ class CausalDebugger:
     def _extract_json(text: str) -> dict[str, Any]:
         """Extract JSON from LLM response."""
         try:
-            return json.loads(text)
+            return json.loads(text)  # type: ignore[no-any-return]
         except json.JSONDecodeError:
             pass
         match = re.search(r"```(?:json)?\n(.*?)```", text, re.DOTALL)
         if match:
-            return json.loads(match.group(1))
+            return json.loads(match.group(1))  # type: ignore[no-any-return]
         brace_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
         if brace_match:
-            return json.loads(brace_match.group(0))
+            return json.loads(brace_match.group(0))  # type: ignore[no-any-return]
         raise json.JSONDecodeError("No JSON found", text, 0)

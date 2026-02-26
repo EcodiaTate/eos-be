@@ -8,9 +8,12 @@ natural language instructions — the vector becomes voice.
 
 from __future__ import annotations
 
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.expression import PersonalityVector
-from ecodiaos.systems.voxis.types import AudienceProfile, ExpressionIntent, StrategyParams
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+    from ecodiaos.primitives.expression import PersonalityVector
+    from ecodiaos.systems.voxis.types import AudienceProfile, ExpressionIntent, StrategyParams
 
 
 def build_system_prompt(

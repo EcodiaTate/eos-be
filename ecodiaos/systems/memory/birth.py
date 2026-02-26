@@ -10,13 +10,16 @@ This is a one-time operation. Once born, the instance exists.
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.embedding import EmbeddingClient
-from ecodiaos.clients.neo4j import Neo4jClient
-from ecodiaos.config import SeedConfig
 from ecodiaos.primitives import AffectState, new_id, utc_now
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.embedding import EmbeddingClient
+    from ecodiaos.clients.neo4j import Neo4jClient
+    from ecodiaos.config import SeedConfig
 
 logger = structlog.get_logger()
 
@@ -26,7 +29,7 @@ async def birth_instance(
     embedding_client: EmbeddingClient,
     seed: SeedConfig,
     instance_id: str,
-) -> dict:
+) -> dict[str, Any]:
     """
     Birth a new EOS instance from a seed configuration.
 

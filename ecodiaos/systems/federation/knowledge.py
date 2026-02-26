@@ -22,16 +22,15 @@ import structlog
 
 from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.primitives.federation import (
+    SHARING_PERMISSIONS,
     FederationInteraction,
     FederationLink,
-    FilteredKnowledge,
     InteractionOutcome,
     KnowledgeItem,
     KnowledgeRequest,
     KnowledgeResponse,
     KnowledgeType,
     PrivacyLevel,
-    SHARING_PERMISSIONS,
     TrustLevel,
 )
 from ecodiaos.systems.federation.privacy import PrivacyFilter
@@ -308,7 +307,7 @@ class KnowledgeExchangeManager:
         """Retrieve non-person entities from the knowledge graph."""
         # Query memory for entities, excluding person-type entities
         try:
-            response = await self._memory.retrieve(
+            response = await self._memory.retrieve(  # type: ignore[union-attr]
                 query_text=query or "public knowledge",
                 max_results=max_results,
             )
@@ -319,10 +318,10 @@ class KnowledgeExchangeManager:
                     knowledge_type=KnowledgeType.PUBLIC_ENTITIES,
                     privacy_level=PrivacyLevel.PUBLIC,
                     content={
-                        "summary": trace.summary,
+                        "summary": trace.summary,  # type: ignore[union-attr]
                         "entities": [
                             {"name": e.name, "type": e.type, "description": e.description}
-                            for e in (trace.entities or [])
+                            for e in (trace.entities or [])  # type: ignore[union-attr]
                             if e.type.lower() not in ("person", "individual", "member")
                         ],
                     },
@@ -334,7 +333,7 @@ class KnowledgeExchangeManager:
     async def _retrieve_community_description(self) -> list[KnowledgeItem]:
         """Retrieve the community description from the Self node."""
         try:
-            self_node = await self._memory.get_self()
+            self_node = await self._memory.get_self()  # type: ignore[union-attr]
             if self_node is None:
                 return []
             return [KnowledgeItem(
@@ -354,7 +353,7 @@ class KnowledgeExchangeManager:
     ) -> list[KnowledgeItem]:
         """Retrieve community-level aggregated knowledge."""
         try:
-            response = await self._memory.retrieve(
+            response = await self._memory.retrieve(  # type: ignore[union-attr]
                 query_text=query or "community patterns",
                 max_results=max_results,
             )
@@ -398,7 +397,7 @@ class KnowledgeExchangeManager:
     async def _retrieve_schema(self, max_results: int) -> list[KnowledgeItem]:
         """Retrieve schema structures (community-level semantic graph)."""
         try:
-            response = await self._memory.retrieve(
+            response = await self._memory.retrieve(  # type: ignore[union-attr]
                 query_text="schema structure knowledge organization",
                 max_results=max_results,
             )

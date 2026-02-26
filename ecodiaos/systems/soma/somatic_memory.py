@@ -20,7 +20,6 @@ import structlog
 
 from ecodiaos.systems.soma.types import (
     ALL_DIMENSIONS,
-    InteroceptiveDimension,
     InteroceptiveState,
     SomaticMarker,
 )
@@ -132,7 +131,7 @@ def _cosine_similarity(
     if len(a) != len(b):
         return 0.0
 
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = a_norm if a_norm is not None else _vector_norm(a)
     norm_b = _vector_norm(b)
 

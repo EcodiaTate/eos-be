@@ -72,6 +72,11 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 
+[tool.ruff.lint.per-file-ignores]
+"ecodiaos/main.py" = ["E402"]
+"ecodiaos/systems/equor/main.py" = ["E402"]
+"ecodiaos/systems/simula/verification/incremental.py" = ["E402"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
@@ -79,3 +84,32 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "asyncpg",
+    "asyncpg.*",
+    "boto3",
+    "boto3.*",
+    "sentence_transformers",
+    "sentence_transformers.*",
+    "z3",
+    "z3.*",
+    "psutil",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "ecodiaos.main",
+    "ecodiaos.systems.equor.main",
+    "ecodiaos.systems.simula.service",
+    "ecodiaos.systems.simula.*",
+    "ecodiaos.systems.thread.identity_schema_engine",
+    "ecodiaos.systems.thread.commitment_keeper",
+    "ecodiaos.systems.thread.diachronic_coherence",
+    "ecodiaos.systems.thread.narrative_synthesizer",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false

@@ -8,12 +8,20 @@ This is the "what things exist" layer of memory.
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.embedding import EmbeddingClient
-from ecodiaos.clients.neo4j import Neo4jClient
-from ecodiaos.primitives import Entity, EntityType, MentionRelation, SemanticRelation, new_id, utc_now
+from ecodiaos.primitives import (
+    Entity,
+    EntityType,
+    MentionRelation,
+    SemanticRelation,
+    utc_now,
+)
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
 
 logger = structlog.get_logger()
 
@@ -77,7 +85,7 @@ async def find_similar_entity(
     name: str,
     embedding: list[float],
     threshold: float = DEDUP_THRESHOLD,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """
     Find an existing entity that matches by name or embedding similarity.
     Used for deduplication during entity extraction.
@@ -93,7 +101,7 @@ async def find_similar_entity(
         {"name": name},
     )
     if results:
-        return results[0]["e"]
+        return results[0]["e"]  # type: ignore[no-any-return]
 
     # Second: vector similarity match (semantic dedup)
     if embedding:
@@ -109,7 +117,7 @@ async def find_similar_entity(
             {"embedding": embedding, "threshold": threshold},
         )
         if results:
-            return results[0]["e"]
+            return results[0]["e"]  # type: ignore[no-any-return]
 
     return None
 
@@ -201,7 +209,7 @@ async def create_or_strengthen_relation(
     )
 
 
-async def get_entity(neo4j: Neo4jClient, entity_id: str) -> dict | None:
+async def get_entity(neo4j: Neo4jClient, entity_id: str) -> dict[str, Any] | None:
     """Retrieve a single entity by ID."""
     results = await neo4j.execute_read(
         "MATCH (e:Entity {id: $id}) RETURN e",
@@ -215,7 +223,7 @@ async def get_entity_neighbours(
     entity_id: str,
     max_depth: int = 2,
     limit: int = 20,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Get entities connected to a given entity within N hops."""
     return await neo4j.execute_read(
         """

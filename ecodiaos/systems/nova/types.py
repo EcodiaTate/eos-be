@@ -17,9 +17,8 @@ Design notes:
 
 from __future__ import annotations
 
-import enum
-from dataclasses import dataclass, field
 from datetime import datetime
+import enum
 from typing import Any
 
 from pydantic import Field
@@ -173,14 +172,14 @@ class BeliefDelta(EOSBaseModel):
 # ─── Goal Types ───────────────────────────────────────────────────
 
 
-class GoalStatus(str, enum.Enum):
+class GoalStatus(enum.StrEnum):
     ACTIVE = "active"
     SUSPENDED = "suspended"
     ACHIEVED = "achieved"
     ABANDONED = "abandoned"
 
 
-class GoalSource(str, enum.Enum):
+class GoalSource(enum.StrEnum):
     USER_REQUEST = "user_request"
     SELF_GENERATED = "self_generated"
     GOVERNANCE = "governance"
@@ -255,6 +254,8 @@ class Policy(Identified):
     """
 
     name: str
+    type: str = "deliberate"            # "deliberate" | "express" | "observe" | "defer" | "do_nothing" | etc.
+    description: str = ""              # Human-readable description of the policy
     reasoning: str = ""
     steps: list[PolicyStep] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)

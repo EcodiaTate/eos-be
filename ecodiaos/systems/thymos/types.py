@@ -10,8 +10,8 @@ first-class primitive alongside Percept, Belief, and Intent.
 
 from __future__ import annotations
 
-import enum
 from datetime import datetime
+import enum
 from typing import Any
 
 from pydantic import Field
@@ -22,7 +22,7 @@ from ecodiaos.primitives.common import EOSBaseModel, new_id, utc_now
 # ─── Enums ────────────────────────────────────────────────────────
 
 
-class IncidentSeverity(str, enum.Enum):
+class IncidentSeverity(enum.StrEnum):
     """How bad is it?"""
 
     CRITICAL = "critical"  # System down, user impact, drives affected
@@ -32,7 +32,7 @@ class IncidentSeverity(str, enum.Enum):
     INFO = "info"  # Normal variance logged for pattern detection
 
 
-class IncidentClass(str, enum.Enum):
+class IncidentClass(enum.StrEnum):
     """What kind of failure is this?"""
 
     CRASH = "crash"  # Unhandled exception, system death
@@ -56,7 +56,7 @@ class RepairTier(int, enum.Enum):
     ESCALATE = 5  # Human operator intervention required
 
 
-class RepairStatus(str, enum.Enum):
+class RepairStatus(enum.StrEnum):
     """Lifecycle of an incident repair."""
 
     PENDING = "pending"
@@ -71,7 +71,7 @@ class RepairStatus(str, enum.Enum):
     ROLLED_BACK = "rolled_back"
 
 
-class HealingMode(str, enum.Enum):
+class HealingMode(enum.StrEnum):
     """Organism-wide healing state."""
 
     NOMINAL = "nominal"  # Normal operation
@@ -146,7 +146,7 @@ class Incident(EOSBaseModel):
 
     # ── Impact Assessment ──
     affected_systems: list[str] = Field(default_factory=list)
-    blast_radius: float = Field(0.0, ge=0.0, le=1.0)
+    blast_radius: float = Field(default=0.0, ge=0.0, le=1.0)
     user_visible: bool = False
     constitutional_impact: dict[str, float] = Field(
         default_factory=lambda: {

@@ -15,11 +15,13 @@ misrepresenting the organism's actual state (enforcing the Honesty drive).
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.systems.voxis.types import StrategyParams
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+    from ecodiaos.systems.voxis.types import StrategyParams
 
 logger = structlog.get_logger()
 

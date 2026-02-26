@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from typing import Any, Sequence
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 # ---------------------------------------------------------------------------
 # Vector math
@@ -22,7 +24,7 @@ def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity between two vectors. Returns 0.0 on degenerate input."""
     if len(a) != len(b) or len(a) == 0:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))
     if norm_a == 0.0 or norm_b == 0.0:

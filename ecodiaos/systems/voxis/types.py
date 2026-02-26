@@ -8,9 +8,8 @@ These are working types used within the Voxis pipeline; the shared primitives
 
 from __future__ import annotations
 
-import enum
-from collections import deque
 from datetime import datetime
+import enum
 from typing import Any
 
 from pydantic import Field
@@ -23,7 +22,7 @@ from ecodiaos.primitives.expression import PersonalityVector
 # ─── Trigger & Channel Enums ─────────────────────────────────────
 
 
-class ExpressionTrigger(str, enum.Enum):
+class ExpressionTrigger(enum.StrEnum):
     """What caused Voxis to consider expressing."""
 
     # From Nova (deliberate communicative intent)
@@ -43,7 +42,7 @@ class ExpressionTrigger(str, enum.Enum):
     AMBIENT_STATUS = "ambient_status"      # Periodic status update
 
 
-class OutputChannel(str, enum.Enum):
+class OutputChannel(enum.StrEnum):
     """Delivery channel for the expression."""
 
     TEXT_CHAT = "text_chat"            # Direct text in conversation UI

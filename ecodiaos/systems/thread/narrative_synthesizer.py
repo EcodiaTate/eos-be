@@ -218,7 +218,7 @@ class NarrativeSynthesizer:
                 "theme (2-3 words)."
             )
             user_content = (
-                f"Chapter duration: {chapter.started_at.isoformat()} "
+                f"Chapter duration: {(chapter.started_at or utc_now()).isoformat()} "
                 f"to {(chapter.ended_at or utc_now()).isoformat()}\n\n"
                 f"Scenes (in order):\n{scenes_text}\n\n"
                 f"Turning points:\n{tps_text}\n\n"

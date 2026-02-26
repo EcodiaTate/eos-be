@@ -15,7 +15,6 @@ from pathlib import Path
 
 import structlog
 
-from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.simula.types import ConfigSnapshot, FileSnapshot
 
 logger = structlog.get_logger().bind(system="simula.rollback")

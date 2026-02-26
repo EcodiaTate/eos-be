@@ -20,10 +20,8 @@ import ast
 import asyncio
 import json
 import re
-import subprocess
 import tempfile
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -39,6 +37,8 @@ from ecodiaos.systems.simula.verification.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.simula.types import ChangeCategory, EvolutionProposal
     from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
@@ -275,7 +275,7 @@ class FormalSpecGenerator:
         try:
             from ecodiaos.clients.llm import Message
 
-            response = await self._llm.complete(
+            response = await self._llm.complete(  # type: ignore[attr-defined]
                 system="You are a TLA+ specification expert for distributed systems.",
                 messages=[Message(role="user", content=prompt)],
                 max_tokens=4096,
@@ -316,7 +316,7 @@ class FormalSpecGenerator:
         try:
             from ecodiaos.clients.llm import Message
 
-            response = await self._llm.complete(
+            response = await self._llm.complete(  # type: ignore[attr-defined]
                 system="You are an Alloy formal specification expert.",
                 messages=[Message(role="user", content=prompt)],
                 max_tokens=4096,
@@ -353,7 +353,7 @@ class FormalSpecGenerator:
         try:
             from ecodiaos.clients.llm import Message
 
-            response = await self._llm.complete(
+            response = await self._llm.complete(  # type: ignore[attr-defined]
                 system="You are a DSL designer for formal verification.",
                 messages=[Message(role="user", content=prompt)],
                 max_tokens=4096,
@@ -438,7 +438,7 @@ class FormalSpecGenerator:
         try:
             from ecodiaos.clients.llm import Message
 
-            response = await self._llm.complete(
+            response = await self._llm.complete(  # type: ignore[attr-defined]
                 system="You are a Dafny formal verification expert.",
                 messages=[Message(role="user", content=prompt)],
                 max_tokens=2048,
@@ -451,13 +451,9 @@ class FormalSpecGenerator:
             verification_output = ""
             if self._dafny is not None:
                 try:
-                    dafny_result = await self._dafny.verify_dafny_source(spec_source)
-                    verified = dafny_result.status.value == "verified"
-                    verification_output = (
-                        dafny_result.error_summary
-                        if not verified
-                        else "Verified"
-                    )
+                    dafny_verified, dafny_stdout, dafny_stderr, _ = await self._dafny.verify_dafny_source(spec_source)
+                    verified = dafny_verified
+                    verification_output = dafny_stderr if not verified else "Verified"
                 except Exception as exc:
                     verification_output = f"Dafny verification error: {exc}"
 
@@ -499,7 +495,7 @@ class FormalSpecGenerator:
         proposal: EvolutionProposal,
     ) -> TlaPlusModelCheckResult:
         """Generate a TLA+ spec from a proposal's target system."""
-        system_name = proposal.target or "UnknownSystem"
+        system_name = getattr(proposal, "target", None) or "UnknownSystem"
         interactions = [proposal.description]
         if hasattr(proposal, "change_spec") and proposal.change_spec:
             if proposal.change_spec.code_hint:

@@ -16,38 +16,40 @@ where only Level 1 (Advisor) actions are permitted.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
-from ecodiaos.clients.llm import LLMProvider
-from ecodiaos.config import EquorConfig, GovernanceConfig
 from ecodiaos.primitives.common import (
     DriveAlignmentVector,
-    HealthStatus,
     Verdict,
     new_id,
     utc_now,
 )
 from ecodiaos.primitives.constitutional import ConstitutionalCheck
-from ecodiaos.primitives.intent import Intent
-
-from ecodiaos.systems.equor.evaluators import evaluate_all_drives
-from ecodiaos.systems.equor.verdict import compute_verdict
-from ecodiaos.systems.equor.invariants import (
-    check_hardcoded_invariants,
-    check_community_invariant,
-    HARDCODED_INVARIANTS,
-)
-from ecodiaos.systems.equor.autonomy import get_autonomy_level, check_promotion_eligibility, apply_autonomy_change
-from ecodiaos.systems.equor.drift import DriftTracker, respond_to_drift, store_drift_report
 from ecodiaos.systems.equor.amendment import (
-    propose_amendment,
     apply_amendment,
-    validate_amendment_proposal,
+    propose_amendment,
+)
+from ecodiaos.systems.equor.autonomy import (
+    apply_autonomy_change,
+    check_promotion_eligibility,
+    get_autonomy_level,
+)
+from ecodiaos.systems.equor.drift import DriftTracker, respond_to_drift, store_drift_report
+from ecodiaos.systems.equor.evaluators import evaluate_all_drives
+from ecodiaos.systems.equor.invariants import (
+    HARDCODED_INVARIANTS,
+    check_community_invariant,
 )
 from ecodiaos.systems.equor.schema import ensure_equor_schema, seed_hardcoded_invariants
+from ecodiaos.systems.equor.verdict import compute_verdict
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.clients.neo4j import Neo4jClient
+    from ecodiaos.config import EquorConfig, GovernanceConfig
+    from ecodiaos.primitives.intent import Intent
 
 logger = structlog.get_logger()
 
@@ -160,7 +162,7 @@ class EquorService:
 
     # ─── Invariant Management ─────────────────────────────────────
 
-    async def get_invariants(self) -> list[dict]:
+    async def get_invariants(self) -> list[dict[str, Any]]:
         """Get all active invariants (hardcoded + community)."""
         results = await self._neo4j.execute_read(
             """
@@ -217,11 +219,11 @@ class EquorService:
     async def get_autonomy_level(self) -> int:
         return await get_autonomy_level(self._neo4j)
 
-    async def check_promotion(self, target_level: int) -> dict:
+    async def check_promotion(self, target_level: int) -> dict[str, Any]:
         current = await get_autonomy_level(self._neo4j)
         return await check_promotion_eligibility(self._neo4j, current, target_level)
 
-    async def apply_autonomy_change(self, new_level: int, reason: str, actor: str = "governance") -> dict:
+    async def apply_autonomy_change(self, new_level: int, reason: str, actor: str = "governance") -> dict[str, Any]:
         return await apply_autonomy_change(self._neo4j, new_level, reason, actor)
 
     # ─── Amendments ───────────────────────────────────────────────
@@ -232,18 +234,18 @@ class EquorService:
         title: str,
         description: str,
         proposer_id: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         return await propose_amendment(
             self._neo4j, proposed_drives, title, description,
             proposer_id, self._governance,
         )
 
-    async def apply_amendment(self, proposal_id: str, proposed_drives: dict[str, float]) -> dict:
+    async def apply_amendment(self, proposal_id: str, proposed_drives: dict[str, float]) -> dict[str, Any]:
         return await apply_amendment(self._neo4j, proposal_id, proposed_drives)
 
     # ─── Drift ────────────────────────────────────────────────────
 
-    async def get_drift_report(self) -> dict:
+    async def get_drift_report(self) -> dict[str, Any]:
         """Get the current drift report."""
         report = self._drift_tracker.compute_report()
         response = respond_to_drift(report)
@@ -251,7 +253,7 @@ class EquorService:
 
     # ─── Governance Records ───────────────────────────────────────
 
-    async def get_recent_reviews(self, limit: int = 20) -> list[dict]:
+    async def get_recent_reviews(self, limit: int = 20) -> list[dict[str, Any]]:
         """Get recent constitutional reviews from the audit trail."""
         results = await self._neo4j.execute_read(
             """
@@ -268,7 +270,7 @@ class EquorService:
         )
         return [dict(r) for r in results]
 
-    async def get_governance_history(self, limit: int = 50) -> list[dict]:
+    async def get_governance_history(self, limit: int = 50) -> list[dict[str, Any]]:
         """Get all governance events."""
         results = await self._neo4j.execute_read(
             """
@@ -285,7 +287,7 @@ class EquorService:
 
     # ─── Health ───────────────────────────────────────────────────
 
-    async def health(self) -> dict:
+    async def health(self) -> dict[str, Any]:
         """Health check for Equor."""
         return {
             "status": "safe_mode" if self._safe_mode else "healthy",
@@ -323,7 +325,7 @@ class EquorService:
             confidence=0.9,
         )
 
-    async def _get_constitution_dict(self) -> dict:
+    async def _get_constitution_dict(self) -> dict[str, Any]:
         """Fetch the current constitution as a plain dict."""
         results = await self._neo4j.execute_read(
             """

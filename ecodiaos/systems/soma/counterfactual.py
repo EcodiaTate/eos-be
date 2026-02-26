@@ -13,16 +13,12 @@ Only active at REFLECTIVE stage and above.
 
 from __future__ import annotations
 
-import math
-from typing import Any, Optional
-
 import structlog
 
 from ecodiaos.systems.soma.types import (
     ALL_DIMENSIONS,
     CounterfactualTrace,
     InteroceptiveDimension,
-    InteroceptiveState,
 )
 
 logger = structlog.get_logger("ecodiaos.systems.soma.counterfactual")

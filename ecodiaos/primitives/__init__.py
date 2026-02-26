@@ -24,6 +24,9 @@ from ecodiaos.primitives.common import (
 from ecodiaos.primitives.constitutional import ConstitutionalCheck, InvariantResult
 from ecodiaos.primitives.expression import Expression, ExpressionStrategy, PersonalityVector
 from ecodiaos.primitives.federation import (
+    SHARING_PERMISSIONS,
+    TRUST_THRESHOLDS,
+    VIOLATION_MULTIPLIER,
     AssistanceRequest,
     AssistanceResponse,
     FederationInteraction,
@@ -37,11 +40,8 @@ from ecodiaos.primitives.federation import (
     KnowledgeResponse,
     KnowledgeType,
     PrivacyLevel,
-    SHARING_PERMISSIONS,
-    TRUST_THRESHOLDS,
     TrustLevel,
     TrustPolicy,
-    VIOLATION_MULTIPLIER,
     ViolationType,
 )
 from ecodiaos.primitives.governance import AmendmentProposal, GovernanceRecord

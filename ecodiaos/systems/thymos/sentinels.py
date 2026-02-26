@@ -19,7 +19,6 @@ import hashlib
 import math
 import traceback
 from collections import deque
-from datetime import timedelta
 from typing import Any
 
 import structlog
@@ -559,11 +558,7 @@ class DriftSentinel:
         z = baseline.z_score(value)
 
         is_drift = False
-        if config.direction == "above" and z > config.sigma_threshold:
-            is_drift = True
-        elif config.direction == "below" and z < -config.sigma_threshold:
-            is_drift = True
-        elif config.direction is None and abs(z) > config.sigma_threshold:
+        if config.direction == "above" and z > config.sigma_threshold or config.direction == "below" and z < -config.sigma_threshold or config.direction is None and abs(z) > config.sigma_threshold:
             is_drift = True
 
         if not is_drift:

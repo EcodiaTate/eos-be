@@ -21,7 +21,6 @@ from ecodiaos.systems.synapse.types import (
     DegradationStrategy,
     SynapseEvent,
     SynapseEventType,
-    SystemStatus,
 )
 
 if TYPE_CHECKING:

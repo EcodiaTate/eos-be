@@ -142,7 +142,7 @@ class TaskPlanner:
 
         for file_path in files:
             full_path = self._root / file_path
-            if not full_path.exists() or not full_path.suffix == ".py":
+            if not full_path.exists() or full_path.suffix != ".py":
                 continue
 
             try:

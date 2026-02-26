@@ -9,16 +9,13 @@ salience hint.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 import structlog
 
-from ecodiaos.primitives.common import new_id, utc_now
+from ecodiaos.primitives.common import Modality, SourceDescriptor, SystemID, new_id, utc_now
 from ecodiaos.primitives.percept import (
     Content,
     Percept,
     Provenance,
-    SourceDescriptor,
     TransformRecord,
 )
 
@@ -180,17 +177,29 @@ async def normalise(
         ),
     )
 
+    # Map channel to a SystemID; fall back to ATUNE for unknown channels
+    try:
+        source_system = SystemID(channel.value)
+    except ValueError:
+        source_system = SystemID.ATUNE
+
+    # Map modality string to Modality enum
+    try:
+        source_modality = Modality(normaliser.modality)
+    except ValueError:
+        source_modality = Modality.TEXT
+
     percept = Percept(
         id=new_id(),
         timestamp=now,
         source=SourceDescriptor(
-            system=channel.value,
+            system=source_system,
             channel=raw_input.channel_id or channel.value,
-            modality=normaliser.modality,
+            modality=source_modality,
         ),
         content=Content(
             raw=raw_input.data if isinstance(raw_input.data, str) else raw_input.data.decode("utf-8", errors="replace"),
-            parsed=text,
+            parsed={"text": text},
             embedding=embedding,
         ),
         provenance=provenance,

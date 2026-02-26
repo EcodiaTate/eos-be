@@ -12,7 +12,6 @@ Designed to maintain coherent behavior without LLM calls.
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import structlog
@@ -68,9 +67,7 @@ class EFEHeuristics:
                 ("clarify", "obfuscate"),
             ]
             for pos, neg in opposing_pairs:
-                if pos in goal_lower and neg in policy_lower:
-                    base_score *= 0.3
-                elif neg in goal_lower and pos in policy_lower:
+                if pos in goal_lower and neg in policy_lower or neg in goal_lower and pos in policy_lower:
                     base_score *= 0.3
 
         return min(1.0, max(0.0, base_score))

@@ -59,9 +59,7 @@ from ecodiaos.systems.soma.types import (
     DevelopmentalStage,
     InteroceptiveDimension,
     InteroceptiveState,
-    SomaHealthSnapshot,
     SomaticMarker,
-    _clamp_dimension,
 )
 
 if TYPE_CHECKING:

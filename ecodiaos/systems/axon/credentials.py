@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
-def _extract_required_services(intent: "Intent") -> set[str]:
+def _extract_required_services(intent: Intent) -> set[str]:
     """
     Determine which external services an intent requires credentials for.
 
@@ -55,7 +55,7 @@ def _extract_required_services(intent: "Intent") -> set[str]:
             services.add("federation")
         if "iot" in executor_name:
             services.add("iot")
-        if "call_api" in executor_name or "api" == executor_name:
+        if "call_api" in executor_name or executor_name == "api":
             # Extract service from parameters if available
             services.add("external_api")
     return services
@@ -89,7 +89,7 @@ class CredentialStore:
         """Add or update credentials in the vault (called at startup)."""
         self._vault.update(credentials)
 
-    async def get_for_intent(self, intent: "Intent") -> ScopedCredentials:
+    async def get_for_intent(self, intent: Intent) -> ScopedCredentials:
         """
         Issue scoped tokens for all services required by this intent.
 

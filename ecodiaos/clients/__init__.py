@@ -5,13 +5,13 @@ Connection management for Neo4j, TimescaleDB, Redis, LLM, Embedding,
 and context compression (Stage 1C).
 """
 
-from ecodiaos.clients.context_compression import ContextCompressor, CompressionMetrics
+from ecodiaos.clients.context_compression import CompressionMetrics, ContextCompressor
 from ecodiaos.clients.embedding import (
     EmbeddingClient,
     VoyageEmbeddingClient,
+    cosine_similarity,
     create_embedding_client,
     create_voyage_client,
-    cosine_similarity,
 )
 from ecodiaos.clients.llm import (
     ExtendedThinkingProvider,

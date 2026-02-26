@@ -27,8 +27,7 @@ import hashlib
 import re
 import time
 from collections import Counter
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -41,6 +40,8 @@ from ecodiaos.systems.simula.verification.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.clients.neo4j import Neo4jClient
 
@@ -147,7 +148,7 @@ class LiloLibraryEngine:
 
         # Step 3: Name and describe qualifying patterns via LLM
         new_abstractions: list[LibraryAbstraction] = []
-        for pattern_hash, functions in patterns.items():
+        for _pattern_hash, functions in patterns.items():
             # Use the first function as representative
             rep = functions[0]
 
@@ -389,7 +390,7 @@ class LiloLibraryEngine:
             return []
 
         full_path = self._root / rel_path
-        if not full_path.is_file() or not full_path.suffix == ".py":
+        if not full_path.is_file() or full_path.suffix != ".py":
             return []
 
         try:

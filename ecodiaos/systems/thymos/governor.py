@@ -13,8 +13,6 @@ is more damaging than the infection itself. In software: spending
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
-from typing import Any
 
 import structlog
 

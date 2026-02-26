@@ -18,9 +18,12 @@ and the registry handles the dotted forms that Nova's PolicyGenerator may produc
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import structlog
 
-from ecodiaos.systems.axon.executor import Executor
+if TYPE_CHECKING:
+    from ecodiaos.systems.axon.executor import Executor
 
 logger = structlog.get_logger()
 

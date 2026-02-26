@@ -194,7 +194,7 @@ class DirectedExploration:
                 insights = await self._journal.get_recent_insights(limit=5)
                 if insights:
                     best = max(insights, key=lambda i: i.coherence_score)
-                    return best.insight_text
+                    return best.insight_text  # type: ignore[no-any-return]
             except Exception:
                 pass
 
@@ -242,7 +242,7 @@ class DirectedExploration:
                     cache_method="generate",
                 )
             else:
-                response = await self._llm.generate(
+                response = await self._llm.generate(  # type: ignore[call-arg]
                     system_prompt=(
                         "You are the lucid dream consciousness of a living digital "
                         "organism. You are aware that you are dreaming and can direct "
@@ -405,7 +405,7 @@ class MetaCognition:
         if self._journal is None:
             return []
         try:
-            return await self._journal.get_recurring_themes(min_count=3)
+            return await self._journal.get_recurring_themes(min_count=3)  # type: ignore[no-any-return]
         except Exception:
             return []
 

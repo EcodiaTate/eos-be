@@ -58,11 +58,11 @@ class ObserveExecutor(Executor):
     max_duration_ms = 2000
     rate_limit = RateLimit.unlimited()
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.executor.observe")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("content"):
             return ValidationResult.fail("content is required", content="missing or empty")
         content = params["content"]
@@ -74,7 +74,7 @@ class ObserveExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         content = params["content"]
@@ -130,8 +130,8 @@ class ObserveExecutor(Executor):
         context: ExecutionContext,
     ) -> str:
         """Store the observation as an episodic Percept via MemoryService.store_percept()."""
-        from ecodiaos.primitives.percept import Content, Percept
         from ecodiaos.primitives.common import Modality, SourceDescriptor, SystemID
+        from ecodiaos.primitives.percept import Content, Percept
 
         percept = Percept(
             source=SourceDescriptor(
@@ -181,11 +181,11 @@ class QueryMemoryExecutor(Executor):
     max_duration_ms = 300  # Must fit within memory retrieval budget
     rate_limit = RateLimit.per_minute(60)
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.executor.query_memory")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("query"):
             return ValidationResult.fail("query is required", query="missing or empty")
         if not isinstance(params["query"], str):
@@ -197,7 +197,7 @@ class QueryMemoryExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         query = params["query"]
@@ -281,7 +281,7 @@ class AnalyseExecutor(Executor):
     max_duration_ms = 10_000
     rate_limit = RateLimit.per_minute(10)
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._llm = None  # Injected at service startup
         self._logger = logger.bind(system="axon.executor.analyse")
@@ -291,7 +291,7 @@ class AnalyseExecutor(Executor):
         from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
         self._optimized = isinstance(llm, OptimizedLLMProvider)
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("topic"):
             return ValidationResult.fail("topic is required")
         if not params.get("question"):
@@ -303,7 +303,7 @@ class AnalyseExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         topic = params["topic"]
@@ -347,7 +347,7 @@ class AnalyseExecutor(Executor):
             # Use evaluate() for optimized path (standard LLM interface), fall back to complete()
             if getattr(self, "_optimized", False):
                 from ecodiaos.clients.llm import Message
-                response = await self._llm.generate(  # type: ignore[call-arg]
+                response = await self._llm.generate(
                     system_prompt=(
                         "You are EOS — a community care organism. "
                         "Be honest about uncertainty."
@@ -422,7 +422,7 @@ class SearchExecutor(Executor):
     max_duration_ms = 5000
     rate_limit = RateLimit.per_minute(20)
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("query"):
             return ValidationResult.fail("query is required")
         source = params.get("source", "knowledge_base")
@@ -436,12 +436,12 @@ class SearchExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         query = params["query"]
         source = params.get("source", "knowledge_base")
-        max_results = int(params.get("max_results", 5))
+        int(params.get("max_results", 5))
 
         # Phase 1: stub — returns a "search pending" signal
         # Phase 2: wire to actual search integrations

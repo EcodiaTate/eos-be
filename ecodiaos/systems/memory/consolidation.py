@@ -13,22 +13,25 @@ Target: ≤60 seconds, non-blocking.
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
 from ecodiaos.systems.memory.salience import decay_all_salience
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
 
 logger = structlog.get_logger()
 
 
-async def run_consolidation(neo4j: Neo4jClient) -> dict:
+async def run_consolidation(neo4j: Neo4jClient) -> dict[str, Any]:
     """
     Run the full consolidation pipeline.
     Called on a timer by Evo (every consolidation_interval_hours).
     """
     start = time.monotonic()
-    report: dict = {"steps": {}}
+    report: dict[str, Any] = {"steps": {}}
 
     # Step 1: Salience decay
     try:
@@ -61,7 +64,7 @@ async def run_consolidation(neo4j: Neo4jClient) -> dict:
     return report
 
 
-async def _run_community_detection(neo4j: Neo4jClient) -> dict:
+async def _run_community_detection(neo4j: Neo4jClient) -> dict[str, Any]:
     """
     Run hierarchical Leiden community detection on the entity graph.
     Requires Neo4j Graph Data Science plugin.
@@ -203,7 +206,7 @@ async def _materialize_community_nodes(neo4j: Neo4jClient) -> int:
         return 0
 
 
-async def _scan_near_duplicate_entities(neo4j: Neo4jClient) -> dict:
+async def _scan_near_duplicate_entities(neo4j: Neo4jClient) -> dict[str, Any]:
     """
     Find and flag near-duplicate entities for potential merging.
     Full merge requires LLM confirmation (done by Evo), so we just flag here.

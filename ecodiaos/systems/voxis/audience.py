@@ -39,6 +39,7 @@ import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Any
 
 import structlog
 
@@ -230,7 +231,7 @@ class AudienceProfiler:
         addressee_id: str | None,
         addressee_name: str | None,
         interaction_count: int,
-        memory_facts: list[dict],
+        memory_facts: list[dict[str, Any]],
         audience_type: str = "individual",
         group_size: int | None = None,
         group_context: str | None = None,
@@ -243,7 +244,7 @@ class AudienceProfiler:
         """
         tech_level = 0.5
         preferred_register = "neutral"
-        comm_prefs: dict = {}
+        comm_prefs: dict[str, Any] = {}
         affect_est = AffectEstimate()
         relationship_strength = self._estimate_relationship_strength(interaction_count)
         language = "en"

@@ -39,10 +39,12 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.systems.voxis.types import StrategyParams
+if TYPE_CHECKING:
+    from ecodiaos.systems.voxis.types import StrategyParams
 
 logger = structlog.get_logger()
 
@@ -275,7 +277,7 @@ class ConversationDynamicsEngine:
             return ConversationDynamics()
 
         user_turns = [t for t in turns if t.role == "user"]
-        assistant_turns = [t for t in turns if t.role == "assistant"]
+        [t for t in turns if t.role == "assistant"]
 
         # ── Emotional trajectory ─────────────────────────────────
         valences = [t.affect_valence for t in turns]

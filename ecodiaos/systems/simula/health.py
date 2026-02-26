@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import importlib.util
 import time
 from pathlib import Path
@@ -46,6 +47,7 @@ from ecodiaos.systems.simula.types import HealthCheckResult
 from ecodiaos.systems.simula.verification.types import (
     LEAN_PROOF_CATEGORIES,
     DafnyVerificationResult,
+    FormalGuaranteesResult,
     FormalVerificationResult,
     InvariantVerificationResult,
     LeanVerificationResult,
@@ -319,7 +321,7 @@ class HealthChecker:
             )
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 await proc.communicate()
                 return False, "Test run timed out after 30s"
@@ -426,7 +428,7 @@ class HealthChecker:
         results = await asyncio.gather(
             *tasks.values(), return_exceptions=True,
         )
-        task_results = dict(zip(tasks.keys(), results))
+        task_results = dict(zip(tasks.keys(), results, strict=False))
 
         # Process Dafny result
         if "dafny" in task_results:
@@ -480,7 +482,6 @@ class HealthChecker:
         if "static" in task_results:
             from ecodiaos.systems.simula.verification.types import (
                 StaticAnalysisResult,
-                StaticAnalysisSeverity,
             )
             raw = task_results["static"]
             if isinstance(raw, StaticAnalysisResult):
@@ -513,7 +514,6 @@ class HealthChecker:
         self, proposal: EvolutionProposal,
     ) -> DafnyVerificationResult:
         """Run Dafny Clover loop for the proposal."""
-        from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
         from ecodiaos.systems.simula.verification.templates import get_template
         from ecodiaos.systems.simula.verification.types import (
             DafnyVerificationResult,
@@ -539,8 +539,8 @@ class HealthChecker:
         function_name = ""
         context = proposal.description
         if proposal.change_spec:
-            context = proposal.change_spec.description
-            function_name = proposal.change_spec.target_system
+            context = getattr(proposal.change_spec, "description", None) or proposal.description
+            function_name = getattr(proposal.change_spec, "target_system", None) or ""
 
         return await self._dafny.run_clover_loop(
             llm=self._llm,
@@ -598,7 +598,7 @@ class HealthChecker:
         python_source = "\n\n".join(python_source_parts)
         domain_context = proposal.description
         if proposal.change_spec:
-            domain_context = proposal.change_spec.description
+            domain_context = getattr(proposal.change_spec, "description", None) or proposal.description
 
         return await self._z3.run_discovery_loop(
             llm=self._llm,
@@ -664,11 +664,11 @@ class HealthChecker:
                 llm=self._llm,
                 python_source=python_source,
                 function_name=function_name,
-                context=domain_context,
+                property_description=domain_context,
                 proposal_id=proposal.id,
             )
             return result
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._log.warning("lean_verification_timeout", proposal_id=proposal.id)
             from ecodiaos.systems.simula.verification.types import LeanProofStatus
             return LeanVerificationResult(
@@ -684,7 +684,7 @@ class HealthChecker:
         self,
         files_written: list[str],
         proposal: EvolutionProposal | None,
-    ) -> object | None:
+    ) -> FormalGuaranteesResult | None:
         """
         Run Stage 6D (e-graph equivalence) and 6E (symbolic execution) checks.
 
@@ -724,7 +724,7 @@ class HealthChecker:
         results = await asyncio.gather(
             *tasks.values(), return_exceptions=True,
         )
-        task_results = dict(zip(tasks.keys(), results))
+        task_results = dict(zip(tasks.keys(), results, strict=False))
 
         # Process e-graph result
         if "egraph" in task_results:
@@ -737,7 +737,7 @@ class HealthChecker:
             if isinstance(raw, EGraphEquivalenceResult):
                 egraph_result = raw
                 if raw.status == EGraphStatus.FAILED:
-                    msg = f"E-graph equivalence check failed: code is not semantically equivalent"
+                    msg = "E-graph equivalence check failed: code is not semantically equivalent"
                     if self._egraph_blocking:
                         blocking_issues.append(msg)
                     else:
@@ -756,7 +756,6 @@ class HealthChecker:
         if "symbolic" in task_results:
             from ecodiaos.systems.simula.verification.types import (
                 SymbolicExecutionResult,
-                SymbolicExecutionStatus,
             )
 
             raw = task_results["symbolic"]
@@ -848,10 +847,8 @@ class HealthChecker:
         # Convert domain strings to enum values
         domains: list[SymbolicDomain] = []
         for d in self._symbolic_execution_domains:
-            try:
+            with contextlib.suppress(ValueError):
                 domains.append(SymbolicDomain(d))
-            except ValueError:
-                pass
 
         if not domains:
             return SymbolicExecutionResult(
@@ -864,7 +861,7 @@ class HealthChecker:
                 codebase_root=self._root,
                 domains=domains,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._log.warning("symbolic_execution_timeout")
             return SymbolicExecutionResult(
                 status=SymbolicExecutionStatus.TIMEOUT,

@@ -24,16 +24,14 @@ All types use EOSBaseModel for consistency with the rest of Simula.
 
 from __future__ import annotations
 
+from datetime import datetime
 import enum
-from typing import TYPE_CHECKING
 
 from pydantic import Field
 
 from ecodiaos.primitives.common import EOSBaseModel, utc_now
 from ecodiaos.systems.simula.types import ChangeCategory
 
-if TYPE_CHECKING:
-    from datetime import datetime
 
 # ── Stage 2A: Dafny Proof-Carrying Code ──────────────────────────────────────
 
@@ -782,7 +780,7 @@ LEAN_PROOF_DOMAINS: list[str] = [
 # ── Stage 5B: Neural Program Repair (SRepair pattern) ──────────────────────
 
 
-class RepairPhase(str, enum.Enum):
+class RepairPhase(enum.StrEnum):
     """FSM states for the SRepair-style repair agent."""
 
     DIAGNOSE = "diagnose"
@@ -793,7 +791,7 @@ class RepairPhase(str, enum.Enum):
     REJECT = "reject"
 
 
-class RepairStatus(str, enum.Enum):
+class RepairStatus(enum.StrEnum):
     """Terminal outcome of a repair attempt."""
 
     REPAIRED = "repaired"
@@ -846,6 +844,7 @@ class FixGenerationResult(EOSBaseModel):
     diff_summary: str = ""
     code_tokens: int = 0
     alternative_fixes_considered: int = 0
+    error: str = ""
 
 
 class RepairAttempt(EOSBaseModel):

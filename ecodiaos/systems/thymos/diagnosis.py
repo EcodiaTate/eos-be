@@ -430,7 +430,7 @@ Respond in JSON array format:
         from ecodiaos.clients.llm import Message
 
         if self._optimized:
-            response = await self._llm.generate(  # type: ignore[call-arg]
+            response = await self._llm.generate(
                 system_prompt="You are a fault diagnosis engine. Respond only in valid JSON.",
                 messages=[Message("user", prompt)],
                 max_tokens=1000,
@@ -589,12 +589,11 @@ Respond in JSON array format:
             confidence = min(1.0, confidence + 0.1)
 
         # If recurrence is high, structural hypotheses are more likely
-        if incident.occurrence_count > 10:
-            if hypothesis.suggested_repair_tier in (
-                RepairTier.NOVEL_FIX,
-                RepairTier.RESTART,
-            ):
-                confidence = min(1.0, confidence + 0.15)
+        if incident.occurrence_count > 10 and hypothesis.suggested_repair_tier in (
+            RepairTier.NOVEL_FIX,
+            RepairTier.RESTART,
+        ):
+            confidence = min(1.0, confidence + 0.15)
 
         # If causal chain is long, upstream hypotheses are more likely
         if "upstream" in hypothesis.statement.lower():

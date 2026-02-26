@@ -17,25 +17,27 @@ Design notes:
 
 from __future__ import annotations
 
+from datetime import datetime
+from typing import TYPE_CHECKING
 import enum
 import hashlib
 import json
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import Field
 
 from ecodiaos.primitives.affect import AffectState
 from ecodiaos.primitives.common import EOSBaseModel, Identified, Timestamped, new_id, utc_now
+
+
 from ecodiaos.primitives.constitutional import ConstitutionalCheck
 from ecodiaos.primitives.intent import Intent
-
 
 # ─── Enums ────────────────────────────────────────────────────────
 
 
-class ExecutionStatus(str, enum.Enum):
+class ExecutionStatus(enum.StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
@@ -47,7 +49,7 @@ class ExecutionStatus(str, enum.Enum):
     CIRCUIT_OPEN = "circuit_open"
 
 
-class FailureReason(str, enum.Enum):
+class FailureReason(enum.StrEnum):
     UNKNOWN_ACTION_TYPE = "unknown_action_type"
     VALIDATION_ERROR = "validation_error"
     RATE_LIMITED = "rate_limited"
@@ -60,7 +62,7 @@ class FailureReason(str, enum.Enum):
     EXECUTION_EXCEPTION = "execution_exception"
 
 
-class CircuitStatus(str, enum.Enum):
+class CircuitStatus(enum.StrEnum):
     CLOSED = "closed"      # Normal — executions allowed
     OPEN = "open"          # Tripped — executions blocked
     HALF_OPEN = "half_open"  # Recovering — limited executions allowed

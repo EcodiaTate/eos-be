@@ -12,11 +12,14 @@ they will also incorporate LLM-based contextual reasoning.
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import structlog
 
 from ecodiaos.primitives.common import DriveAlignmentVector
-from ecodiaos.primitives.intent import Intent
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.intent import Intent
 
 logger = structlog.get_logger()
 

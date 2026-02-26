@@ -330,7 +330,7 @@ class AntibodyLibrary:
         except ValueError:
             repair_tier = RepairTier.NOOP
 
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         def _parse_dt(val: Any) -> Any:
             if val is None:

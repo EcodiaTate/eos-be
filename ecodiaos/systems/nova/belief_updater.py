@@ -20,11 +20,11 @@ toward 1.0, weighted by that evidence's precision.
 
 from __future__ import annotations
 
-import math
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.systems.atune.types import WorkspaceBroadcast
+from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.nova.types import (
     BeliefDelta,
     BeliefState,
@@ -32,7 +32,9 @@ from ecodiaos.systems.nova.types import (
     EntityBelief,
     IndividualBelief,
 )
-from ecodiaos.primitives.common import utc_now
+
+if TYPE_CHECKING:
+    from ecodiaos.systems.atune.types import WorkspaceBroadcast
 
 logger = structlog.get_logger()
 
@@ -210,8 +212,8 @@ class BeliefUpdater:
 
     def _apply_delta(self, delta: BeliefDelta) -> None:
         """Apply a BeliefDelta to the belief state (immutable model_copy pattern)."""
-        updated_entities = dict(self._beliefs.entities)
-        updated_individuals = dict(self._beliefs.individual_beliefs)
+        updated_entities: dict[str, EntityBelief] = dict(self._beliefs.entities)
+        updated_individuals: dict[str, IndividualBelief] = dict(self._beliefs.individual_beliefs)
 
         # Apply entity updates
         for eid, belief in delta.entity_updates.items():
@@ -227,8 +229,8 @@ class BeliefUpdater:
             updated_entities.pop(eid, None)
 
         # Apply individual updates
-        for iid, belief in delta.individual_updates.items():
-            updated_individuals[iid] = belief
+        for iid, ind_belief in delta.individual_updates.items():
+            updated_individuals[iid] = ind_belief
 
         # Recompute overall confidence (mean of entity confidences)
         if updated_entities:

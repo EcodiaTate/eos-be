@@ -32,24 +32,24 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.config import SimulaConfig
 from ecodiaos.systems.simula.types import (
+    GOVERNANCE_REQUIRED,
+    SELF_APPLICABLE,
     CautionAdjustment,
     ChangeCategory,
     CounterfactualResult,
     DependencyImpact,
     EnrichedSimulationResult,
     EvolutionProposal,
-    GOVERNANCE_REQUIRED,
     ImpactType,
     ResourceCostEstimate,
     RiskLevel,
-    SELF_APPLICABLE,
     SimulationResult,
 )
 
 if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.config import SimulaConfig
     from ecodiaos.systems.memory.service import MemoryService
     from ecodiaos.systems.simula.analytics import EvolutionAnalyticsEngine
 
@@ -239,7 +239,6 @@ class ChangeSimulator:
 
         # Determine the relevant name and validate by category
         name: str | None = None
-        class_name: str | None = None
 
         if proposal.category == ChangeCategory.ADD_EXECUTOR:
             name = spec.executor_name
@@ -357,7 +356,7 @@ class ChangeSimulator:
         if self._memory is not None:
             try:
                 episodes = await asyncio.wait_for(
-                    self._memory.retrieve_recent_episodes(limit=30),
+                    self._memory.retrieve_recent_episodes(limit=30),  # type: ignore[attr-defined]
                     timeout=5.0,
                 )
                 episodes_count = len(episodes)
@@ -417,7 +416,7 @@ class ChangeSimulator:
                     timeout=10.0,
                 )
             risk_level, risk_summary, benefit_summary = self._parse_llm_risk(response.text)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._log.warning("simulation_llm_timeout", proposal_id=proposal.id)
             risk_level = RiskLevel.HIGH
             risk_summary = "LLM assessment timed out; defaulting to HIGH risk."
@@ -463,7 +462,7 @@ class ChangeSimulator:
         # Retrieve recent episodes
         try:
             episodes = await asyncio.wait_for(
-                self._memory.retrieve_recent_episodes(limit=30),
+                self._memory.retrieve_recent_episodes(limit=30),  # type: ignore[attr-defined]
                 timeout=5.0,
             )
         except Exception as exc:
@@ -480,7 +479,6 @@ class ChangeSimulator:
             source = getattr(ep, "source", "unknown")
             episode_summaries.append(f"{i}. [{source}] {summary[:150]}")
 
-        spec = proposal.change_spec
         change_desc = self._describe_additive_change(proposal)
 
         # KVzip: compress episode summaries when batch is large to reduce tokens.
@@ -495,9 +493,9 @@ class ChangeSimulator:
             f"- Would this new capability have been triggered/relevant? (yes/no)\n"
             f"- If yes, what would have been different? (improvement/regression/neutral)\n\n"
             f"EPISODES:\n" + "\n".join(episode_summaries) + "\n\n"
-            f"Reply as a numbered list matching the episode numbers:\n"
-            f"<number>. <yes|no> | <improvement|regression|neutral> | <1 sentence reason>\n"
-            f"Only include episodes where the answer is 'yes'."
+            "Reply as a numbered list matching the episode numbers:\n"
+            "<number>. <yes|no> | <improvement|regression|neutral> | <1 sentence reason>\n"
+            "Only include episodes where the answer is 'yes'."
         )
 
         # Budget gate: skip counterfactual replay in RED tier
@@ -550,7 +548,7 @@ class ChangeSimulator:
         return proposal.description
 
     def _parse_counterfactual_response(
-        self, text: str, episodes: list,
+        self, text: str, episodes: list[Any],
     ) -> list[CounterfactualResult]:
         """Parse the LLM's batch counterfactual response into structured results."""
         results: list[CounterfactualResult] = []
@@ -672,7 +670,7 @@ class ChangeSimulator:
 
         # Extract the short module name for import matching
         parts = module_name.split(".")
-        short_name = parts[-1] if parts else module_name
+        parts[-1] if parts else module_name
 
         for py_file in src_dir.rglob("*.py"):
             try:
@@ -975,11 +973,9 @@ class ChangeSimulator:
 
     async def _check_name_conflict(self, name: str, category: ChangeCategory) -> bool:
         """Returns True if the name would cause a conflict."""
-        if not _VALID_NAME.match(name):
-            return True
-        return False
+        return bool(not _VALID_NAME.match(name))
 
-    def _build_episode_context(self, episodes: list) -> str:
+    def _build_episode_context(self, episodes: list[Any]) -> str:
         """Build concise context string from episode objects."""
         lines: list[str] = []
         for i, ep in enumerate(episodes[:30], start=1):

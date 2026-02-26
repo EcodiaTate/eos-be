@@ -8,17 +8,19 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.config import LoggingConfig
+if TYPE_CHECKING:
+    from ecodiaos.config import LoggingConfig
 
 
 def setup_logging(config: LoggingConfig, instance_id: str = "") -> None:
     """
     Configure structured logging for the entire application.
     """
-    shared_processors: list = [
+    shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
@@ -35,6 +37,7 @@ def setup_logging(config: LoggingConfig, instance_id: str = "") -> None:
             ),
         )
 
+    renderer: Any
     if config.format == "json":
         renderer = structlog.processors.JSONRenderer()
     else:

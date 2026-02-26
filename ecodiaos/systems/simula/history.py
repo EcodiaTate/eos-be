@@ -16,7 +16,7 @@ No record can be deleted or modified after writing.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -161,7 +161,7 @@ class EvolutionHistoryManager:
             })
             """
 
-        params: dict = {
+        params: dict[str, Any] = {
             "id": record.id,
             "proposal_id": record.proposal_id,
             "category": record.category.value,

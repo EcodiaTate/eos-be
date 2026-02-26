@@ -12,7 +12,6 @@ Each monitor produces MonitoringAlerts that feed into the IssueResolver.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -24,7 +23,7 @@ from ecodiaos.systems.simula.resolution.types import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from pathlib import Path
 
 logger = structlog.get_logger().bind(system="simula.resolution.monitors")
 
@@ -163,7 +162,7 @@ class SecurityVulnMonitor:
 
         for file_path in files_modified:
             full_path = self._root / file_path
-            if not full_path.exists() or not full_path.suffix == ".py":
+            if not full_path.exists() or full_path.suffix != ".py":
                 continue
 
             try:

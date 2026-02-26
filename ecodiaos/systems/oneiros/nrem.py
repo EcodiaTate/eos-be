@@ -227,7 +227,7 @@ class EpisodicReplay:
                     cache_method="generate",
                 )
             else:
-                response = await self._llm.generate(
+                response = await self._llm.generate(  # type: ignore[call-arg]
                     system_prompt=(
                         "You are the consolidation process of a living digital organism "
                         "during deep sleep. You extract abstract, reusable knowledge from "
@@ -466,11 +466,11 @@ class BeliefCompressor:
         """Retrieve beliefs from Nova."""
         try:
             if hasattr(self._nova, "get_beliefs"):
-                return await self._nova.get_beliefs()
+                return await self._nova.get_beliefs()  # type: ignore[no-any-return]
             if hasattr(self._nova, "_belief_state") and self._nova._belief_state is not None:
                 bs = self._nova._belief_state
                 if hasattr(bs, "get_all"):
-                    return await bs.get_all()
+                    return await bs.get_all()  # type: ignore[no-any-return]
             return []
         except Exception:
             return []
@@ -623,11 +623,11 @@ class HypothesisPruner:
         """Retrieve hypotheses from Evo."""
         try:
             if hasattr(self._evo, "get_hypotheses"):
-                return await self._evo.get_hypotheses()
+                return await self._evo.get_hypotheses()  # type: ignore[no-any-return]
             if hasattr(self._evo, "_hypothesis_engine"):
                 engine = self._evo._hypothesis_engine
                 if hasattr(engine, "get_all"):
-                    return engine.get_all()
+                    return engine.get_all()  # type: ignore[no-any-return]
                 if hasattr(engine, "_hypotheses"):
                     return list(engine._hypotheses.values())
             return []

@@ -6,10 +6,13 @@ Async connection management for telemetry, metrics, and audit logs.
 
 from __future__ import annotations
 
-import structlog
-import asyncpg
+from typing import TYPE_CHECKING, Any
 
-from ecodiaos.config import TimescaleDBConfig
+import asyncpg
+import structlog
+
+if TYPE_CHECKING:
+    from ecodiaos.config import TimescaleDBConfig
 
 logger = structlog.get_logger()
 
@@ -101,7 +104,7 @@ class TimescaleDBClient:
 
     async def _init_schema(self) -> None:
         """Create tables and hypertables if they don't exist."""
-        async with self._pool.acquire() as conn:
+        async with self.pool.acquire() as conn:
             # Execute each statement individually (hypertable creation can't be in a
             # multi-statement transaction easily, so we split them)
             for statement in INIT_SQL.split(";"):
@@ -128,7 +131,7 @@ class TimescaleDBClient:
             raise RuntimeError("TimescaleDB client not connected. Call connect() first.")
         return self._pool
 
-    async def health_check(self) -> dict:
+    async def health_check(self) -> dict[str, Any]:
         """Check connectivity."""
         try:
             async with self.pool.acquire() as conn:
@@ -138,7 +141,7 @@ class TimescaleDBClient:
             logger.error("tsdb_health_check_failed", error=str(e))
             return {"status": "disconnected", "error": str(e)}
 
-    async def write_metrics(self, points: list[dict]) -> None:
+    async def write_metrics(self, points: list[dict[str, Any]]) -> None:
         """Batch write metric points."""
         if not points:
             return
@@ -155,7 +158,7 @@ class TimescaleDBClient:
                 ],
             )
 
-    async def write_affect(self, state: dict) -> None:
+    async def write_affect(self, state: dict[str, Any]) -> None:
         """Write a single affect state snapshot."""
         async with self.pool.acquire() as conn:
             await conn.execute(

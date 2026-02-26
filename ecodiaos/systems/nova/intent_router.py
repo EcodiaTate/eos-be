@@ -22,15 +22,14 @@ but the routing classification is synchronous and fast.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.constitutional import ConstitutionalCheck
-from ecodiaos.primitives.intent import Intent
-
 if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+    from ecodiaos.primitives.constitutional import ConstitutionalCheck
+    from ecodiaos.primitives.intent import Intent
     from ecodiaos.systems.axon.service import AxonService
     from ecodiaos.systems.voxis.service import VoxisService
     from ecodiaos.systems.voxis.types import ExpressionTrigger
@@ -54,8 +53,8 @@ class IntentRouter:
 
     def __init__(
         self,
-        voxis: "VoxisService",
-        axon: "AxonService | None" = None,
+        voxis: VoxisService,
+        axon: AxonService | None = None,
     ) -> None:
         self._voxis = voxis
         self._axon = axon
@@ -64,7 +63,7 @@ class IntentRouter:
         self._routed_to_axon: int = 0
         self._routed_internal: int = 0
 
-    def set_axon(self, axon: "AxonService") -> None:
+    def set_axon(self, axon: AxonService) -> None:
         """Wire Axon after both services are initialised."""
         self._axon = axon
         self._logger.info("axon_wired", system="nova.intent_router")
@@ -74,7 +73,7 @@ class IntentRouter:
         intent: Intent,
         affect: AffectState,
         conversation_id: str | None = None,
-        equor_check: "ConstitutionalCheck | None" = None,
+        equor_check: ConstitutionalCheck | None = None,
     ) -> str:
         """
         Route an approved intent to its executor.
@@ -113,7 +112,7 @@ class IntentRouter:
         return route
 
     @property
-    def stats(self) -> dict:
+    def stats(self) -> dict[str, Any]:
         return {
             "routed_to_voxis": self._routed_to_voxis,
             "routed_to_axon": self._routed_to_axon,
@@ -131,7 +130,6 @@ class IntentRouter:
         """
         Extract the expression content from the intent and deliver via Voxis.
         """
-        from ecodiaos.systems.voxis.types import ExpressionTrigger
 
         # Extract the expression content from the first express action step
         content = intent.goal.description  # Default to goal description
@@ -162,7 +160,7 @@ class IntentRouter:
     async def _route_to_axon(
         self,
         intent: Intent,
-        equor_check: "ConstitutionalCheck | None",
+        equor_check: ConstitutionalCheck | None,
     ) -> None:
         """
         Route an action intent to Axon for execution.
@@ -180,8 +178,8 @@ class IntentRouter:
             )
             return
 
-        from ecodiaos.primitives.constitutional import ConstitutionalCheck
         from ecodiaos.primitives.common import Verdict
+        from ecodiaos.primitives.constitutional import ConstitutionalCheck
         from ecodiaos.systems.axon.types import ExecutionRequest
 
         # Security default: BLOCKED if no equor_check provided.
@@ -241,7 +239,7 @@ def _classify_route(intent: Intent) -> str:
     return "internal"
 
 
-def _classify_voxis_trigger(intent: Intent) -> "ExpressionTrigger":
+def _classify_voxis_trigger(intent: Intent) -> ExpressionTrigger:
     """
     Map an intent's goal and plan to the most appropriate Voxis trigger.
     """

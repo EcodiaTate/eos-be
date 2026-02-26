@@ -15,12 +15,9 @@ then combined using learned base-weights into a composite
 from __future__ import annotations
 
 import asyncio
-from typing import Protocol, Sequence
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
-
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.percept import Percept
 
 from .helpers import (
     clamp,
@@ -37,6 +34,10 @@ from .helpers import (
     match_keyword_set,
 )
 from .types import AttentionContext, SalienceVector
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+    from ecodiaos.primitives.percept import Percept
 
 logger = structlog.get_logger("ecodiaos.systems.atune.salience")
 
@@ -183,7 +184,7 @@ class RiskHead(SalienceHead):
 
         # Semantic similarity to known risk categories
         risk_similarity = 0.0
-        if context.risk_categories:
+        if context.risk_categories and percept.content.embedding:
             risk_similarity = max(
                 cosine_similarity(percept.content.embedding, cat.embedding)
                 for cat in context.risk_categories
@@ -231,7 +232,7 @@ class IdentityHead(SalienceHead):
 
         # Similarity to core identity entities
         max_identity_sim = 0.0
-        if context.core_identity_embeddings:
+        if context.core_identity_embeddings and percept.content.embedding:
             max_identity_sim = max(
                 cosine_similarity(percept.content.embedding, e)
                 for e in context.core_identity_embeddings
@@ -242,7 +243,7 @@ class IdentityHead(SalienceHead):
 
         # Community relevance
         community_rel = 0.0
-        if context.community_embedding:
+        if context.community_embedding and percept.content.embedding:
             community_rel = cosine_similarity(
                 percept.content.embedding, context.community_embedding
             )
@@ -280,15 +281,19 @@ class GoalHead(SalienceHead):
         if not context.active_goals:
             return 0.0
 
-        goal_scores = [
-            cosine_similarity(percept.content.embedding, g.target_embedding) * g.priority
-            for g in context.active_goals
-        ]
+        goal_scores = (
+            [
+                cosine_similarity(percept.content.embedding, g.target_embedding) * g.priority
+                for g in context.active_goals
+            ]
+            if percept.content.embedding
+            else []
+        )
         max_goal = max(goal_scores) if goal_scores else 0.0
 
         # Bonus: resolves a pending decision?
         resolves = 0.0
-        if context.pending_decisions:
+        if context.pending_decisions and percept.content.embedding:
             for dec in context.pending_decisions:
                 if dec.embedding:
                     sim = cosine_similarity(percept.content.embedding, dec.embedding)
@@ -470,7 +475,7 @@ async def compute_salience(
 
     # Precision-weight each score
     precision_weighted: dict[str, float] = {}
-    for head, raw in zip(heads, raw_scores):
+    for head, raw in zip(heads, raw_scores, strict=False):
         p = compute_precision(head, affect)
         precision_weighted[head.name] = raw * p
 

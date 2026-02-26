@@ -38,9 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.common import Verdict, new_id, utc_now
-from ecodiaos.primitives.constitutional import ConstitutionalCheck
+from ecodiaos.primitives.common import Verdict, new_id
 from ecodiaos.primitives.intent import (
     Action,
     ActionSequence,
@@ -48,13 +46,9 @@ from ecodiaos.primitives.intent import (
     GoalDescriptor,
     Intent,
 )
-from ecodiaos.systems.atune.types import WorkspaceBroadcast
-from ecodiaos.systems.nova.efe_evaluator import EFEEvaluator
-from ecodiaos.systems.nova.goal_manager import GoalManager
 from ecodiaos.systems.nova.policy_generator import (
     PolicyGenerator,
     find_matching_procedure,
-    make_do_nothing_policy,
     procedure_to_policy,
 )
 from ecodiaos.systems.nova.types import (
@@ -68,7 +62,12 @@ from ecodiaos.systems.nova.types import (
 )
 
 if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+    from ecodiaos.primitives.constitutional import ConstitutionalCheck
+    from ecodiaos.systems.atune.types import WorkspaceBroadcast
     from ecodiaos.systems.equor.service import EquorService
+    from ecodiaos.systems.nova.efe_evaluator import EFEEvaluator
+    from ecodiaos.systems.nova.goal_manager import GoalManager
 
 logger = structlog.get_logger()
 
@@ -96,7 +95,7 @@ class DeliberationEngine:
         goal_manager: GoalManager,
         policy_generator: PolicyGenerator,
         efe_evaluator: EFEEvaluator,
-        equor: "EquorService",
+        equor: EquorService,
         drive_weights: dict[str, float] | None = None,
         fast_path_timeout_ms: int = 100,
         slow_path_timeout_ms: int = 5000,
@@ -128,7 +127,7 @@ class DeliberationEngine:
         belief_state: BeliefState,
         affect: AffectState,
         belief_delta_is_conflicting: bool = False,
-        memory_traces: list[dict] | None = None,
+        memory_traces: list[dict[str, Any]] | None = None,
         allostatic_mode: bool = False,
         allostatic_error_dim: Any = None,
     ) -> tuple[Intent | None, DecisionRecord]:
@@ -151,7 +150,7 @@ class DeliberationEngine:
                     belief_delta_is_conflicting, memory_traces, start,
                     allostatic_mode, allostatic_error_dim,
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             elapsed_ms = int((time.monotonic() - start) * 1000)
             self._logger.warning("deliberation_end_to_end_timeout", elapsed_ms=elapsed_ms)
             record = DecisionRecord(
@@ -167,7 +166,7 @@ class DeliberationEngine:
         belief_state: BeliefState,
         affect: AffectState,
         belief_delta_is_conflicting: bool,
-        memory_traces: list[dict] | None,
+        memory_traces: list[dict[str, Any]] | None,
         start: float,
         allostatic_mode: bool = False,
         allostatic_error_dim: Any = None,
@@ -357,7 +356,7 @@ class DeliberationEngine:
                     self._logger.info("fast_path_equor_denied_escalating", intent_id=intent.id)
                     return None, True
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._logger.warning("fast_path_timeout_escalating")
             return None, True
         except Exception as exc:
@@ -372,7 +371,7 @@ class DeliberationEngine:
         assessment: SituationAssessment,
         belief_state: BeliefState,
         affect: AffectState,
-        memory_traces: list[dict] | None,
+        memory_traces: list[dict[str, Any]] | None,
     ) -> Intent | None:
         """
         System 2: Generate → EFE score → select → Equor standard review.
@@ -454,7 +453,7 @@ class DeliberationEngine:
 
                 return None  # All policies blocked
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._logger.warning("slow_path_timeout")
             return None
         except Exception as exc:

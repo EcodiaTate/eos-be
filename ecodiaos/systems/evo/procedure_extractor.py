@@ -24,14 +24,14 @@ import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
-from ecodiaos.primitives.common import new_id, utc_now
+from ecodiaos.primitives.common import new_id
 from ecodiaos.primitives.memory_trace import Episode
 from ecodiaos.systems.evo.types import (
+    VELOCITY_LIMITS,
     PatternCandidate,
     PatternType,
     Procedure,
     ProcedureStep,
-    VELOCITY_LIMITS,
 )
 
 if TYPE_CHECKING:
@@ -343,9 +343,10 @@ def _parse_json_safe(text: str) -> dict[str, Any]:
 
 def _dict_to_episode(data: dict[str, Any]) -> Episode:
     """Convert a Neo4j node dict to an Episode object."""
-    from ecodiaos.primitives.common import utc_now as _utc_now
-    from datetime import timezone
+
     from dateutil.parser import parse as parse_dt
+
+    from ecodiaos.primitives.common import utc_now as _utc_now
 
     def _safe_dt(v: Any) -> Any:
         if v is None:

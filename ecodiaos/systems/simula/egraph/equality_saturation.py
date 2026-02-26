@@ -29,7 +29,6 @@ from __future__ import annotations
 import ast
 import hashlib
 import time
-from typing import Any
 
 import structlog
 
@@ -303,11 +302,7 @@ def _apply_identity_rules(egraph: _EGraph) -> int:
                 child_nodes = egraph._classes.get(child_root, [])
                 for cn in child_nodes:
                     other = right if child_eid == left else left
-                    if node.op == "Add" and cn.op == "Constant:0":
-                        if not egraph.equivalent(eid, other):
-                            egraph.merge(eid, other)
-                            merges += 1
-                    elif node.op == "Mult" and cn.op == "Constant:1":
+                    if node.op == "Add" and cn.op == "Constant:0" or node.op == "Mult" and cn.op == "Constant:1":
                         if not egraph.equivalent(eid, other):
                             egraph.merge(eid, other)
                             merges += 1
@@ -364,9 +359,9 @@ class EqualitySaturationEngine:
         except SyntaxError:
             # Try statement mode
             try:
-                orig_ast = ast.parse(original_code, mode="exec")
-                rewr_ast = ast.parse(rewritten_code, mode="exec")
-            except SyntaxError as exc:
+                orig_ast = ast.parse(original_code, mode="exec")  # type: ignore[assignment]
+                rewr_ast = ast.parse(rewritten_code, mode="exec")  # type: ignore[assignment]
+            except SyntaxError:
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 return EGraphEquivalenceResult(
                     status=EGraphStatus.FAILED,
@@ -384,7 +379,7 @@ class EqualitySaturationEngine:
         rules_applied: list[str] = []
         deadline = time.monotonic() + self._timeout_s
 
-        for i in range(self._max_iterations):
+        for _i in range(self._max_iterations):
             if time.monotonic() > deadline:
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 return EGraphEquivalenceResult(

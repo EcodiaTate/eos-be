@@ -26,7 +26,7 @@ Usage:
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -40,7 +40,9 @@ from ecodiaos.clients.llm import (
 from ecodiaos.clients.output_validator import OutputValidator
 from ecodiaos.clients.prompt_cache import PromptCache, TTLConfig
 from ecodiaos.clients.token_budget import BudgetTier, TokenBudget
-from ecodiaos.telemetry.llm_metrics import LLMMetricsCollector
+
+if TYPE_CHECKING:
+    from ecodiaos.telemetry.llm_metrics import LLMMetricsCollector
 
 logger = structlog.get_logger()
 

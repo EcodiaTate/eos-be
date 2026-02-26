@@ -29,11 +29,14 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict, deque
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.config import AxonConfig
 from ecodiaos.systems.axon.types import CircuitState, CircuitStatus, ExecutionBudget, RateLimit
+
+if TYPE_CHECKING:
+    from ecodiaos.config import AxonConfig
 
 logger = structlog.get_logger()
 

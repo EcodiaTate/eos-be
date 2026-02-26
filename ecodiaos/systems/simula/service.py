@@ -35,6 +35,7 @@ Iron Rules (never violated — see SIMULA_IRON_RULES in types.py):
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -43,7 +44,7 @@ import structlog
 
 from ecodiaos.clients.embedding import EmbeddingClient, create_voyage_client
 from ecodiaos.clients.llm import LLMProvider, create_thinking_provider
-from ecodiaos.config import SimulaConfig
+from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.systems.simula.analytics import EvolutionAnalyticsEngine
 from ecodiaos.systems.simula.applicator import ChangeApplicator
 from ecodiaos.systems.simula.bridge import EvoSimulaBridge
@@ -56,15 +57,14 @@ from ecodiaos.systems.simula.proposal_intelligence import ProposalIntelligence
 from ecodiaos.systems.simula.retrieval.swe_grep import SweGrepRetriever
 from ecodiaos.systems.simula.rollback import RollbackManager
 from ecodiaos.systems.simula.simulation import ChangeSimulator
-from ecodiaos.systems.simula.verification.incremental import IncrementalVerificationEngine
 from ecodiaos.systems.simula.types import (
     FORBIDDEN,
     GOVERNANCE_REQUIRED,
     ConfigVersion,
     EnrichedSimulationResult,
     EvolutionAnalytics,
-    EvolutionRecord,
     EvolutionProposal,
+    EvolutionRecord,
     ProposalResult,
     ProposalStatus,
     RiskLevel,
@@ -72,11 +72,16 @@ from ecodiaos.systems.simula.types import (
     TriageResult,
     TriageStatus,
 )
-from ecodiaos.primitives.common import new_id, utc_now
+from ecodiaos.systems.simula.verification.incremental import IncrementalVerificationEngine
 
 if TYPE_CHECKING:
     from ecodiaos.clients.neo4j import Neo4jClient
+    from ecodiaos.clients.timescaledb import TimescaleDBClient
+    from ecodiaos.config import SimulaConfig
     from ecodiaos.systems.memory.service import MemoryService
+    from ecodiaos.systems.simula.hunter.analytics import HunterAnalyticsEmitter
+    from ecodiaos.systems.simula.hunter.service import HunterService
+    from ecodiaos.systems.simula.hunter.types import HuntResult
 
 logger = structlog.get_logger()
 
@@ -106,6 +111,7 @@ class SimulaService:
         memory: MemoryService | None = None,
         codebase_root: Path | None = None,
         instance_name: str = "EOS",
+        tsdb: TimescaleDBClient | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -113,6 +119,7 @@ class SimulaService:
         self._memory = memory
         self._root = codebase_root or Path(config.codebase_root).resolve()
         self._instance_name = instance_name
+        self._tsdb = tsdb
         self._initialized: bool = False
         self._logger = logger.bind(system="simula")
 
@@ -154,6 +161,10 @@ class SimulaService:
         self._egraph: object | None = None  # EqualitySaturationEngine (lazy import)
         self._symbolic_execution: object | None = None  # SymbolicExecutionEngine (lazy import)
 
+        # Stage 7 sub-systems (Hunter — lazy runtime imports in initialize())
+        self._hunter: HunterService | None = None
+        self._hunter_analytics: HunterAnalyticsEmitter | None = None
+
         # State
         self._current_version: int = 0
         self._active_proposals: dict[str, EvolutionProposal] = {}
@@ -182,8 +193,8 @@ class SimulaService:
 
         # ── Stage 2: Verification bridges ─────────────────────────────────────
         from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
-        from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge
         from ecodiaos.systems.simula.verification.static_analysis import StaticAnalysisBridge
+        from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge
 
         dafny_bridge: DafnyBridge | None = None
         if self._config.dafny_enabled:
@@ -352,7 +363,7 @@ class SimulaService:
 
             redis_client: RedisClient | None = None
             try:
-                redis_client = RedisClient()
+                redis_client = RedisClient()  # type: ignore[call-arg]
             except Exception as exc:
                 self._logger.warning("redis_client_init_failed", error=str(exc))
 
@@ -389,12 +400,12 @@ class SimulaService:
 
             lean_bridge_instance = LeanBridge(
                 lean_path=self._config.lean_binary_path,
-                project_path=self._config.lean_project_path or None,
+                project_path=self._config.lean_project_path or "",
                 verify_timeout_s=self._config.lean_verify_timeout_s,
                 max_attempts=self._config.lean_max_attempts,
                 copilot_enabled=self._config.lean_copilot_enabled,
                 dojo_enabled=self._config.lean_dojo_enabled,
-                proof_library_max_size=self._config.lean_proof_library_max_size,
+                max_library_size=self._config.lean_proof_library_max_size,
                 neo4j=self._neo4j,
             )
             self._lean_bridge = lean_bridge_instance
@@ -420,7 +431,6 @@ class SimulaService:
             self._diffusion_repair = DiffusionRepairAgent(
                 llm=self._llm,
                 codebase_root=self._root,
-                model_name=self._config.diffusion_model,
                 max_denoise_steps=self._config.diffusion_max_denoise_steps,
                 timeout_s=self._config.diffusion_timeout_s,
                 sketch_first=self._config.diffusion_sketch_first,
@@ -515,6 +525,7 @@ class SimulaService:
 
         # ── Stage 5E: Autonomous issue resolution ────────────────────────────
         if self._config.issue_resolution_enabled:
+            from ecodiaos.systems.simula.agents.repair_agent import RepairAgent
             from ecodiaos.systems.simula.resolution.issue_resolver import IssueResolver
             from ecodiaos.systems.simula.resolution.monitors import (
                 DegradationMonitor,
@@ -541,7 +552,7 @@ class SimulaService:
                 codebase_root=self._root,
                 neo4j=self._neo4j,
                 code_agent=self._code_agent,
-                repair_agent=self._repair_agent if isinstance(self._repair_agent, object) else None,
+                repair_agent=self._repair_agent if isinstance(self._repair_agent, RepairAgent) else None,
                 perf_monitor=perf_monitor,
                 security_monitor=security_monitor,
                 degradation_monitor=degradation_monitor,
@@ -569,7 +580,9 @@ class SimulaService:
             self._logger.info("content_credentials_initialized")
 
         if self._config.verifiable_credentials_enabled:
-            from ecodiaos.systems.simula.audit.verifiable_credentials import GovernanceCredentialManager
+            from ecodiaos.systems.simula.audit.verifiable_credentials import (
+                GovernanceCredentialManager,
+            )
 
             self._governance_credentials = GovernanceCredentialManager(
                 neo4j=self._neo4j,
@@ -589,7 +602,9 @@ class SimulaService:
             self._logger.info("hard_negative_miner_initialized")
 
             if self._config.adversarial_test_generation_enabled:
-                from ecodiaos.systems.simula.coevolution.adversarial_tester import AdversarialTestGenerator
+                from ecodiaos.systems.simula.coevolution.adversarial_tester import (
+                    AdversarialTestGenerator,
+                )
 
                 self._adversarial_tester = AdversarialTestGenerator(
                     llm=self._llm,
@@ -625,7 +640,9 @@ class SimulaService:
 
         # ── Stage 6E: Hybrid symbolic execution ──────────────────────────────
         if self._config.symbolic_execution_enabled:
-            from ecodiaos.systems.simula.verification.symbolic_execution import SymbolicExecutionEngine
+            from ecodiaos.systems.simula.verification.symbolic_execution import (
+                SymbolicExecutionEngine,
+            )
 
             self._symbolic_execution = SymbolicExecutionEngine(
                 z3_bridge=z3_bridge,
@@ -648,6 +665,71 @@ class SimulaService:
         # Wire SWE-grep into the bridge for pre-translation retrieval (3B.5)
         if self._bridge is not None and self._swe_grep is not None:
             self._bridge.set_swe_grep(self._swe_grep)
+
+        # ── Stage 7: Hunter — Zero-Day Discovery Engine ─────────────────────
+        if self._config.hunter_enabled and z3_bridge is not None:
+            from ecodiaos.systems.simula.hunter.analytics import HunterAnalyticsEmitter
+            from ecodiaos.systems.simula.hunter.prover import VulnerabilityProver
+            from ecodiaos.systems.simula.hunter.service import HunterService
+            from ecodiaos.systems.simula.hunter.types import HunterConfig
+
+            hunter_config = HunterConfig(
+                authorized_targets=self._config.hunter_authorized_targets,
+                max_workers=self._config.hunter_max_workers,
+                sandbox_timeout_seconds=self._config.hunter_sandbox_timeout_s,
+                log_vulnerability_analytics=self._config.hunter_log_analytics,
+                clone_depth=self._config.hunter_clone_depth,
+            )
+
+            hunter_prover = VulnerabilityProver(
+                z3_bridge=z3_bridge,
+                llm=self._llm,
+            )
+
+            # Phase 9: Build analytics emitter with optional TSDB persistence
+            hunter_analytics: HunterAnalyticsEmitter | None = None
+            if self._config.hunter_log_analytics:
+                hunter_analytics = HunterAnalyticsEmitter(tsdb=self._tsdb)
+                self._hunter_analytics = hunter_analytics
+                # Initialize TSDB schema (creates hunter_events hypertable)
+                await hunter_analytics.initialize()
+
+            # Build optional remediation orchestrator
+            hunter_remediation = None
+            if self._config.hunter_remediation_enabled and self._repair_agent is not None:
+                from ecodiaos.systems.simula.hunter.remediation import HunterRepairOrchestrator
+                from ecodiaos.systems.simula.hunter.workspace import TargetWorkspace
+
+                # Remediation needs a workspace; it's set per-hunt by HunterService
+                placeholder_workspace = TargetWorkspace.internal(self._root)
+                hunter_remediation = HunterRepairOrchestrator(
+                    repair_agent=self._repair_agent,  # type: ignore[arg-type]
+                    prover=hunter_prover,
+                    workspace=placeholder_workspace,
+                )
+
+            self._hunter = HunterService(
+                prover=hunter_prover,
+                config=hunter_config,
+                eos_root=self._root,
+                analytics=hunter_analytics,
+                remediation=hunter_remediation,
+            )
+
+            # Phase 9: Wire Hunter analytics into the unified EvolutionAnalyticsEngine
+            if self._analytics is not None and self._hunter is not None:
+                self._analytics.set_hunter_view(self._hunter.analytics_view)
+                if hunter_analytics is not None and hunter_analytics._store is not None:
+                    self._analytics.set_hunter_store(hunter_analytics._store)
+
+            self._logger.info(
+                "hunter_initialized",
+                hunter="active",
+                max_workers=hunter_config.max_workers,
+                authorized_targets=len(hunter_config.authorized_targets),
+                remediation=hunter_remediation is not None,
+                tsdb_persistence=self._tsdb is not None,
+            )
 
         # Pre-compute analytics from history
         if self._history is not None:
@@ -688,6 +770,7 @@ class SimulaService:
                 "formal_spec_generator" if self._formal_spec_generator else "formal_spec_generator(disabled)",
                 "egraph" if self._egraph else "egraph(disabled)",
                 "symbolic_execution" if self._symbolic_execution else "symbolic_execution(disabled)",
+                "hunter" if self._hunter else "hunter(disabled)",
             ],
             stage1_extended_thinking=thinking_provider is not None,
             stage1_embeddings=embedding_client is not None,
@@ -716,16 +799,17 @@ class SimulaService:
             stage6_formal_specs=self._formal_spec_generator is not None,
             stage6_egraph=self._egraph is not None,
             stage6_symbolic_execution=self._symbolic_execution is not None,
+            stage7_hunter=self._hunter is not None,
+            stage9_hunter_analytics=self._hunter_analytics is not None,
+            stage9_tsdb_persistence=self._tsdb is not None,
         )
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
         # Clean up Stage 1B embedding client
         if hasattr(self, "_embedding_client") and self._embedding_client is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._embedding_client.close()
-            except Exception:
-                pass
 
         self._logger.info(
             "simula_shutdown",
@@ -1066,7 +1150,191 @@ class SimulaService:
             "symbolic_execution": self._symbolic_execution is not None,
         }
 
+        # Stage 7 subsystem status
+        base["stage7"] = {
+            "hunter": self._hunter is not None,
+        }
+        if self._hunter is not None:
+            base["stage7"]["hunter_stats"] = self._hunter.stats
+
+        # Phase 9: Hunter analytics observability
+        base["stage9_analytics"] = {
+            "hunter_analytics_emitter": self._hunter_analytics is not None,
+            "hunter_tsdb_persistence": (
+                self._hunter_analytics is not None
+                and self._hunter_analytics._store is not None
+            ),
+            "hunter_view_attached": (
+                self._analytics is not None
+                and self._analytics._hunter_view is not None
+            ),
+            "hunter_store_attached": (
+                self._analytics is not None
+                and self._analytics._hunter_store is not None
+            ),
+        }
+        if self._hunter_analytics is not None:
+            base["stage9_analytics"]["emitter_stats"] = self._hunter_analytics.stats
+
         return base
+
+    # ─── Hunter API ───────────────────────────────────────────────────────────
+
+    def _ensure_hunter(self) -> HunterService:
+        """Validate that Hunter is enabled and return the typed service."""
+        if self._hunter is None:
+            raise RuntimeError(
+                "Hunter is not enabled. Set hunter_enabled=True in SimulaConfig."
+            )
+        return self._hunter
+
+    async def hunt_external_target(
+        self,
+        github_url: str,
+        *,
+        authorized_targets: list[str] | None = None,
+        attack_goals: list[str] | None = None,
+        generate_pocs: bool | None = None,
+        generate_patches: bool | None = None,
+    ) -> HuntResult:
+        """
+        Run Hunter against an external GitHub repository.
+
+        Hunter is purely additive — it never modifies EOS files and all
+        analysis happens in temporary workspaces.
+
+        Args:
+            github_url: HTTPS URL of the target repository.
+            authorized_targets: Override config authorized targets for this hunt.
+                Creates a scoped config copy — the shared config is never mutated.
+            attack_goals: Custom attack goals (defaults to predefined set).
+            generate_pocs: Generate exploit PoC scripts (default from config).
+            generate_patches: Generate + verify patches (default from config).
+
+        Returns:
+            HuntResult with discovered vulnerabilities and optional patches.
+
+        Raises:
+            RuntimeError: If Hunter is not enabled.
+        """
+        hunter = self._ensure_hunter()
+
+        # Scope-safe authorized target override: create a copy of the config
+        # so concurrent hunts don't corrupt each other's authorization lists.
+        if authorized_targets is not None:
+            from ecodiaos.systems.simula.hunter.types import HunterConfig
+
+            original_config = hunter._config
+            hunter._config = HunterConfig(
+                authorized_targets=authorized_targets,
+                max_workers=original_config.max_workers,
+                sandbox_timeout_seconds=original_config.sandbox_timeout_seconds,
+                log_vulnerability_analytics=original_config.log_vulnerability_analytics,
+                clone_depth=original_config.clone_depth,
+            )
+            try:
+                return await hunter.hunt_external_repo(
+                    github_url=github_url,
+                    attack_goals=attack_goals,
+                    generate_pocs=generate_pocs if generate_pocs is not None else self._config.hunter_generate_pocs,
+                    generate_patches=generate_patches if generate_patches is not None else self._config.hunter_generate_patches,
+                )
+            finally:
+                hunter._config = original_config
+
+        return await hunter.hunt_external_repo(
+            github_url=github_url,
+            attack_goals=attack_goals,
+            generate_pocs=generate_pocs if generate_pocs is not None else self._config.hunter_generate_pocs,
+            generate_patches=generate_patches if generate_patches is not None else self._config.hunter_generate_patches,
+        )
+
+    async def hunt_internal(
+        self,
+        *,
+        attack_goals: list[str] | None = None,
+        generate_pocs: bool | None = None,
+        generate_patches: bool | None = None,
+    ) -> HuntResult:
+        """
+        Run Hunter against the internal EOS codebase for self-testing.
+
+        Args:
+            attack_goals: Custom attack goals (defaults to predefined set).
+            generate_pocs: Generate exploit PoC scripts (default from config).
+            generate_patches: Generate + verify patches (default from config).
+
+        Returns:
+            HuntResult with discovered vulnerabilities.
+
+        Raises:
+            RuntimeError: If Hunter is not enabled.
+        """
+        hunter = self._ensure_hunter()
+
+        return await hunter.hunt_internal_eos(
+            attack_goals=attack_goals,
+            generate_pocs=generate_pocs if generate_pocs is not None else self._config.hunter_generate_pocs,
+            generate_patches=generate_patches if generate_patches is not None else self._config.hunter_generate_patches,
+        )
+
+    async def generate_patches_for_hunt(
+        self,
+        hunt_result: HuntResult,
+    ) -> dict[str, str]:
+        """
+        Generate patches for vulnerabilities found in a completed hunt.
+
+        Useful when a hunt was run without generate_patches=True and you want
+        to retroactively generate patches for the discovered vulnerabilities.
+
+        Args:
+            hunt_result: A completed HuntResult from hunt_external_target
+                         or hunt_internal.
+
+        Returns:
+            Dict mapping vulnerability ID → unified diff patch string.
+
+        Raises:
+            RuntimeError: If Hunter or remediation is not enabled.
+        """
+        hunter = self._ensure_hunter()
+        return await hunter.generate_patches(hunt_result)
+
+    def get_hunter_analytics(self) -> dict[str, Any]:
+        """Return aggregate Hunter analytics if available."""
+        hunter = self._ensure_hunter()
+        return hunter.analytics_view.summary
+
+    async def get_unified_analytics(self) -> dict[str, Any]:
+        """
+        Return unified analytics combining evolution metrics and Hunter
+        security metrics. This is the Phase 9 observability entry point.
+        """
+        if self._analytics is None:
+            return {}
+        return await self._analytics.get_unified_analytics()
+
+    async def get_hunter_weekly_trends(
+        self,
+        *,
+        weeks: int = 12,
+        target_url: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Query weekly Hunter vulnerability trends from TSDB or in-memory view.
+        """
+        if self._analytics is None:
+            return []
+        return await self._analytics.get_hunter_weekly_trends(
+            weeks=weeks, target_url=target_url,
+        )
+
+    async def get_hunter_error_summary(self, *, days: int = 7) -> list[dict[str, Any]]:
+        """Query Hunter pipeline error summary from TSDB."""
+        if self._analytics is None:
+            return []
+        return await self._analytics.get_hunter_error_summary(days=days)
 
     # ─── Evo Bridge Callback ──────────────────────────────────────────────────
 
@@ -1141,7 +1409,7 @@ class SimulaService:
             try:
                 from ecodiaos.systems.simula.verification.lean_bridge import LeanBridge
                 if isinstance(self._lean_bridge, LeanBridge):
-                    lib_stats = self._lean_bridge.get_library_stats()
+                    lib_stats = await self._lean_bridge.get_library_stats()
                     if lib_stats.total_lemmas > 0:
                         self._code_agent._proof_library_prompt = (
                             f"\n\n## Proof Library ({lib_stats.total_lemmas} proven lemmas)\n"
@@ -1206,13 +1474,16 @@ class SimulaService:
         # ── Stage 5C: Multi-agent orchestration for multi-file proposals ──────
         if self._orchestrator is not None:
             try:
-                from ecodiaos.systems.simula.orchestration.orchestrator import MultiAgentOrchestrator
+                from ecodiaos.systems.simula.orchestration.orchestrator import (
+                    MultiAgentOrchestrator,
+                )
 
                 if isinstance(self._orchestrator, MultiAgentOrchestrator):
                     # Estimate affected files from proposal target + code_hint
                     estimated_files = []
-                    if proposal.target:
-                        estimated_files.append(proposal.target)
+                    _target = getattr(proposal, "target", None)
+                    if _target:
+                        estimated_files.append(_target)
                     if hasattr(proposal, "affected_files"):
                         estimated_files.extend(proposal.affected_files)
 
@@ -1230,9 +1501,9 @@ class SimulaService:
                         proposal._orchestration_result = orc_result  # type: ignore[attr-defined]
                         log.info(
                             "orchestration_complete",
-                            success=orc_result.success,
-                            stages=orc_result.parallel_stages,
-                            agents=orc_result.agents_used,
+                            success=not orc_result.error,
+                            stages=orc_result.parallel_stages_executed,
+                            agents=orc_result.total_agents_used,
                         )
             except Exception as exc:
                 log.warning("orchestration_error", error=str(exc))
@@ -1243,7 +1514,9 @@ class SimulaService:
         if not code_result.success and self._repair_agent is not None:
             log.info("repair_agent_attempting")
             try:
-                from ecodiaos.systems.simula.agents.repair_agent import RepairAgent as RepairAgentCls
+                from ecodiaos.systems.simula.agents.repair_agent import (
+                    RepairAgent as RepairAgentCls,
+                )
                 from ecodiaos.systems.simula.verification.types import RepairStatus
 
                 if isinstance(self._repair_agent, RepairAgentCls):
@@ -1284,25 +1557,30 @@ class SimulaService:
             try:
                 from ecodiaos.systems.simula.agents.diffusion_repair import DiffusionRepairAgent
                 if isinstance(self._diffusion_repair, DiffusionRepairAgent):
-                    repair_result = await self._diffusion_repair.repair(
-                        original_code=code_result.summary or "",
-                        files_written=code_result.files_written,
-                        test_failures=code_result.test_output or code_result.error,
+                    broken_files_dr = {
+                        f: (self._root / f).read_text()
+                        for f in code_result.files_written
+                        if (self._root / f).exists()
+                    }
+                    dr_result = await self._diffusion_repair.repair(
+                        proposal=proposal,
+                        broken_files=broken_files_dr,
+                        test_output=code_result.test_output or code_result.error or "",
                     )
-                    if repair_result.status.value == "repaired":
+                    if dr_result.status.value == "repaired":
                         log.info(
                             "diffusion_repair_succeeded",
-                            steps=len(repair_result.denoise_steps),
-                            improvement=f"{repair_result.improvement_rate:.0%}",
+                            steps=len(dr_result.denoise_steps),
+                            improvement=f"{dr_result.improvement_rate:.0%}",
                         )
                         # Mark as success — diffusion repair saved the change
                         code_result.success = True
-                        code_result.files_written = repair_result.files_repaired
+                        code_result.files_written = dr_result.files_repaired
                         code_result.error = ""
                         # Stash repair metadata on proposal for history recording
-                        proposal._diffusion_repair_result = repair_result  # type: ignore[attr-defined]
+                        proposal._diffusion_repair_result = dr_result  # type: ignore[attr-defined]
                     else:
-                        log.info("diffusion_repair_insufficient", status=repair_result.status.value)
+                        log.info("diffusion_repair_insufficient", status=dr_result.status.value)
             except Exception as exc:
                 log.warning("diffusion_repair_error", error=str(exc))
 
@@ -1352,7 +1630,9 @@ class SimulaService:
             if self._causal_debugger is not None:
                 log.info("causal_debugging_starting", issues=health.issues)
                 try:
-                    from ecodiaos.systems.simula.debugging.causal_dag import CausalDebugger as CausalDbgCls
+                    from ecodiaos.systems.simula.debugging.causal_dag import (
+                        CausalDebugger as CausalDbgCls,
+                    )
 
                     if isinstance(self._causal_debugger, CausalDbgCls):
                         causal_diagnosis = await self._causal_debugger.diagnose(
@@ -1362,9 +1642,9 @@ class SimulaService:
                         )
                         log.info(
                             "causal_diagnosis_complete",
-                            root_cause=causal_diagnosis.root_cause,
+                            root_cause=causal_diagnosis.root_cause_node,
                             confidence=f"{causal_diagnosis.confidence:.2f}",
-                            interventions=causal_diagnosis.interventions_performed,
+                            interventions=causal_diagnosis.total_interventions,
                         )
                         # Stash for history recording
                         proposal._causal_diagnosis = causal_diagnosis  # type: ignore[attr-defined]
@@ -1376,7 +1656,9 @@ class SimulaService:
             if self._repair_agent is not None:
                 log.info("repair_agent_post_health_attempting")
                 try:
-                    from ecodiaos.systems.simula.agents.repair_agent import RepairAgent as RepairAgentCls
+                    from ecodiaos.systems.simula.agents.repair_agent import (
+                        RepairAgent as RepairAgentCls,
+                    )
                     from ecodiaos.systems.simula.verification.types import RepairStatus
 
                     if isinstance(self._repair_agent, RepairAgentCls):
@@ -1389,8 +1671,8 @@ class SimulaService:
                         diag_context = ""
                         if causal_diagnosis is not None:
                             diag_context = (
-                                f"Root cause: {causal_diagnosis.root_cause}\n"
-                                f"Fix location: {causal_diagnosis.fix_location}\n"
+                                f"Root cause: {causal_diagnosis.root_cause_node}\n"
+                                f"Fix location: {causal_diagnosis.root_cause_file}\n"
                                 f"Confidence: {causal_diagnosis.confidence:.2f}\n"
                                 f"Reasoning: {' → '.join(causal_diagnosis.reasoning_chain)}"
                             )
@@ -1401,7 +1683,7 @@ class SimulaService:
                                 code_result.test_output
                                 or "; ".join(health.issues)
                             ),
-                            lint_output=diag_context or None,
+                            lint_output=diag_context or "",
                         )
                         if repair_result.status == RepairStatus.REPAIRED:
                             log.info(
@@ -1463,7 +1745,9 @@ class SimulaService:
         # ── Stage 6A.2: Sign generated files with content credentials ────────
         if self._content_credentials is not None:
             try:
-                from ecodiaos.systems.simula.audit.content_credentials import ContentCredentialManager
+                from ecodiaos.systems.simula.audit.content_credentials import (
+                    ContentCredentialManager,
+                )
 
                 if isinstance(self._content_credentials, ContentCredentialManager):
                     cc_result = await self._content_credentials.sign_files(
@@ -1548,6 +1832,7 @@ class SimulaService:
                         from_version=from_version,
                         to_version=self._current_version,
                         files_changed=code_result.files_written,
+                        simulation_risk=RiskLevel.LOW,
                         rolled_back=False,
                     )
                     hce = await self._hash_chain.append(hash_record)
@@ -1578,14 +1863,7 @@ class SimulaService:
         # ── Stage 4B: Record GRPO training data ──────────────────────────────
         if self._grpo is not None:
             try:
-                await self._grpo.record_proposal_applied(
-                    proposal_id=proposal.id,
-                    category=proposal.category.value,
-                    files_written=code_result.files_written,
-                    tests_passed=code_result.tests_passed,
-                    lint_passed=code_result.lint_passed,
-                    rolled_back=False,
-                )
+                self._grpo.record_proposal_applied()
                 # Check if retraining is warranted
                 if self._grpo.should_retrain():
                     log.info("grpo_retrain_triggered")
@@ -1614,9 +1892,7 @@ class SimulaService:
                     self._proposals_applied_since_consolidation
                     >= self._config.lilo_consolidation_interval_proposals
                 ):
-                    await self._lilo.consolidate(
-                        max_library_size=self._config.lilo_max_library_size,
-                    )
+                    await self._lilo.consolidate()
                     self._proposals_applied_since_consolidation = 0
                     log.info("lilo_consolidation_complete")
             except Exception as exc:
@@ -1671,7 +1947,7 @@ class SimulaService:
                 if enrichment:
                     risk_summary = f"{risk_summary} [{'; '.join(enrichment)}]"
 
-                await self._neo4j.execute(
+                await self._neo4j.execute_write(
                     """
                     CREATE (:GovernanceProposal {
                         id: $id,
@@ -1722,7 +1998,7 @@ class SimulaService:
         )
 
         # Extract simulation detail fields if enriched simulation was performed
-        sim_detail = {
+        sim_detail: dict[str, Any] = {
             "simulation_episodes_tested": 0,
             "counterfactual_regression_rate": 0.0,
             "dependency_blast_radius": 0,
@@ -1921,21 +2197,21 @@ class SimulaService:
             return
         try:
             self._logger.info("grpo_retrain_starting")
-            run = await self._grpo.collect_training_data()
-            if run is None:
+            training_examples = await self._grpo.collect_training_data()
+            if not training_examples:
                 self._logger.info("grpo_retrain_skipped_insufficient_data")
                 return
 
-            run = await self._grpo.run_sft(run)
-            run = await self._grpo.run_grpo(run)
-            evaluation = await self._grpo.evaluate(run)
+            training_run = await self._grpo.run_sft(training_examples)
+            training_run = await self._grpo.run_grpo(training_run)
+            evaluation = await self._grpo.evaluate()
 
             if evaluation.statistically_significant and evaluation.improvement_percent > 0:
                 self._logger.info(
                     "grpo_retrain_deployed",
                     improvement=f"{evaluation.improvement_percent:.1f}%",
-                    pass_at_1_base=f"{evaluation.base_pass_at_1:.2f}",
-                    pass_at_1_finetuned=f"{evaluation.finetuned_pass_at_1:.2f}",
+                    pass_at_1_base=f"{evaluation.base_model_pass_at_1:.2f}",
+                    pass_at_1_finetuned=f"{evaluation.finetuned_model_pass_at_1:.2f}",
                 )
             else:
                 self._logger.info(
@@ -1969,7 +2245,9 @@ class SimulaService:
             # Import adversarial tester if available
             adversarial_gen = None
             if self._adversarial_tester is not None:
-                from ecodiaos.systems.simula.coevolution.adversarial_tester import AdversarialTestGenerator
+                from ecodiaos.systems.simula.coevolution.adversarial_tester import (
+                    AdversarialTestGenerator,
+                )
 
                 if isinstance(self._adversarial_tester, AdversarialTestGenerator):
                     adversarial_gen = self._adversarial_tester

@@ -8,12 +8,13 @@ This is the "what happened" layer of memory.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
-from ecodiaos.primitives import Episode, new_id, utc_now
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
+    from ecodiaos.primitives import Episode
 
 logger = structlog.get_logger()
 
@@ -135,14 +136,14 @@ async def link_episode_sequence(
     )
 
 
-async def get_episode(neo4j: Neo4jClient, episode_id: str) -> dict | None:
+async def get_episode(neo4j: Neo4jClient, episode_id: str) -> dict[str, Any] | None:
     """Retrieve a single episode by ID."""
     results = await neo4j.execute_read(
         "MATCH (e:Episode {id: $id}) RETURN e",
         {"id": episode_id},
     )
     if results:
-        return results[0]["e"]
+        return results[0]["e"]  # type: ignore[no-any-return]
     return None
 
 
@@ -150,7 +151,7 @@ async def get_recent_episodes(
     neo4j: Neo4jClient,
     limit: int = 20,
     min_salience: float = 0.0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Get the most recent episodes, optionally filtered by salience."""
     return await neo4j.execute_read(
         """

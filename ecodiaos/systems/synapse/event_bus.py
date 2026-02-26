@@ -126,7 +126,7 @@ class EventBus:
                     callback(event),
                     timeout=_CALLBACK_TIMEOUT_S,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._total_callback_timeouts += 1
                 self._logger.warning(
                     "event_callback_timeout",

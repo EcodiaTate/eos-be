@@ -25,20 +25,20 @@ Interface contracts (from spec):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.config import AxonConfig
 from ecodiaos.systems.axon.audit import AuditLogger
 from ecodiaos.systems.axon.credentials import CredentialStore
 from ecodiaos.systems.axon.executors import build_default_registry
 from ecodiaos.systems.axon.pipeline import ExecutionPipeline
-from ecodiaos.systems.axon.registry import ExecutorRegistry
 from ecodiaos.systems.axon.safety import BudgetTracker, CircuitBreaker, RateLimiter
 from ecodiaos.systems.axon.types import AxonOutcome, ExecutionRequest
 
 if TYPE_CHECKING:
+    from ecodiaos.config import AxonConfig
+    from ecodiaos.systems.axon.registry import ExecutorRegistry
     from ecodiaos.systems.memory.service import MemoryService
     from ecodiaos.systems.nova.service import NovaService
     from ecodiaos.systems.voxis.service import VoxisService
@@ -68,9 +68,9 @@ class AxonService:
     def __init__(
         self,
         config: AxonConfig,
-        memory: "MemoryService | None" = None,
-        voxis: "VoxisService | None" = None,
-        redis_client=None,
+        memory: MemoryService | None = None,
+        voxis: VoxisService | None = None,
+        redis_client: Any = None,
         instance_id: str = "eos-default",
     ) -> None:
         self._config = config
@@ -147,7 +147,7 @@ class AxonService:
             executor_types=self._registry.list_types(),
         )
 
-    def set_nova(self, nova: "NovaService") -> None:
+    def set_nova(self, nova: NovaService) -> None:
         """
         Wire the Nova feedback loop.
 
@@ -159,7 +159,7 @@ class AxonService:
         self._pipeline.set_nova(nova)
         self._logger.info("nova_wired", system="axon")
 
-    def set_atune(self, atune) -> None:
+    def set_atune(self, atune: Any) -> None:
         """
         Wire Atune so execution outcomes become workspace percepts.
 
@@ -229,8 +229,8 @@ class AxonService:
                 intent_id=request.intent.id,
                 error=str(exc),
             )
-            from ecodiaos.systems.axon.types import ExecutionStatus, FailureReason
             from ecodiaos.primitives.common import new_id
+            from ecodiaos.systems.axon.types import ExecutionStatus, FailureReason
             outcome = AxonOutcome(
                 intent_id=request.intent.id,
                 execution_id=new_id(),
@@ -247,7 +247,7 @@ class AxonService:
 
         return outcome
 
-    def register_executor(self, executor) -> None:
+    def register_executor(self, executor: Any) -> None:
         """
         Register a custom executor at runtime.
 
@@ -262,7 +262,7 @@ class AxonService:
             action_type=executor.action_type,
         )
 
-    async def health(self) -> dict:
+    async def health(self) -> dict[str, Any]:
         """Self-health report (implements ManagedSystem protocol)."""
         return {
             "status": "healthy" if self._initialized else "starting",
@@ -285,7 +285,7 @@ class AxonService:
         )
 
     @property
-    def stats(self) -> dict:
+    def stats(self) -> dict[str, Any]:
         """Return current operational statistics."""
         return {
             "initialized": self._initialized,

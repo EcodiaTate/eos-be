@@ -19,23 +19,24 @@ between in-process instances.
 
 from __future__ import annotations
 
+import contextlib
 import ssl
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import structlog
 import httpx
+import structlog
 
-from ecodiaos.primitives.common import utc_now
 from ecodiaos.primitives.federation import (
     AssistanceRequest,
     AssistanceResponse,
     FederationLink,
-    FederationLinkStatus,
     InstanceIdentityCard,
     KnowledgeRequest,
     KnowledgeResponse,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = structlog.get_logger("ecodiaos.systems.federation.channel")
 
@@ -204,10 +205,8 @@ class ChannelManager:
     async def close_all(self) -> None:
         """Close all channels (shutdown)."""
         for channel in self._channels.values():
-            try:
+            with contextlib.suppress(Exception):
                 await channel.close()
-            except Exception:
-                pass
         self._channels.clear()
 
     def get_channel(self, link_id: str) -> FederationChannel | None:

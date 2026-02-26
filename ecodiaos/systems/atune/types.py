@@ -8,25 +8,24 @@ workspace pipeline.
 
 from __future__ import annotations
 
+from datetime import datetime
 import enum
-from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from ecodiaos.primitives.affect import AffectState
 from ecodiaos.primitives.common import new_id, utc_now
-from ecodiaos.primitives.memory_trace import MemoryTrace
-from ecodiaos.primitives.percept import Percept
 
+
+from ecodiaos.primitives.affect import AffectState
+from ecodiaos.primitives.memory_trace import MemoryTrace
 
 # ---------------------------------------------------------------------------
 # Input channels
 # ---------------------------------------------------------------------------
 
 
-class InputChannel(str, enum.Enum):
+class InputChannel(enum.StrEnum):
     """All channels from which Atune can receive raw input."""
 
     # User-facing
@@ -67,7 +66,7 @@ class RawInput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class PredictionErrorDirection(str, enum.Enum):
+class PredictionErrorDirection(enum.StrEnum):
     """Category of surprise."""
 
     CONTRADICTS_BELIEF = "contradicts_belief"

@@ -13,9 +13,8 @@ Metric tracked: self-generated test coverage growth (6B.4).
 from __future__ import annotations
 
 import asyncio
-import json
+import contextlib
 import re
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -110,7 +109,7 @@ class AdversarialTestGenerator:
         try:
             from ecodiaos.clients.llm import Message
 
-            response = await self._llm.complete(
+            response = await self._llm.complete(  # type: ignore[attr-defined]
                 system="You are an adversarial testing expert for Python systems.",
                 messages=[Message(role="user", content=prompt)],
                 max_tokens=4096,
@@ -252,7 +251,5 @@ class AdversarialTestGenerator:
         finally:
             # Clean up temp test file
             for tf in test_files:
-                try:
+                with contextlib.suppress(OSError):
                     Path(tf).unlink(missing_ok=True)
-                except OSError:
-                    pass

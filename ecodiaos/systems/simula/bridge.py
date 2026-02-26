@@ -23,16 +23,16 @@ Rule-based category inference uses zero LLM tokens.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.systems.simula.types import (
     ChangeCategory,
     ChangeSpec,
-    EvoProposalEnriched,
     EvolutionProposal,
+    EvoProposalEnriched,
     ProposalStatus,
 )
 
@@ -373,15 +373,11 @@ class EvoSimulaBridge:
             key = key.strip().lower()
             value = value.strip()
 
-            if key == "affected_systems":
-                fields[key] = [s.strip() for s in value.split(",")]
-            elif key == "contract_changes":
+            if key == "affected_systems" or key == "contract_changes":
                 fields[key] = [s.strip() for s in value.split(",")]
             elif key in ("budget_old_value", "budget_new_value", "timing_old_value", "timing_new_value"):
-                try:
+                with contextlib.suppress(ValueError):
                     fields[key] = float(value)
-                except ValueError:
-                    pass
             else:
                 fields[key] = value
 

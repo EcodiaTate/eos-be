@@ -11,17 +11,19 @@ and automatic fallback to a secondary provider when the primary is unavailable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json as _json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
 
-from ecodiaos.config import LLMConfig
-from ecodiaos.clients.token_budget import TokenBudget, BudgetTier
+if TYPE_CHECKING:
+    from ecodiaos.clients.token_budget import TokenBudget
+    from ecodiaos.config import LLMConfig
 
 logger = structlog.get_logger()
 
@@ -259,10 +261,8 @@ class AnthropicProvider(LLMProvider):
                     # Respect Retry-After header if present
                     retry_after = response.headers.get("retry-after")
                     if retry_after:
-                        try:
+                        with contextlib.suppress(ValueError):
                             delay = max(delay, float(retry_after))
-                        except ValueError:
-                            pass
                     logger.warning(
                         "llm_retrying",
                         status=response.status_code,
@@ -272,7 +272,7 @@ class AnthropicProvider(LLMProvider):
                     await asyncio.sleep(delay)
                     continue
                 response.raise_for_status()
-                return response.json()
+                return response.json()  # type: ignore[no-any-return]
             except httpx.TimeoutException as exc:
                 last_exc = exc
                 if attempt < _MAX_RETRIES:
@@ -288,10 +288,8 @@ class AnthropicProvider(LLMProvider):
             except httpx.HTTPStatusError as exc:
                 # Include API error details in the exception message
                 body = ""
-                try:
+                with contextlib.suppress(Exception):
                     body = exc.response.text[:500]
-                except Exception:
-                    pass
                 raise httpx.HTTPStatusError(
                     message=f"{exc.response.status_code}: {body}",
                     request=exc.request,
@@ -561,10 +559,8 @@ class OpenAIProvider(LLMProvider):
                     delay = _BASE_DELAY_S * (2 ** attempt)
                     retry_after = response.headers.get("retry-after")
                     if retry_after:
-                        try:
+                        with contextlib.suppress(ValueError):
                             delay = max(delay, float(retry_after))
-                        except ValueError:
-                            pass
                     logger.warning(
                         "llm_retrying",
                         status=response.status_code,
@@ -574,7 +570,7 @@ class OpenAIProvider(LLMProvider):
                     await asyncio.sleep(delay)
                     continue
                 response.raise_for_status()
-                return response.json()
+                return response.json()  # type: ignore[no-any-return]
             except httpx.TimeoutException as exc:
                 last_exc = exc
                 if attempt < _MAX_RETRIES:
@@ -589,10 +585,8 @@ class OpenAIProvider(LLMProvider):
                 raise
             except httpx.HTTPStatusError as exc:
                 body = ""
-                try:
+                with contextlib.suppress(Exception):
                     body = exc.response.text[:500]
-                except Exception:
-                    pass
                 raise httpx.HTTPStatusError(
                     message=f"{exc.response.status_code}: {body}",
                     request=exc.request,
@@ -789,10 +783,8 @@ class ExtendedThinkingProvider(LLMProvider):
                     delay = _BASE_DELAY_S * (2 ** attempt)
                     retry_after = response.headers.get("retry-after")
                     if retry_after:
-                        try:
+                        with contextlib.suppress(ValueError):
                             delay = max(delay, float(retry_after))
-                        except ValueError:
-                            pass
                     logger.warning(
                         "thinking_model_retrying",
                         status=response.status_code,
@@ -802,7 +794,7 @@ class ExtendedThinkingProvider(LLMProvider):
                     await asyncio.sleep(delay)
                     continue
                 response.raise_for_status()
-                return response.json()
+                return response.json()  # type: ignore[no-any-return]
             except httpx.TimeoutException as exc:
                 last_exc = exc
                 if attempt < _MAX_RETRIES:
@@ -817,10 +809,8 @@ class ExtendedThinkingProvider(LLMProvider):
                 raise
             except httpx.HTTPStatusError as exc:
                 body = ""
-                try:
+                with contextlib.suppress(Exception):
                     body = exc.response.text[:500]
-                except Exception:
-                    pass
                 raise httpx.HTTPStatusError(
                     message=f"{exc.response.status_code}: {body}",
                     request=exc.request,
@@ -1060,8 +1050,8 @@ class BedrockProvider(LLMProvider):
         # Import boto3 here to avoid hard dependency if not using Bedrock
         try:
             import boto3
-        except ImportError:
-            raise ImportError("boto3 required for Bedrock provider. Install with: pip install boto3")
+        except ImportError as exc:
+            raise ImportError("boto3 required for Bedrock provider. Install with: pip install boto3") from exc
 
         self._client = boto3.client("bedrock-runtime", region_name=self._region)
 

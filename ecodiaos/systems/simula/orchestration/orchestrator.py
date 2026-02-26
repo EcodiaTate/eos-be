@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -39,6 +38,8 @@ from ecodiaos.systems.simula.orchestration.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.simula.agents.test_designer import TestDesignerAgent
     from ecodiaos.systems.simula.agents.test_executor import TestExecutorAgent
@@ -181,7 +182,7 @@ class MultiAgentOrchestrator:
             f"interfaces to implement, and acceptance criteria."
         )
 
-        response = await self._llm.complete(
+        response = await self._llm.complete(  # type: ignore[attr-defined]
             system="You are a technical specification writer for EcodiaOS.",
             messages=[Message(role="user", content=spec_prompt)],
             max_tokens=2048,
@@ -232,7 +233,7 @@ class MultiAgentOrchestrator:
             f"error handling strategy, and integration points."
         )
 
-        response = await self._llm.complete(
+        response = await self._llm.complete(  # type: ignore[attr-defined]
             system="You are a software architect for EcodiaOS.",
             messages=[Message(role="user", content=design_prompt)],
             max_tokens=3072,
@@ -356,7 +357,7 @@ class MultiAgentOrchestrator:
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for nid, result in zip(batch, results):
+            for nid, result in zip(batch, results, strict=False):
                 node = next((n for n in dag.nodes if n.node_id == nid), None)
                 if node is None:
                     continue
@@ -426,7 +427,7 @@ class MultiAgentOrchestrator:
         if self._test_designer:
             for file_path in all_files[:5]:
                 try:
-                    test_result = await self._test_designer.design_tests(
+                    test_result = await self._test_designer.design_tests(  # type: ignore[call-arg]
                         file_path=file_path,
                         context=proposal.description,
                     )
@@ -443,7 +444,7 @@ class MultiAgentOrchestrator:
         # Run tests via test executor if available
         if self._test_executor and all_files:
             try:
-                exec_result = await self._test_executor.execute_tests(
+                exec_result = await self._test_executor.execute_tests(  # type: ignore[call-arg]
                     test_paths=all_files,
                 )
                 artifacts.append(PipelineArtifact(
@@ -496,7 +497,7 @@ class MultiAgentOrchestrator:
             f"edge cases, and potential regressions. List any issues found."
         )
 
-        response = await self._llm.complete(
+        response = await self._llm.complete(  # type: ignore[attr-defined]
             system="You are a code reviewer for EcodiaOS. Be thorough but concise.",
             messages=[Message(role="user", content=review_prompt)],
             max_tokens=1024,

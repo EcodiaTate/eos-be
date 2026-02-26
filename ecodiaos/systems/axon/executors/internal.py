@@ -67,11 +67,11 @@ class StoreInsightExecutor(Executor):
     max_duration_ms = 2000
     rate_limit = RateLimit.per_minute(20)
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.executor.store_insight")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("insight"):
             return ValidationResult.fail("insight is required", insight="missing or empty")
         if not params.get("domain"):
@@ -86,14 +86,14 @@ class StoreInsightExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         insight = params["insight"]
         domain = str(params["domain"])
         confidence = float(params.get("confidence", 0.7))
-        evidence_episodes = list(params.get("evidence_episodes", []))
-        tags = list(params.get("tags", []))
+        list(params.get("evidence_episodes", []))
+        list(params.get("tags", []))
 
         self._logger.info(
             "store_insight_execute",
@@ -179,7 +179,7 @@ class UpdateGoalExecutor(Executor):
     def __init__(self) -> None:
         self._logger = logger.bind(system="axon.executor.update_goal")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("goal_id"):
             return ValidationResult.fail("goal_id is required")
         status = params.get("status", "")
@@ -197,7 +197,7 @@ class UpdateGoalExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         goal_id = params["goal_id"]
@@ -274,11 +274,11 @@ class ConsolidationExecutor(Executor):
     max_duration_ms = 30_000  # Consolidation can be slow
     rate_limit = RateLimit.per_hour(6)  # At most every 10 minutes
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.executor.consolidation")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         scope = params.get("scope", "recent")
         valid_scopes = ("recent", "domain", "full")
         if scope not in valid_scopes:
@@ -298,7 +298,7 @@ class ConsolidationExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         scope = params.get("scope", "recent")
@@ -335,7 +335,7 @@ class ConsolidationExecutor(Executor):
                     )
                 else:
                     # Unreachable — kept for structural clarity
-                    return ExecutionResult(  # type: ignore[unreachable]
+                    return ExecutionResult(
                         success=True,
                         data={"note": "Consolidation API unavailable"},
                         side_effects=["Consolidation requested but API unavailable"],

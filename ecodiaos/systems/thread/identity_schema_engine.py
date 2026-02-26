@@ -513,7 +513,7 @@ class IdentitySchemaEngine:
                 assert isinstance(self._llm, OptimizedLLMProvider)
                 if not self._llm.should_use_llm("thread.evidence", estimated_tokens=100):
                     return ("irrelevant", 0.0)
-                response = await self._llm.evaluate(  # type: ignore[call-arg]
+                response = await self._llm.evaluate(
                     prompt=prompt,
                     max_tokens=100,
                     temperature=self._config.llm_temperature_evaluation,

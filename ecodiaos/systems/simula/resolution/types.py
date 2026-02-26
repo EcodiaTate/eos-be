@@ -15,8 +15,8 @@ Autonomy levels (ordered by risk):
 
 from __future__ import annotations
 
-import enum
 from datetime import datetime
+import enum
 
 from pydantic import Field
 
@@ -26,7 +26,7 @@ from ecodiaos.primitives.common import EOSBaseModel, utc_now
 # ── Enums ────────────────────────────────────────────────────────────────────
 
 
-class AutonomyLevel(str, enum.Enum):
+class AutonomyLevel(enum.StrEnum):
     """Progressive autonomy levels — ordered by risk and required confidence."""
 
     LINT = "lint"
@@ -35,7 +35,7 @@ class AutonomyLevel(str, enum.Enum):
     LOGIC_BUG = "logic_bug"
 
 
-class IssueKind(str, enum.Enum):
+class IssueKind(enum.StrEnum):
     """Classification of detected issues."""
 
     LINT_ERROR = "lint_error"
@@ -47,7 +47,7 @@ class IssueKind(str, enum.Enum):
     DEGRADATION = "degradation"
 
 
-class IssueSource(str, enum.Enum):
+class IssueSource(enum.StrEnum):
     """Where the issue was detected."""
 
     HEALTH_CHECK = "health_check"
@@ -56,7 +56,7 @@ class IssueSource(str, enum.Enum):
     MANUAL = "manual"
 
 
-class ResolutionStatus(str, enum.Enum):
+class ResolutionStatus(enum.StrEnum):
     """Terminal outcome of an issue resolution attempt."""
 
     RESOLVED = "resolved"

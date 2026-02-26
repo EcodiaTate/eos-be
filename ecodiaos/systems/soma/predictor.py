@@ -16,18 +16,14 @@ with cross-dimension coupling from the dynamics matrix.
 
 from __future__ import annotations
 
-import math
 from collections import deque
-from typing import Optional
 
 import structlog
 
 from ecodiaos.systems.soma.types import (
     ALL_DIMENSIONS,
-    DIMENSION_RANGES,
     HORIZONS,
     InteroceptiveDimension,
-    InteroceptiveState,
     ScheduledAllostaticEvent,
     _clamp_dimension,
 )

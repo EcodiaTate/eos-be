@@ -8,7 +8,6 @@ Every Intent passes through Equor and receives one of these.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from pydantic import Field
 

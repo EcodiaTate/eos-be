@@ -10,14 +10,14 @@ workspace cycle (budget: ≤2 000 ms, performed outside the theta rhythm).
 
 from __future__ import annotations
 
-import json
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
 
-from ecodiaos.primitives.percept import Percept
-
 from .types import EntityCandidate, ExtractionResult, RelationCandidate
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.percept import Percept
 
 logger = structlog.get_logger("ecodiaos.systems.atune.extraction")
 

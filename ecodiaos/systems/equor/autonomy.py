@@ -9,12 +9,14 @@ Demotion can be automatic on critical violations.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
 from ecodiaos.primitives.common import new_id, utc_now
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
 
 logger = structlog.get_logger()
 
@@ -57,7 +59,7 @@ async def check_promotion_eligibility(
     neo4j: Neo4jClient,
     current_level: int,
     target_level: int,
-) -> dict:
+) -> dict[str, Any]:
     """
     Check whether the instance meets the requirements for autonomy promotion.
     Returns eligibility status and details.
@@ -123,7 +125,7 @@ async def check_promotion_eligibility(
         },
     }
 
-    all_met = all(c["met"] for c in checks.values())
+    all_met = all(c["met"] for c in checks.values())  # type: ignore[index]
 
     return {
         "eligible": all_met,
@@ -139,7 +141,7 @@ async def apply_autonomy_change(
     new_level: int,
     reason: str,
     actor: str = "governance",
-) -> dict:
+) -> dict[str, Any]:
     """Apply an autonomy level change and record the governance event."""
     now = utc_now()
 

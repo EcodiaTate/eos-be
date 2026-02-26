@@ -14,13 +14,15 @@ Schedule:
 from __future__ import annotations
 
 import json
-import math
 from collections import deque
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
 from ecodiaos.primitives.common import DriveAlignmentVector, new_id, utc_now
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
 
 logger = structlog.get_logger()
 
@@ -33,7 +35,7 @@ class DriftTracker:
 
     def __init__(self, window_size: int = 1000):
         self.window_size = window_size
-        self._history: deque[dict] = deque(maxlen=window_size)
+        self._history: deque[dict[str, Any]] = deque(maxlen=window_size)
         self._decision_count: int = 0
 
     def record_decision(self, alignment: DriveAlignmentVector, verdict: str) -> None:
@@ -56,7 +58,7 @@ class DriftTracker:
     def history_size(self) -> int:
         return len(self._history)
 
-    def compute_report(self) -> dict:
+    def compute_report(self) -> dict[str, Any]:
         """Compute a drift report over the current window."""
         if len(self._history) < 10:
             return {
@@ -169,7 +171,7 @@ def _compute_drift_direction(
     return "; ".join(drifting)
 
 
-def respond_to_drift(report: dict) -> dict:
+def respond_to_drift(report: dict[str, Any]) -> dict[str, Any]:
     """
     Determine appropriate response to a drift report.
     """
@@ -208,8 +210,8 @@ def respond_to_drift(report: dict) -> dict:
 
 async def store_drift_report(
     neo4j: Neo4jClient,
-    report: dict,
-    response: dict,
+    report: dict[str, Any],
+    response: dict[str, Any],
 ) -> str:
     """Persist a drift report as a governance record."""
     record_id = new_id()

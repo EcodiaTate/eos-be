@@ -11,12 +11,16 @@ Denial is final. No system can override a DENY.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import structlog
 
 from ecodiaos.primitives.common import DriveAlignmentVector, Verdict
 from ecodiaos.primitives.constitutional import ConstitutionalCheck, InvariantResult
-from ecodiaos.primitives.intent import Intent
-from ecodiaos.systems.equor.invariants import InvariantViolation, check_hardcoded_invariants
+from ecodiaos.systems.equor.invariants import check_hardcoded_invariants
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.intent import Intent
 
 logger = structlog.get_logger()
 
@@ -76,7 +80,7 @@ def _assess_required_autonomy(intent: Intent) -> int | str:
     return max_level
 
 
-def _assess_risk(intent: Intent) -> dict:
+def _assess_risk(intent: Intent) -> dict[str, Any]:
     """
     Quick risk assessment of an intent.
     Returns harm_potential and reversibility scores.
@@ -123,7 +127,7 @@ def compute_verdict(
     alignment: DriveAlignmentVector,
     intent: Intent,
     autonomy_level: int,
-    constitution: dict,
+    constitution: dict[str, Any],
 ) -> ConstitutionalCheck:
     """
     The 8-stage verdict pipeline.

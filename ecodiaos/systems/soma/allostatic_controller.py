@@ -13,8 +13,7 @@ When urgency > threshold, Nova triggers allostatic deliberation.
 
 from __future__ import annotations
 
-import math
-from typing import Any, Optional
+from typing import Any
 
 import structlog
 
@@ -25,7 +24,6 @@ from ecodiaos.systems.soma.types import (
     AllostaticSignal,
     InteroceptiveDimension,
     InteroceptiveState,
-    _clamp_dimension,
 )
 
 logger = structlog.get_logger("ecodiaos.systems.soma.allostatic_controller")
@@ -44,7 +42,7 @@ class AllostaticController:
 
     def __init__(
         self,
-        default_setpoints: Optional[dict[InteroceptiveDimension, float]] = None,
+        default_setpoints: dict[InteroceptiveDimension, float] | None = None,
         adaptation_alpha: float = 0.05,
         urgency_threshold: float = 0.3,
     ) -> None:
@@ -174,7 +172,7 @@ class AllostaticController:
 
         return dominant_dim, max_mag
 
-    def track_energy_burn(self, energy: float) -> tuple[float, Optional[float]]:
+    def track_energy_burn(self, energy: float) -> tuple[float, float | None]:
         """
         Track energy consumption rate and predict exhaustion.
 
@@ -230,7 +228,7 @@ class AllostaticController:
 
         # Temporal dissonance
         max_td = 0.0
-        td_dim: Optional[InteroceptiveDimension] = None
+        td_dim: InteroceptiveDimension | None = None
         for dim, td in state.temporal_dissonance.items():
             if abs(td) > abs(max_td):
                 max_td = td

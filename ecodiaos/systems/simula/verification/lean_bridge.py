@@ -29,12 +29,11 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import structlog
 
 from ecodiaos.clients.llm import Message
-from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.simula.verification.types import (
     LEAN_PROOF_DOMAINS,
     LeanProofAttempt,
@@ -602,7 +601,7 @@ class LeanBridge:
         """
         # Gather context from preceding lines
         context = "\n".join(preceding_lines[-10:]).lower()
-        current = current_line.lower()
+        current_line.lower()
 
         # Numeric goals → norm_num or omega
         if any(kw in context for kw in ("nat", "int", "fin", "≤", "≥", "<", ">")):
@@ -656,7 +655,7 @@ class LeanBridge:
             return ""
 
         # Sort by reuse count (most-reused first)
-        relevant.sort(key=lambda l: l.reuse_count, reverse=True)
+        relevant.sort(key=lambda lm: lm.reuse_count, reverse=True)
         top_lemmas = relevant[:10]
 
         lines = [
@@ -698,10 +697,7 @@ class LeanBridge:
             statement_start = match.start()
             # Find the end of the proof (next theorem/lemma or end of file)
             next_match = theorem_pattern.search(lean_code, match.end())
-            if next_match:
-                proof_end = next_match.start()
-            else:
-                proof_end = len(lean_code)
+            proof_end = next_match.start() if next_match else len(lean_code)
             full_proof = lean_code[statement_start:proof_end].strip()
 
             # Extract statement (between name and :=)
@@ -792,7 +788,7 @@ class LeanBridge:
             await self._ensure_library_loaded()
             assert self._proof_library is not None
             # Check for duplicate
-            if not any(l.name == lemma.name for l in self._proof_library):
+            if not any(lm.name == lemma.name for lm in self._proof_library):
                 if len(self._proof_library) < self._max_library_size:
                     self._proof_library.append(lemma)
             return
@@ -843,7 +839,7 @@ class LeanBridge:
             # Update in-memory cache
             await self._ensure_library_loaded()
             assert self._proof_library is not None
-            if not any(l.name == lemma.name for l in self._proof_library):
+            if not any(lm.name == lemma.name for lm in self._proof_library):
                 if len(self._proof_library) < self._max_library_size:
                     self._proof_library.append(lemma)
 
@@ -887,7 +883,6 @@ class LeanBridge:
 
         by_domain: dict[str, int] = {}
         total_reuse = 0
-        total_copilot = 0.0
 
         for lemma in self._proof_library:
             domain = lemma.domain or "general"
@@ -926,9 +921,7 @@ class LeanBridge:
             line = line.strip()
             if not line:
                 continue
-            if "error" in line.lower() or "sorry" in line.lower():
-                errors.append(line)
-            elif "unsolved goals" in line.lower():
+            if "error" in line.lower() or "sorry" in line.lower() or "unsolved goals" in line.lower():
                 errors.append(line)
         return errors[:30]
 
@@ -1009,7 +1002,7 @@ class LeanBridge:
             f"Generate a Lean 4 proof that `{function_name}` satisfies "
             f"the following property:",
             "",
-            f"## Property to Prove",
+            "## Property to Prove",
             property_description,
             "",
             "## Python Source",

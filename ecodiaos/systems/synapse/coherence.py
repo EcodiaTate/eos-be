@@ -221,7 +221,7 @@ class CoherenceMonitor:
         for latencies in self._response_latencies:
             if len(latencies) >= 2:
                 mean = sum(latencies) / len(latencies)
-                var = sum((l - mean) ** 2 for l in latencies) / len(latencies)
+                var = sum((lat - mean) ** 2 for lat in latencies) / len(latencies)
                 variances.append(var)
 
         if not variances:
@@ -288,7 +288,7 @@ class CoherenceMonitor:
             return 0.5
 
         mean = sum(all_latencies) / len(all_latencies)
-        variance = sum((l - mean) ** 2 for l in all_latencies) / len(all_latencies)
+        variance = sum((lat - mean) ** 2 for lat in all_latencies) / len(all_latencies)
         std_dev = math.sqrt(variance)
 
         # Normalise: std_dev=0 → synchrony=1.0

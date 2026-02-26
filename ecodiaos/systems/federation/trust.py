@@ -16,19 +16,18 @@ specific pair of instances, not inherited from the network.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 import structlog
 
 from ecodiaos.primitives.common import utc_now
 from ecodiaos.primitives.federation import (
+    TRUST_THRESHOLDS,
+    VIOLATION_MULTIPLIER,
     FederationInteraction,
     FederationLink,
     InteractionOutcome,
-    TRUST_THRESHOLDS,
     TrustLevel,
-    VIOLATION_MULTIPLIER,
     ViolationType,
 )
 
@@ -181,7 +180,7 @@ class TrustManager:
         self, link: FederationLink, knowledge_type: str
     ) -> bool:
         """Check if the current trust level permits sharing a knowledge type."""
-        from ecodiaos.primitives.federation import KnowledgeType, SHARING_PERMISSIONS
+        from ecodiaos.primitives.federation import SHARING_PERMISSIONS, KnowledgeType
 
         try:
             kt = KnowledgeType(knowledge_type)
@@ -199,7 +198,7 @@ class TrustManager:
         """Compute mean trust score across all active links."""
         if not links:
             return 0.0
-        return sum(l.trust_score for l in links) / len(links)
+        return sum(lnk.trust_score for lnk in links) / len(links)
 
     # ─── Internal ───────────────────────────────────────────────────
 
@@ -215,7 +214,7 @@ class TrustManager:
           ALLY: 100
         """
         # Iterate from highest to lowest threshold
-        for level in sorted(TRUST_THRESHOLDS.keys(), key=lambda l: l.value, reverse=True):
+        for level in sorted(TRUST_THRESHOLDS.keys(), key=lambda lvl: lvl.value, reverse=True):
             if score >= TRUST_THRESHOLDS[level]:
                 return level
         return TrustLevel.NONE

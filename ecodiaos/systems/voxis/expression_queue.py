@@ -40,11 +40,14 @@ import heapq
 import math
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
 from ecodiaos.systems.voxis.types import ExpressionIntent, ExpressionTrigger
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
 
 logger = structlog.get_logger()
 

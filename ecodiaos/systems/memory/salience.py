@@ -9,11 +9,13 @@ versus what's deep in sediment.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
 
 logger = structlog.get_logger()
 
@@ -91,12 +93,12 @@ def compute_enriched_salience(
     return min(1.0, max(0.0, salience))
 
 
-async def decay_all_salience(neo4j: Neo4jClient) -> dict:
+async def decay_all_salience(neo4j: Neo4jClient) -> dict[str, Any]:
     """
     Apply time-based salience decay to all entities and episodes.
     Called during consolidation (every few hours).
     """
-    now = datetime.now(timezone.utc)
+    datetime.now(UTC)
 
     # Decay entity salience
     entity_result = await neo4j.execute_write(

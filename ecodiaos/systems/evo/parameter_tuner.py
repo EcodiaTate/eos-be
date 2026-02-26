@@ -25,23 +25,19 @@ Performance: parameter adjustment application ≤50ms (spec Section X).
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from ecodiaos.systems.evo.types import (
-    EVO_CONSTRAINTS,
     PARAMETER_DEFAULTS,
     TUNABLE_PARAMETERS,
     VELOCITY_LIMITS,
     Hypothesis,
     HypothesisCategory,
     HypothesisStatus,
-    Mutation,
     MutationType,
     ParameterAdjustment,
-    ParameterSpec,
 )
 
 if TYPE_CHECKING:

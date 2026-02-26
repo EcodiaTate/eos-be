@@ -31,7 +31,6 @@ import asyncio
 import fnmatch
 import re
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -44,6 +43,8 @@ from ecodiaos.systems.simula.verification.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.llm import LLMProvider
 
 logger = structlog.get_logger().bind(system="simula.retrieval")

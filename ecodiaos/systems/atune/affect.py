@@ -23,15 +23,19 @@ Mood dynamics (v2):
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import structlog
 
 from ecodiaos.primitives.affect import AffectState
 from ecodiaos.primitives.common import utc_now
-from ecodiaos.primitives.percept import Percept
 
 from .helpers import clamp, detect_distress
 from .salience import analyse_sentiment
 from .types import PredictionError, PredictionErrorDirection, SystemLoad
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.percept import Percept
 
 logger = structlog.get_logger("ecodiaos.systems.atune.affect")
 

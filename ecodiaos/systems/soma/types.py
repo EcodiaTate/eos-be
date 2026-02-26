@@ -12,10 +12,10 @@ no DB, no network calls. 5ms budget per theta cycle.
 
 from __future__ import annotations
 
+from datetime import datetime
 import enum
 import math
-from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import Field
 
@@ -25,7 +25,7 @@ from ecodiaos.primitives.common import EOSBaseModel, new_id, utc_now
 # ─── Enums ────────────────────────────────────────────────────────
 
 
-class InteroceptiveDimension(str, enum.Enum):
+class InteroceptiveDimension(enum.StrEnum):
     """The nine dimensions of felt internal state."""
 
     ENERGY = "energy"                       # Metabolic budget (token/compute availability)
@@ -39,7 +39,7 @@ class InteroceptiveDimension(str, enum.Enum):
     TEMPORAL_PRESSURE = "temporal_pressure"  # Urgency / time horizon compression
 
 
-class DevelopmentalStage(str, enum.Enum):
+class DevelopmentalStage(enum.StrEnum):
     """Maturation stages governing which Soma capabilities are active."""
 
     REFLEXIVE = "reflexive"        # Boot to hours — basic sensing, reactive
@@ -349,12 +349,12 @@ class AllostaticSignal(EOSBaseModel):
     dominant_error_rate: float = 0.0
     precision_weights: dict[InteroceptiveDimension, float] = Field(default_factory=dict)
     max_temporal_dissonance: float = 0.0
-    dissonant_dimension: Optional[InteroceptiveDimension] = None
-    nearest_attractor: Optional[str] = None
-    distance_to_bifurcation: Optional[float] = None
+    dissonant_dimension: InteroceptiveDimension | None = None
+    nearest_attractor: str | None = None
+    distance_to_bifurcation: float | None = None
     trajectory_heading: str = "transient"
     energy_burn_rate: float = 0.0
-    predicted_energy_exhaustion_s: Optional[float] = None
+    predicted_energy_exhaustion_s: float | None = None
     timestamp: datetime = Field(default_factory=utc_now)
     cycle_number: int = 0
 
@@ -437,7 +437,7 @@ class Bifurcation(EOSBaseModel):
     pre_regime: str  # Attractor label before crossing
     post_regime: str  # Attractor label after crossing
     crossing_count: int = 0
-    mean_recovery_time_s: Optional[float] = None
+    mean_recovery_time_s: float | None = None
     # Learned boundary coefficients for distance computation
     # weights[dim] * sensed[dim] + bias > 0 means "past the boundary"
     weights: dict[InteroceptiveDimension, float] = Field(default_factory=dict)
@@ -460,7 +460,7 @@ class Bifurcation(EOSBaseModel):
         self,
         state: dict[InteroceptiveDimension, float],
         velocity: dict[InteroceptiveDimension, float],
-    ) -> Optional[float]:
+    ) -> float | None:
         """
         Estimated seconds until boundary is crossed, given current velocity.
         Returns None if moving away or boundary not defined.
@@ -518,11 +518,11 @@ class ScheduledAllostaticEvent(EOSBaseModel):
 class PhaseSpaceSnapshot(EOSBaseModel):
     """Snapshot of the current phase-space navigation state."""
 
-    nearest_attractor: Optional[str] = None
+    nearest_attractor: str | None = None
     nearest_attractor_distance: float = float("inf")
     trajectory_heading: str = "transient"
     distance_to_nearest_bifurcation: float = float("inf")
-    time_to_nearest_bifurcation: Optional[float] = None
+    time_to_nearest_bifurcation: float | None = None
     attractor_count: int = 0
     bifurcation_count: int = 0
 

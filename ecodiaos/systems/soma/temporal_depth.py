@@ -13,13 +13,10 @@ High temporal dissonance signals Nova to deliberate time-horizon tradeoffs:
 
 from __future__ import annotations
 
-from typing import Optional
-
 import structlog
 
 from ecodiaos.systems.soma.types import (
     ALL_DIMENSIONS,
-    HORIZONS,
     STAGE_HORIZONS,
     DevelopmentalStage,
     InteroceptiveDimension,
@@ -73,7 +70,7 @@ class TemporalDepthManager:
     def max_dissonance(
         self,
         dissonance: dict[InteroceptiveDimension, float],
-    ) -> tuple[float, Optional[InteroceptiveDimension]]:
+    ) -> tuple[float, InteroceptiveDimension | None]:
         """
         Find the dimension with maximum absolute temporal dissonance.
         Returns (max_value, dimension) or (0.0, None) if no dissonance.
@@ -82,7 +79,7 @@ class TemporalDepthManager:
             return 0.0, None
 
         max_val = 0.0
-        max_dim: Optional[InteroceptiveDimension] = None
+        max_dim: InteroceptiveDimension | None = None
 
         for dim, val in dissonance.items():
             if abs(val) > abs(max_val):

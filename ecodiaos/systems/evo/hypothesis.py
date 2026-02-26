@@ -25,7 +25,6 @@ Performance budget: evidence_evaluate ≤200ms per hypothesis (spec Section X).
 from __future__ import annotations
 
 import json
-import time
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -33,9 +32,9 @@ import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
-from ecodiaos.primitives.common import new_id, utc_now
-from ecodiaos.primitives.memory_trace import Episode
+from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.evo.types import (
+    VELOCITY_LIMITS,
     EvidenceDirection,
     EvidenceResult,
     Hypothesis,
@@ -44,10 +43,10 @@ from ecodiaos.systems.evo.types import (
     Mutation,
     MutationType,
     PatternCandidate,
-    VELOCITY_LIMITS,
 )
 
 if TYPE_CHECKING:
+    from ecodiaos.primitives.memory_trace import Episode
     from ecodiaos.systems.memory.service import MemoryService
 
 logger = structlog.get_logger()

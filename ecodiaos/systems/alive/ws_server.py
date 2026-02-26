@@ -19,9 +19,10 @@ from typing import TYPE_CHECKING, Any
 import orjson
 import structlog
 import websockets
-from websockets.asyncio.server import ServerConnection
 
 if TYPE_CHECKING:
+    from websockets.asyncio.server import ServerConnection
+
     from ecodiaos.clients.redis import RedisClient
     from ecodiaos.systems.atune.service import AtuneService
 
@@ -161,7 +162,7 @@ class AliveWebSocketServer:
             self._logger.error("alive_redis_subscriber_error", error=str(exc))
         finally:
             await pubsub.unsubscribe(channel)
-            await pubsub.aclose()
+            await pubsub.aclose()  # type: ignore[no-untyped-call]
 
     # ─── Affect Poller ─────────────────────────────────────────────────
 

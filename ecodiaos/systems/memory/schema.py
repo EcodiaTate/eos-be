@@ -7,9 +7,12 @@ This is the physical structure of the knowledge graph.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
 
 logger = structlog.get_logger()
 

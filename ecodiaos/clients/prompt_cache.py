@@ -17,8 +17,8 @@ import asyncio
 import hashlib
 import json as _json
 from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Generic, TypeVar
+from enum import StrEnum
+from typing import Any, TypeVar
 
 import structlog
 
@@ -28,7 +28,7 @@ logger = structlog.get_logger()
 T = TypeVar('T')
 
 
-class CacheStrategy(str, Enum):
+class CacheStrategy(StrEnum):
     """Cache configuration per system."""
     AGGRESSIVE = "aggressive"  # Short TTL (1min), high hit rate expected
     NORMAL = "normal"          # Medium TTL (5min), balanced
@@ -36,7 +36,7 @@ class CacheStrategy(str, Enum):
 
 
 @dataclass
-class CacheEntry(Generic[T]):
+class CacheEntry[T]:
     """A cached value with metadata."""
     value: T
     timestamp: float
@@ -74,7 +74,7 @@ class PromptCache:
     ) -> str:
         """Compute cache key from system, method, prompt."""
         digest = hashlib.sha256(
-            f"{system}:{method}:{prompt}".encode("utf-8")
+            f"{system}:{method}:{prompt}".encode()
         ).hexdigest()
         return f"{self._prefix}:{system}:{method}:{digest}"
 
@@ -179,7 +179,7 @@ class PromptCache:
         try:
             keys = await self._redis.keys(f"{self._prefix}:{pattern}")
             if keys:
-                deleted = await self._redis.delete(*keys)
+                deleted = int(await self._redis.delete(*keys))
                 self._logger.info(
                     "cache_cleared",
                     pattern=pattern,

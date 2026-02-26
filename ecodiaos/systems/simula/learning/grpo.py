@@ -31,10 +31,8 @@ References:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -239,7 +237,7 @@ class GRPOTrainingEngine:
         sft_data = self._prepare_sft_data(positive_examples)
 
         # Build training configuration
-        training_config = {
+        training_config: dict[str, Any] = {
             "model_id": self._config.grpo_base_model,
             "method": "sft",
             "epochs": self._config.grpo_sft_epochs,
@@ -328,7 +326,7 @@ class GRPOTrainingEngine:
         # Build contrastive training batches
         batches = self._build_grpo_batches(self._training_data)
 
-        training_config = {
+        training_config: dict[str, Any] = {
             "model_id": current.finetuned_model_id or self._config.grpo_base_model,
             "model_path": current.finetuned_model_path,
             "method": "grpo",

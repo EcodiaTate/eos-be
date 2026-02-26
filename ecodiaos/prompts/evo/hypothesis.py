@@ -8,7 +8,10 @@ without touching logic code.
 
 from __future__ import annotations
 
-from ecodiaos.systems.evo.types import Hypothesis, PatternCandidate
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ecodiaos.systems.evo.types import Hypothesis, PatternCandidate
 
 
 def build_generation_system_prompt(instance_name: str) -> str:

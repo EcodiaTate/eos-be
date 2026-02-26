@@ -26,29 +26,29 @@ from __future__ import annotations
 
 import time
 from datetime import timedelta
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from ecodiaos.primitives.common import utc_now
-from ecodiaos.systems.evo.hypothesis import HypothesisEngine
-from ecodiaos.systems.evo.parameter_tuner import ParameterTuner
-from ecodiaos.systems.evo.procedure_extractor import ProcedureExtractor
-from ecodiaos.systems.evo.self_model import SelfModelManager
 from ecodiaos.systems.evo.types import (
+    VELOCITY_LIMITS,
     ConsolidationResult,
     EvolutionProposal,
-    Hypothesis,
     HypothesisCategory,
     HypothesisStatus,
     MutationType,
     PatternContext,
     SchemaInduction,
-    VELOCITY_LIMITS,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ecodiaos.systems.evo.hypothesis import HypothesisEngine
+    from ecodiaos.systems.evo.parameter_tuner import ParameterTuner
+    from ecodiaos.systems.evo.procedure_extractor import ProcedureExtractor
+    from ecodiaos.systems.evo.self_model import SelfModelManager
     from ecodiaos.systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
@@ -95,9 +95,7 @@ class ConsolidationOrchestrator:
         hours_elapsed = (utc_now() - self._last_run_at).total_seconds() / 3600
         if hours_elapsed >= _CONSOLIDATION_INTERVAL_HOURS:
             return True
-        if cycles_since_last >= _CONSOLIDATION_CYCLE_THRESHOLD:
-            return True
-        return False
+        return cycles_since_last >= _CONSOLIDATION_CYCLE_THRESHOLD
 
     async def run(self, pattern_context: PatternContext) -> ConsolidationResult:
         """
@@ -245,7 +243,7 @@ class ConsolidationOrchestrator:
         Phase 4: Extract procedures from mature action-sequence patterns.
         Returns the count of new procedures extracted.
         """
-        mature_patterns = context.get_mature_sequences(
+        context.get_mature_sequences(
             min_occurrences=VELOCITY_LIMITS["max_new_procedures_per_cycle"]
         )
         # Get_mature_sequences returns patterns >= min, use ≥3 (spec threshold)

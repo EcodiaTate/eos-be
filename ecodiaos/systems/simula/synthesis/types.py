@@ -20,11 +20,10 @@ from pydantic import Field
 
 from ecodiaos.primitives.common import EOSBaseModel
 
-
 # ── Enums ────────────────────────────────────────────────────────────────────
 
 
-class SynthesisStrategy(str, enum.Enum):
+class SynthesisStrategy(enum.StrEnum):
     """Available synthesis strategies (ordered by typical speed)."""
 
     HYSYNTH = "hysynth"
@@ -33,7 +32,7 @@ class SynthesisStrategy(str, enum.Enum):
     CEGIS_FALLBACK = "cegis_fallback"
 
 
-class SynthesisStatus(str, enum.Enum):
+class SynthesisStatus(enum.StrEnum):
     """Terminal status of a synthesis attempt."""
 
     SYNTHESIZED = "synthesized"
@@ -43,7 +42,7 @@ class SynthesisStatus(str, enum.Enum):
     SKIPPED = "skipped"
 
 
-class HoleKind(str, enum.Enum):
+class HoleKind(enum.StrEnum):
     """Kind of hole in a sketch template."""
 
     EXPRESSION = "expression"

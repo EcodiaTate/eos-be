@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     from ecodiaos.clients.embedding import EmbeddingClient
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.simula.analytics import EvolutionAnalyticsEngine
-    from ecodiaos.systems.simula.history import EvolutionHistoryManager
 
 logger = structlog.get_logger().bind(system="simula.intelligence")
 
@@ -374,7 +373,7 @@ class ProposalIntelligence:
         try:
             import asyncio
             response = await asyncio.wait_for(
-                self._llm.evaluate(prompt=prompt, max_tokens=200, temperature=0.1),
+                self._llm.evaluate(prompt=prompt, max_tokens=200, temperature=0.1),  # type: ignore[union-attr]
                 timeout=8.0,
             )
 
@@ -466,7 +465,7 @@ class ProposalIntelligence:
                     dependencies.append((
                         add_p.id,
                         cap_p.id,
-                        f"Add component before adding system capability",
+                        "Add component before adding system capability",
                     ))
 
         # Budget changes should come after the thing they budget for
@@ -474,8 +473,8 @@ class ProposalIntelligence:
             param = budget_p.change_spec.budget_parameter or ""
             for add_p in additive:
                 # If the budget parameter references the additive system
-                add_systems = add_p.change_spec.affected_systems
-                for sys in add_systems:
+                add_systems_list = add_p.change_spec.affected_systems
+                for sys in add_systems_list:
                     if sys in param:
                         dependencies.append((
                             add_p.id,

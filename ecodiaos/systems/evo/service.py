@@ -34,15 +34,11 @@ Guard rails inherited from sub-systems:
 from __future__ import annotations
 
 import asyncio
-import time
+import contextlib
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.llm import LLMProvider
-from ecodiaos.config import EvoConfig
-from ecodiaos.primitives.memory_trace import Episode
-from ecodiaos.systems.atune.types import WorkspaceBroadcast
 from ecodiaos.systems.evo.consolidation import ConsolidationOrchestrator
 from ecodiaos.systems.evo.detectors import PatternDetector, build_default_detectors
 from ecodiaos.systems.evo.hypothesis import HypothesisEngine
@@ -58,6 +54,10 @@ from ecodiaos.systems.evo.types import (
 )
 
 if TYPE_CHECKING:
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.config import EvoConfig
+    from ecodiaos.primitives.memory_trace import Episode
+    from ecodiaos.systems.atune.types import WorkspaceBroadcast
     from ecodiaos.systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
@@ -169,10 +169,8 @@ class EvoService:
         """Graceful shutdown. Cancels any running consolidation task."""
         if self._consolidation_task and not self._consolidation_task.done():
             self._consolidation_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._consolidation_task
-            except asyncio.CancelledError:
-                pass
 
         self._logger.info(
             "evo_shutdown",
@@ -280,15 +278,15 @@ class EvoService:
                     error=str(exc),
                 )
 
-    async def _generate_goal_from_hypothesis(self, hypothesis) -> None:
+    async def _generate_goal_from_hypothesis(self, hypothesis: Any) -> None:
         """
         Convert a supported hypothesis into an epistemic exploration goal.
 
         When Evo accumulates enough evidence to support a hypothesis, the
         organism should actively explore and test it — not just passively wait.
         """
+        from ecodiaos.primitives.common import DriveAlignmentVector, new_id
         from ecodiaos.systems.nova.types import Goal, GoalSource, GoalStatus
-        from ecodiaos.primitives.common import new_id, DriveAlignmentVector
 
         goal = Goal(
             id=new_id(),
@@ -770,7 +768,7 @@ def _broadcast_to_episode(broadcast: WorkspaceBroadcast) -> Episode:
 
 def _trace_to_episode(trace: Any) -> Episode:
     """Build a minimal Episode from a RetrievalResult for evidence evaluation."""
-    from ecodiaos.primitives.common import new_id, utc_now
+    from ecodiaos.primitives.common import new_id
     from ecodiaos.primitives.memory_trace import Episode
 
     return Episode(

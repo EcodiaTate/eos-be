@@ -7,8 +7,7 @@ Shared enums, base classes, and utilities used across all systems.
 from __future__ import annotations
 
 import enum
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 from ulid import ULID
@@ -21,13 +20,13 @@ def new_id() -> str:
 
 def utc_now() -> datetime:
     """Current UTC time, timezone-aware."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ─── Enums ────────────────────────────────────────────────────────
 
 
-class SystemID(str, enum.Enum):
+class SystemID(enum.StrEnum):
     MEMORY = "memory"
     EQUOR = "equor"
     ATUNE = "atune"
@@ -45,7 +44,7 @@ class SystemID(str, enum.Enum):
     API = "api"
 
 
-class Modality(str, enum.Enum):
+class Modality(enum.StrEnum):
     TEXT = "text"
     VOICE = "voice"
     SENSOR = "sensor"
@@ -53,7 +52,7 @@ class Modality(str, enum.Enum):
     FEDERATION = "federation"
 
 
-class EntityType(str, enum.Enum):
+class EntityType(enum.StrEnum):
     PERSON = "person"
     PLACE = "place"
     ORGANISATION = "organisation"
@@ -77,14 +76,14 @@ class AutonomyLevel(int, enum.Enum):
     STEWARD = 3     # Acts autonomously within bounds
 
 
-class Verdict(str, enum.Enum):
+class Verdict(enum.StrEnum):
     APPROVED = "approved"
     MODIFIED = "modified"
     BLOCKED = "blocked"
     DEFERRED = "deferred"
 
 
-class HealthStatus(str, enum.Enum):
+class HealthStatus(enum.StrEnum):
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"

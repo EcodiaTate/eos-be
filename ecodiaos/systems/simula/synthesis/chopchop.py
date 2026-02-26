@@ -23,7 +23,6 @@ from __future__ import annotations
 import ast
 import re
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -36,6 +35,8 @@ from ecodiaos.systems.simula.synthesis.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.simula.types import ChangeSpec
 
@@ -283,7 +284,7 @@ class ChopChopEngine:
             if chunk_idx > 0:
                 prompt += f"\n\nThis is chunk {chunk_idx + 1} of ~{total_chunks}."
 
-            response = await self._llm.complete(
+            response = await self._llm.complete(  # type: ignore[attr-defined]
                 system="You are a precise Python code generator.",
                 messages=[Message(role="user", content=prompt)],
                 max_tokens=1024,

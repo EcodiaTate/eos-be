@@ -18,7 +18,6 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 # ─── Sub-configs ──────────────────────────────────────────────────
 
 
@@ -35,7 +34,7 @@ class ServerConfig(BaseModel):
 
 
 class Neo4jConfig(BaseModel):
-    uri: str = "neo4j+s://localhost:7687"
+    uri: str = ""  # Required: set via ECODIAOS_NEO4J_URI (e.g., neo4j+s://xxx.databases.neo4j.io)
     username: str = "neo4j"
     password: str = ""
     database: str = "neo4j"
@@ -93,7 +92,7 @@ class LLMConfig(BaseModel):
     budgets: dict[str, LLMBudget] = Field(default_factory=dict)  # Deprecated, use budget
 
     @model_validator(mode="after")
-    def _strip_api_key(self) -> "LLMConfig":
+    def _strip_api_key(self) -> LLMConfig:
         # GCP Secret Manager can inject trailing \r\n into env vars
         if self.api_key:
             object.__setattr__(self, "api_key", self.api_key.strip())
@@ -347,6 +346,18 @@ class SimulaConfig(BaseModel):
     symbolic_execution_domains: list[str] = Field(
         default_factory=lambda: ["budget_calculation", "risk_scoring"],
     )  # domains to target for symbolic execution
+    # Stage 7: Hunter — Zero-Day Discovery Engine
+    hunter_enabled: bool = False  # opt-in vulnerability hunting
+    hunter_max_workers: int = 4  # concurrent surface × goal analysis workers (1-16)
+    hunter_sandbox_timeout_s: int = 30  # PoC sandbox execution timeout
+    hunter_clone_depth: int = 1  # git clone depth (1 = shallow)
+    hunter_log_analytics: bool = True  # emit structlog analytics events
+    hunter_authorized_targets: list[str] = Field(
+        default_factory=list,
+    )  # domains allowed for PoC execution
+    hunter_generate_pocs: bool = False  # auto-generate exploit PoC scripts
+    hunter_generate_patches: bool = False  # auto-generate + verify patches
+    hunter_remediation_enabled: bool = False  # enable HunterRepairOrchestrator
 
 
 class ThymosConfig(BaseModel):

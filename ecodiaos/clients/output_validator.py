@@ -52,7 +52,8 @@ class OutputValidator:
 
         # Try direct parse
         try:
-            return _json.loads(text)
+            parsed: dict[str, Any] | None = _json.loads(text)
+            return parsed
         except _json.JSONDecodeError:
             pass
 
@@ -63,7 +64,8 @@ class OutputValidator:
         if start_idx >= 0 and end_idx > start_idx:
             candidate = text[start_idx : end_idx + 1]
             try:
-                return _json.loads(candidate)
+                parsed = _json.loads(candidate)
+                return parsed
             except _json.JSONDecodeError:
                 pass
 
@@ -74,7 +76,8 @@ class OutputValidator:
         if start_idx >= 0 and end_idx > start_idx:
             candidate = text[start_idx : end_idx + 1]
             try:
-                return _json.loads(candidate)
+                parsed = _json.loads(candidate)
+                return parsed
             except _json.JSONDecodeError:
                 pass
 

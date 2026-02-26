@@ -19,8 +19,7 @@ All strategies:
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 import yaml
@@ -33,7 +32,8 @@ from ecodiaos.systems.simula.types import (
 )
 
 if TYPE_CHECKING:
-    from ecodiaos.clients.llm import LLMProvider
+    from pathlib import Path
+
     from ecodiaos.systems.simula.agents.test_designer import TestDesignerAgent
     from ecodiaos.systems.simula.agents.test_executor import TestExecutorAgent
     from ecodiaos.systems.simula.code_agent import SimulaCodeAgent
@@ -130,7 +130,7 @@ class ChangeApplicator:
         )
 
         try:
-            data: dict = {}
+            data: dict[str, Any] = {}
             if config_path.exists():
                 with open(config_path) as f:
                     data = yaml.safe_load(f) or {}
@@ -314,7 +314,7 @@ class ChangeApplicator:
             if te.total > 0:
                 final_pass_rate = te.passed / te.total
 
-        agent_coder_result = AgentCoderResult(
+        AgentCoderResult(
             iterations=iterations,
             total_iterations=len(iterations),
             final_pass_rate=final_pass_rate,

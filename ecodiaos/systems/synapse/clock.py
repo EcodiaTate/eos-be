@@ -18,6 +18,7 @@ Timing model:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections import deque
 from collections.abc import Callable, Coroutine
@@ -25,11 +26,11 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.config import SynapseConfig
 from ecodiaos.systems.atune.types import SystemLoad
 from ecodiaos.systems.synapse.types import ClockState, CycleResult
 
 if TYPE_CHECKING:
+    from ecodiaos.config import SynapseConfig
     from ecodiaos.systems.atune.service import AtuneService
 
 logger = structlog.get_logger("ecodiaos.systems.synapse.clock")
@@ -128,10 +129,8 @@ class CognitiveClock:
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         self._task = None
         self._logger.info(
             "clock_stopped",
@@ -387,4 +386,4 @@ class CognitiveClock:
         n = len(periods)
         mean = sum(periods) / n
         variance = sum((p - mean) ** 2 for p in periods) / n
-        return variance ** 0.5
+        return float(variance ** 0.5)

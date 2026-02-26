@@ -8,11 +8,14 @@ Writes are batched and flushed to TimescaleDB periodically.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+import contextlib
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.timescaledb import TimescaleDBClient
+if TYPE_CHECKING:
+    from ecodiaos.clients.timescaledb import TimescaleDBClient
 
 logger = structlog.get_logger()
 
@@ -35,9 +38,9 @@ class MetricCollector:
         self._tsdb = tsdb
         self._flush_interval = flush_interval_ms / 1000.0
         self._batch_size = batch_size
-        self._buffer: list[dict] = []
+        self._buffer: list[dict[str, Any]] = []
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
     async def record(
         self,
@@ -48,7 +51,7 @@ class MetricCollector:
     ) -> None:
         """Record a metric data point."""
         self._buffer.append({
-            "time": datetime.now(timezone.utc),
+            "time": datetime.now(UTC),
             "system": system,
             "metric": metric,
             "value": value,
@@ -90,9 +93,7 @@ class MetricCollector:
         self._running = False
         if self._task:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         await self.flush()
         logger.info("metric_writer_stopped")

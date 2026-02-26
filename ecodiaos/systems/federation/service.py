@@ -40,8 +40,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.config import FederationConfig
-from ecodiaos.primitives.common import new_id, utc_now
+from ecodiaos.primitives.common import utc_now
 from ecodiaos.primitives.federation import (
     AssistanceRequest,
     AssistanceResponse,
@@ -65,6 +64,7 @@ from ecodiaos.systems.federation.trust import TrustManager
 
 if TYPE_CHECKING:
     from ecodiaos.clients.redis import RedisClient
+    from ecodiaos.config import FederationConfig
     from ecodiaos.systems.equor.service import EquorService
     from ecodiaos.systems.memory.service import MemoryService
     from ecodiaos.telemetry.metrics import MetricCollector
@@ -267,8 +267,8 @@ class FederationService:
 
         # Check max links
         active_count = sum(
-            1 for l in self._links.values()
-            if l.status == FederationLinkStatus.ACTIVE
+            1 for lnk in self._links.values()
+            if lnk.status == FederationLinkStatus.ACTIVE
         )
         if active_count >= self._config.max_concurrent_links:
             return {"error": f"Maximum concurrent links ({self._config.max_concurrent_links}) reached"}
@@ -316,7 +316,10 @@ class FederationService:
             try:
                 # Build a lightweight intent for federation link review
                 from ecodiaos.primitives.intent import (
-                    Intent, GoalDescriptor, ActionSequence, DecisionTrace,
+                    ActionSequence,
+                    DecisionTrace,
+                    GoalDescriptor,
+                    Intent,
                 )
                 intent = Intent(
                     goal=GoalDescriptor(
@@ -465,7 +468,10 @@ class FederationService:
         if self._equor:
             try:
                 from ecodiaos.primitives.intent import (
-                    Intent, GoalDescriptor, ActionSequence, DecisionTrace,
+                    ActionSequence,
+                    DecisionTrace,
+                    GoalDescriptor,
+                    Intent,
                 )
                 intent = Intent(
                     goal=GoalDescriptor(
@@ -576,7 +582,10 @@ class FederationService:
         if self._equor:
             try:
                 from ecodiaos.primitives.intent import (
-                    Intent, GoalDescriptor, ActionSequence, DecisionTrace,
+                    ActionSequence,
+                    DecisionTrace,
+                    GoalDescriptor,
+                    Intent,
                 )
                 intent = Intent(
                     goal=GoalDescriptor(
@@ -654,8 +663,8 @@ class FederationService:
     def active_links(self) -> list[FederationLink]:
         """All active federation links."""
         return [
-            l for l in self._links.values()
-            if l.status == FederationLinkStatus.ACTIVE
+            lnk for lnk in self._links.values()
+            if lnk.status == FederationLinkStatus.ACTIVE
         ]
 
     def get_link(self, link_id: str) -> FederationLink | None:
@@ -716,19 +725,19 @@ class FederationService:
             "interaction_history_size": len(self._interaction_history),
             "links": [
                 {
-                    "id": l.id,
-                    "remote_id": l.remote_instance_id,
-                    "remote_name": l.remote_name,
-                    "trust_level": l.trust_level.name,
-                    "trust_score": round(l.trust_score, 2),
-                    "status": l.status.value,
-                    "shared_count": l.shared_knowledge_count,
-                    "received_count": l.received_knowledge_count,
-                    "successful": l.successful_interactions,
-                    "failed": l.failed_interactions,
-                    "violations": l.violation_count,
+                    "id": lnk.id,
+                    "remote_id": lnk.remote_instance_id,
+                    "remote_name": lnk.remote_name,
+                    "trust_level": lnk.trust_level.name,
+                    "trust_score": round(lnk.trust_score, 2),
+                    "status": lnk.status.value,
+                    "shared_count": lnk.shared_knowledge_count,
+                    "received_count": lnk.received_knowledge_count,
+                    "successful": lnk.successful_interactions,
+                    "failed": lnk.failed_interactions,
+                    "violations": lnk.violation_count,
                 }
-                for l in self._links.values()
+                for lnk in self._links.values()
             ],
         }
 
@@ -750,7 +759,7 @@ class FederationService:
         if len(self._interaction_history) > self._max_history:
             self._interaction_history = self._interaction_history[-self._max_history:]
 
-    async def _inject_federated_percept(self, knowledge_items: list, link: Any) -> None:
+    async def _inject_federated_percept(self, knowledge_items: list[Any], link: Any) -> None:
         """
         Inject federated knowledge into Atune as perceived input.
 
@@ -794,16 +803,14 @@ class FederationService:
                 for link_id, link in self._links.items()
             }
             for link_id, data in links_data.items():
-                await self._redis.set(
+                await self._redis.set_json(
                     f"fed:links:{link_id}",
                     data,
-                    ttl=None,  # Persistent
                 )
             # Store the link ID index
-            await self._redis.set(
+            await self._redis.set_json(
                 "fed:link_ids",
-                ",".join(self._links.keys()),
-                ttl=None,
+                list(self._links.keys()),
             )
         except Exception as exc:
             self._logger.warning(
@@ -817,15 +824,15 @@ class FederationService:
 
         if self._redis:
             try:
-                link_ids_raw = await self._redis.get("fed:link_ids")
+                link_ids_raw = await self._redis.get_json("fed:link_ids")
                 if link_ids_raw:
-                    link_ids = link_ids_raw.split(",") if link_ids_raw else []
+                    link_ids: list[str] = list(link_ids_raw) if link_ids_raw else []
                     for link_id in link_ids:
                         if not link_id:
                             continue
-                        data = await self._redis.get(f"fed:links:{link_id}")
+                        data = await self._redis.get_json(f"fed:links:{link_id}")
                         if data:
-                            link = FederationLink.model_validate_json(data)
+                            link = FederationLink.model_validate_json(str(data))
                             self._links[link.id] = link
                     loaded = bool(self._links)
             except Exception as exc:
@@ -857,7 +864,7 @@ class FederationService:
             if not backup_path.exists():
                 return
             raw = json.loads(backup_path.read_text(encoding="utf-8"))
-            for link_id, link_json in raw.items():
+            for _link_id, link_json in raw.items():
                 link = FederationLink.model_validate_json(link_json)
                 self._links[link.id] = link
         except Exception as exc:

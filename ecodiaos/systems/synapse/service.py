@@ -30,11 +30,11 @@ The _on_cycle callback (called by CognitiveClock after every tick):
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.config import SynapseConfig
 from ecodiaos.systems.synapse.clock import CognitiveClock
 from ecodiaos.systems.synapse.coherence import CoherenceMonitor
 from ecodiaos.systems.synapse.degradation import DegradationManager
@@ -53,6 +53,7 @@ from ecodiaos.systems.synapse.types import (
 
 if TYPE_CHECKING:
     from ecodiaos.clients.redis import RedisClient
+    from ecodiaos.config import SynapseConfig
     from ecodiaos.systems.atune.service import AtuneService
     from ecodiaos.telemetry.metrics import MetricCollector
 
@@ -269,10 +270,8 @@ class SynapseService:
 
         # ── 1. Feed rhythm detector (every cycle) ──
         coherence_stress = 0.0
-        try:
+        with contextlib.suppress(Exception):
             coherence_stress = self._atune.current_affect.coherence_stress
-        except Exception:
-            pass
 
         await self._rhythm.update(result, coherence_stress=coherence_stress)
 

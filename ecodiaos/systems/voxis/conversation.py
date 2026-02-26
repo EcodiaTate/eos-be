@@ -16,21 +16,21 @@ a deliberate trade-off: perfect recall vs. practical context budget.
 
 from __future__ import annotations
 
-import json
-from collections import deque
-from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.clients.llm import LLMProvider, Message
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
-from ecodiaos.clients.redis import RedisClient
 from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.prompts.voxis.conversation import (
     build_summarise_segment_prompt,
     build_topic_extraction_prompt,
 )
 from ecodiaos.systems.voxis.types import ConversationMessage, ConversationState
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.clients.redis import RedisClient
 
 logger = structlog.get_logger()
 
@@ -250,10 +250,9 @@ class ConversationManager:
     async def _load_from_redis(self, conversation_id: str) -> ConversationState | None:
         key = self._redis_key(conversation_id)
         try:
-            raw = await self._redis.get(key)
-            if raw is None:
+            data = await self._redis.get_json(key)
+            if data is None:
                 return None
-            data = json.loads(raw)
             return ConversationState(**data)
         except Exception:
             self._logger.warning("conversation_load_failed", conversation_id=conversation_id, exc_info=True)
@@ -262,8 +261,7 @@ class ConversationManager:
     async def _save_to_redis(self, state: ConversationState) -> None:
         key = self._redis_key(state.conversation_id)
         try:
-            raw = state.model_dump_json()
-            await self._redis.set(key, raw, ex=_CONVERSATION_TTL_SECONDS)
+            await self._redis.set_json(key, state.model_dump(), ttl=_CONVERSATION_TTL_SECONDS)
         except Exception:
             self._logger.warning("conversation_save_failed", conversation_id=state.conversation_id, exc_info=True)
 

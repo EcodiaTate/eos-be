@@ -10,8 +10,8 @@ application, and immutable history.
 
 from __future__ import annotations
 
-import enum
 from datetime import datetime
+import enum
 from typing import Any
 
 from pydantic import Field
@@ -20,7 +20,6 @@ from ecodiaos.primitives.common import (
     EOSBaseModel,
     Identified,
     Timestamped,
-    new_id,
     utc_now,
 )
 
@@ -28,7 +27,7 @@ from ecodiaos.primitives.common import (
 # --- Enums -------------------------------------------------------------------
 
 
-class ChangeCategory(str, enum.Enum):
+class ChangeCategory(enum.StrEnum):
     ADD_EXECUTOR = "add_executor"
     ADD_INPUT_CHANNEL = "add_input_channel"
     ADD_PATTERN_DETECTOR = "add_pattern_detector"
@@ -43,7 +42,7 @@ class ChangeCategory(str, enum.Enum):
     MODIFY_SELF_EVOLUTION = "modify_self_evolution"
 
 
-class ProposalStatus(str, enum.Enum):
+class ProposalStatus(enum.StrEnum):
     PROPOSED = "proposed"
     SIMULATING = "simulating"
     AWAITING_GOVERNANCE = "awaiting_governance"
@@ -54,20 +53,20 @@ class ProposalStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
-class RiskLevel(str, enum.Enum):
+class RiskLevel(enum.StrEnum):
     LOW = "low"
     MODERATE = "moderate"
     HIGH = "high"
     UNACCEPTABLE = "unacceptable"
 
 
-class ImpactType(str, enum.Enum):
+class ImpactType(enum.StrEnum):
     IMPROVEMENT = "improvement"
     REGRESSION = "regression"
     NEUTRAL = "neutral"
 
 
-class TriageStatus(str, enum.Enum):
+class TriageStatus(enum.StrEnum):
     """Status of proposal triage (fast-path pre-simulation check)."""
     TRIVIAL = "trivial"
     REQUIRES_SIMULATION = "requires_simulation"

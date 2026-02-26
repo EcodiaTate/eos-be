@@ -15,14 +15,16 @@ scoring.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from datetime import datetime
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
-from ecodiaos.primitives.percept import Percept
-
 from .helpers import clamp, cosine_similarity
 from .types import PredictionError, PredictionErrorDirection
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.percept import Percept
 
 logger = structlog.get_logger("ecodiaos.systems.atune.prediction")
 
@@ -147,13 +149,16 @@ async def compute_prediction_error(
     # When the belief prediction has a valid embedding, use both embedding
     # distance and semantic divergence. When only predicted_content is
     # available (embedding=[]), rely entirely on semantic divergence.
-    has_embedding = bool(expected.embedding) and len(expected.embedding) == len(
-        percept.content.embedding
+    percept_embedding = percept.content.embedding
+    has_embedding = (
+        bool(expected.embedding)
+        and percept_embedding is not None
+        and len(expected.embedding) == len(percept_embedding)
     )
 
-    if has_embedding:
-        embedding_distance = 1.0 - cosine_similarity(
-            percept.content.embedding,
+    if has_embedding and percept_embedding is not None:
+        embedding_distance: float | None = 1.0 - cosine_similarity(
+            percept_embedding,
             expected.embedding,
         )
     else:
@@ -176,7 +181,7 @@ async def compute_prediction_error(
 
     direction = _classify_surprise(
         magnitude,
-        percept.content.embedding,
+        percept_embedding or [],
         expected.embedding,
     )
 

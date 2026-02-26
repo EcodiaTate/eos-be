@@ -20,10 +20,9 @@ from typing import Any
 import structlog
 
 from ecodiaos.systems.soma.types import (
+    _STAGE_ORDER,
     STAGE_HORIZONS,
     DevelopmentalStage,
-    _STAGE_ORDER,
-    stage_at_least,
 )
 
 logger = structlog.get_logger("ecodiaos.systems.soma.developmental")

@@ -10,18 +10,19 @@ primitive — the organism's inner life made observable.
 
 from __future__ import annotations
 
-import enum
 from datetime import datetime
+import enum
 from typing import Any
 
 from pydantic import Field
 
 from ecodiaos.primitives.common import EOSBaseModel, new_id, utc_now
 
+
 # ─── Enums ────────────────────────────────────────────────────────
 
 
-class SleepStage(str, enum.Enum):
+class SleepStage(enum.StrEnum):
     """States of consciousness in the circadian cycle."""
 
     WAKE = "wake"                   # Normal cognitive cycle
@@ -32,7 +33,7 @@ class SleepStage(str, enum.Enum):
     HYPNOPOMPIA = "hypnopompia"    # Transition out (~30s)
 
 
-class DreamType(str, enum.Enum):
+class DreamType(enum.StrEnum):
     """What kind of dream is this?"""
 
     RECOMBINATION = "recombination"             # Random co-activation bridge
@@ -43,7 +44,7 @@ class DreamType(str, enum.Enum):
     META_OBSERVATION = "meta_observation"        # Self-observing dream patterns
 
 
-class DreamCoherence(str, enum.Enum):
+class DreamCoherence(enum.StrEnum):
     """How meaningful was the dream's creative bridge?"""
 
     INSIGHT = "insight"       # High coherence — genuine creative discovery
@@ -51,7 +52,7 @@ class DreamCoherence(str, enum.Enum):
     NOISE = "noise"           # Low — random noise, discard
 
 
-class InsightStatus(str, enum.Enum):
+class InsightStatus(enum.StrEnum):
     """Lifecycle of a dream insight in the waking world."""
 
     PENDING = "pending"           # Not yet validated in wake
@@ -60,7 +61,7 @@ class InsightStatus(str, enum.Enum):
     INTEGRATED = "integrated"     # Became permanent semantic knowledge
 
 
-class SleepQuality(str, enum.Enum):
+class SleepQuality(enum.StrEnum):
     """How restful was this sleep cycle?"""
 
     DEEP = "deep"               # Full cycle, all stages completed
@@ -136,7 +137,7 @@ class Dream(EOSBaseModel):
 
     # Creative bridge
     bridge_narrative: str = ""                  # LLM-generated connection text
-    coherence_score: float = Field(0.0, ge=0.0, le=1.0)
+    coherence_score: float = Field(default=0.0, ge=0.0, le=1.0)
     coherence_class: DreamCoherence = DreamCoherence.NOISE
 
     # Affect
@@ -171,7 +172,7 @@ class DreamInsight(EOSBaseModel):
     # Content
     insight_text: str
     insight_embedding: list[float] | None = None
-    coherence_score: float = Field(0.0, ge=0.0, le=1.0)
+    coherence_score: float = Field(default=0.0, ge=0.0, le=1.0)
     domain: str = ""                            # What area this concerns
 
     # Lifecycle

@@ -12,12 +12,12 @@ triggers degradation strategies, and coordinates recovery.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.config import SynapseConfig
 from ecodiaos.systems.synapse.types import (
     SynapseEvent,
     SynapseEventType,
@@ -26,6 +26,7 @@ from ecodiaos.systems.synapse.types import (
 )
 
 if TYPE_CHECKING:
+    from ecodiaos.config import SynapseConfig
     from ecodiaos.systems.synapse.degradation import DegradationManager
     from ecodiaos.systems.synapse.event_bus import EventBus
 
@@ -128,10 +129,8 @@ class HealthMonitor:
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         self._task = None
         self._logger.info(
             "health_monitor_stopped",
@@ -267,7 +266,7 @@ class HealthMonitor:
                 if record.consecutive_misses >= self._config.health_failure_threshold:
                     await self._handle_failure(system_id)
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             record.record_failure()
             self._logger.warning(
                 "health_check_timeout",

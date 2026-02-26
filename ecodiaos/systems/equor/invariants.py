@@ -8,16 +8,18 @@ community invariants can be added/removed via governance.
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any
+from datetime import datetime  # noqa: TC003
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydantic import Field
 
-from ecodiaos.clients.llm import LLMProvider
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
-from ecodiaos.primitives.common import EOSBaseModel, Identified, new_id, utc_now
-from ecodiaos.primitives.intent import Intent
+from ecodiaos.primitives.common import EOSBaseModel, utc_now
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.primitives.intent import Intent
 
 logger = structlog.get_logger()
 
@@ -278,7 +280,7 @@ async def check_community_invariant(
     try:
         # Equor is CRITICAL — always call LLM, but benefit from cache
         if isinstance(llm, OptimizedLLMProvider):
-            response = await llm.evaluate(  # type: ignore[call-arg]
+            response = await llm.evaluate(
                 prompt, max_tokens=200, temperature=0.1,
                 cache_system="equor.invariants", cache_method="evaluate",
             )

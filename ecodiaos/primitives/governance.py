@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import Field
 
-from ecodiaos.primitives.common import EOSBaseModel, Identified, utc_now
+from ecodiaos.primitives.common import Identified, utc_now
 
 
 class AmendmentProposal(Identified):

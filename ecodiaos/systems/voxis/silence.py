@@ -13,7 +13,7 @@ each candidate expression against a set of well-defined heuristics.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 import structlog
 
@@ -23,6 +23,7 @@ from ecodiaos.systems.voxis.types import (
     SilenceContext,
     SilenceDecision,
 )
+
 
 logger = structlog.get_logger()
 

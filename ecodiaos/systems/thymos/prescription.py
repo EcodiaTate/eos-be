@@ -266,16 +266,15 @@ class RepairValidator:
                     )
 
         # Gate 2: Blast radius for Tier 3+
-        if repair.tier >= RepairTier.KNOWN_FIX:
-            if incident.blast_radius > 0.5:
-                return ValidationResult(
-                    approved=False,
-                    reason=(
-                        f"Blast radius too high ({incident.blast_radius:.2f}) "
-                        f"for automated repair"
-                    ),
-                    escalate_to=RepairTier.ESCALATE,
-                )
+        if repair.tier >= RepairTier.KNOWN_FIX and incident.blast_radius > 0.5:
+            return ValidationResult(
+                approved=False,
+                reason=(
+                    f"Blast radius too high ({incident.blast_radius:.2f}) "
+                    f"for automated repair"
+                ),
+                escalate_to=RepairTier.ESCALATE,
+            )
 
         # Gate 3: Rate limiting
         now_ts = utc_now().timestamp()
@@ -326,6 +325,7 @@ class RepairValidator:
         repair: RepairSpec,
     ) -> ValidationResult:
         """Submit repair to Equor as an Intent for constitutional review."""
+        from ecodiaos.primitives.common import SystemID
         from ecodiaos.primitives.intent import (
             Action,
             ActionSequence,
@@ -333,7 +333,6 @@ class RepairValidator:
             GoalDescriptor,
             Intent,
         )
-        from ecodiaos.primitives.common import SystemID
 
         intent = Intent(
             goal=GoalDescriptor(

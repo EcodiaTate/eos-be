@@ -74,12 +74,18 @@ class TargetWorkspace:
             )
 
     @classmethod
-    async def from_github_url(cls, github_url: str) -> TargetWorkspace:
+    async def from_github_url(
+        cls,
+        github_url: str,
+        *,
+        clone_depth: int = 1,
+    ) -> TargetWorkspace:
         """
         Clone a GitHub repo into a temp directory and return a TargetWorkspace.
 
         Args:
             github_url: HTTPS URL of the repository to clone.
+            clone_depth: Git clone depth (1 = shallow clone for speed).
 
         Returns:
             A TargetWorkspace pointing at the cloned repo root.
@@ -90,10 +96,11 @@ class TargetWorkspace:
         temp_dir = Path(tempfile.mkdtemp(prefix="hunter_"))
         clone_target = temp_dir / "repo"
 
-        logger.info("cloning_repo", url=github_url, target=str(clone_target))
+        logger.info("cloning_repo", url=github_url, target=str(clone_target), depth=clone_depth)
 
         proc = await asyncio.create_subprocess_exec(
-            "git", "clone", "--depth", "1", github_url, str(clone_target),
+            "git", "clone", "--depth", str(max(1, clone_depth)),
+            github_url, str(clone_target),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

@@ -12,14 +12,16 @@ Amendment history is immutable.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
-from ecodiaos.config import GovernanceConfig
 from ecodiaos.primitives.common import new_id, utc_now
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
+    from ecodiaos.config import GovernanceConfig
 
 logger = structlog.get_logger()
 
@@ -80,7 +82,7 @@ async def check_amendment_cooldown(
         last = datetime.fromisoformat(last)
 
     if not last.tzinfo:
-        last = last.replace(tzinfo=timezone.utc)
+        last = last.replace(tzinfo=UTC)
 
     next_allowed = last + timedelta(days=cooldown_days)
     now = utc_now()
@@ -97,7 +99,7 @@ async def propose_amendment(
     description: str,
     proposer_id: str,
     governance_config: GovernanceConfig,
-) -> dict:
+) -> dict[str, Any]:
     """
     Submit a constitutional amendment proposal.
     Validates, checks cooldown, and stores the proposal.
@@ -185,7 +187,7 @@ async def apply_amendment(
     neo4j: Neo4jClient,
     proposal_id: str,
     proposed_drives: dict[str, float],
-) -> dict:
+) -> dict[str, Any]:
     """
     Apply a passed amendment to the Constitution node.
     Called after a successful vote. Increments version, preserves history.

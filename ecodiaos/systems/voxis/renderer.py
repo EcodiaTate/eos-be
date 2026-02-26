@@ -52,35 +52,34 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.primitives.expression import (
     Expression,
     ExpressionStrategy,
     GenerationTrace,
-    PersonalityVector,
 )
 from ecodiaos.prompts.voxis.expression import (
     build_system_prompt,
     build_user_prompt,
 )
-from ecodiaos.systems.voxis.affect_colouring import AffectColouringEngine
-from ecodiaos.systems.voxis.audience import AudienceProfiler
-from ecodiaos.systems.voxis.personality import PersonalityEngine
 from ecodiaos.systems.voxis.types import (
-    AudienceProfile,
     ExpressionContext,
     ExpressionIntent,
     ExpressionTrigger,
-    OutputChannel,
     StrategyParams,
 )
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+    from ecodiaos.systems.voxis.affect_colouring import AffectColouringEngine
+    from ecodiaos.systems.voxis.audience import AudienceProfiler
+    from ecodiaos.systems.voxis.personality import PersonalityEngine
 
 logger = structlog.get_logger()
 
@@ -88,7 +87,7 @@ logger = structlog.get_logger()
 # ─── Expression Policy Classes ────────────────────────────────────
 
 
-class ExpressionPolicyClass(str, Enum):
+class ExpressionPolicyClass(StrEnum):
     """
     The three Active Inference expression policy classes.
     Each class serves different drives and reduces different EFE components.
@@ -474,7 +473,7 @@ class ContentRenderer:
                 )()
             else:
                 t_gen_start = time.monotonic()
-                llm_response = await self._llm.generate(  # type: ignore[call-arg]
+                llm_response = await self._llm.generate(
                     system_prompt=system_prompt,
                     messages=messages,
                     max_tokens=max_tokens,
@@ -674,7 +673,7 @@ def _build_template_fallback(
     without burning tokens. The content is honest about the limitation
     (Honesty drive compliance).
     """
-    content = intent.content_hint or intent.raw_content or ""
+    content = intent.content_to_express or ""
     trigger = intent.trigger
 
     if trigger in (ExpressionTrigger.NOVA_RESPOND, ExpressionTrigger.ATUNE_DIRECT_ADDRESS):

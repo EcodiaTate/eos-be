@@ -26,6 +26,8 @@ Public interface:
 
 from ecodiaos.systems.evo.service import EvoService
 from ecodiaos.systems.evo.types import (
+    TUNABLE_PARAMETERS,
+    VELOCITY_LIMITS,
     ConsolidationResult,
     Hypothesis,
     HypothesisCategory,
@@ -35,8 +37,6 @@ from ecodiaos.systems.evo.types import (
     PatternType,
     Procedure,
     SelfModelStats,
-    TUNABLE_PARAMETERS,
-    VELOCITY_LIMITS,
 )
 
 __all__ = [

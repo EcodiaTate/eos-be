@@ -16,20 +16,21 @@ Four detectors (spec Section III):
 
 from __future__ import annotations
 
-import json
 from abc import ABC, abstractmethod
 from itertools import combinations
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.memory_trace import Episode
 from ecodiaos.systems.evo.types import (
     PatternCandidate,
     PatternContext,
     PatternType,
     hash_sequence,
 )
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.memory_trace import Episode
 
 logger = structlog.get_logger()
 

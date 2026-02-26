@@ -40,8 +40,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import subprocess
-from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -54,19 +53,21 @@ from ecodiaos.clients.embedding import (
 from ecodiaos.clients.llm import (
     ExtendedThinkingProvider,
     LLMProvider,
-    ToolAwareResponse,
     ToolCall,
     ToolDefinition,
     ToolResult,
 )
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.systems.simula.types import (
+    GOVERNANCE_REQUIRED,
     ChangeCategory,
     CodeChangeResult,
     EvolutionProposal,
-    GOVERNANCE_REQUIRED,
     RiskLevel,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = structlog.get_logger()
 
@@ -656,7 +657,7 @@ class SimulaCodeAgent:
                         cache_system="simula.code_agent",
                     )
                 else:
-                    response = await active_llm.generate_with_tools(
+                    response = await active_llm.generate_with_tools(  # type: ignore[union-attr]
                         system_prompt=system_prompt,
                         messages=messages,
                         tools=SIMULA_AGENT_TOOLS,
@@ -735,7 +736,7 @@ class SimulaCodeAgent:
         static_fix_iterations = 0
         sa_result = None
         if self._files_written and self._static_bridge is not None:
-            sa_result = await self._static_bridge.run_all(self._files_written)
+            sa_result = await self._static_bridge.run_all(self._files_written)  # type: ignore[attr-defined]
             if sa_result.error_count > 0:
                 from ecodiaos.systems.simula.verification.static_analysis import (
                     StaticAnalysisBridge,
@@ -752,10 +753,10 @@ class SimulaCodeAgent:
                     ),
                 })
                 # Run one more tool-use turn to fix
-                for fix_turn in range(self._static_fix_max_iterations):
+                for _fix_turn in range(self._static_fix_max_iterations):
                     static_fix_iterations += 1
                     try:
-                        response = await active_llm.generate_with_tools(
+                        response = await active_llm.generate_with_tools(  # type: ignore[union-attr]
                             system_prompt=system_prompt,
                             messages=messages,
                             tools=SIMULA_AGENT_TOOLS,
@@ -788,7 +789,7 @@ class SimulaCodeAgent:
                         break
 
                 # Re-run static analysis to see if fixes worked
-                sa_result = await self._static_bridge.run_all(self._files_written)
+                sa_result = await self._static_bridge.run_all(self._files_written)  # type: ignore[attr-defined]
                 self._logger.info(
                     "static_analysis_post_fix",
                     errors_remaining=sa_result.error_count,
@@ -796,7 +797,7 @@ class SimulaCodeAgent:
                 )
 
         cm = self._compressor.metrics
-        result = CodeChangeResult(
+        change_result = CodeChangeResult(
             success=len(self._files_written) > 0,
             files_written=self._files_written,
             summary=last_text[:1000] if last_text else "Change implemented",
@@ -813,7 +814,7 @@ class SimulaCodeAgent:
             ),
             static_analysis_fix_iterations=static_fix_iterations,
         )
-        return result
+        return change_result
 
     # ─── Tool Dispatch ───────────────────────────────────────────────────────
 
@@ -923,7 +924,7 @@ class SimulaCodeAgent:
             for line in output.splitlines()[:50]:
                 results.append(line.replace(str(self._root) + "/", "").replace(str(self._root) + "\\", ""))
             return ToolResult(tc.id, "\n".join(results) if results else "No matches found")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(tc.id, "Search timed out", True)
         except Exception as exc:
             return ToolResult(tc.id, f"Search error: {exc}", True)
@@ -950,7 +951,7 @@ class SimulaCodeAgent:
                 f"{'PASSED' if passed else 'FAILED'}\n{output[-2000:]}",
                 is_error=not passed,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(tc.id, "Tests timed out after 60s", True)
         except Exception as exc:
             return ToolResult(tc.id, f"Test run error: {exc}", True)
@@ -974,7 +975,7 @@ class SimulaCodeAgent:
                 tc.id,
                 f"{'CLEAN' if passed else 'ISSUES FOUND'}\n{output}" if output else "CLEAN",
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(tc.id, "Linter timed out", True)
         except Exception as exc:
             return ToolResult(tc.id, f"Linter error: {exc}", True)
@@ -1056,7 +1057,7 @@ class SimulaCodeAgent:
                 f"TYPE CHECK ISSUES:\n{output[-2000:]}",
                 is_error=True,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(tc.id, "Type check timed out after 30s", True)
         except FileNotFoundError:
             return ToolResult(tc.id, "mypy not found — type checking unavailable")
@@ -1084,10 +1085,9 @@ class SimulaCodeAgent:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     imports.append(alias.name)
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    names = ", ".join(a.name for a in (node.names or []))
-                    imports.append(f"from {node.module} import {names}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = ", ".join(a.name for a in (node.names or []))
+                imports.append(f"from {node.module} import {names}")
 
         # Find files that import this module
         module_name = self._path_to_module(module_path)
@@ -1202,7 +1202,7 @@ class SimulaCodeAgent:
 
             try:
                 embeddings = await self._embedding.embed_batch(texts)
-                self._code_index = dict(zip(paths, embeddings))
+                self._code_index = dict(zip(paths, embeddings, strict=False))
                 self._logger.info(
                     "code_index_built",
                     files_indexed=len(self._code_index),

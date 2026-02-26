@@ -10,10 +10,9 @@ when approaching limits. Evo learns optimal EFE weights given budget constraints
 
 from __future__ import annotations
 
-import asyncio
 import time
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+from enum import StrEnum
 from threading import Lock
 
 import structlog
@@ -21,7 +20,7 @@ import structlog
 logger = structlog.get_logger()
 
 
-class BudgetTier(str, Enum):
+class BudgetTier(StrEnum):
     """Budget utilization tier determines which systems can use LLM."""
     GREEN = "green"      # 0–70% of limit: All systems active
     YELLOW = "yellow"    # 70–90% of limit: Low-priority systems degrade to heuristics

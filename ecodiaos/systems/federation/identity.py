@@ -80,11 +80,12 @@ class IdentityManager:
         # Load or generate Ed25519 keypair
         if private_key_path and private_key_path.exists():
             key_bytes = private_key_path.read_bytes()
-            self._private_key = serialization.load_pem_private_key(
+            loaded_key = serialization.load_pem_private_key(
                 key_bytes, password=None,
             )
-            if not isinstance(self._private_key, Ed25519PrivateKey):
+            if not isinstance(loaded_key, Ed25519PrivateKey):
                 raise TypeError("Federation key must be Ed25519")
+            self._private_key = loaded_key
             self._logger.info("identity_key_loaded", path=str(private_key_path))
         else:
             self._private_key = Ed25519PrivateKey.generate()
@@ -120,7 +121,7 @@ class IdentityManager:
 
         # Compute constitutional hash (hash of the drives for compatibility)
         constitutional_hash = hashlib.sha256(
-            f"coherence:1.0|care:1.0|growth:1.0|honesty:1.0".encode()
+            b"coherence:1.0|care:1.0|growth:1.0|honesty:1.0"
         ).hexdigest()[:16]
 
         # Build local identity card

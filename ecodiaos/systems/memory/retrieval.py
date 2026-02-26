@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.clients.neo4j import Neo4jClient
 from ecodiaos.primitives.memory_trace import (
     MemoryRetrievalRequest,
     MemoryRetrievalResponse,
     RetrievalResult,
 )
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.neo4j import Neo4jClient
 
 logger = structlog.get_logger()
 
@@ -341,18 +344,27 @@ async def hybrid_retrieve(
     )
 
     # Handle any failures gracefully
-    if isinstance(vector_results, Exception):
+    safe_vector: list[RetrievalResult]
+    safe_bm25: list[RetrievalResult]
+    safe_graph: list[RetrievalResult]
+    if isinstance(vector_results, BaseException):
         logger.warning("vector_search_failed", error=str(vector_results))
-        vector_results = []
-    if isinstance(bm25_results, Exception):
+        safe_vector = []
+    else:
+        safe_vector = vector_results
+    if isinstance(bm25_results, BaseException):
         logger.warning("bm25_search_failed", error=str(bm25_results))
-        bm25_results = []
-    if isinstance(graph_results, Exception):
+        safe_bm25 = []
+    else:
+        safe_bm25 = bm25_results
+    if isinstance(graph_results, BaseException):
         logger.warning("graph_search_failed", error=str(graph_results))
-        graph_results = []
+        safe_graph = []
+    else:
+        safe_graph = graph_results
 
     # Merge and compute unified scores
-    all_results = _merge_deduplicate(vector_results, bm25_results, graph_results)
+    all_results = _merge_deduplicate(safe_vector, safe_bm25, safe_graph)
 
     for result in all_results:
         result.unified_score = _compute_unified_score(result, request.temporal_bias)
@@ -368,9 +380,9 @@ async def hybrid_retrieve(
 
     logger.debug(
         "hybrid_retrieval_complete",
-        vector_hits=len(vector_results),
-        bm25_hits=len(bm25_results),
-        graph_hits=len(graph_results),
+        vector_hits=len(safe_vector),
+        bm25_hits=len(safe_bm25),
+        graph_hits=len(safe_graph),
         merged=len(all_results),
         returned=len(ranked),
         elapsed_ms=elapsed_ms,

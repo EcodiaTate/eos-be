@@ -22,17 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.common import utc_now
 from ecodiaos.primitives.percept import Percept
 
 from .affect import AffectManager
 from .extraction import ExtractionLLMClient, extract_entities_and_relations
-from .helpers import clamp
 from .meta import MetaAttentionController
 from .normalisation import normalise
 from .prediction import BeliefStateReader, compute_prediction_error
@@ -47,13 +44,15 @@ from .types import (
     MetaContext,
     RawInput,
     RiskCategory,
-    SalienceVector,
     SystemLoad,
     WorkspaceBroadcast,
     WorkspaceCandidate,
     WorkspaceContribution,
 )
 from .workspace import BroadcastSubscriber, GlobalWorkspace, WorkspaceMemoryClient
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
 
 logger = structlog.get_logger("ecodiaos.systems.atune")
 
@@ -306,7 +305,7 @@ class AtuneService:
                 peek_pe = top.prediction_error
 
         # Get precision weights from Soma (if available)
-        precision_weights = {}
+        precision_weights: dict[str, float] = {}
         if self._soma is not None:
             try:
                 signal = self._soma.get_current_signal()

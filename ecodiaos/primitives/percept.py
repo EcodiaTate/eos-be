@@ -19,7 +19,6 @@ from ecodiaos.primitives.common import (
     SourceDescriptor,
     SystemID,
     Timestamped,
-    new_id,
     utc_now,
 )
 

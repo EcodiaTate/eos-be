@@ -9,30 +9,30 @@ consolidation state, and self-model statistics.
 
 from __future__ import annotations
 
+from datetime import datetime
 import enum
 import hashlib
 import json
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import Field
 
-from ecodiaos.primitives.affect import AffectState
 from ecodiaos.primitives.common import (
     EOSBaseModel,
     Identified,
     Timestamped,
-    new_id,
     utc_now,
 )
 
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
 
 
-class PatternType(str, enum.Enum):
+class PatternType(enum.StrEnum):
     """Categories of patterns Evo can detect."""
 
     COOCCURRENCE = "cooccurrence"
@@ -41,7 +41,7 @@ class PatternType(str, enum.Enum):
     AFFECT_PATTERN = "affect_pattern"
 
 
-class HypothesisCategory(str, enum.Enum):
+class HypothesisCategory(enum.StrEnum):
     """What kind of claim does this hypothesis make?"""
 
     WORLD_MODEL = "world_model"    # Claim about external world structure
@@ -51,7 +51,7 @@ class HypothesisCategory(str, enum.Enum):
     PARAMETER = "parameter"        # Claim about optimal system parameters
 
 
-class HypothesisStatus(str, enum.Enum):
+class HypothesisStatus(enum.StrEnum):
     """Lifecycle states for a hypothesis."""
 
     PROPOSED = "proposed"      # Just generated, not yet tested
@@ -62,7 +62,7 @@ class HypothesisStatus(str, enum.Enum):
     ARCHIVED = "archived"      # Stale or superseded
 
 
-class MutationType(str, enum.Enum):
+class MutationType(enum.StrEnum):
     """What kind of change does a confirmed hypothesis propose?"""
 
     PARAMETER_ADJUSTMENT = "parameter_adjustment"  # Nudge a system parameter
@@ -71,7 +71,7 @@ class MutationType(str, enum.Enum):
     EVOLUTION_PROPOSAL = "evolution_proposal"       # Structural change → Simula
 
 
-class EvidenceDirection(str, enum.Enum):
+class EvidenceDirection(enum.StrEnum):
     """How does a piece of evidence relate to a hypothesis?"""
 
     SUPPORTS = "supports"

@@ -14,11 +14,10 @@ from pydantic import Field
 
 from ecodiaos.primitives.common import (
     ConsolidationLevel,
-    EOSBaseModel,
     EntityType,
+    EOSBaseModel,
     Identified,
     SalienceVector,
-    new_id,
     utc_now,
 )
 

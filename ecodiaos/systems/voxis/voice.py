@@ -42,11 +42,15 @@ celebration would violate care.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.expression import PersonalityVector
 from ecodiaos.systems.voxis.types import VoiceParams
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+    from ecodiaos.primitives.expression import PersonalityVector
 
 logger = structlog.get_logger()
 

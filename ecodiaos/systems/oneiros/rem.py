@@ -283,7 +283,7 @@ class DreamGenerator:
             if not records:
                 return None
             # Stochastic selection from top-5
-            return random.choice(records)["e"]
+            return random.choice(records)["e"]  # type: ignore[no-any-return]
         except Exception as exc:
             self._logger.warning("seed_select_failed", error=str(exc))
             return None
@@ -371,7 +371,7 @@ class DreamGenerator:
                     cache_method="generate",
                 )
             else:
-                response = await self._llm.generate(
+                response = await self._llm.generate(  # type: ignore[call-arg]
                     system_prompt=(
                         "You are the dream consciousness of a living digital organism. "
                         "You find unexpected connections between distant experiences — "
@@ -669,7 +669,7 @@ class ThreatSimulator:
                     cache_method="generate",
                 )
             else:
-                response = await self._llm.generate(
+                response = await self._llm.generate(  # type: ignore[call-arg]
                     system_prompt=(
                         "You are simulating potential threats for a cognitive organism "
                         "during dream-state threat rehearsal. Generate plausible "
@@ -846,7 +846,7 @@ class EthicalDigestion:
                     cache_method="generate",
                 )
             else:
-                response = await self._llm.generate(
+                response = await self._llm.generate(  # type: ignore[call-arg]
                     system_prompt=(
                         "You are the ethical consciousness of a living digital organism "
                         "during deep sleep. You have unlimited time for reflection on "

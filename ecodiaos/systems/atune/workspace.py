@@ -15,27 +15,24 @@ from __future__ import annotations
 import asyncio
 import random
 from collections import deque
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
 from ecodiaos.primitives.percept import Percept
 
-from .helpers import clamp
 from .types import (
     ActiveGoalSummary,
-    AttentionContext,
-    AtuneCache,
     MemoryContext,
-    PredictionError,
     SalienceVector,
-    SystemLoad,
     WorkspaceBroadcast,
     WorkspaceCandidate,
     WorkspaceContext,
     WorkspaceContribution,
 )
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
 
 logger = structlog.get_logger("ecodiaos.systems.atune.workspace")
 
@@ -233,7 +230,7 @@ class GlobalWorkspace:
 
         try:
             return await memory_client.retrieve_context(
-                query_embedding=percept.content.embedding,
+                query_embedding=percept.content.embedding or [],
                 query_text=text,
                 max_results=10,
             )
@@ -370,7 +367,7 @@ class GlobalWorkspace:
                 *(sub.receive_broadcast(broadcast) for sub in self._subscribers),
                 return_exceptions=True,
             )
-            for sub, result in zip(self._subscribers, results):
+            for sub, result in zip(self._subscribers, results, strict=False):
                 if isinstance(result, Exception):
                     self._logger.warning(
                         "broadcast_ack_failed",

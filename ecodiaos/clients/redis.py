@@ -7,13 +7,14 @@ affect state cache, rate limiting, and pub/sub.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import orjson
 import structlog
 from redis.asyncio import Redis
 
-from ecodiaos.config import RedisConfig
+if TYPE_CHECKING:
+    from ecodiaos.config import RedisConfig
 
 logger = structlog.get_logger()
 
@@ -54,7 +55,7 @@ class RedisClient:
         """Prefix a key with the instance prefix."""
         return f"{self._config.prefix}:{key}"
 
-    async def health_check(self) -> dict:
+    async def health_check(self) -> dict[str, Any]:
         """Check connectivity."""
         try:
             await self.client.ping()
@@ -89,7 +90,7 @@ class RedisClient:
     async def push(self, key: str, value: Any) -> None:
         """Push a JSON value to a list."""
         raw = orjson.dumps(value).decode()
-        await self.client.rpush(self._key(key), raw)
+        await self.client.rpush(self._key(key), raw)  # type: ignore[misc]
 
     async def pop_all(self, key: str) -> list[Any]:
         """Pop all items from a list atomically."""
@@ -103,30 +104,30 @@ class RedisClient:
 
     async def list_length(self, key: str) -> int:
         """Get list length."""
-        return await self.client.llen(self._key(key))
+        return await self.client.llen(self._key(key))  # type: ignore[misc, no-any-return]
 
     # ─── Hash Operations (Active Goals, Conversations) ────────────
 
     async def hset(self, key: str, field: str, value: Any) -> None:
         """Set a hash field."""
         raw = orjson.dumps(value).decode()
-        await self.client.hset(self._key(key), field, raw)
+        await self.client.hset(self._key(key), field, raw)  # type: ignore[misc]
 
     async def hget(self, key: str, field: str) -> Any | None:
         """Get a hash field."""
-        raw = await self.client.hget(self._key(key), field)
+        raw = await self.client.hget(self._key(key), field)  # type: ignore[misc]
         if raw is None:
             return None
         return orjson.loads(raw)
 
     async def hgetall(self, key: str) -> dict[str, Any]:
         """Get all hash fields."""
-        raw = await self.client.hgetall(self._key(key))
+        raw = await self.client.hgetall(self._key(key))  # type: ignore[misc]
         return {k: orjson.loads(v) for k, v in raw.items()}
 
     async def hdel(self, key: str, field: str) -> None:
         """Delete a hash field."""
-        await self.client.hdel(self._key(key), field)
+        await self.client.hdel(self._key(key), field)  # type: ignore[misc]
 
     # ─── Pub/Sub ──────────────────────────────────────────────────
 

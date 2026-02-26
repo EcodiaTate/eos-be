@@ -8,8 +8,8 @@ decomposition, with a hard 2-agent-per-stage overcrowding constraint.
 
 from __future__ import annotations
 
-import enum
 from datetime import datetime
+import enum
 
 from pydantic import Field
 
@@ -19,7 +19,7 @@ from ecodiaos.primitives.common import EOSBaseModel, utc_now
 # ── Enums ────────────────────────────────────────────────────────────────────
 
 
-class ArtifactKind(str, enum.Enum):
+class ArtifactKind(enum.StrEnum):
     """Types of structured artifacts passed between pipeline stages."""
 
     SPEC = "spec"
@@ -29,7 +29,7 @@ class ArtifactKind(str, enum.Enum):
     REVIEW = "review"
 
 
-class TaskStatus(str, enum.Enum):
+class TaskStatus(enum.StrEnum):
     """Status of an individual task node in the execution DAG."""
 
     PENDING = "pending"
@@ -39,7 +39,7 @@ class TaskStatus(str, enum.Enum):
     BLOCKED = "blocked"
 
 
-class DelegationMode(str, enum.Enum):
+class DelegationMode(enum.StrEnum):
     """How agents are assigned to a pipeline stage."""
 
     SINGLE_AGENT = "single_agent"

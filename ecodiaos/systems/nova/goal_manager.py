@@ -20,20 +20,21 @@ growth-aligned goal is more salient when curiosity is high.
 
 from __future__ import annotations
 
-import math
-from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from ecodiaos.primitives.common import DriveAlignmentVector, new_id, utc_now
-from ecodiaos.systems.atune.types import WorkspaceBroadcast
 from ecodiaos.systems.nova.types import (
-    BeliefState,
     Goal,
     GoalSource,
     GoalStatus,
     PriorityContext,
 )
+
+if TYPE_CHECKING:
+    import ecodiaos.primitives.affect
+    from ecodiaos.systems.atune.types import WorkspaceBroadcast
 
 logger = structlog.get_logger()
 
@@ -156,7 +157,7 @@ class GoalManager:
         Recompute dynamic priorities for all active goals.
         Must complete in ≤30ms per spec.
         """
-        goal_statuses = {gid: g.status.value for gid, g in self._goals.items()}
+        {gid: g.status.value for gid, g in self._goals.items()}
         for goal_id, goal in self._goals.items():
             if goal.status != GoalStatus.ACTIVE:
                 continue
@@ -269,7 +270,7 @@ class GoalManager:
             self._logger.info("goals_pruned", count=len(to_remove))
         return len(to_remove)
 
-    def stats(self) -> dict:
+    def stats(self) -> dict[str, Any]:
         counts = {s.value: 0 for s in GoalStatus}
         for g in self._goals.values():
             counts[g.status.value] += 1
@@ -349,7 +350,7 @@ def compute_goal_priority(goal: Goal, context: PriorityContext) -> float:
 
 def compute_drive_resonance(
     alignment: DriveAlignmentVector,
-    affect: "ecodiaos.primitives.affect.AffectState",
+    affect: ecodiaos.primitives.affect.AffectState,
     drive_weights: dict[str, float],
 ) -> float:
     """
@@ -496,4 +497,3 @@ def _initial_urgency(broadcast: WorkspaceBroadcast) -> float:
 # ─── Import fix for type hint ─────────────────────────────────────
 # AffectState is used in compute_drive_resonance signature.
 # Import here to avoid circular at module level.
-import ecodiaos.primitives.affect  # noqa: E402 — intentional bottom import

@@ -24,33 +24,33 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.llm import LLMProvider
 from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.intent import Intent
+from ecodiaos.systems.atune.prediction import BeliefPrediction
 from ecodiaos.systems.atune.types import ActiveGoalSummary, WorkspaceBroadcast
 from ecodiaos.systems.nova.belief_updater import BeliefUpdater
 from ecodiaos.systems.nova.deliberation_engine import DeliberationEngine
-from ecodiaos.systems.nova.efe_evaluator import EFEEvaluator, EFEWeights
+from ecodiaos.systems.nova.efe_evaluator import EFEEvaluator
 from ecodiaos.systems.nova.goal_manager import GoalManager
 from ecodiaos.systems.nova.intent_router import IntentRouter
 from ecodiaos.systems.nova.policy_generator import PolicyGenerator
 from ecodiaos.systems.nova.types import (
     DecisionRecord,
+    EFEWeights,
     Goal,
     GoalSource,
     GoalStatus,
     IntentOutcome,
     PendingIntent,
 )
-from ecodiaos.config import NovaConfig
 
 if TYPE_CHECKING:
-    from ecodiaos.systems.atune.service import AtuneService
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.config import NovaConfig
+    from ecodiaos.primitives.intent import Intent
     from ecodiaos.systems.axon.service import AxonService
     from ecodiaos.systems.equor.service import EquorService
     from ecodiaos.systems.memory.service import MemoryService
@@ -79,9 +79,9 @@ class NovaService:
 
     def __init__(
         self,
-        memory: "MemoryService",
-        equor: "EquorService",
-        voxis: "VoxisService",
+        memory: MemoryService,
+        equor: EquorService,
+        voxis: VoxisService,
         llm: LLMProvider,
         config: NovaConfig,
     ) -> None:
@@ -209,7 +209,7 @@ class NovaService:
         self._soma = soma
         self._logger.info("soma_wired_to_nova")
 
-    def set_axon(self, axon: "AxonService") -> None:
+    def set_axon(self, axon: AxonService) -> None:
         """
         Wire Axon into Nova's intent router after both are initialised.
         This enables Step 5 of the cognitive cycle: ACT.
@@ -221,7 +221,7 @@ class NovaService:
             self._logger.warning("set_axon_called_before_initialize")
 
     @property
-    def belief_state_reader(self) -> "_NovaBeliefStateReader":
+    def belief_state_reader(self) -> _NovaBeliefStateReader:
         """
         Returns a BeliefStateReader adapter that Atune can use for
         top-down prediction. This closes the predictive processing loop:
@@ -413,7 +413,7 @@ class NovaService:
 
     # ─── Observability ────────────────────────────────────────────
 
-    async def health(self) -> dict:
+    async def health(self) -> dict[str, Any]:
         """Health check — returns current metrics snapshot."""
         total_decisions = (
             self._total_fast_path + self._total_slow_path + self._total_do_nothing
@@ -535,7 +535,7 @@ class NovaService:
             self._logger.debug("goal_embedding_failed", goal_id=goal.id)
 
     @property
-    def beliefs(self):
+    def beliefs(self) -> Any:
         return self._belief_updater.beliefs
 
     # ─── Private ──────────────────────────────────────────────────
@@ -577,7 +577,7 @@ class NovaService:
     async def _retrieve_relevant_memories_safe(
         self,
         broadcast: WorkspaceBroadcast,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Memory retrieval with hard timeout (non-blocking)."""
         try:
             # Extract query text from broadcast
@@ -595,13 +595,13 @@ class NovaService:
                 self._memory.retrieve(query_text=query, max_results=5),
                 timeout=0.15,  # 150ms hard timeout
             )
-            traces: list[dict] = []
+            traces: list[dict[str, str]] = []
             for trace in result.traces[:5]:
-                summary = trace.get("summary") or trace.get("content", "")
+                summary = trace.metadata.get("summary") or trace.content
                 if summary:
                     traces.append({"summary": str(summary)[:200]})
             return traces
-        except (asyncio.TimeoutError, Exception):
+        except (TimeoutError, Exception):
             return []
 
     async def _sync_goals_to_atune_safe(self) -> None:
@@ -676,7 +676,7 @@ class _NovaBeliefStateReader:
     def __init__(self, belief_updater: BeliefUpdater) -> None:
         self._beliefs = belief_updater
 
-    async def predict_for_source(self, source_system: str) -> "BeliefPrediction | None":
+    async def predict_for_source(self, source_system: str) -> BeliefPrediction | None:
         """
         Return the expected embedding for the next Percept from *source_system*.
 
@@ -689,8 +689,6 @@ class _NovaBeliefStateReader:
         Future improvements: maintain per-source prediction models, track
         prediction accuracy, adapt precision based on historical errors.
         """
-        from ecodiaos.systems.atune.prediction import BeliefPrediction
-
         beliefs = self._beliefs.beliefs
         ctx = beliefs.current_context
 

@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import json
 import time
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from ecodiaos.clients.llm import LLMProvider, Message
-from ecodiaos.primitives.affect import AffectState
 from ecodiaos.primitives.common import new_id
 from ecodiaos.prompts.nova.policy import (
     AVAILABLE_ACTION_TYPES,
@@ -36,6 +36,9 @@ from ecodiaos.systems.nova.types import (
     Policy,
     PolicyStep,
 )
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
 
 logger = structlog.get_logger()
 
@@ -84,7 +87,7 @@ def make_do_nothing_policy() -> Policy:
 
 # Known patterns that map broadcast characteristics to reliable policy templates.
 # These are used by the fast path to avoid LLM calls for routine situations.
-_PROCEDURE_TEMPLATES: list[dict] = [
+_PROCEDURE_TEMPLATES: list[dict[str, Any]] = [
     {
         "name": "Acknowledge and respond",
         "condition": lambda broadcast: (
@@ -125,13 +128,13 @@ _PROCEDURE_TEMPLATES: list[dict] = [
 ]
 
 
-def find_matching_procedure(broadcast: object) -> dict | None:
+def find_matching_procedure(broadcast: object) -> dict[str, Any] | None:
     """
     Pattern-match a broadcast against known procedure templates.
     Returns the highest-success-rate matching template, or None.
     Must complete in ≤20ms.
     """
-    matches: list[dict] = []
+    matches: list[dict[str, Any]] = []
     for template in _PROCEDURE_TEMPLATES:
         try:
             if template["condition"](broadcast):
@@ -143,7 +146,7 @@ def find_matching_procedure(broadcast: object) -> dict | None:
     return max(matches, key=lambda t: t["success_rate"])
 
 
-def procedure_to_policy(procedure: dict) -> Policy:
+def procedure_to_policy(procedure: dict[str, Any]) -> Policy:
     """Convert a procedure template to a Policy."""
     return Policy(
         id=new_id(),
@@ -194,7 +197,7 @@ class PolicyGenerator:
         situation_summary: str,
         beliefs: BeliefState,
         affect: AffectState,
-        memory_traces: list[dict] | None = None,
+        memory_traces: list[dict[str, Any]] | None = None,
     ) -> list[Policy]:
         """
         Generate 2-5 candidate policies for achieving a goal.
@@ -264,7 +267,9 @@ def _parse_policy_response(raw: str) -> list[Policy]:
             text = text.split("```", 2)[1]
             if text.startswith("json"):
                 text = text[4:]
-        text = text.strip().rstrip("```")
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
 
         data = json.loads(text)
         policies_raw = data.get("policies", [])

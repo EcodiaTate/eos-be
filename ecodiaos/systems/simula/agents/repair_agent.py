@@ -354,7 +354,7 @@ class RepairAgent:
                     f"- {fix}" for fix in similar_fixes[:5]
                 )
 
-        response = await self._reasoning_llm.complete(
+        response = await self._reasoning_llm.complete(  # type: ignore[attr-defined]
             system=DIAGNOSIS_SYSTEM_PROMPT,
             messages=[Message(role="user", content=user_msg)],
             max_tokens=2048,
@@ -556,7 +556,7 @@ class RepairAgent:
             code=faulty_code[:8000],  # cap at 8K chars
         )
 
-        response = await self._code_llm.complete(
+        response = await self._code_llm.complete(  # type: ignore[attr-defined]
             system=prompt,
             messages=[Message(
                 role="user",
@@ -798,18 +798,18 @@ class RepairAgent:
         """Extract JSON object from LLM response text."""
         # Try direct parse
         try:
-            return json.loads(text)
+            return json.loads(text)  # type: ignore[no-any-return]
         except json.JSONDecodeError:
             pass
 
         # Try extracting from code fences
         match = re.search(r"```(?:json)?\n(.*?)```", text, re.DOTALL)
         if match:
-            return json.loads(match.group(1))
+            return json.loads(match.group(1))  # type: ignore[no-any-return]
 
         # Try finding first { ... } block
         brace_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
         if brace_match:
-            return json.loads(brace_match.group(0))
+            return json.loads(brace_match.group(0))  # type: ignore[no-any-return]
 
         raise json.JSONDecodeError("No JSON found", text, 0)

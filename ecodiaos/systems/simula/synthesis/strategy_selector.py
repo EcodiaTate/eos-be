@@ -17,7 +17,6 @@ Routing heuristics:
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -31,6 +30,8 @@ from ecodiaos.systems.simula.synthesis.types import (
 from ecodiaos.systems.simula.types import ChangeCategory
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.systems.simula.synthesis.chopchop import ChopChopEngine
     from ecodiaos.systems.simula.synthesis.hysynth import HySynthEngine
     from ecodiaos.systems.simula.synthesis.sketch_solver import SketchSolver
@@ -261,7 +262,7 @@ class SynthesisStrategySelector:
                 final_code=sketch_result.final_code,
                 speedup_vs_cegis=0.0,
                 total_llm_tokens=(
-                    (sketch_result.template.llm_tokens if sketch_result.template else 0)
+                    sketch_result.template.llm_tokens if sketch_result.template else 0
                 ),
                 total_duration_ms=sketch_result.duration_ms,
             )

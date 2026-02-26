@@ -10,11 +10,16 @@ Infrastructure Architecture specification.
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 import structlog
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Load .env file before any configuration is loaded
+load_dotenv()
 
 from ecodiaos.clients.embedding import create_embedding_client
 from ecodiaos.clients.llm import create_llm_provider
@@ -24,24 +29,24 @@ from ecodiaos.clients.prompt_cache import PromptCache
 from ecodiaos.clients.redis import RedisClient
 from ecodiaos.clients.timescaledb import TimescaleDBClient
 from ecodiaos.clients.token_budget import TokenBudget
-from ecodiaos.config import EcodiaOSConfig, load_config, load_seed
-from ecodiaos.telemetry.llm_metrics import LLMMetricsCollector
-from ecodiaos.systems.memory.service import MemoryService
-from ecodiaos.systems.equor.service import EquorService
-from ecodiaos.systems.atune.service import AtuneService, AtuneConfig
+from ecodiaos.config import load_config, load_seed
+from ecodiaos.systems.atune.service import AtuneConfig, AtuneService
 from ecodiaos.systems.atune.types import InputChannel, RawInput
+from ecodiaos.systems.axon.service import AxonService
+from ecodiaos.systems.equor.service import EquorService
+from ecodiaos.systems.evo.service import EvoService
+from ecodiaos.systems.federation.service import FederationService
+from ecodiaos.systems.memory.service import MemoryService
+from ecodiaos.systems.nova.service import NovaService
+from ecodiaos.systems.oneiros.service import OneirosService
+from ecodiaos.systems.simula.service import SimulaService
+from ecodiaos.systems.soma.service import SomaService
+from ecodiaos.systems.synapse.service import SynapseService
+from ecodiaos.systems.thread.service import ThreadService
+from ecodiaos.systems.thymos.service import ThymosService
 from ecodiaos.systems.voxis.service import VoxisService
 from ecodiaos.systems.voxis.types import ExpressionTrigger
-from ecodiaos.systems.nova.service import NovaService
-from ecodiaos.systems.axon.service import AxonService
-from ecodiaos.systems.evo.service import EvoService
-from ecodiaos.systems.thread.service import ThreadService
-from ecodiaos.systems.simula.service import SimulaService
-from ecodiaos.systems.synapse.service import SynapseService
-from ecodiaos.systems.thymos.service import ThymosService
-from ecodiaos.systems.oneiros.service import OneirosService
-from ecodiaos.systems.soma.service import SomaService
-from ecodiaos.systems.federation.service import FederationService
+from ecodiaos.telemetry.llm_metrics import LLMMetricsCollector
 from ecodiaos.telemetry.logging import setup_logging
 from ecodiaos.telemetry.metrics import MetricCollector
 
@@ -157,7 +162,7 @@ async def lifespan(app: FastAPI):
     atune = AtuneService(
         embed_fn=embedding_client.embed,
         memory_client=workspace_memory,
-        llm_client=llm_client,
+        llm_client=llm_client,  # type: ignore[arg-type]
         belief_state=None,  # Wired in step 9c after Nova initializes
         config=atune_config,
     )
@@ -228,6 +233,7 @@ async def lifespan(app: FastAPI):
         if feedback.trigger in ("nova_respond", "nova_inform", "nova_request",
                                 "nova_mediate", "nova_celebrate", "nova_warn"):
             import asyncio as _aio
+
             from ecodiaos.systems.nova.types import IntentOutcome
             intent_id = getattr(feedback, "expression_id", "")
             outcome = IntentOutcome(
@@ -284,12 +290,12 @@ async def lifespan(app: FastAPI):
         # Migration: backfill personality_json on existing instances that lack it
         if not instance.personality_json and instance.personality_vector:
             import json as _json
-            _PKEYS = [
+            _pkeys = [
                 "warmth", "directness", "verbosity", "formality",
                 "curiosity_expression", "humour", "empathy_expression",
                 "confidence_display", "metaphor_use",
             ]
-            pdict = dict(zip(_PKEYS, instance.personality_vector[:9]))
+            pdict = dict(zip(_pkeys, instance.personality_vector[:9], strict=False))
             await neo4j_client.execute_write(
                 "MATCH (s:Self {instance_id: $iid}) SET s.personality_json = $pj",
                 {"iid": instance.instance_id, "pj": _json.dumps(pdict)},
@@ -301,12 +307,12 @@ async def lifespan(app: FastAPI):
     # are only created from broadcasts, which require goals for salience.
     # Seed from the birth config (new instances) or create defaults (existing).
     if nova._goal_manager is not None and len(nova._goal_manager.active_goals) == 0:
-        from ecodiaos.systems.nova.types import Goal, GoalSource, GoalStatus
         from ecodiaos.primitives.common import DriveAlignmentVector, new_id
+        from ecodiaos.systems.nova.types import Goal, GoalSource, GoalStatus
 
         # Try loading goals from seed config
         seed_path = os.environ.get("ECODIAOS_SEED_PATH", "config/seeds/example_seed.yaml")
-        seed_goals: list[dict] = []
+        seed_goals: list[dict[str, Any]] = []
         try:
             seed = load_seed(seed_path)
             seed_goals = [
@@ -412,7 +418,6 @@ async def lifespan(app: FastAPI):
     app.state.thread = thread
 
     # ── 12. Initialize Simula (Self-Evolution) ────────────────
-    import asyncio as _asyncio
     from pathlib import Path as _Path
     simula = SimulaService(
         config=config.simula,
@@ -421,6 +426,7 @@ async def lifespan(app: FastAPI):
         memory=memory,
         codebase_root=_Path(config.simula.codebase_root).resolve(),
         instance_name=config.instance_id,
+        tsdb=tsdb_client,
     )
     await simula.initialize()
     app.state.simula = simula
@@ -561,7 +567,7 @@ async def lifespan(app: FastAPI):
     # goal reflection, and memory-prompted curiosity.
     import asyncio as _aio_gen
 
-    _inner_life_task: _aio_gen.Task | None = None
+    _inner_life_task: _aio_gen.Task[Any] | None = None
 
     async def _inner_life_loop() -> None:
         """
@@ -574,8 +580,9 @@ async def lifespan(app: FastAPI):
         the cognitive cycle even when no external input arrives.
         """
         _il_logger = structlog.get_logger("ecodiaos.inner_life")
-        from ecodiaos.systems.atune.types import WorkspaceContribution
         import random as _rnd
+
+        from ecodiaos.systems.atune.types import WorkspaceContribution
 
         cycle = 0
         while True:
@@ -790,10 +797,8 @@ async def lifespan(app: FastAPI):
                 #   Every 200 cycles: Evo pattern check
                 #   Every 1000 cycles: schema conflict scan
                 #   Every 5000 cycles: life story synthesis
-                try:
+                with suppress(Exception):
                     await thread.on_cycle(cycle)
-                except Exception:
-                    pass
 
                 # ── Thread identity reflection (every 20th cycle, offset 5 = ~100s) ──
                 if cycle % 20 == 5:
@@ -833,10 +838,8 @@ async def lifespan(app: FastAPI):
     # Cancel inner life before shutdown
     if _inner_life_task is not None:
         _inner_life_task.cancel()
-        try:
+        with suppress(_aio_gen.CancelledError):
             await _inner_life_task
-        except _aio_gen.CancelledError:
-            pass
 
     # ── Shutdown ──────────────────────────────────────────────
     logger.info("ecodiaos_shutting_down")
@@ -937,14 +940,17 @@ class _MemoryWorkspaceAdapter:
 
             row = results[0]
             # Return as a minimal Percept that the workspace can wrap
-            from ecodiaos.primitives.percept import Percept, Content
             from ecodiaos.primitives.common import (
-                Modality, SourceDescriptor, SystemID, utc_now,
+                Modality,
+                SourceDescriptor,
+                SystemID,
+                utc_now,
             )
+            from ecodiaos.primitives.percept import Content, Percept
 
             return Percept(
                 source=SourceDescriptor(
-                    system=SystemID.INTERNAL,
+                    system=SystemID.MEMORY,
                     channel="spontaneous_recall",
                     modality=Modality.TEXT,
                 ),
@@ -960,16 +966,13 @@ class _MemoryWorkspaceAdapter:
     async def store_percept_with_broadcast(self, percept, salience, affect) -> None:
         """Store the broadcast-winning percept as an episode."""
         try:
-            episode_id = await self._memory.store_percept(
+            await self._memory.store_percept(
                 percept=percept,
                 salience_composite=salience.composite,
                 salience_scores=salience.scores,
                 affect_valence=affect.valence,
                 affect_arousal=affect.arousal,
             )
-            # Tell Atune so entity extraction can link to this episode
-            # (Atune service picks this up via set_last_episode_id)
-            return episode_id
         except Exception:
             logger.debug("broadcast_storage_failed", exc_info=True)
 
@@ -994,7 +997,7 @@ async def _seed_atune_cache(atune: AtuneService, embedding_client, instance) -> 
         logger.warning("atune_cache_seed_failed", exc_info=True)
 
 
-def _resolve_governance_config(config):
+def _resolve_governance_config(config: Any) -> Any:
     """Resolve governance config from seed or use defaults."""
     from ecodiaos.config import GovernanceConfig
     try:
@@ -1044,7 +1047,7 @@ import orjson as _ws_orjson
 from fastapi import WebSocket, WebSocketDisconnect
 
 
-def _ws_json(data: dict) -> str:
+def _ws_json(data: dict[str, Any]) -> str:
     return _ws_orjson.dumps(data).decode()
 
 
@@ -1120,15 +1123,13 @@ async def alive_websocket(ws: WebSocket):
                     raw = message["data"]
                     payload = _ws_orjson.loads(raw) if isinstance(raw, (str, bytes)) else raw
                     msg = _ws_json({"stream": "synapse", "payload": payload})
-                    try:
+                    with suppress(_ws_asyncio.QueueFull):
                         queue.put_nowait(msg)
-                    except _ws_asyncio.QueueFull:
-                        pass
         except _ws_asyncio.CancelledError:
             pass
         finally:
             await pubsub.unsubscribe(channel)
-            await pubsub.aclose()
+            await pubsub.aclose()  # type: ignore[no-untyped-call]
 
     async def _sender() -> None:
         """Drain the queue and send to the WebSocket client."""
@@ -1157,9 +1158,13 @@ async def alive_websocket(ws: WebSocket):
 # Protects all /api/v1/* endpoints. /health is always public.
 # When no API keys are configured (dev mode), all requests pass through.
 
+from typing import TYPE_CHECKING
+
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -1213,7 +1218,7 @@ app.add_middleware(APIKeyMiddleware)
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, Any]:
     """System health check."""
     memory_health = await app.state.memory.health()
     equor_health = await app.state.equor.health()
@@ -1357,7 +1362,7 @@ async def full_health():
 
 
 @app.post("/api/v1/perceive/event")
-async def perceive_event(body: dict):
+async def perceive_event(body: dict[str, Any]):
     """
     Ingest a percept through Atune's full perception pipeline.
 
@@ -1447,7 +1452,7 @@ async def get_workspace_state():
 
 
 @app.post("/api/v1/memory/retrieve")
-async def retrieve_memory(body: dict):
+async def retrieve_memory(body: dict[str, Any]):
     """
     Query memory (temporary test endpoint).
     In later phases, retrieval is triggered by the cognitive cycle.
@@ -1467,7 +1472,7 @@ async def retrieve_memory(body: dict):
 
 
 @app.post("/api/v1/equor/review")
-async def review_intent(body: dict):
+async def review_intent(body: dict[str, Any]):
     """
     Submit an Intent for constitutional review (test endpoint).
     In later phases, Nova calls this automatically.
@@ -1475,7 +1480,11 @@ async def review_intent(body: dict):
     Body: {goal, steps?, reasoning?, alternatives?, domain?, expected_free_energy?}
     """
     from ecodiaos.primitives.intent import (
-        Intent, GoalDescriptor, ActionSequence, Action, DecisionTrace,
+        Action,
+        ActionSequence,
+        DecisionTrace,
+        GoalDescriptor,
+        Intent,
     )
 
     goal_text = body.get("goal", "")
@@ -1546,7 +1555,7 @@ async def recent_reviews():
 
 
 @app.post("/api/v1/governance/amendments")
-async def propose_amendment_endpoint(body: dict):
+async def propose_amendment_endpoint(body: dict[str, Any]):
     """
     Propose a constitutional amendment.
     Body: {proposed_drives: {coherence, care, growth, honesty}, title, description, proposer_id}
@@ -1568,7 +1577,7 @@ async def propose_amendment_endpoint(body: dict):
 
 
 @app.post("/api/v1/chat/message")
-async def chat_message(body: dict):
+async def chat_message(body: dict[str, Any]):
     """
     Send a message to EOS and receive an expression in response.
 
@@ -1635,12 +1644,10 @@ async def chat_message(body: dict):
     # Include Thread identity context in response (P2.9)
     identity_context = ""
     if hasattr(app.state, "thread"):
-        try:
+        with suppress(Exception):
             identity_context = app.state.thread.get_identity_context()
-        except Exception:
-            pass
 
-    response: dict = {
+    response: dict[str, Any] = {
         "expression_id": expression.id,
         "conversation_id": expression.conversation_id,
         "content": expression.content,
@@ -1799,7 +1806,7 @@ async def thread_identity():
         schema_data = {
             "id": s.id,
             "statement": s.statement,
-            "strength": getattr(s, 'strength', 'nascent').value if hasattr(getattr(s, 'strength', None), 'value') else 'nascent',
+            "strength": getattr(s, 'strength', 'nascent').value if hasattr(getattr(s, 'strength', None), 'value') else 'nascent',  # type: ignore[union-attr]
             "valence": getattr(s, 'valence', 'ambivalent'),
             "confirmation_count": getattr(s, 'confirmation_count', 0),
             "disconfirmation_count": getattr(s, 'disconfirmation_count', 0),
@@ -1854,7 +1861,7 @@ async def thread_identity():
             current_chapter_theme = latest_ch.theme if hasattr(latest_ch, 'theme') else None
 
     # Get turning points (from latest chapter if available)
-    recent_turning_points = []
+    recent_turning_points: list[dict[str, Any]] = []
     if hasattr(thread, '_chapters') and thread._chapters:
         latest_ch = thread._chapters[-1]
         # Attempt to extract turning points from the chapter
@@ -1951,7 +1958,7 @@ async def thread_schemas():
         schema_data = {
             "id": s.id,
             "statement": s.statement,
-            "strength": getattr(s, 'strength', 'nascent').value if hasattr(getattr(s, 'strength', None), 'value') else 'nascent',
+            "strength": getattr(s, 'strength', 'nascent').value if hasattr(getattr(s, 'strength', None), 'value') else 'nascent',  # type: ignore[union-attr]
             "valence": getattr(s, 'valence', 'ambivalent'),
             "confirmation_count": getattr(s, 'confirmation_count', 0),
             "disconfirmation_count": getattr(s, 'disconfirmation_count', 0),
@@ -2087,7 +2094,7 @@ async def thread_current_chapter():
         "episode_count": 1,  # Placeholder
         "scenes": scenes,
         "turning_points": turning_points,
-        "status": getattr(current_ch, 'status', 'forming').value if hasattr(getattr(current_ch, 'status', None), 'value') else 'forming',
+        "status": getattr(current_ch, 'status', 'forming').value if hasattr(getattr(current_ch, 'status', None), 'value') else 'forming',  # type: ignore[union-attr]
     }
 
 
@@ -2145,7 +2152,7 @@ async def get_simula_stats():
 
 
 @app.post("/api/v1/simula/proposals")
-async def submit_evolution_proposal(body: dict):
+async def submit_evolution_proposal(body: dict[str, Any]):
     """
     Submit an evolution proposal to Simula.
 
@@ -2160,7 +2167,9 @@ async def submit_evolution_proposal(body: dict):
     }
     """
     from ecodiaos.systems.simula.types import (
-        ChangeCategory, ChangeSpec, EvolutionProposal,
+        ChangeCategory,
+        ChangeSpec,
+        EvolutionProposal,
     )
 
     try:
@@ -2215,7 +2224,7 @@ async def get_simula_version():
 
 
 @app.post("/api/v1/simula/proposals/{proposal_id}/approve")
-async def approve_governed_proposal(proposal_id: str, body: dict):
+async def approve_governed_proposal(proposal_id: str, body: dict[str, Any]):
     """
     Approve a governed proposal after community governance.
     Body: {governance_record_id: str}
@@ -2327,7 +2336,7 @@ async def get_synapse_budget():
 
 
 @app.post("/api/v1/admin/synapse/safe-mode")
-async def toggle_safe_mode(body: dict):
+async def toggle_safe_mode(body: dict[str, Any]):
     """
     Manually toggle safe mode.
 
@@ -2557,29 +2566,29 @@ async def get_federation_links():
     return {
         "links": [
             {
-                "id": l.id,
-                "remote_instance_id": l.remote_instance_id,
-                "remote_name": l.remote_name,
-                "remote_endpoint": l.remote_endpoint,
-                "trust_level": l.trust_level.name,
-                "trust_score": round(l.trust_score, 2),
-                "status": l.status.value,
-                "established_at": l.established_at.isoformat(),
-                "last_communication": l.last_communication.isoformat()
-                if l.last_communication else None,
-                "shared_knowledge_count": l.shared_knowledge_count,
-                "received_knowledge_count": l.received_knowledge_count,
-                "successful_interactions": l.successful_interactions,
-                "failed_interactions": l.failed_interactions,
+                "id": lnk.id,
+                "remote_instance_id": lnk.remote_instance_id,
+                "remote_name": lnk.remote_name,
+                "remote_endpoint": lnk.remote_endpoint,
+                "trust_level": lnk.trust_level.name,
+                "trust_score": round(lnk.trust_score, 2),
+                "status": lnk.status.value,
+                "established_at": lnk.established_at.isoformat(),
+                "last_communication": lnk.last_communication.isoformat()
+                if lnk.last_communication else None,
+                "shared_knowledge_count": lnk.shared_knowledge_count,
+                "received_knowledge_count": lnk.received_knowledge_count,
+                "successful_interactions": lnk.successful_interactions,
+                "failed_interactions": lnk.failed_interactions,
             }
-            for l in links
+            for lnk in links
         ],
         "total_active": len(links),
     }
 
 
 @app.post("/api/v1/federation/links")
-async def establish_federation_link(body: dict):
+async def establish_federation_link(body: dict[str, Any]):
     """
     Establish a new federation link with a remote instance.
 
@@ -2615,7 +2624,7 @@ async def withdraw_federation_link(link_id: str):
 
 
 @app.post("/api/v1/federation/knowledge/request")
-async def handle_federation_knowledge_request(body: dict):
+async def handle_federation_knowledge_request(body: dict[str, Any]):
     """
     Handle an inbound knowledge request from a federated instance.
 
@@ -2651,7 +2660,7 @@ async def handle_federation_knowledge_request(body: dict):
 
 
 @app.post("/api/v1/federation/knowledge/share")
-async def request_knowledge_from_remote(body: dict):
+async def request_knowledge_from_remote(body: dict[str, Any]):
     """
     Request knowledge from a linked remote instance.
 
@@ -2683,7 +2692,7 @@ async def request_knowledge_from_remote(body: dict):
 
 
 @app.post("/api/v1/federation/assistance/request")
-async def handle_federation_assistance_request(body: dict):
+async def handle_federation_assistance_request(body: dict[str, Any]):
     """
     Handle an inbound assistance request from a federated instance.
 
@@ -2707,7 +2716,7 @@ async def handle_federation_assistance_request(body: dict):
 
 
 @app.post("/api/v1/federation/assistance/respond")
-async def request_assistance_from_remote(body: dict):
+async def request_assistance_from_remote(body: dict[str, Any]):
     """
     Request assistance from a linked remote instance.
 

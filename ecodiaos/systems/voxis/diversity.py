@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import structlog
 

@@ -12,13 +12,17 @@ organism's attention patterns through experience.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import structlog
 
-from ecodiaos.primitives.affect import AffectState
-
 from .helpers import clamp
-from .salience import ALL_HEADS, SalienceHead
-from .types import MetaContext
+from .salience import ALL_HEADS
+
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+
+    from .types import MetaContext
 
 logger = structlog.get_logger("ecodiaos.systems.atune.meta")
 

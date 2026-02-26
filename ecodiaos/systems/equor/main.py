@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from typing import Any
 
 import structlog
 from fastapi import FastAPI
@@ -21,9 +22,9 @@ from ecodiaos.clients.llm import create_llm_provider
 from ecodiaos.clients.neo4j import Neo4jClient
 from ecodiaos.clients.redis import RedisClient
 from ecodiaos.clients.timescaledb import TimescaleDBClient
-from ecodiaos.config import EcodiaOSConfig, load_config, load_seed
-from ecodiaos.systems.memory.service import MemoryService
+from ecodiaos.config import load_config, load_seed
 from ecodiaos.systems.equor.service import EquorService
+from ecodiaos.systems.memory.service import MemoryService
 from ecodiaos.telemetry.logging import setup_logging
 from ecodiaos.telemetry.metrics import MetricCollector
 
@@ -146,7 +147,7 @@ async def lifespan(app: FastAPI):
     logger.info("ecodiaos_shutdown_complete")
 
 
-def _resolve_governance_config(config):
+def _resolve_governance_config(config: Any) -> Any:
     """Resolve governance config from seed or use defaults."""
     from ecodiaos.config import GovernanceConfig
     try:
@@ -180,7 +181,7 @@ app.add_middleware(
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, Any]:
     """System health check."""
     memory_health = await app.state.memory.health()
     equor_health = await app.state.equor.health()
@@ -250,7 +251,7 @@ async def full_health():
 
 
 @app.post("/api/v1/perceive/event")
-async def perceive_event(body: dict):
+async def perceive_event(body: dict[str, Any]):
     """
     Ingest a percept (temporary test endpoint).
     In later phases, this goes through Atune's full pipeline.
@@ -271,7 +272,7 @@ async def perceive_event(body: dict):
 
 
 @app.post("/api/v1/memory/retrieve")
-async def retrieve_memory(body: dict):
+async def retrieve_memory(body: dict[str, Any]):
     """
     Query memory (temporary test endpoint).
     In later phases, retrieval is triggered by the cognitive cycle.
@@ -291,7 +292,7 @@ async def retrieve_memory(body: dict):
 
 
 @app.post("/api/v1/equor/review")
-async def review_intent(body: dict):
+async def review_intent(body: dict[str, Any]):
     """
     Submit an Intent for constitutional review (test endpoint).
     In later phases, Nova calls this automatically.
@@ -299,7 +300,11 @@ async def review_intent(body: dict):
     Body: {goal, steps?, reasoning?, alternatives?, domain?, expected_free_energy?}
     """
     from ecodiaos.primitives.intent import (
-        Intent, GoalDescriptor, ActionSequence, Action, DecisionTrace,
+        Action,
+        ActionSequence,
+        DecisionTrace,
+        GoalDescriptor,
+        Intent,
     )
 
     goal_text = body.get("goal", "")
@@ -370,7 +375,7 @@ async def recent_reviews():
 
 
 @app.post("/api/v1/governance/amendments")
-async def propose_amendment_endpoint(body: dict):
+async def propose_amendment_endpoint(body: dict[str, Any]):
     """
     Propose a constitutional amendment.
     Body: {proposed_drives: {coherence, care, growth, honesty}, title, description, proposer_id}

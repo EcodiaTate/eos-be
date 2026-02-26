@@ -8,10 +8,11 @@ affect context, and constitutional drives.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ecodiaos.primitives.affect import AffectState
-from ecodiaos.systems.nova.types import BeliefState, Goal
+if TYPE_CHECKING:
+    from ecodiaos.primitives.affect import AffectState
+    from ecodiaos.systems.nova.types import BeliefState, Goal
 
 
 def build_policy_generation_prompt(

@@ -26,17 +26,13 @@ Architecture note on async/sync:
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.clients.llm import LLMProvider
-from ecodiaos.clients.redis import RedisClient
-from ecodiaos.config import VoxisConfig
 from ecodiaos.primitives.affect import AffectState
-from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.primitives.expression import Expression, PersonalityVector
-from ecodiaos.systems.memory.service import MemoryService
 from ecodiaos.systems.voxis.affect_colouring import AffectColouringEngine
 from ecodiaos.systems.voxis.audience import AudienceProfiler
 from ecodiaos.systems.voxis.conversation import ConversationManager
@@ -53,14 +49,16 @@ from ecodiaos.systems.voxis.types import (
     ExpressionFeedback,
     ExpressionIntent,
     ExpressionTrigger,
-    ReceptionEstimate,
     SilenceContext,
-    VoiceParams,
 )
 from ecodiaos.systems.voxis.voice import VoiceEngine
 
 if TYPE_CHECKING:
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.clients.redis import RedisClient
+    from ecodiaos.config import VoxisConfig
     from ecodiaos.systems.atune.types import WorkspaceBroadcast
+    from ecodiaos.systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
 
@@ -152,12 +150,12 @@ class VoxisService:
         self._soma: Any = None
 
         # Background task tracking -- prevents fire-and-forget error loss
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_task_failures: int = 0
 
         # Periodic background loop handles
-        self._queue_drain_task: asyncio.Task | None = None
-        self._reception_expire_task: asyncio.Task | None = None
+        self._queue_drain_task: asyncio.Task[Any] | None = None
+        self._reception_expire_task: asyncio.Task[Any] | None = None
 
         # Observability counters
         self._total_expressions: int = 0
@@ -200,12 +198,12 @@ class VoxisService:
                 except Exception:
                     self._logger.warning("personality_json_load_failed", exc_info=True)
             elif raw_vector and isinstance(raw_vector, list) and len(raw_vector) >= 9:
-                _KEYS = [
+                _keys = [
                     "warmth", "directness", "verbosity", "formality",
                     "curiosity_expression", "humour", "empathy_expression",
                     "confidence_display", "metaphor_use",
                 ]
-                personality_dict = dict(zip(_KEYS, raw_vector[:9]))
+                personality_dict = dict(zip(_keys, raw_vector[:9], strict=False))
                 try:
                     personality_vector = PersonalityVector(**personality_dict)
                     self._logger.info(
@@ -351,7 +349,7 @@ class VoxisService:
             name=f"voxis_express_{intent.id}",
         )
 
-    async def receive_broadcast(self, broadcast: "WorkspaceBroadcast") -> None:
+    async def receive_broadcast(self, broadcast: WorkspaceBroadcast) -> None:
         """BroadcastSubscriber protocol -- delegates to on_broadcast()."""
         await self.on_broadcast(broadcast)
 
@@ -519,7 +517,7 @@ class VoxisService:
         )
 
         # Generate voice parameters for multimodal delivery
-        voice_params = self._voice_engine.derive(
+        self._voice_engine.derive(
             personality=self._personality_engine.current,  # type: ignore[union-attr]
             affect=current_affect,
             strategy_register=expression.strategy.register if expression.strategy else "neutral",
@@ -731,7 +729,7 @@ class VoxisService:
         """
         self._feedback_callbacks.append(callback)
 
-    async def health(self) -> dict:
+    async def health(self) -> dict[str, Any]:
         """Health check -- returns current metrics snapshot."""
         total_decisions = self._total_speak + self._total_silence
         silence_rate = self._total_silence / max(1, total_decisions)
@@ -825,7 +823,7 @@ class VoxisService:
         interaction_count: int,
     ) -> AudienceProfile:
         """Build an AudienceProfile, pulling facts from Memory where available."""
-        memory_facts: list[dict] = []
+        memory_facts: list[dict[str, str]] = []
 
         if addressee_id:
             try:
@@ -836,13 +834,11 @@ class VoxisService:
                     ),
                     timeout=0.1,
                 )
-                for trace in result.traces:
-                    for entity in result.entities:
-                        if entity.get("name") == addressee_id or entity.get("id") == addressee_id:
-                            props = entity.get("properties", {})
-                            for k, v in props.items():
-                                memory_facts.append({"type": k, "value": v})
-            except (asyncio.TimeoutError, Exception):
+                for entity in result.entities:
+                    if entity.name == addressee_id or entity.id == addressee_id:
+                        memory_facts.append({"type": "name", "value": entity.name})
+                        memory_facts.append({"type": "description", "value": entity.description})
+            except (TimeoutError, Exception):
                 pass
 
         return self._audience_profiler.build_profile(
@@ -868,14 +864,14 @@ class VoxisService:
             )
             summaries: list[str] = []
             for trace in result.traces[:5]:
-                summary = trace.get("summary") or trace.get("content", "")
+                summary = trace.metadata.get("summary") or trace.content
                 if summary:
                     summaries.append(str(summary)[:300])
             return summaries
-        except (asyncio.TimeoutError, Exception):
+        except (TimeoutError, Exception):
             return []
 
-    def _spawn_tracked_task(self, coro, name: str = "") -> asyncio.Task:  # type: ignore[type-arg]
+    def _spawn_tracked_task(self, coro: Any, name: str = "") -> asyncio.Task[Any]:
         """
         Spawn a background task with lifecycle tracking.
 
@@ -926,8 +922,8 @@ class VoxisService:
         if self._memory is None:
             return
         try:
-            from ecodiaos.systems.memory.episodic import store_episode
             from ecodiaos.primitives.memory_trace import Episode
+            from ecodiaos.systems.memory.episodic import store_episode
 
             episode = Episode(
                 source=f"voxis.expression:{trigger.value}",

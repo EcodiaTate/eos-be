@@ -12,31 +12,39 @@ Key metrics:
   - Dynamic caution adjustment (increase risk thresholds for
     categories with high recent rollback rates)
 
+Phase 9 addition:
+  - Hunter security analytics integration (vulnerability discovery
+    metrics surfaced alongside evolution metrics for unified observability)
+
 Used by:
   - ChangeSimulator: dynamic risk threshold adjustment
   - SimulaService: enhanced stats reporting
   - ProposalIntelligence: cost/risk estimation
+  - HunterService: unified analytics surface (Phase 9)
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.simula.types import (
-    CautionAdjustment,
     CategorySuccessRate,
+    CautionAdjustment,
     ChangeCategory,
     EvolutionAnalytics,
-    EvolutionRecord,
     RiskLevel,
 )
 
 if TYPE_CHECKING:
     from ecodiaos.systems.simula.history import EvolutionHistoryManager
+    from ecodiaos.systems.simula.hunter.analytics import (
+        HunterAnalyticsStore,
+        HunterAnalyticsView,
+    )
 
 logger = structlog.get_logger().bind(system="simula.analytics")
 
@@ -64,12 +72,22 @@ class EvolutionAnalyticsEngine:
     All computation is from Neo4j records -- no LLM tokens consumed.
     """
 
-    def __init__(self, history: EvolutionHistoryManager | None = None) -> None:
+    def __init__(
+        self,
+        history: EvolutionHistoryManager | None = None,
+        *,
+        hunter_view: HunterAnalyticsView | None = None,
+        hunter_store: HunterAnalyticsStore | None = None,
+    ) -> None:
         self._history = history
         self._log = logger
         self._cached_analytics: EvolutionAnalytics | None = None
         self._cache_ttl_seconds: int = 300  # 5 minutes
         self._last_computed: datetime | None = None
+
+        # Phase 9: Hunter analytics integration
+        self._hunter_view = hunter_view
+        self._hunter_store = hunter_store
 
     async def compute_analytics(self) -> EvolutionAnalytics:
         """
@@ -289,6 +307,153 @@ class EvolutionAnalyticsEngine:
             factors=factors,
             reasoning=" | ".join(reasoning_parts),
         )
+
+    # ── Phase 9: Hunter Integration ──────────────────────────────────────────
+
+    def set_hunter_view(self, view: HunterAnalyticsView) -> None:
+        """Attach a Hunter analytics view for unified querying."""
+        self._hunter_view = view
+
+    def set_hunter_store(self, store: HunterAnalyticsStore) -> None:
+        """Attach a Hunter analytics store for durable historical queries."""
+        self._hunter_store = store
+
+    def get_hunter_summary(self) -> dict[str, Any]:
+        """
+        Return in-memory Hunter analytics summary.
+
+        Provides: total vulnerabilities, severity distribution, most common
+        classes, patch success rate, weekly trends, rolling windows, and
+        throughput metrics.
+
+        Returns empty dict if Hunter analytics view is not attached.
+        """
+        if self._hunter_view is None:
+            return {}
+        return self._hunter_view.summary
+
+    async def get_hunter_weekly_trends(
+        self,
+        *,
+        weeks: int = 12,
+        target_url: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Query weekly vulnerability trends from TimescaleDB.
+
+        Falls back to in-memory view if store is unavailable.
+
+        Args:
+            weeks: Number of weeks to look back.
+            target_url: Optional filter by target repository.
+
+        Returns:
+            List of weekly buckets with vulnerability counts + severity breakdown.
+        """
+        if self._hunter_store is not None:
+            try:
+                return await self._hunter_store.get_vulnerabilities_per_week(
+                    weeks=weeks, target_url=target_url,
+                )
+            except Exception as exc:
+                self._log.warning(
+                    "hunter_store_query_failed",
+                    query="weekly_trends",
+                    error=str(exc),
+                )
+
+        # Fallback to in-memory view
+        if self._hunter_view is not None:
+            if target_url:
+                return self._hunter_view.get_target_weekly_trend(target_url)
+            trends = self._hunter_view.summary.get("weekly_trends", [])
+            return trends[-weeks:] if isinstance(trends, list) else []
+
+        return []
+
+    async def get_hunter_severity_distribution(
+        self,
+        *,
+        days: int = 30,
+        target_url: str | None = None,
+    ) -> dict[str, int]:
+        """
+        Query severity distribution from TimescaleDB over a rolling window.
+
+        Falls back to in-memory view (all-time) if store is unavailable.
+        """
+        if self._hunter_store is not None:
+            try:
+                return await self._hunter_store.get_severity_distribution(
+                    days=days, target_url=target_url,
+                )
+            except Exception as exc:
+                self._log.warning(
+                    "hunter_store_query_failed",
+                    query="severity_distribution",
+                    error=str(exc),
+                )
+
+        if self._hunter_view is not None:
+            dist: dict[str, int] = self._hunter_view.summary.get("severity_distribution", {})
+            return dist
+
+        return {}
+
+    async def get_hunter_error_summary(self, *, days: int = 7) -> list[dict[str, Any]]:
+        """
+        Query aggregated pipeline errors from TimescaleDB.
+
+        Only available when a Hunter analytics store is attached.
+        """
+        if self._hunter_store is not None:
+            try:
+                return await self._hunter_store.get_error_summary(days=days)
+            except Exception as exc:
+                self._log.warning(
+                    "hunter_store_query_failed",
+                    query="error_summary",
+                    error=str(exc),
+                )
+        return []
+
+    async def get_unified_analytics(self) -> dict[str, Any]:
+        """
+        Return a unified analytics payload combining evolution metrics
+        and Hunter security metrics for comprehensive observability.
+
+        This is the single entry point for dashboard consumers that want
+        the complete system health picture.
+        """
+        evolution = await self.compute_analytics()
+
+        result: dict[str, Any] = {
+            "evolution": {
+                "total_proposals": evolution.total_proposals,
+                "evolution_velocity": evolution.evolution_velocity,
+                "rollback_rate": evolution.rollback_rate,
+                "mean_simulation_risk": evolution.mean_simulation_risk,
+                "category_count": len(evolution.category_rates),
+                "last_updated": evolution.last_updated.isoformat() if evolution.last_updated else None,
+            },
+        }
+
+        # Hunter security analytics
+        hunter_summary = self.get_hunter_summary()
+        if hunter_summary:
+            result["hunter"] = {
+                "total_vulnerabilities": hunter_summary.get("total_vulnerabilities", 0),
+                "total_hunts": hunter_summary.get("total_hunts", 0),
+                "severity_distribution": hunter_summary.get("severity_distribution", {}),
+                "patch_success_rate": hunter_summary.get("patch_success_rate", 0),
+                "avg_vulns_per_hunt": hunter_summary.get("avg_vulns_per_hunt", 0),
+                "rolling_7d": hunter_summary.get("rolling_7d", {}),
+                "rolling_30d": hunter_summary.get("rolling_30d", {}),
+            }
+        else:
+            result["hunter"] = None
+
+        return result
 
     def invalidate_cache(self) -> None:
         """Force recomputation on next analytics request."""

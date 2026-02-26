@@ -15,7 +15,6 @@ from typing import Any
 
 import structlog
 
-from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.thymos.types import (
     ParameterAdjustment,
     ParameterFix,
@@ -216,7 +215,7 @@ class HomeostasisController:
         """
         adjustments: list[ParameterAdjustment] = []
 
-        for metric, (opt_min, opt_max, unit) in self._ranges.items():
+        for metric, (opt_min, opt_max, _unit) in self._ranges.items():
             history = self._history[metric]
             if len(history) < 10:
                 continue  # Need enough data

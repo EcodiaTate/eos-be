@@ -8,9 +8,9 @@ and cross-system coherence measurement.
 
 from __future__ import annotations
 
-import enum
 from datetime import datetime
-from typing import Any
+import enum
+from typing import Any, Protocol
 
 from pydantic import Field
 
@@ -20,7 +20,7 @@ from ecodiaos.primitives.common import EOSBaseModel, new_id, utc_now
 # ─── System Status ────────────────────────────────────────────────────
 
 
-class SystemStatus(str, enum.Enum):
+class SystemStatus(enum.StrEnum):
     """Operational state of a managed cognitive system."""
 
     HEALTHY = "healthy"
@@ -86,9 +86,7 @@ class SystemHealthRecord(EOSBaseModel):
         )
         self.latency_peak_ms = max(self.latency_peak_ms, latency_ms)
         # Recover from degraded states
-        if self.status == SystemStatus.FAILED and self.consecutive_successes >= 3:
-            self.status = SystemStatus.HEALTHY
-        elif self.status in (SystemStatus.DEGRADED, SystemStatus.OVERLOADED):
+        if self.status == SystemStatus.FAILED and self.consecutive_successes >= 3 or self.status in (SystemStatus.DEGRADED, SystemStatus.OVERLOADED):
             self.status = SystemStatus.HEALTHY
 
     def record_failure(self) -> None:
@@ -181,7 +179,7 @@ class ClockState(EOSBaseModel):
 # ─── Degradation ──────────────────────────────────────────────────────
 
 
-class DegradationLevel(str, enum.Enum):
+class DegradationLevel(enum.StrEnum):
     """Overall organism degradation level."""
 
     NOMINAL = "nominal"
@@ -204,7 +202,7 @@ class DegradationStrategy(EOSBaseModel):
 # ─── Event Bus ────────────────────────────────────────────────────────
 
 
-class SynapseEventType(str, enum.Enum):
+class SynapseEventType(enum.StrEnum):
     """All event types emitted by Synapse."""
 
     # System lifecycle
@@ -253,7 +251,7 @@ class SynapseEvent(EOSBaseModel):
 # ─── Emergent Rhythm ──────────────────────────────────────────────────
 
 
-class RhythmState(str, enum.Enum):
+class RhythmState(enum.StrEnum):
     """
     Meta-cognitive state detected from raw cycle telemetry.
 
@@ -302,15 +300,15 @@ class CoherenceSnapshot(EOSBaseModel):
     """
 
     # Composite integration metric (higher = more integrated)
-    phi_approximation: float = Field(0.0, ge=0.0, le=1.0)
+    phi_approximation: float = Field(default=0.0, ge=0.0, le=1.0)
     # How in-sync system responses are (low latency variance = high resonance)
-    system_resonance: float = Field(0.0, ge=0.0, le=1.0)
+    system_resonance: float = Field(default=0.0, ge=0.0, le=1.0)
     # Entropy of broadcast content sources (diversity of topics)
-    broadcast_diversity: float = Field(0.0, ge=0.0, le=1.0)
+    broadcast_diversity: float = Field(default=0.0, ge=0.0, le=1.0)
     # Uniformity of response latencies across systems
-    response_synchrony: float = Field(0.0, ge=0.0, le=1.0)
+    response_synchrony: float = Field(default=0.0, ge=0.0, le=1.0)
     # Weighted composite
-    composite: float = Field(0.0, ge=0.0, le=1.0)
+    composite: float = Field(default=0.0, ge=0.0, le=1.0)
     # Window size used for computation
     window_cycles: int = 0
     timestamp: datetime = Field(default_factory=utc_now)
@@ -319,7 +317,7 @@ class CoherenceSnapshot(EOSBaseModel):
 # ─── Protocol ─────────────────────────────────────────────────────────
 
 
-class ManagedSystemProtocol:
+class ManagedSystemProtocol(Protocol):
     """
     Protocol that any cognitive system must satisfy to be managed by Synapse.
 

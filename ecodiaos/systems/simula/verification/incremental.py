@@ -24,7 +24,6 @@ import ast
 import asyncio
 import hashlib
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -35,16 +34,13 @@ from ecodiaos.systems.simula.verification.types import (
     FormalVerificationResult,
     FunctionSignature,
     IncrementalVerificationResult,
-    VerificationCacheStatus,
-    VerificationCacheTier,
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.neo4j import Neo4jClient
     from ecodiaos.clients.redis import RedisClient
-    from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
-    from ecodiaos.systems.simula.verification.static_analysis import StaticAnalysisBridge
-    from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge
 
 logger = structlog.get_logger().bind(system="simula.incremental")
 
@@ -605,7 +601,7 @@ class IncrementalVerificationEngine:
 
 
 # Type alias for the formal verifier callback
-from typing import Callable, Coroutine
+from collections.abc import Callable, Coroutine
 
 _FormalVerifierCallable = Callable[
     ...,

@@ -28,20 +28,19 @@ from __future__ import annotations
 
 import json
 import time
+from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.clients.llm import LLMProvider, Message
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.clients.output_validator import OutputValidator
-from ecodiaos.primitives.affect import AffectState
 from ecodiaos.prompts.nova.policy import (
     build_epistemic_value_prompt,
     build_pragmatic_value_prompt,
     summarise_beliefs,
 )
 from ecodiaos.systems.nova.efe_heuristics import EFEHeuristics
-from ecodiaos.systems.nova.policy_generator import DO_NOTHING_EFE, make_do_nothing_policy
+from ecodiaos.systems.nova.policy_generator import DO_NOTHING_EFE
 from ecodiaos.systems.nova.types import (
     BeliefState,
     EFEScore,
@@ -52,6 +51,10 @@ from ecodiaos.systems.nova.types import (
     PragmaticEstimate,
     RiskEstimate,
 )
+
+if TYPE_CHECKING:
+    from ecodiaos.clients.llm import LLMProvider
+    from ecodiaos.primitives.affect import AffectState
 
 logger = structlog.get_logger()
 
@@ -236,16 +239,19 @@ class EFEEvaluator:
         scores = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: list[tuple[Policy, EFEScore]] = []
-        for policy, score in zip(policies, scores):
-            if isinstance(score, Exception):
+        for policy, score in zip(policies, scores, strict=False):
+            safe_score: EFEScore
+            if isinstance(score, BaseException):
                 self._logger.warning(
                     "efe_evaluation_error",
                     policy=policy.name,
                     error=str(score),
                 )
                 # Assign a neutral EFE on failure so it doesn't block selection
-                score = EFEScore(total=0.0, reasoning="Evaluation failed — using neutral score")
-            results.append((policy, score))
+                safe_score = EFEScore(total=0.0, reasoning="Evaluation failed — using neutral score")
+            else:
+                safe_score = score
+            results.append((policy, safe_score))
 
         # Sort: minimum EFE first
         results.sort(key=lambda x: x[1].total)
@@ -489,7 +495,7 @@ def _identify_uncertain_domains(beliefs: BeliefState) -> str:
     return "; ".join(uncertain) if uncertain else "no specific uncertainties identified"
 
 
-def _parse_json_response(raw: str) -> dict | None:
+def _parse_json_response(raw: str) -> dict[str, object] | None:
     """Safely parse a JSON response from the LLM."""
     try:
         text = raw.strip()
@@ -498,6 +504,6 @@ def _parse_json_response(raw: str) -> dict | None:
             text = parts[1] if len(parts) > 1 else text
             if text.startswith("json"):
                 text = text[4:]
-        return json.loads(text.strip())
+        return json.loads(text.strip())  # type: ignore[no-any-return]
     except Exception:
         return None

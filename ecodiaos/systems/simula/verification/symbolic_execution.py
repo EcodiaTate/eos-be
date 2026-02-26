@@ -22,13 +22,11 @@ from __future__ import annotations
 import ast
 import re
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
 
 from ecodiaos.systems.simula.verification.types import (
-    PathCondition,
     SymbolicDomain,
     SymbolicExecutionResult,
     SymbolicExecutionStatus,
@@ -36,6 +34,8 @@ from ecodiaos.systems.simula.verification.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge
 
@@ -269,7 +269,7 @@ class SymbolicExecutionEngine:
         try:
             from ecodiaos.clients.llm import Message
 
-            response = await self._llm.complete(
+            response = await self._llm.complete(  # type: ignore[attr-defined]
                 system="You are a formal verification expert specializing in Z3 SMT encoding.",
                 messages=[Message(role="user", content=prompt)],
                 max_tokens=2048,

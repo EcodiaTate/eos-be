@@ -201,7 +201,7 @@ def _deep_anonymise(obj: Any, _depth: int = 0) -> Any:
 
     if isinstance(obj, list):
         new_list = [_deep_anonymise(item, _depth + 1) for item in obj]
-        if any(new is not old for new, old in zip(new_list, obj)):
+        if any(new is not old for new, old in zip(new_list, obj, strict=False)):
             return new_list
         return obj
 

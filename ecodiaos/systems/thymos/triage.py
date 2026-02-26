@@ -9,8 +9,8 @@ When sentinels produce Incidents, Triage determines what to do with them:
 
 from __future__ import annotations
 
+from datetime import datetime
 from collections import defaultdict
-from datetime import datetime, timedelta
 
 import structlog
 
@@ -21,6 +21,7 @@ from ecodiaos.systems.thymos.types import (
     IncidentSeverity,
     RepairTier,
 )
+
 
 logger = structlog.get_logger()
 

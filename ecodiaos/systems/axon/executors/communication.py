@@ -18,7 +18,7 @@ Axon never sends raw text directly to users.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -33,6 +33,7 @@ from ecodiaos.systems.axon.types import (
 if TYPE_CHECKING:
     from ecodiaos.systems.memory.service import MemoryService
     from ecodiaos.systems.voxis.service import VoxisService
+    from ecodiaos.systems.voxis.types import ExpressionTrigger
 
 logger = structlog.get_logger()
 
@@ -66,11 +67,11 @@ class RespondTextExecutor(Executor):
     max_duration_ms = 5000
     rate_limit = RateLimit.per_minute(30)
 
-    def __init__(self, voxis: "VoxisService | None" = None) -> None:
+    def __init__(self, voxis: VoxisService | None = None) -> None:
         self._voxis = voxis
         self._logger = logger.bind(system="axon.executor.respond_text")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("content"):
             return ValidationResult.fail("content is required", content="missing or empty")
         content = params["content"]
@@ -85,7 +86,7 @@ class RespondTextExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         content = params["content"]
@@ -109,7 +110,6 @@ class RespondTextExecutor(Executor):
             )
 
         try:
-            from ecodiaos.systems.voxis.types import ExpressionTrigger
 
             trigger = _resolve_trigger(trigger_name)
             await self._voxis.express(
@@ -131,7 +131,7 @@ class RespondTextExecutor(Executor):
             )
 
 
-def _resolve_trigger(trigger_name: str) -> "ExpressionTrigger":
+def _resolve_trigger(trigger_name: str) -> ExpressionTrigger:
     from ecodiaos.systems.voxis.types import ExpressionTrigger
     try:
         return ExpressionTrigger[trigger_name]
@@ -167,11 +167,11 @@ class NotificationExecutor(Executor):
     max_duration_ms = 5000
     rate_limit = RateLimit.per_hour(10)  # Strict — notification spam is harmful
 
-    def __init__(self, redis_client=None) -> None:
+    def __init__(self, redis_client: Any = None) -> None:
         self._redis = redis_client
         self._logger = logger.bind(system="axon.executor.notification")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         for field in ("recipient_id", "title", "body"):
             if not params.get(field):
                 return ValidationResult.fail(
@@ -191,7 +191,7 @@ class NotificationExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         recipient_id = params["recipient_id"]
@@ -272,11 +272,11 @@ class PostMessageExecutor(Executor):
     max_duration_ms = 5000
     rate_limit = RateLimit.per_hour(20)
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.executor.post_message")
 
-    async def validate_params(self, params: dict) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         for field in ("channel_id", "content"):
             if not params.get(field):
                 return ValidationResult.fail(
@@ -290,7 +290,7 @@ class PostMessageExecutor(Executor):
 
     async def execute(
         self,
-        params: dict,
+        params: dict[str, Any],
         context: ExecutionContext,
     ) -> ExecutionResult:
         channel_id = params["channel_id"]
@@ -305,26 +305,8 @@ class PostMessageExecutor(Executor):
             execution_id=context.execution_id,
         )
 
-        # Store the post as an episodic memory (EOS said this, publicly)
-        if self._memory is not None:
-            try:
-                from ecodiaos.primitives.memory_trace import MemoryTrace
-                from ecodiaos.primitives.common import Modality, SourceDescriptor, SystemID
-
-                trace = MemoryTrace(
-                    content=f"[Channel post to {channel_id}] {content}",
-                    source=SourceDescriptor(
-                        system=SystemID.AXON,
-                        channel=channel_id,
-                        modality=Modality.TEXT,
-                    ),
-                    salience=0.7,  # Public posts have high salience
-                    tags=["channel_post", channel_id],
-                    affect_at_encoding=context.affect_state,
-                )
-                await self._memory.store_episodic(trace)
-            except Exception as exc:
-                self._logger.warning("post_message_memory_write_failed", error=str(exc))
+        # Note: episodic memory storage for channel posts requires Percept ingestion
+        # through Atune → Memory pipeline, not direct MemoryTrace creation.
 
         # Phase 1: stub delivery — Phase 2 will integrate with community platform
         return ExecutionResult(

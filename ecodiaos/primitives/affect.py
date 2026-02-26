@@ -54,7 +54,8 @@ class AffectState(EOSBaseModel):
     @classmethod
     def from_map(cls, data: dict[str, float]) -> AffectState:
         """Reconstruct from a Neo4j MAP property."""
-        return cls(**{k: v for k, v in data.items() if k in cls.model_fields})
+        filtered = {k: v for k, v in data.items() if k in cls.model_fields}
+        return cls.model_validate(filtered)
 
 
 class AffectDelta(EOSBaseModel):

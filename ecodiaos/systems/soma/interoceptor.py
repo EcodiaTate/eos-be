@@ -11,7 +11,7 @@ transform function and fallback value for when the source is unavailable.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import structlog
 
@@ -20,9 +20,6 @@ from ecodiaos.systems.soma.types import (
     InteroceptiveDimension,
     _clamp_dimension,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = structlog.get_logger("ecodiaos.systems.soma.interoceptor")
 

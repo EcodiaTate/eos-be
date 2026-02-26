@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -41,6 +40,8 @@ from ecodiaos.systems.simula.resolution.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.clients.neo4j import Neo4jClient
     from ecodiaos.systems.simula.agents.repair_agent import RepairAgent
@@ -297,7 +298,7 @@ class IssueResolver:
             f"Determine: root cause, affected scope, confidence of diagnosis."
         )
 
-        response = await self._llm.complete(
+        response = await self._llm.complete(  # type: ignore[attr-defined]
             system="You are a debugging investigator for EcodiaOS. Be precise and concise.",
             messages=[Message(role="user", content=prompt)],
             max_tokens=1024,

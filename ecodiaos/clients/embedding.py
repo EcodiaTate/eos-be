@@ -12,13 +12,16 @@ Dimension is model-dependent:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import numpy as np
 import structlog
 
-from ecodiaos.config import EmbeddingConfig
+if TYPE_CHECKING:
+    from ecodiaos.config import EmbeddingConfig
 
 logger = structlog.get_logger()
 
@@ -51,9 +54,9 @@ class LocalEmbeddingClient(EmbeddingClient):
     def __init__(self, model_name: str, device: str = "cpu") -> None:
         self._model_name = model_name
         self._device = device
-        self._model = None
+        self._model: Any = None
 
-    def _load_model(self):
+    def _load_model(self) -> None:
         """Lazy-load the model on first use."""
         if self._model is None:
             from sentence_transformers import SentenceTransformer
@@ -68,14 +71,14 @@ class LocalEmbeddingClient(EmbeddingClient):
     async def embed(self, text: str) -> list[float]:
         self._load_model()
         embedding = self._model.encode(text, convert_to_numpy=True)
-        return embedding.tolist()
+        return embedding.tolist()  # type: ignore[no-any-return]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
         self._load_model()
         embeddings = self._model.encode(texts, convert_to_numpy=True, batch_size=32)
-        return embeddings.tolist()
+        return embeddings.tolist()  # type: ignore[no-any-return]
 
     async def close(self) -> None:
         self._model = None
@@ -97,7 +100,7 @@ class SidecarEmbeddingClient(EmbeddingClient):
             json={"text": text},
         )
         response.raise_for_status()
-        return response.json()["embedding"]
+        return response.json()["embedding"]  # type: ignore[no-any-return]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         response = await self._client.post(
@@ -105,7 +108,7 @@ class SidecarEmbeddingClient(EmbeddingClient):
             json={"texts": texts},
         )
         response.raise_for_status()
-        return response.json()["embeddings"]
+        return response.json()["embeddings"]  # type: ignore[no-any-return]
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -152,7 +155,7 @@ class VoyageEmbeddingClient(EmbeddingClient):
             dimension=dimension,
         )
 
-    async def _post_with_retry(self, payload: dict) -> dict:
+    async def _post_with_retry(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST with exponential backoff on retryable status codes."""
         last_exc: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
@@ -163,10 +166,8 @@ class VoyageEmbeddingClient(EmbeddingClient):
                         delay = self._BASE_DELAY_S * (2 ** attempt)
                         retry_after = response.headers.get("retry-after")
                         if retry_after:
-                            try:
+                            with contextlib.suppress(ValueError):
                                 delay = max(delay, float(retry_after))
-                            except ValueError:
-                                pass
                         logger.warning(
                             "voyage_retrying",
                             status=response.status_code,
@@ -176,7 +177,7 @@ class VoyageEmbeddingClient(EmbeddingClient):
                         await asyncio.sleep(delay)
                         continue
                 response.raise_for_status()
-                return response.json()
+                return response.json()  # type: ignore[no-any-return]
             except httpx.TimeoutException as exc:
                 last_exc = exc
                 if attempt < self._MAX_RETRIES:
@@ -195,7 +196,7 @@ class VoyageEmbeddingClient(EmbeddingClient):
         embeddings = data.get("data", [])
         if not embeddings:
             raise ValueError("Voyage API returned no embeddings")
-        return embeddings[0]["embedding"]
+        return embeddings[0]["embedding"]  # type: ignore[no-any-return]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -234,7 +235,7 @@ class VoyageEmbeddingClient(EmbeddingClient):
         embeddings = data.get("data", [])
         if not embeddings:
             raise ValueError("Voyage API returned no embeddings for query")
-        return embeddings[0]["embedding"]
+        return embeddings[0]["embedding"]  # type: ignore[no-any-return]
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -252,7 +253,7 @@ class MockEmbeddingClient(EmbeddingClient):
     async def embed(self, text: str) -> list[float]:
         vec = np.random.randn(self._dimension).astype(np.float32)
         vec = vec / np.linalg.norm(vec)
-        return vec.tolist()
+        return vec.tolist()  # type: ignore[no-any-return]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         results = []

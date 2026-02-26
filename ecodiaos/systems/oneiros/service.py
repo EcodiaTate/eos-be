@@ -819,8 +819,8 @@ class OneirosService:
         that the waking mind should explore. This closes the dream→goal loop:
         insight → Nova goal → deliberation → action → new experience.
         """
+        from ecodiaos.primitives.common import DriveAlignmentVector, new_id
         from ecodiaos.systems.nova.types import Goal, GoalSource, GoalStatus
-        from ecodiaos.primitives.common import new_id, DriveAlignmentVector
 
         # Higher coherence → higher priority (0.5 base + up to 0.2 bonus)
         priority = min(1.0, 0.5 + insight.coherence_score * 0.2)

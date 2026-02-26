@@ -222,7 +222,7 @@ class SketchSolver:
         if context_code:
             user_msg += f"\n\n## Surrounding Context\n```python\n{context_code}\n```"
 
-        response = await self._llm.complete(
+        response = await self._llm.complete(  # type: ignore[attr-defined]
             system=SKETCH_TEMPLATE_PROMPT,
             messages=[Message(role="user", content=user_msg)],
             max_tokens=4096,
@@ -329,10 +329,7 @@ class SketchSolver:
             solver.set("timeout", self._solver_timeout_ms)
 
             # Create a variable for the hole value
-            if hole.type_hint in ("int", "Int"):
-                var = z3_mod.Int("value")
-            else:
-                var = z3_mod.Real("value")
+            var = z3_mod.Int("value") if hole.type_hint in ("int", "Int") else z3_mod.Real("value")
 
             # Parse constraints
             for constraint in hole.constraints:
@@ -380,7 +377,7 @@ class SketchSolver:
                     try:
                         value = float(parts[1].strip())
                         if isinstance(var, z3_mod.ArithRef):
-                            return op_fn(var, z3_mod.RealVal(value))
+                            return op_fn(var, z3_mod.RealVal(value))  # type: ignore[no-untyped-call]
                     except ValueError:
                         pass
                     break
@@ -425,7 +422,7 @@ class SketchSolver:
             context="\n".join(context_lines),
         )
 
-        response = await self._llm.complete(
+        response = await self._llm.complete(  # type: ignore[attr-defined]
             system="You are a concise code completion assistant.",
             messages=[Message(role="user", content=prompt)],
             max_tokens=256,
@@ -436,7 +433,7 @@ class SketchSolver:
         if text.startswith("```"):
             text = re.sub(r"^```\w*\n?", "", text)
             text = re.sub(r"\n?```$", "", text)
-        return text.strip()
+        return text.strip()  # type: ignore[no-any-return]
 
     # ── Validation ──────────────────────────────────────────────────────────
 

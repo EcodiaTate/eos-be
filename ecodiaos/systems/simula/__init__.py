@@ -42,15 +42,36 @@ Hunter — Zero-Day Discovery Engine:
   HunterConfig         — authorization and resource limits
 """
 
-from ecodiaos.systems.simula.code_agent import SimulaCodeAgent
-from ecodiaos.systems.simula.history import EvolutionHistoryManager
-from ecodiaos.systems.simula.service import SimulaService
+# Stage 2D: AgentCoder agents
+from ecodiaos.systems.simula.agents.test_designer import TestDesignerAgent
+from ecodiaos.systems.simula.agents.test_executor import TestExecutorAgent
 from ecodiaos.systems.simula.analytics import EvolutionAnalyticsEngine
 from ecodiaos.systems.simula.bridge import EvoSimulaBridge
+from ecodiaos.systems.simula.code_agent import SimulaCodeAgent
+from ecodiaos.systems.simula.history import EvolutionHistoryManager
+
+# Hunter: Zero-Day Discovery Engine
+from ecodiaos.systems.simula.hunter import (
+    AttackSurface,
+    AttackSurfaceType,
+    HunterConfig,
+    HuntResult,
+    TargetType,
+    TargetWorkspace,
+    VulnerabilityReport,
+    VulnerabilitySeverity,
+)
+from ecodiaos.systems.simula.learning.lilo import LiloLibraryEngine
 from ecodiaos.systems.simula.proposal_intelligence import ProposalIntelligence
+from ecodiaos.systems.simula.retrieval.swe_grep import SweGrepRetriever
+from ecodiaos.systems.simula.service import SimulaService
 from ecodiaos.systems.simula.types import (
-    CautionAdjustment,
+    FORBIDDEN,
+    GOVERNANCE_REQUIRED,
+    SELF_APPLICABLE,
+    SIMULA_IRON_RULES,
     CategorySuccessRate,
+    CautionAdjustment,
     ChangeCategory,
     ChangeSpec,
     CodeChangeResult,
@@ -71,69 +92,52 @@ from ecodiaos.systems.simula.types import (
     SimulationResult,
     TriageResult,
     TriageStatus,
-    FORBIDDEN,
-    GOVERNANCE_REQUIRED,
-    SELF_APPLICABLE,
-    SIMULA_IRON_RULES,
 )
+
+# Stage 2: Verification bridges
+from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
+
+# Stage 3: Engines
+from ecodiaos.systems.simula.verification.incremental import IncrementalVerificationEngine
+from ecodiaos.systems.simula.verification.static_analysis import StaticAnalysisBridge
+
 # Stages 2 + 3: Verification types
 from ecodiaos.systems.simula.verification.types import (
+    DAFNY_TRIGGERABLE_CATEGORIES,
+    AbstractionExtractionResult,
+    # Stage 3C: LILO Library Learning
+    AbstractionKind,
     # Stage 2A: Dafny
     AgentCoderIterationResult,
     AgentCoderResult,
+    CachedVerificationResult,
     CloverRoundResult,
     DafnyVerificationResult,
     DafnyVerificationStatus,
     DiscoveredInvariant,
     FormalVerificationResult,
+    FunctionSignature,
+    IncrementalVerificationResult,
     InvariantKind,
     InvariantVerificationResult,
     InvariantVerificationStatus,
+    LibraryAbstraction,
+    LibraryStats,
+    RetrievalHop,
+    # Stage 3B: SWE-grep Retrieval
+    RetrievalToolKind,
+    RetrievedContext,
     StaticAnalysisFinding,
     StaticAnalysisResult,
     StaticAnalysisSeverity,
+    SweGrepResult,
     TestDesignResult,
     TestExecutionResult,
-    DAFNY_TRIGGERABLE_CATEGORIES,
     # Stage 3A: Incremental Verification
     VerificationCacheStatus,
     VerificationCacheTier,
-    FunctionSignature,
-    CachedVerificationResult,
-    IncrementalVerificationResult,
-    # Stage 3B: SWE-grep Retrieval
-    RetrievalToolKind,
-    RetrievalHop,
-    RetrievedContext,
-    SweGrepResult,
-    # Stage 3C: LILO Library Learning
-    AbstractionKind,
-    LibraryAbstraction,
-    AbstractionExtractionResult,
-    LibraryStats,
 )
-# Stage 2: Verification bridges
-from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
 from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge
-from ecodiaos.systems.simula.verification.static_analysis import StaticAnalysisBridge
-# Stage 2D: AgentCoder agents
-from ecodiaos.systems.simula.agents.test_designer import TestDesignerAgent
-from ecodiaos.systems.simula.agents.test_executor import TestExecutorAgent
-# Stage 3: Engines
-from ecodiaos.systems.simula.verification.incremental import IncrementalVerificationEngine
-from ecodiaos.systems.simula.retrieval.swe_grep import SweGrepRetriever
-from ecodiaos.systems.simula.learning.lilo import LiloLibraryEngine
-# Hunter: Zero-Day Discovery Engine
-from ecodiaos.systems.simula.hunter import (
-    TargetWorkspace,
-    TargetType,
-    AttackSurface,
-    AttackSurfaceType,
-    VulnerabilityReport,
-    VulnerabilitySeverity,
-    HuntResult,
-    HunterConfig,
-)
 
 __all__ = [
     # Services

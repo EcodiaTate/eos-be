@@ -28,7 +28,7 @@ import asyncio
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -477,7 +477,7 @@ class DiffusionRepairAgent:
                 stdout, _ = await asyncio.wait_for(
                     proc.communicate(), timeout=30.0,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 await proc.communicate()
                 return False, "Test run timed out after 30s"
@@ -513,7 +513,7 @@ class DiffusionRepairAgent:
                 stdout, _ = await asyncio.wait_for(
                     proc.communicate(), timeout=15.0,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 await proc.communicate()
                 return False, "Lint timed out"

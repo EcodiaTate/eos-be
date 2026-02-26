@@ -22,7 +22,7 @@ This protects sensitive data while still enabling deduplication and correlation.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -49,7 +49,7 @@ class AuditLogger:
     as a fallback — it will not be silently dropped.
     """
 
-    def __init__(self, memory: "MemoryService | None" = None) -> None:
+    def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.audit")
         self._records_written: int = 0
@@ -68,7 +68,7 @@ class AuditLogger:
         """
         try:
             # Collect parameters from all steps for hashing
-            all_params: dict = {}
+            all_params: dict[str, Any] = {}
             for i, step in enumerate(context.intent.plan.steps):
                 all_params[f"step_{i}_{step.executor}"] = step.parameters
 
@@ -171,7 +171,7 @@ class AuditLogger:
             )
 
     @property
-    def stats(self) -> dict:
+    def stats(self) -> dict[str, Any]:
         return {
             "records_written": self._records_written,
             "records_failed": self._records_failed,

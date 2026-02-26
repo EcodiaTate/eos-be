@@ -21,7 +21,6 @@ from __future__ import annotations
 import ast
 import json
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -34,6 +33,8 @@ from ecodiaos.systems.simula.synthesis.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.simula.types import ChangeSpec
 
@@ -259,7 +260,7 @@ class HySynthEngine:
             f"Context: {change_spec.additional_context}"
         )
 
-        response = await self._llm.complete(
+        response = await self._llm.complete(  # type: ignore[attr-defined]
             system=GRAMMAR_WEIGHT_PROMPT,
             messages=[Message(
                 role="user",
@@ -295,7 +296,7 @@ class HySynthEngine:
             by_lhs.setdefault(rule.lhs, []).append(rule)
 
         # Normalize weights per LHS
-        for lhs, group in by_lhs.items():
+        for _lhs, group in by_lhs.items():
             total = sum(r.weight for r in group)
             if total > 0:
                 for r in group:
@@ -312,10 +313,10 @@ class HySynthEngine:
         import_rules = sorted(by_lhs.get("Import", []), key=lambda r: r.weight, reverse=True)
 
         # Generate candidates by combining top rules
-        for ci, class_rule in enumerate(class_rules[:self._beam_width]):
+        for _ci, class_rule in enumerate(class_rules[:self._beam_width]):
             if time.monotonic() - start_time > self._timeout_s:
                 break
-            for fi, func_rule in enumerate(func_rules[:self._beam_width]):
+            for _fi, func_rule in enumerate(func_rules[:self._beam_width]):
                 if len(candidates) >= self._max_candidates:
                     break
                 if time.monotonic() - start_time > self._timeout_s:
