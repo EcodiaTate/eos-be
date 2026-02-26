@@ -144,6 +144,16 @@ class SimulaService:
         self._causal_debugger: object | None = None  # CausalDebugger (lazy import)
         self._issue_resolver: object | None = None  # IssueResolver (lazy import)
 
+        # Stage 6 sub-systems
+        self._hash_chain: object | None = None  # HashChainManager (lazy import)
+        self._content_credentials: object | None = None  # ContentCredentialManager (lazy import)
+        self._governance_credentials: object | None = None  # GovernanceCredentialManager (lazy import)
+        self._hard_negative_miner: object | None = None  # HardNegativeMiner (lazy import)
+        self._adversarial_tester: object | None = None  # AdversarialTestGenerator (lazy import)
+        self._formal_spec_generator: object | None = None  # FormalSpecGenerator (lazy import)
+        self._egraph: object | None = None  # EqualitySaturationEngine (lazy import)
+        self._symbolic_execution: object | None = None  # SymbolicExecutionEngine (lazy import)
+
         # State
         self._current_version: int = 0
         self._active_proposals: dict[str, EvolutionProposal] = {}
@@ -540,6 +550,101 @@ class SimulaService:
             )
             self._logger.info("issue_resolver_initialized")
 
+        # ── Stage 6A: Cryptographic auditability ────────────────────────────
+        if self._config.hash_chain_enabled:
+            from ecodiaos.systems.simula.audit.hash_chain import HashChainManager
+
+            self._hash_chain = HashChainManager(
+                neo4j=self._neo4j,
+            )
+            self._logger.info("hash_chain_initialized")
+
+        if self._config.c2pa_enabled:
+            from ecodiaos.systems.simula.audit.content_credentials import ContentCredentialManager
+
+            self._content_credentials = ContentCredentialManager(
+                signing_key_path=self._config.c2pa_signing_key_path,
+                issuer_name=self._config.c2pa_issuer_name,
+            )
+            self._logger.info("content_credentials_initialized")
+
+        if self._config.verifiable_credentials_enabled:
+            from ecodiaos.systems.simula.audit.verifiable_credentials import GovernanceCredentialManager
+
+            self._governance_credentials = GovernanceCredentialManager(
+                neo4j=self._neo4j,
+                signing_key_path=self._config.c2pa_signing_key_path,
+            )
+            self._logger.info("governance_credentials_initialized")
+
+        # ── Stage 6B: Co-evolving agents ──────────────────────────────────────
+        if self._config.coevolution_enabled:
+            from ecodiaos.systems.simula.coevolution.hard_negative_miner import HardNegativeMiner
+
+            self._hard_negative_miner = HardNegativeMiner(
+                neo4j=self._neo4j,
+                llm=self._llm,
+                max_negatives_per_cycle=self._config.adversarial_max_tests_per_cycle,
+            )
+            self._logger.info("hard_negative_miner_initialized")
+
+            if self._config.adversarial_test_generation_enabled:
+                from ecodiaos.systems.simula.coevolution.adversarial_tester import AdversarialTestGenerator
+
+                self._adversarial_tester = AdversarialTestGenerator(
+                    llm=self._llm,
+                    codebase_root=self._root,
+                    max_tests_per_cycle=self._config.adversarial_max_tests_per_cycle,
+                )
+                self._logger.info("adversarial_tester_initialized")
+
+        # ── Stage 6C: Formal spec generation ─────────────────────────────────
+        if self._config.formal_spec_generation_enabled:
+            from ecodiaos.systems.simula.formal_specs.spec_generator import FormalSpecGenerator
+
+            self._formal_spec_generator = FormalSpecGenerator(
+                llm=self._llm,
+                dafny_bridge=dafny_bridge,
+                tla_plus_path=self._config.tla_plus_binary_path,
+                alloy_path=self._config.alloy_binary_path,
+                dafny_bench_target=self._config.dafny_bench_coverage_target,
+                tla_plus_timeout_s=self._config.tla_plus_model_check_timeout_s,
+                alloy_scope=self._config.alloy_scope,
+            )
+            self._logger.info("formal_spec_generator_initialized")
+
+        # ── Stage 6D: Equality saturation (E-graphs) ─────────────────────────
+        if self._config.egraph_enabled:
+            from ecodiaos.systems.simula.egraph.equality_saturation import EqualitySaturationEngine
+
+            self._egraph = EqualitySaturationEngine(
+                max_iterations=self._config.egraph_max_iterations,
+                timeout_s=self._config.egraph_timeout_s,
+            )
+            self._logger.info("egraph_initialized")
+
+        # ── Stage 6E: Hybrid symbolic execution ──────────────────────────────
+        if self._config.symbolic_execution_enabled:
+            from ecodiaos.systems.simula.verification.symbolic_execution import SymbolicExecutionEngine
+
+            self._symbolic_execution = SymbolicExecutionEngine(
+                z3_bridge=z3_bridge,
+                llm=self._llm,
+                timeout_ms=self._config.symbolic_execution_timeout_ms,
+                blocking=self._config.symbolic_execution_blocking,
+            )
+            self._logger.info("symbolic_execution_initialized")
+
+        # Wire Stage 6D + 6E into health checker
+        if self._health is not None:
+            if self._egraph is not None:
+                self._health._egraph = self._egraph  # type: ignore[assignment]
+                self._health._egraph_blocking = self._config.egraph_blocking
+            if self._symbolic_execution is not None:
+                self._health._symbolic_execution = self._symbolic_execution  # type: ignore[assignment]
+                self._health._symbolic_execution_blocking = self._config.symbolic_execution_blocking
+                self._health._symbolic_execution_domains = self._config.symbolic_execution_domains
+
         # Wire SWE-grep into the bridge for pre-translation retrieval (3B.5)
         if self._bridge is not None and self._swe_grep is not None:
             self._bridge.set_swe_grep(self._swe_grep)
@@ -575,6 +680,14 @@ class SimulaService:
                 "orchestrator" if self._orchestrator else "orchestrator(disabled)",
                 "causal_debugger" if self._causal_debugger else "causal_debugger(disabled)",
                 "issue_resolver" if self._issue_resolver else "issue_resolver(disabled)",
+                "hash_chain" if self._hash_chain else "hash_chain(disabled)",
+                "content_credentials" if self._content_credentials else "content_credentials(disabled)",
+                "governance_credentials" if self._governance_credentials else "governance_credentials(disabled)",
+                "hard_negative_miner" if self._hard_negative_miner else "hard_negative_miner(disabled)",
+                "adversarial_tester" if self._adversarial_tester else "adversarial_tester(disabled)",
+                "formal_spec_generator" if self._formal_spec_generator else "formal_spec_generator(disabled)",
+                "egraph" if self._egraph else "egraph(disabled)",
+                "symbolic_execution" if self._symbolic_execution else "symbolic_execution(disabled)",
             ],
             stage1_extended_thinking=thinking_provider is not None,
             stage1_embeddings=embedding_client is not None,
@@ -595,6 +708,14 @@ class SimulaService:
             stage5_orchestrator=self._orchestrator is not None,
             stage5_causal_debugger=self._causal_debugger is not None,
             stage5_issue_resolver=self._issue_resolver is not None,
+            stage6_hash_chain=self._hash_chain is not None,
+            stage6_content_credentials=self._content_credentials is not None,
+            stage6_governance_credentials=self._governance_credentials is not None,
+            stage6_coevolution=self._hard_negative_miner is not None,
+            stage6_adversarial_tester=self._adversarial_tester is not None,
+            stage6_formal_specs=self._formal_spec_generator is not None,
+            stage6_egraph=self._egraph is not None,
+            stage6_symbolic_execution=self._symbolic_execution is not None,
         )
 
     async def shutdown(self) -> None:
@@ -933,6 +1054,18 @@ class SimulaService:
             "issue_resolver": self._issue_resolver is not None,
         }
 
+        # Stage 6 subsystem status
+        base["stage6"] = {
+            "hash_chain": self._hash_chain is not None,
+            "content_credentials": self._content_credentials is not None,
+            "governance_credentials": self._governance_credentials is not None,
+            "hard_negative_miner": self._hard_negative_miner is not None,
+            "adversarial_tester": self._adversarial_tester is not None,
+            "formal_spec_generator": self._formal_spec_generator is not None,
+            "egraph": self._egraph is not None,
+            "symbolic_execution": self._symbolic_execution is not None,
+        }
+
         return base
 
     # ─── Evo Bridge Callback ──────────────────────────────────────────────────
@@ -1207,6 +1340,10 @@ class SimulaService:
         if health.lean_verification is not None:
             proposal._lean_verification_result = health.lean_verification  # type: ignore[attr-defined]
 
+        # Stash Stage 6 formal guarantees result for history recording
+        if health.formal_guarantees is not None:
+            proposal._formal_guarantees_result = health.formal_guarantees  # type: ignore[attr-defined]
+
         if not health.healthy:
             recovered = False
 
@@ -1323,6 +1460,49 @@ class SimulaService:
                     reason=f"Post-apply health check failed: {'; '.join(health.issues)}",
                 )
 
+        # ── Stage 6A.2: Sign generated files with content credentials ────────
+        if self._content_credentials is not None:
+            try:
+                from ecodiaos.systems.simula.audit.content_credentials import ContentCredentialManager
+
+                if isinstance(self._content_credentials, ContentCredentialManager):
+                    cc_result = await self._content_credentials.sign_files(
+                        files=code_result.files_written,
+                        codebase_root=self._root,
+                    )
+                    proposal._content_credential_result = cc_result  # type: ignore[attr-defined]
+                    log.info(
+                        "content_credentials_signed",
+                        signed=len(cc_result.credentials),
+                        unsigned=len(cc_result.unsigned_files),
+                    )
+            except Exception as exc:
+                log.warning("content_credentials_error", error=str(exc))
+
+        # ── Stage 6C: Generate formal specs for changed code ─────────────────
+        if self._formal_spec_generator is not None:
+            try:
+                from ecodiaos.systems.simula.formal_specs.spec_generator import FormalSpecGenerator
+
+                if isinstance(self._formal_spec_generator, FormalSpecGenerator):
+                    fsg_result = await self._formal_spec_generator.generate_all(
+                        files=code_result.files_written,
+                        proposal=proposal,
+                        codebase_root=self._root,
+                        dafny_enabled=self._config.dafny_spec_generation_enabled,
+                        tla_plus_enabled=self._config.tla_plus_enabled,
+                        alloy_enabled=self._config.alloy_enabled,
+                        self_spec_enabled=self._config.self_spec_dsl_enabled,
+                    )
+                    proposal._formal_spec_result = fsg_result  # type: ignore[attr-defined]
+                    log.info(
+                        "formal_specs_generated",
+                        specs=len(fsg_result.specs),
+                        coverage=f"{fsg_result.overall_coverage_percent:.0%}",
+                    )
+            except Exception as exc:
+                log.warning("formal_spec_generation_error", error=str(exc))
+
         # ── Stage 3A: Incremental verification cache update ─────────────────
         if self._incremental is not None:
             try:
@@ -1351,6 +1531,49 @@ class SimulaService:
             code_result.files_written,
             rolled_back=False,
         )
+
+        # ── Stage 6A.1: Append to hash chain ─────────────────────────────────
+        if self._hash_chain is not None:
+            try:
+                from ecodiaos.systems.simula.audit.hash_chain import HashChainManager
+
+                if isinstance(self._hash_chain, HashChainManager):
+                    # Build a record-like object for hashing (use the same fields as the recording)
+                    from ecodiaos.systems.simula.types import EvolutionRecord as ERec
+
+                    hash_record = ERec(
+                        proposal_id=proposal.id,
+                        category=proposal.category,
+                        description=proposal.description,
+                        from_version=from_version,
+                        to_version=self._current_version,
+                        files_changed=code_result.files_written,
+                        rolled_back=False,
+                    )
+                    hce = await self._hash_chain.append(hash_record)
+                    proposal._hash_chain_entry = hce  # type: ignore[attr-defined]
+                    log.info(
+                        "hash_chain_appended",
+                        chain_hash=hce.chain_hash[:16],
+                        position=hce.chain_position,
+                    )
+            except Exception as exc:
+                log.warning("hash_chain_append_error", error=str(exc))
+
+        # ── Stage 6B: Co-evolution cycle (fire-and-forget) ───────────────────
+        if self._hard_negative_miner is not None:
+            try:
+                import asyncio as _aio
+
+                _aio.create_task(
+                    self._coevolution_background(
+                        files=code_result.files_written,
+                        proposal_id=proposal.id,
+                    ),
+                )
+                log.info("coevolution_cycle_scheduled")
+            except Exception as exc:
+                log.warning("coevolution_schedule_error", error=str(exc))
 
         # ── Stage 4B: Record GRPO training data ──────────────────────────────
         if self._grpo is not None:
@@ -1613,6 +1836,62 @@ class SimulaService:
                 record.issue_autonomy_level = ir.autonomy_level.value
                 record.issue_abstained = ir.status.value == "abstained"
 
+        # Stage 6A: Attach hash chain metadata
+        if hasattr(proposal, "_hash_chain_entry"):
+            hce = proposal._hash_chain_entry
+            if hce is not None:
+                record.hash_chain_hash = hce.chain_hash
+                record.hash_chain_position = hce.chain_position
+
+        # Stage 6A: Content credentials count
+        if hasattr(proposal, "_content_credential_result"):
+            ccr = proposal._content_credential_result
+            if ccr is not None:
+                record.content_credentials_signed = len(ccr.credentials)
+
+        # Stage 6A: Governance credential status
+        if hasattr(proposal, "_governance_credential_result"):
+            gcr = proposal._governance_credential_result
+            if gcr is not None:
+                record.governance_credential_status = gcr.status.value
+
+        # Stage 6B: Co-evolution metadata
+        if hasattr(proposal, "_coevolution_result"):
+            cr = proposal._coevolution_result
+            if cr is not None:
+                record.coevolution_hard_negatives_mined = cr.hard_negatives_mined
+                record.coevolution_adversarial_tests = cr.adversarial_tests_generated
+                record.coevolution_bugs_found = cr.tests_found_bugs
+
+        # Stage 6C: Formal spec metadata
+        if hasattr(proposal, "_formal_spec_result"):
+            fsr = proposal._formal_spec_result
+            if fsr is not None:
+                record.formal_specs_generated = len(fsr.specs)
+                record.formal_spec_coverage_percent = fsr.overall_coverage_percent
+                if fsr.tla_plus_results:
+                    record.tla_plus_states_explored = sum(
+                        r.states_explored for r in fsr.tla_plus_results
+                    )
+
+        # Stage 6D: E-graph metadata
+        if hasattr(proposal, "_formal_guarantees_result"):
+            fg = proposal._formal_guarantees_result
+            if fg is not None and fg.egraph is not None:
+                er = fg.egraph
+                record.egraph_used = True
+                record.egraph_status = er.status.value
+                record.egraph_rules_applied = len(er.rules_applied)
+
+        # Stage 6E: Symbolic execution metadata
+        if hasattr(proposal, "_formal_guarantees_result"):
+            fg = proposal._formal_guarantees_result
+            if fg is not None and fg.symbolic_execution is not None:
+                se = fg.symbolic_execution
+                record.symbolic_execution_used = True
+                record.symbolic_properties_proved = se.properties_proved
+                record.symbolic_counterexamples = len(se.counterexamples)
+
         try:
             await self._history.record(record)
         except Exception as exc:
@@ -1666,6 +1945,66 @@ class SimulaService:
                 )
         except Exception as exc:
             self._logger.warning("grpo_retrain_error", error=str(exc))
+
+    # ─── Stage 6B: Co-Evolution Background Cycle ────────────────────────────
+
+    async def _coevolution_background(
+        self,
+        files: list[str],
+        proposal_id: str,
+    ) -> None:
+        """
+        Background task to run a co-evolution cycle:
+        mine hard negatives from history and adversarial tests,
+        then feed into GRPO training.
+        """
+        if self._hard_negative_miner is None:
+            return
+        try:
+            from ecodiaos.systems.simula.coevolution.hard_negative_miner import HardNegativeMiner
+
+            if not isinstance(self._hard_negative_miner, HardNegativeMiner):
+                return
+
+            # Import adversarial tester if available
+            adversarial_gen = None
+            if self._adversarial_tester is not None:
+                from ecodiaos.systems.simula.coevolution.adversarial_tester import AdversarialTestGenerator
+
+                if isinstance(self._adversarial_tester, AdversarialTestGenerator):
+                    adversarial_gen = self._adversarial_tester
+
+            cycle_result = await self._hard_negative_miner.run_cycle(
+                adversarial_generator=adversarial_gen,
+                files=files,
+            )
+
+            self._logger.info(
+                "coevolution_cycle_complete",
+                proposal_id=proposal_id,
+                hard_negatives=cycle_result.hard_negatives_mined,
+                adversarial_tests=cycle_result.adversarial_tests_generated,
+                bugs_found=cycle_result.tests_found_bugs,
+                grpo_examples=cycle_result.grpo_examples_produced,
+                duration_ms=cycle_result.duration_ms,
+            )
+
+            # Feed hard negatives into GRPO if available
+            if self._grpo is not None and cycle_result.grpo_examples_produced > 0:
+                grpo_batch = await self._hard_negative_miner.prepare_grpo_batch(
+                    await self._hard_negative_miner.mine_from_history(),
+                )
+                self._logger.info(
+                    "coevolution_grpo_batch_ready",
+                    examples=len(grpo_batch),
+                )
+
+        except Exception as exc:
+            self._logger.warning(
+                "coevolution_background_error",
+                error=str(exc),
+                proposal_id=proposal_id,
+            )
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
