@@ -1034,7 +1034,7 @@ class BedrockProvider(LLMProvider):
 
     def __init__(
         self,
-        model: str = "anthropic.claude-3-5-haiku-20241022-v1:0",
+        model: str = "us.anthropic.claude-3-5-haiku-20241022-v1:0",
         region: str = "us-east-1",
         token_budget: TokenBudget | None = None,
     ) -> None:
@@ -1053,7 +1053,14 @@ class BedrockProvider(LLMProvider):
         except ImportError as exc:
             raise ImportError("boto3 required for Bedrock provider. Install with: pip install boto3") from exc
 
-        self._client = boto3.client("bedrock-runtime", region_name=self._region)
+        try:
+            self._client = boto3.client("bedrock-runtime", region_name=self._region)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to initialize Bedrock client. Ensure AWS credentials are configured. "
+                f"Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION environment variables. "
+                f"Error: {e}"
+            ) from e
 
     async def generate(
         self,
@@ -1063,19 +1070,19 @@ class BedrockProvider(LLMProvider):
         temperature: float = 0.7,
         output_format: str | None = None,
     ) -> LLMResponse:
-        payload = {
-            "modelId": self._model,
+        body = {
             "messages": [m.to_dict() for m in messages],
-            "system": system_prompt,
+            "system": [{"type": "text", "text": system_prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "anthropic_version": "bedrock-2023-05-31",
         }
 
         # Bedrock InvokeModel is synchronous; wrap in thread pool
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: self._client.invoke_model(body=_json.dumps(payload).encode())
+            lambda: self._client.invoke_model(modelId=self._model, body=_json.dumps(body).encode())
         )
 
         response_body = _json.loads(response["body"].read())
@@ -1124,19 +1131,19 @@ class BedrockProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.3,
     ) -> ToolAwareResponse:
-        payload = {
-            "modelId": self._model,
+        body = {
             "messages": messages,
-            "system": system_prompt,
+            "system": [{"type": "text", "text": system_prompt}],
             "tools": [t.to_dict() for t in tools],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "anthropic_version": "bedrock-2023-05-31",
         }
 
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: self._client.invoke_model(body=_json.dumps(payload).encode())
+            lambda: self._client.invoke_model(modelId=self._model, body=_json.dumps(body).encode())
         )
 
         response_body = _json.loads(response["body"].read())
@@ -1182,23 +1189,46 @@ def create_llm_provider(
     token_budget: TokenBudget | None = None,
 ) -> LLMProvider:
     """Factory to create the configured LLM provider."""
-    if config.provider == "anthropic":
-        return AnthropicProvider(
-            api_key=config.api_key,
-            model=config.model,
-            token_budget=token_budget,
-        )
-    elif config.provider == "bedrock":
-        return BedrockProvider(
-            model=config.model,
-            token_budget=token_budget,
-        )
-    elif config.provider == "openai":
-        return OpenAIProvider(api_key=config.api_key, model=config.model)
-    elif config.provider == "ollama":
-        return OllamaProvider(model=config.model)
-    else:
-        raise ValueError(f"Unknown LLM provider: {config.provider}")
+    import structlog
+    logger = structlog.get_logger()
+
+    try:
+        if config.provider == "anthropic":
+            return AnthropicProvider(
+                api_key=config.api_key,
+                model=config.model,
+                token_budget=token_budget,
+            )
+        elif config.provider == "bedrock":
+            return BedrockProvider(
+                model=config.model,
+                token_budget=token_budget,
+            )
+        elif config.provider == "openai":
+            return OpenAIProvider(api_key=config.api_key, model=config.model)
+        elif config.provider == "ollama":
+            return OllamaProvider(model=config.model)
+        else:
+            raise ValueError(f"Unknown LLM provider: {config.provider}")
+    except Exception as e:
+        # Try fallback provider if configured
+        if config.fallback_provider:
+            logger.warning("llm_provider_init_failed", provider=config.provider, error=str(e), fallback=config.fallback_provider)
+            try:
+                if config.fallback_provider == "anthropic":
+                    return AnthropicProvider(
+                        api_key=config.api_key,
+                        model=config.model,
+                        token_budget=token_budget,
+                    )
+                elif config.fallback_provider == "openai":
+                    return OpenAIProvider(api_key=config.api_key, model=config.model)
+                elif config.fallback_provider == "ollama":
+                    return OllamaProvider(model=config.model)
+            except Exception as fallback_error:
+                logger.error("llm_fallback_also_failed", error=str(fallback_error))
+                raise ValueError(f"Both primary and fallback LLM providers failed. Primary: {e}, Fallback: {fallback_error}") from e
+        raise
 
 
 def create_thinking_provider(

@@ -24,10 +24,10 @@ Iron Rules (non-negotiable):
 
 from __future__ import annotations
 
-import ast as ast_module
 import asyncio
+import json
 import time
-from pathlib import Path  # noqa: TC003
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -35,6 +35,7 @@ import structlog
 from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.systems.simula.hunter.analytics import HunterAnalyticsView
 from ecodiaos.systems.simula.hunter.ingestor import TargetIngestor
+from ecodiaos.systems.simula.hunter.safety import HunterSafetyGates
 from ecodiaos.systems.simula.hunter.types import (
     AttackSurface,
     HunterConfig,
@@ -109,10 +110,19 @@ class HunterService:
         self._eos_root = eos_root
         self._analytics = analytics
         self._remediation = remediation
+        self._safety = HunterSafetyGates()
         self._log = logger.bind(
             max_workers=config.max_workers,
             authorized_targets=len(config.authorized_targets),
         )
+
+        # Pre-validate config via safety gates
+        config_check = self._safety.validate_hunter_config(config)
+        if not config_check:
+            self._log.warning(
+                "hunter_config_safety_warning",
+                reason=config_check.reason,
+            )
 
         # Aggregate analytics view — ingests every HuntResult automatically
         self._analytics_view = HunterAnalyticsView()
@@ -127,6 +137,9 @@ class HunterService:
         self._hunt_history: list[HuntResult] = []
         self._max_history: int = 50
 
+        # Vulnerability templates loaded once at construction
+        self._templates: list[dict[str, Any]] = self._load_templates()
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def hunt_external_repo(
@@ -134,7 +147,7 @@ class HunterService:
         github_url: str,
         *,
         attack_goals: list[str] | None = None,
-        generate_pocs: bool = False,
+        generate_pocs: bool = True,
         generate_patches: bool = False,
     ) -> HuntResult:
         """
@@ -155,6 +168,22 @@ class HunterService:
         Returns:
             HuntResult with all discovered vulnerabilities and optional patches.
         """
+        # Step A: Authorization gate — target must be in authorized_targets
+        if not any(
+            github_url.startswith(t) or t in github_url
+            for t in self._config.authorized_targets
+        ):
+            self._log.error(
+                "hunt_target_not_authorized",
+                url=github_url,
+                authorized_targets=self._config.authorized_targets,
+            )
+            start = time.monotonic()
+            return self._build_empty_result(
+                new_id(), github_url, TargetType.EXTERNAL_REPO,
+                start, utc_now(),
+            )
+
         goals = attack_goals or PREDEFINED_ATTACK_GOALS
         start = time.monotonic()
         started_at = utc_now()
@@ -174,13 +203,12 @@ class HunterService:
 
         log.info("hunt_started", url=github_url)
 
-        # Step 1: Clone and ingest
-        workspace: TargetWorkspace | None = None
+        # Step 1: Clone and ingest — workspace is an async context manager;
+        # the temp directory is nuked from orbit on exit regardless of outcome.
         try:
             ingestor = await TargetIngestor.ingest_from_github(
                 github_url, clone_depth=self._config.clone_depth,
             )
-            workspace = ingestor.workspace
         except Exception as exc:
             log.error("hunt_clone_failed", error=str(exc))
             if self._analytics:
@@ -196,8 +224,19 @@ class HunterService:
                 start, started_at,
             )
 
-        try:
-            result = await self._run_hunt_pipeline(
+        async with ingestor.workspace as workspace:
+            # Safety gate: validate workspace isolation before proceeding
+            ws_check = self._safety.validate_workspace_isolation(
+                workspace, eos_root=self._eos_root,
+            )
+            if not ws_check:
+                log.error("safety_gate_workspace_failed", reason=ws_check.reason)
+                return self._build_empty_result(
+                    hunt_id, github_url, TargetType.EXTERNAL_REPO,
+                    start, started_at,
+                )
+
+            return await self._run_hunt_pipeline(
                 hunt_id=hunt_id,
                 ingestor=ingestor,
                 workspace=workspace,
@@ -210,11 +249,6 @@ class HunterService:
                 started_at=started_at,
                 log=log,
             )
-            return result
-        finally:
-            # Always clean up temp workspace
-            if workspace is not None:
-                workspace.cleanup()
 
     async def hunt_internal_eos(
         self,
@@ -362,10 +396,9 @@ class HunterService:
         """
         Validate that a proof-of-concept script does not reach unauthorized targets.
 
-        Checks:
-          - If authorized_target is provided, it must be in config.authorized_targets
-          - PoC code is syntactically valid Python
-          - No imports of forbidden modules (subprocess, socket, etc.)
+        Delegates to HunterSafetyGates.validate_poc_execution() for deep
+        validation (syntax, forbidden imports, dangerous calls, URL domain
+        authorization) plus a pre-check on the explicit authorized_target.
 
         Args:
             poc_code: The Python PoC script to validate.
@@ -384,32 +417,19 @@ class HunterService:
                 )
                 return False
 
-        # Single parse for both syntax validation and import checking
-        try:
-            tree = ast_module.parse(poc_code)
-        except SyntaxError:
-            self._log.warning("poc_syntax_error")
-            return False
-
-        # Walk the AST once for forbidden imports
-        for node in ast_module.walk(tree):
-            if isinstance(node, ast_module.Import):
-                for alias in node.names:
-                    root_module = alias.name.split(".")[0]
-                    if root_module in _FORBIDDEN_POC_MODULES:
-                        self._log.warning(
-                            "poc_forbidden_import", module=alias.name,
-                        )
-                        return False
-            elif isinstance(node, ast_module.ImportFrom) and node.module:
-                root_module = node.module.split(".")[0]
-                if root_module in _FORBIDDEN_POC_MODULES:
-                    self._log.warning(
-                        "poc_forbidden_import", module=node.module,
-                    )
-                    return False
-
-        return True
+        # Delegate full validation to safety gates
+        result = self._safety.validate_poc_execution(
+            poc_code,
+            self._config.authorized_targets,
+            sandbox_timeout_seconds=self._config.sandbox_timeout_seconds,
+        )
+        if not result:
+            self._log.warning(
+                "poc_safety_gate_failed",
+                gate=result.gate,
+                reason=result.reason,
+            )
+        return result.passed
 
     def get_hunt_history(self, limit: int = 20) -> list[HuntResult]:
         """Return recent hunt results (newest first)."""
@@ -509,10 +529,22 @@ class HunterService:
                 except Exception:
                     pass  # best-effort
 
+        # Step D: Augment goals with template-derived attack descriptions
+        # for surfaces whose type matches a loaded template.
+        template_goals = self._template_goals_for_surfaces(surfaces)
+        effective_goals = goals + [g for g in template_goals if g not in goals]
+
+        if template_goals:
+            log.info(
+                "template_goals_applied",
+                template_count=len(self._templates),
+                extra_goals=len(effective_goals) - len(goals),
+            )
+
         # Step 4: Prove vulnerabilities across surfaces × goals
         vulnerabilities = await self._prove_all(
             surfaces=surfaces,
-            goals=goals,
+            goals=effective_goals,
             target_url=target_url,
             generate_pocs=generate_pocs,
             hunt_id=hunt_id,
@@ -773,6 +805,75 @@ class HunterService:
         return vulnerabilities
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_templates() -> list[dict[str, Any]]:
+        """
+        Load vulnerability templates from the templates/ directory.
+
+        Each JSON file describes a framework-specific vulnerability pattern
+        with Z3 encoding instructions and reproduction guidance. Templates
+        are loaded once at construction and cached on the instance.
+
+        Returns:
+            List of parsed template dicts. Empty list if the directory
+            does not exist or no JSON files are found.
+        """
+        templates_dir = Path(__file__).parent / "templates"
+        if not templates_dir.is_dir():
+            return []
+
+        loaded: list[dict[str, Any]] = []
+        for path in sorted(templates_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    loaded.append(data)
+            except (json.JSONDecodeError, OSError):
+                pass  # skip malformed/unreadable templates
+        return loaded
+
+    def _template_goals_for_surfaces(
+        self,
+        surfaces: list[AttackSurface],
+    ) -> list[str]:
+        """
+        Derive additional attack goals from loaded templates for the given surfaces.
+
+        A template contributes a goal when at least one surface's type appears
+        in the template's ``target_surface_types`` list.  The goal string is
+        built from the template's ``description`` field so the Prover LLM
+        receives human-readable intent rather than raw JSON.
+
+        Returns:
+            Deduplicated list of extra goal strings derived from templates.
+        """
+        surface_types = {s.surface_type.value for s in surfaces}
+        extra: list[str] = []
+        seen: set[str] = set()
+
+        for tmpl in self._templates:
+            target_types: list[str] = tmpl.get("target_surface_types", [])
+            if not any(t in surface_types for t in target_types):
+                continue
+
+            description: str = tmpl.get("description", "").strip()
+            if not description or description in seen:
+                continue
+
+            # Attach Z3 encoding hints inline so the Prover LLM has full
+            # context without needing to re-load the template itself.
+            instructions: list[str] = tmpl.get("z3_encoding_instructions", [])
+            if instructions:
+                hint = " | ".join(instructions)
+                goal = f"{description} [Z3 hints: {hint}]"
+            else:
+                goal = description
+
+            seen.add(description)
+            extra.append(goal)
+
+        return extra
 
     @staticmethod
     def _build_empty_result(

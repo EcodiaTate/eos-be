@@ -61,7 +61,7 @@ class ExpressionStrategy(EOSBaseModel):
     channel: str = "text_chat"          # OutputChannel value
     trigger: str = "nova_respond"       # ExpressionTrigger value
     context_type: str = "conversation"  # "conversation" | "warning" | "celebration" | etc.
-    register: str = "neutral"           # "formal" | "casual" | "neutral"
+    speech_register: str = "neutral"    # "formal" | "casual" | "neutral"
     target_length: int = 200            # Target character count
     temperature: float = 0.7            # LLM temperature used
     personality_influence: float = 0.5

@@ -251,10 +251,10 @@ class ConversationDynamicsEngine:
         if dynamics.turn_count > 4:
             # Gradually match user's formality level
             user_formality = dynamics.user_formality_trend
-            if user_formality < 0.3 and s.register != "casual":
+            if user_formality < 0.3 and s.speech_register != "casual":
                 s.formality_override = "relaxed"
                 s.contraction_use = True
-            elif user_formality > 0.7 and s.register != "formal":
+            elif user_formality > 0.7 and s.speech_register != "formal":
                 s.formality_override = "professional"
 
             # Match user's verbosity

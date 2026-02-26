@@ -67,13 +67,13 @@ class TestPersonalityApplication:
     def test_formality_high_sets_formal_register(self, base_strategy: StrategyParams) -> None:
         engine = PersonalityEngine(PersonalityVector(formality=0.6))
         result = engine.apply(base_strategy)
-        assert result.register == "formal"
+        assert result.speech_register == "formal"
         assert result.contraction_use is False
 
     def test_formality_low_sets_casual_register(self, base_strategy: StrategyParams) -> None:
         engine = PersonalityEngine(PersonalityVector(formality=-0.6))
         result = engine.apply(base_strategy)
-        assert result.register == "casual"
+        assert result.speech_register == "casual"
         assert result.contraction_use is True
 
     def test_curiosity_above_threshold_enables_followup_question(self, base_strategy: StrategyParams) -> None:

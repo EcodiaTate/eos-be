@@ -1613,11 +1613,13 @@ class ThymosService:
         """Emit a metric if the collector is available."""
         if self._metrics is not None:
             try:
-                self._metrics.record(  # type: ignore[unused-coroutine]
-                    system="thymos",
-                    metric=name,
-                    value=value,
-                    labels=tags,
+                asyncio.create_task(
+                    self._metrics.record(
+                        system="thymos",
+                        metric=name,
+                        value=value,
+                        labels=tags,
+                    )
                 )
             except Exception:
                 pass  # Telemetry failures must never affect immune function

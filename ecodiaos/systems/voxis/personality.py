@@ -91,10 +91,10 @@ class PersonalityEngine:
 
         # ── Formality ─────────────────────────────────────────────
         if p.formality > 0.4:
-            s.register = "formal"
+            s.speech_register = "formal"
             s.contraction_use = False
         elif p.formality < -0.4:
-            s.register = "casual"
+            s.speech_register = "casual"
             s.contraction_use = True
 
         # ── Curiosity expression ──────────────────────────────────

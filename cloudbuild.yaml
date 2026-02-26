@@ -1,37 +1,41 @@
 steps:
-  # Build Docker image
-  - name: 'gcr.io/cloud-builders/docker'
+  # Build & push with BuildKit + remote cache
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
     args:
-      - 'build'
-      - '-t'
-      - '${_IMAGE}'
-      - '.'
+      - -lc
+      - |
+        set -euo pipefail
+        docker buildx create --use --name cbuilder || docker buildx use cbuilder
 
-  # Push to Artifact Registry
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - '${_IMAGE}'
+        docker buildx build \
+          --progress=plain \
+          --tag ${_IMAGE} \
+          --cache-from type=registry,ref=${_CACHE_IMAGE} \
+          --cache-to type=registry,ref=${_CACHE_IMAGE},mode=max \
+          --push \
+          .
 
   # Deploy to Cloud Run
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    entrypoint: 'gcloud'
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: "gcloud"
     args:
-      - 'run'
-      - 'deploy'
-      - '${_SERVICE_NAME}'
-      - '--image'
-      - '${_IMAGE}'
-      - '--region'
-      - '${_REGION}'
-      - '--platform'
-      - 'managed'
-      - '--allow-unauthenticated'
+      - "run"
+      - "deploy"
+      - "${_SERVICE_NAME}"
+      - "--image"
+      - "${_IMAGE}"
+      - "--region"
+      - "${_REGION}"
+      - "--platform"
+      - "managed"
+      - "--allow-unauthenticated"
 
 images:
-  - '${_IMAGE}'
+  - "${_IMAGE}"
 
 substitutions:
-  _IMAGE: 'australia-southeast1-docker.pkg.dev/ecodiaos/ecodiaos/backend:latest'
-  _SERVICE_NAME: 'ecodiaos-core'
-  _REGION: 'australia-southeast1'
+  _IMAGE: "australia-southeast1-docker.pkg.dev/ecodiaos/ecodiaos/backend:latest"
+  _CACHE_IMAGE: "australia-southeast1-docker.pkg.dev/ecodiaos/ecodiaos/backend:buildcache"
+  _SERVICE_NAME: "ecodiaos-core"
+  _REGION: "australia-southeast1"

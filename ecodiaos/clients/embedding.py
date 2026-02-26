@@ -59,8 +59,14 @@ class LocalEmbeddingClient(EmbeddingClient):
     def _load_model(self) -> None:
         """Lazy-load the model on first use."""
         if self._model is None:
+            import warnings
             from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(self._model_name, device=self._device)
+
+            # Suppress HF Hub auth warning if HF_TOKEN is not set
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
+                self._model = SentenceTransformer(self._model_name, device=self._device)
+
             logger.info(
                 "embedding_model_loaded",
                 model=self._model_name,

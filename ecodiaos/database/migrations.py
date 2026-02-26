@@ -23,7 +23,8 @@ async def migrate_timescaledb_interoceptive_state(conn: Connection) -> None:
     Stores every cycle's 9D sensed state, allostatic errors, urgency signal,
     and phase space position for retrospective analysis and telemetry.
     """
-    migration_sql = """
+    # 1. Table + indexes — plain Postgres.
+    table_sql = """
     CREATE TABLE IF NOT EXISTS interoceptive_state (
         time             TIMESTAMPTZ NOT NULL,
         tenant_id        UUID NOT NULL,
@@ -64,28 +65,6 @@ async def migrate_timescaledb_interoceptive_state(conn: Connection) -> None:
         PRIMARY KEY (time, tenant_id)
     );
 
-    -- Create the hypertable
-    SELECT create_hypertable(
-        'interoceptive_state',
-        'time',
-        if_not_exists => TRUE
-    );
-
-    -- Compression policy (compress chunks older than 7 days)
-    SELECT add_compression_policy(
-        'interoceptive_state',
-        INTERVAL '7 days',
-        if_not_exists => TRUE
-    );
-
-    -- Retention policy (keep data for 90 days)
-    SELECT add_retention_policy(
-        'interoceptive_state',
-        INTERVAL '90 days',
-        if_not_exists => TRUE
-    );
-
-    -- Indexes for common queries
     CREATE INDEX IF NOT EXISTS idx_interoceptive_tenant_time
         ON interoceptive_state (tenant_id, time DESC);
 
@@ -99,11 +78,34 @@ async def migrate_timescaledb_interoceptive_state(conn: Connection) -> None:
     """
 
     try:
-        await conn.execute(migration_sql)
-        logger.info("interoceptive_state hypertable created successfully")
+        await conn.execute(table_sql)
     except Exception as exc:
-        logger.error(f"Failed to create interoceptive_state hypertable: {exc}")
+        logger.error("interoceptive_state table creation failed", error=str(exc))
         raise
+
+    # 2. Hypertable + policies — only if TimescaleDB extension is present.
+    has_timescaledb = await conn.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')"
+    )
+
+    if has_timescaledb:
+        try:
+            await conn.execute(
+                "SELECT create_hypertable('interoceptive_state', 'time', if_not_exists => TRUE)"
+            )
+            await conn.execute(
+                "SELECT add_compression_policy('interoceptive_state', INTERVAL '7 days', if_not_exists => TRUE)"
+            )
+            await conn.execute(
+                "SELECT add_retention_policy('interoceptive_state', INTERVAL '90 days', if_not_exists => TRUE)"
+            )
+            logger.info("interoceptive_state hypertable created with policies")
+        except Exception as exc:
+            logger.warning("interoceptive_state hypertable setup failed", error=str(exc))
+    else:
+        logger.info(
+            "interoceptive_state created as plain table — timescaledb extension not available"
+        )
 
 
 def migrate_neo4j_somatic_vector_index(session: Session) -> None:

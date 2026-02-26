@@ -1,19 +1,20 @@
 """
 EcodiaOS — Hunter Vulnerability Prover (Phases 4 + 5)
 
-Proves vulnerabilities exist by encoding attacker goals as Z3 constraints,
-then translates proven counterexamples into executable exploit scripts.
+Proves vulnerabilities exist by encoding security conditions as Z3 constraints,
+then translates proven counterexamples into local diagnostic reproduction scripts.
 
 The Inversion:
   Internal Simula: "Is this code correct?" → NOT(property) → UNSAT = correct
   Hunter:          "Is this code exploitable?" → NOT(security_property) → SAT = exploitable
 
-When Z3 returns SAT, the counterexample is a concrete set of inputs that
-demonstrates the vulnerability — Phase 5 then translates these into
-weaponized proof-of-concept Python scripts via LLM.
+When Z3 returns SAT, the counterexample is a concrete set of variable assignments
+that violate the security property. Phase 5 translates these into a local-only
+Security Unit Test script (targeting localhost only) for the RepairAgent to
+use as a regression test during its patch-verify loop.
 
 Uses the same Z3Bridge.check_invariant() infrastructure as Stage 2B but
-inverts the interpretation: SAT means a vulnerability is proven to exist.
+inverts the interpretation: SAT means the security property can be violated.
 """
 
 from __future__ import annotations
@@ -204,33 +205,38 @@ Respond with ONLY a JSON object:
 }"""
 
 
-# ── Phase 5: PoC generation prompt ─────────────────────────────────────────
+# ── Phase 5: Reproduction script generation prompt ─────────────────────────
 
 _POC_GENERATION_SYSTEM_PROMPT = """\
-You are a security exploit developer translating formal Z3 counterexamples \
-into executable Python proof-of-concept scripts.
+You are a security verification engineer generating diagnostic reproduction \
+scripts from formal Z3 counterexamples.
 
-Your task: given a Z3 counterexample (concrete variable assignments proving \
-a vulnerability exists) and the attack surface context, generate a Python \
-script that demonstrates the vulnerability.
+Your task: given a Z3 counterexample (concrete variable assignments that \
+demonstrate a vulnerability condition) and the attack surface context, \
+generate a Python Security Unit Test script that:
+  1. Reproduces the exact input conditions Z3 identified against a LOCAL \
+     development server only.
+  2. Asserts the expected secure behaviour (a failing assertion documents \
+     the bug for the RepairAgent to fix).
+  3. Is safe, readable, and never touches a production system.
 
 ## Rules
 
 1. The script must use the `requests` library (or `httpx` as fallback).
-2. The script must NOT execute against any live system — construct the \
-request but wrap execution behind a `if __name__ == "__main__"` guard \
-with a clearly commented `TARGET_URL` variable that defaults to \
-"http://localhost:8000" (or the appropriate local address).
+2. The script MUST target localhost only — `TARGET_URL` defaults to \
+"http://localhost:8000". Add a comment: "# Run against local dev server only".
 3. Include detailed comments explaining:
-   - What vulnerability is being demonstrated
-   - How the Z3 counterexample maps to concrete exploit inputs
-   - What the expected vulnerable response would look like
+   - Which security property the Z3 counterexample violates
+   - How each Z3 variable maps to a concrete request parameter
+   - What the assertion checks (i.e., the expected SECURE response)
 4. Structure the script as:
-   - Module docstring describing the vulnerability
-   - `TARGET_URL` constant at the top
-   - An `exploit()` function that returns (url, headers, payload) WITHOUT executing
-   - A `demonstrate()` function that calls exploit() and executes the request
-   - A `if __name__ == "__main__"` block that calls demonstrate()
+   - Module docstring labelled "Security Unit Test: <VulnerabilityClass>"
+   - `TARGET_URL` constant at the top with the localhost comment
+   - A `build_request()` function that returns (url, headers, payload) \
+     WITHOUT executing the request
+   - A `run_security_test()` function that calls `build_request()`, sends \
+     the request, and asserts the response indicates secure behaviour
+   - A `if __name__ == "__main__"` block that calls `run_security_test()`
 5. Map Z3 variable assignments to concrete HTTP values:
    - Bool False → omit auth headers or use empty tokens
    - Bool True → include the header/parameter
@@ -251,31 +257,32 @@ Surface: GET /api/user/{id}
 
 Output:
 \"\"\"
-Proof of Concept: Broken Access Control (IDOR)
-Vulnerability: Authenticated user can access another user's data by manipulating the user ID parameter.
-Z3 proof: is_authenticated=True, requested_user_id=999, current_user_id=1 → can_access_data=True
+Security Unit Test: Broken Access Control (IDOR)
+Z3 condition: is_authenticated=True, requested_user_id=999, current_user_id=1 → can_access_data=True
+Expected secure behaviour: server returns 403 Forbidden when user 1 requests user 999's data.
 \"\"\"
 import requests
 
-TARGET_URL = "http://localhost:8000"
+TARGET_URL = "http://localhost:8000"  # Run against local dev server only
 
-def exploit():
+def build_request():
     url = f"{TARGET_URL}/api/user/999"
     headers = {"Authorization": "Bearer <valid_token_for_user_1>"}
     return url, headers, None
 
-def demonstrate():
-    url, headers, payload = exploit()
-    print(f"[*] Requesting user 999's data as user 1")
-    print(f"[*] URL: {url}")
+def run_security_test():
+    url, headers, payload = build_request()
+    print(f"[test] GET {url} as user 1 (should be denied)")
     response = requests.get(url, headers=headers)
-    print(f"[*] Status: {response.status_code}")
-    if response.status_code == 200:
-        print("[!] VULNERABLE: Received another user's data")
+    assert response.status_code == 403, (
+        f"SECURITY BUG: expected 403 Forbidden, got {response.status_code}. "
+        "User can read another user's data."
+    )
+    print("[pass] Server correctly denied cross-user data access")
     return response
 
 if __name__ == "__main__":
-    demonstrate()
+    run_security_test()
 
 ### Example 2: SQL Injection
 Z3 counterexample: input_length=10, contains_sql_metachar=True, input_sanitized=False, query_parameterized=False, sql_executed_with_input=True
@@ -283,33 +290,34 @@ Surface: POST /api/search, function search(query)
 
 Output:
 \"\"\"
-Proof of Concept: SQL Injection
-Vulnerability: User input containing SQL metacharacters reaches query execution without sanitization.
-Z3 proof: contains_sql_metachar=True, input_sanitized=False, query_parameterized=False
+Security Unit Test: SQL Injection
+Z3 condition: contains_sql_metachar=True, input_sanitized=False, query_parameterized=False
+Expected secure behaviour: server rejects or safely handles SQL metacharacters.
 \"\"\"
 import requests
 import json
 
-TARGET_URL = "http://localhost:8000"
+TARGET_URL = "http://localhost:8000"  # Run against local dev server only
 
-def exploit():
+def build_request():
     url = f"{TARGET_URL}/api/search"
     headers = {"Content-Type": "application/json"}
     payload = {"query": "' OR 1=1 --"}
     return url, headers, payload
 
-def demonstrate():
-    url, headers, payload = exploit()
-    print(f"[*] Injecting SQL via search endpoint")
-    print(f"[*] Payload: {json.dumps(payload)}")
+def run_security_test():
+    url, headers, payload = build_request()
+    print(f"[test] POST {url} with SQL metacharacters")
     response = requests.post(url, headers=headers, json=payload)
-    print(f"[*] Status: {response.status_code}")
-    if response.status_code == 200:
-        print("[!] VULNERABLE: SQL injection succeeded")
+    assert response.status_code != 500, (
+        "SECURITY BUG: server threw a 500, likely due to unparameterized SQL. "
+        "Input must be sanitized or queries must use parameterized statements."
+    )
+    print("[pass] Server handled SQL metacharacters without error")
     return response
 
 if __name__ == "__main__":
-    demonstrate()"""
+    run_security_test()"""
 
 
 # ── Unsafe import / network patterns for PoC safety validation ─────────────
@@ -331,14 +339,16 @@ _POC_ALLOWED_IMPORTS = frozenset({
 
 class VulnerabilityProver:
     """
-    Proves vulnerabilities exist by encoding attacker goals as Z3 constraints.
+    Proves security violations exist by encoding vulnerability conditions as Z3 constraints.
 
     The key inversion from internal Simula verification:
     - Simula checks NOT(invariant) → UNSAT means code is correct
-    - Hunter checks NOT(security_property) → SAT means code is exploitable
+    - Hunter checks NOT(security_property) → SAT means the security property
+      can be violated (i.e., a vulnerability exists)
 
     When SAT, the Z3 model provides concrete variable assignments that
-    demonstrate the exploit conditions.
+    demonstrate the violation. These drive a local Security Unit Test script
+    for the RepairAgent to verify its patches against.
     """
 
     def __init__(
@@ -444,9 +454,9 @@ class VulnerabilityProver:
                 z3_constraints_code=z3_expr_code,
             )
 
-            # Phase 5: generate PoC exploit script if requested
+            # Phase 5: generate Security Unit Test reproduction script if requested
             if generate_poc:
-                poc_code = await self.generate_poc(report, config=config)
+                poc_code = await self.generate_reproduction_script(report, config=config)
                 if poc_code:
                     report.proof_of_concept_code = poc_code
 
@@ -971,35 +981,38 @@ class VulnerabilityProver:
         except ValueError:
             return None
 
-    # ── Phase 5: Proof-of-Concept generation ─────────────────────────────────
+    # ── Phase 5: Reproduction script generation ───────────────────────────────
 
-    async def generate_poc(
+    async def generate_reproduction_script(
         self,
         report: VulnerabilityReport,
         *,
         config: HunterConfig | None = None,
     ) -> str:
         """
-        Generate an executable Python exploit script from a proven vulnerability.
+        Generate a Security Unit Test script from a proven vulnerability.
 
-        Takes the Z3 counterexample (concrete variable assignments) and the
-        attack surface context, then uses the LLM to translate them into a
-        weaponized PoC script.
+        Takes the Z3 counterexample (concrete variable assignments that
+        demonstrate a violated security property) and the attack surface
+        context, then uses the LLM to produce a local-only diagnostic
+        reproduction script. The script is structured as a Python test
+        that asserts the expected secure response — making it directly
+        consumable by the RepairAgent's patch-verify loop.
 
         Args:
             report: A proven VulnerabilityReport containing the surface,
-                counterexample, and attack goal.
+                Z3 counterexample, and vulnerability goal.
             config: Optional HunterConfig for authorized_targets validation.
 
         Returns:
-            Python source code string of the exploit script.
-            Empty string if generation or validation fails.
+            Python source code of the Security Unit Test script.
+            Empty string if generation or safety validation fails.
         """
         start = time.monotonic()
         surface = report.attack_surface
 
         self._log.info(
-            "poc_generation_start",
+            "reproduction_script_generation_start",
             vuln_id=report.id,
             vulnerability_class=report.vulnerability_class.value,
             severity=report.severity.value,
@@ -1043,8 +1056,9 @@ class VulnerabilityProver:
 
         prompt_parts.extend([
             "",
-            "Generate a Python proof-of-concept exploit script that demonstrates "
-            "this vulnerability using the concrete values from the Z3 counterexample.",
+            "Generate a Python Security Unit Test script (reproduction script) that "
+            "reproduces the exact violation conditions from the Z3 counterexample "
+            "against a local development server and asserts the expected secure response.",
         ])
 
         user_prompt = "\n".join(prompt_parts)
@@ -1059,7 +1073,7 @@ class VulnerabilityProver:
             )
         except Exception as exc:
             self._log.error(
-                "poc_generation_llm_error",
+                "reproduction_script_llm_error",
                 vuln_id=report.id,
                 error=str(exc),
             )
@@ -1069,7 +1083,7 @@ class VulnerabilityProver:
         poc_code = self._parse_poc_response(response.text)
         if not poc_code:
             self._log.warning(
-                "poc_generation_parse_failed",
+                "reproduction_script_parse_failed",
                 vuln_id=report.id,
                 response_preview=response.text[:200],
             )
@@ -1079,12 +1093,12 @@ class VulnerabilityProver:
         syntax_error = self._validate_poc_syntax(poc_code)
         if syntax_error is not None:
             self._log.warning(
-                "poc_syntax_invalid",
+                "reproduction_script_syntax_invalid",
                 vuln_id=report.id,
                 error=syntax_error,
             )
             # Attempt a single retry with the error fed back
-            poc_code = await self._retry_poc_with_error(
+            poc_code = await self._retry_reproduction_script_with_error(
                 user_prompt, poc_code, syntax_error,
             )
             if not poc_code:
@@ -1092,7 +1106,7 @@ class VulnerabilityProver:
             syntax_error = self._validate_poc_syntax(poc_code)
             if syntax_error is not None:
                 self._log.warning(
-                    "poc_syntax_retry_failed",
+                    "reproduction_script_syntax_retry_failed",
                     vuln_id=report.id,
                     error=syntax_error,
                 )
@@ -1103,7 +1117,7 @@ class VulnerabilityProver:
         safety_error = self._validate_poc_safety(poc_code, authorized_targets)
         if safety_error is not None:
             self._log.warning(
-                "poc_safety_violation",
+                "reproduction_script_safety_violation",
                 vuln_id=report.id,
                 error=safety_error,
             )
@@ -1111,53 +1125,59 @@ class VulnerabilityProver:
 
         total_ms = int((time.monotonic() - start) * 1000)
         self._log.info(
-            "poc_generated",
+            "reproduction_script_generated",
             vuln_id=report.id,
-            poc_size_bytes=len(poc_code.encode()),
+            script_size_bytes=len(poc_code.encode()),
             total_ms=total_ms,
         )
 
         return poc_code
 
-    async def generate_poc_batch(
+    # Keep backward-compatible alias for callers that pre-date the rename.
+    generate_poc = generate_reproduction_script
+
+    async def generate_reproduction_script_batch(
         self,
         reports: list[VulnerabilityReport],
         *,
         config: HunterConfig | None = None,
     ) -> dict[str, str]:
         """
-        Generate PoC scripts for multiple vulnerability reports.
+        Generate Security Unit Test scripts for multiple vulnerability reports.
 
         Args:
             reports: List of proven VulnerabilityReport objects.
             config: Optional HunterConfig for authorized_targets validation.
 
         Returns:
-            Dict mapping vulnerability report ID → PoC Python code.
+            Dict mapping vulnerability report ID → reproduction script code.
             Only includes entries where generation succeeded.
         """
         results: dict[str, str] = {}
 
         for report in reports:
-            poc = await self.generate_poc(report, config=config)
-            if poc:
-                results[report.id] = poc
+            script = await self.generate_reproduction_script(report, config=config)
+            if script:
+                results[report.id] = script
 
         self._log.info(
-            "poc_batch_complete",
+            "reproduction_script_batch_complete",
             total_reports=len(reports),
-            successful_pocs=len(results),
+            successful_scripts=len(results),
         )
 
         return results
 
-    async def _retry_poc_with_error(
+    # Backward-compatible alias.
+    generate_poc_batch = generate_reproduction_script_batch
+
+    async def _retry_reproduction_script_with_error(
         self,
         original_prompt: str,
         failed_code: str,
         error: str,
     ) -> str:
-        """Retry PoC generation feeding back the syntax error for correction."""
+        """Retry reproduction script generation feeding back the syntax error for correction."""
         retry_prompt = (
             f"{original_prompt}\n\n"
             f"## Previous Attempt Error\n"
@@ -1165,7 +1185,8 @@ class VulnerabilityProver:
             f"```\n{error}\n```\n\n"
             f"Previous code (first 2000 chars):\n"
             f"```python\n{failed_code[:2000]}\n```\n\n"
-            f"Fix the syntax error and regenerate. Respond with ONLY Python code."
+            f"Fix the syntax error and regenerate the Security Unit Test. "
+            f"Respond with ONLY Python code."
         )
 
         try:
@@ -1182,7 +1203,7 @@ class VulnerabilityProver:
 
     def _parse_poc_response(self, llm_text: str) -> str:
         """
-        Extract Python code from the LLM's PoC generation response.
+        Extract Python code from the LLM's reproduction script response.
 
         Handles:
         - Raw Python code (no fences)
@@ -1246,7 +1267,7 @@ class VulnerabilityProver:
 
     def _validate_poc_syntax(self, poc_code: str) -> str | None:
         """
-        Validate that the PoC script is syntactically valid Python.
+        Validate that the reproduction script is syntactically valid Python.
 
         Uses ast.parse() — the code is NOT executed.
 
@@ -1267,17 +1288,17 @@ class VulnerabilityProver:
         authorized_targets: list[str],
     ) -> str | None:
         """
-        Validate that the PoC script does not contain dangerous operations.
+        Validate that the reproduction script does not contain dangerous operations.
 
         Checks:
         1. No forbidden imports (subprocess, socket, ctypes, etc.)
         2. No hardcoded URLs pointing to unauthorized domains
-        3. No eval/exec calls (the PoC should be a straightforward script)
+        3. No eval/exec calls (the script should be a straightforward test)
 
         Args:
             poc_code: The generated Python source code.
             authorized_targets: List of authorized target domains/URLs.
-                If empty, URL validation is skipped (offline-only mode).
+                If empty, URL validation is skipped (offline/localhost-only mode).
 
         Returns:
             None if safe, or a human-readable error string if unsafe.

@@ -35,6 +35,7 @@ Iron Rules (never violated — see SIMULA_IRON_RULES in types.py):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 from pathlib import Path
@@ -76,6 +77,7 @@ from ecodiaos.systems.simula.verification.incremental import IncrementalVerifica
 
 if TYPE_CHECKING:
     from ecodiaos.clients.neo4j import Neo4jClient
+    from ecodiaos.clients.redis import RedisClient
     from ecodiaos.clients.timescaledb import TimescaleDBClient
     from ecodiaos.config import SimulaConfig
     from ecodiaos.systems.memory.service import MemoryService
@@ -112,6 +114,7 @@ class SimulaService:
         codebase_root: Path | None = None,
         instance_name: str = "EOS",
         tsdb: TimescaleDBClient | None = None,
+        redis: RedisClient | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -120,6 +123,7 @@ class SimulaService:
         self._root = codebase_root or Path(config.codebase_root).resolve()
         self._instance_name = instance_name
         self._tsdb = tsdb
+        self._redis = redis
         self._initialized: bool = False
         self._logger = logger.bind(system="simula")
 
@@ -167,7 +171,9 @@ class SimulaService:
 
         # State
         self._current_version: int = 0
+        self._version_lock: asyncio.Lock = asyncio.Lock()
         self._active_proposals: dict[str, EvolutionProposal] = {}
+        self._proposals_lock: asyncio.Lock = asyncio.Lock()
 
         # Metrics
         self._proposals_received: int = 0
@@ -319,18 +325,16 @@ class SimulaService:
         )
 
         # Build the history manager (requires Neo4j) with Stage 1B embedding support
-        if self._neo4j is not None:
-            self._history = EvolutionHistoryManager(
-                neo4j=self._neo4j,
-                embedding_client=embedding_client,
+        if self._neo4j is None:
+            raise RuntimeError(
+                "Simula requires a Neo4j client for evolution history, analytics, "
+                "governance, and learning. Either supply a Neo4jClient or disable Simula."
             )
-            self._current_version = await self._history.get_current_version()
-        else:
-            self._logger.warning(
-                "simula_no_neo4j",
-                message="Evolution history will not be persisted (no Neo4j client)",
-            )
-            self._current_version = 0
+        self._history = EvolutionHistoryManager(
+            neo4j=self._neo4j,
+            embedding_client=embedding_client,
+        )
+        self._current_version = await self._history.get_current_version()
 
         # Build the analytics engine (depends on history)
         self._analytics = EvolutionAnalyticsEngine(history=self._history)
@@ -359,17 +363,9 @@ class SimulaService:
 
         # ── Stage 3A: Incremental verification ─────────────────────────────────
         if self._config.incremental_verification_enabled:
-            from ecodiaos.clients.redis import RedisClient
-
-            redis_client: RedisClient | None = None
-            try:
-                redis_client = RedisClient()  # type: ignore[call-arg]
-            except Exception as exc:
-                self._logger.warning("redis_client_init_failed", error=str(exc))
-
             self._incremental = IncrementalVerificationEngine(
                 codebase_root=self._root,
-                redis=redis_client,
+                redis=self._redis,
                 neo4j=self._neo4j,
                 hot_ttl_seconds=self._config.incremental_hot_ttl_seconds,
             )
@@ -738,6 +734,10 @@ class SimulaService:
             except Exception as exc:
                 self._logger.warning("initial_analytics_failed", error=str(exc))
 
+        # Validate that all enabled external tool binaries are reachable.
+        # Fail fast at startup rather than silently degrade on first use.
+        await self._validate_tools()
+
         self._initialized = True
         self._logger.info(
             "simula_initialized",
@@ -803,6 +803,40 @@ class SimulaService:
             stage9_hunter_analytics=self._hunter_analytics is not None,
             stage9_tsdb_persistence=self._tsdb is not None,
         )
+
+    async def _validate_tools(self) -> None:
+        """
+        Verify every enabled external tool binary exists and is executable.
+        Raises RuntimeError on the first missing binary so the process crashes
+        at startup rather than silently falling back to a degraded mode.
+        """
+        import shutil
+
+        checks: list[tuple[bool, str, str]] = [
+            # (enabled, binary_path, tool_name)
+            (self._config.dafny_enabled, self._config.dafny_binary_path, "Dafny"),
+            (self._config.lean_enabled, self._config.lean_binary_path, "Lean 4"),
+            (
+                self._config.formal_spec_generation_enabled and bool(self._config.tla_plus_binary_path),
+                self._config.tla_plus_binary_path or "",
+                "TLA+",
+            ),
+            (
+                self._config.formal_spec_generation_enabled and bool(self._config.alloy_binary_path),
+                self._config.alloy_binary_path or "",
+                "Alloy",
+            ),
+        ]
+
+        for enabled, binary_path, tool_name in checks:
+            if not enabled or not binary_path:
+                continue
+            if not shutil.which(binary_path) and not Path(binary_path).is_file():
+                raise RuntimeError(
+                    f"Simula: {tool_name} is enabled but binary not found: '{binary_path}'. "
+                    f"Install {tool_name} or set the correct path in SimulaConfig."
+                )
+            self._logger.debug("tool_binary_ok", tool=tool_name, path=binary_path)
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
@@ -887,22 +921,83 @@ class SimulaService:
         log.info("proposal_received", source=proposal.source, description=proposal.description[:100])
 
         # ── STEP 0: Deduplication ────────────────────────────────────────────
-        if self._intelligence is not None and self._active_proposals:
-            try:
-                all_proposals = [proposal] + list(self._active_proposals.values())
-                clusters = await self._intelligence.deduplicate(all_proposals)
-                if self._intelligence.is_duplicate(proposal, clusters):
-                    self._proposals_deduplicated += 1
-                    log.info("proposal_deduplicated")
-                    return ProposalResult(
-                        status=ProposalStatus.REJECTED,
-                        reason="Duplicate of an active proposal",
-                    )
-            except Exception as exc:
-                log.warning("dedup_check_failed", error=str(exc))
+        # Snapshot active proposals under lock (cheap), run async dedup
+        # outside the lock to avoid blocking other proposals during the
+        # potential LLM Tier-3 similarity call, then re-acquire the lock for
+        # the atomic capacity-check + insert.
+        if self._intelligence is not None:
+            async with self._proposals_lock:
+                snapshot = list(self._active_proposals.values())
+            if snapshot:
+                try:
+                    all_proposals = [proposal] + snapshot
+                    clusters = await self._intelligence.deduplicate(all_proposals)
+                    if self._intelligence.is_duplicate(proposal, clusters):
+                        self._proposals_deduplicated += 1
+                        log.info("proposal_deduplicated")
+                        return ProposalResult(
+                            status=ProposalStatus.REJECTED,
+                            reason="Duplicate of an active proposal",
+                        )
+                except Exception as exc:
+                    log.warning("dedup_check_failed", error=str(exc))
 
-        self._active_proposals[proposal.id] = proposal
+        async with self._proposals_lock:
+            if len(self._active_proposals) >= self._config.max_active_proposals:
+                log.warning(
+                    "proposal_rejected_queue_full",
+                    active=len(self._active_proposals),
+                    limit=self._config.max_active_proposals,
+                )
+                return ProposalResult(
+                    status=ProposalStatus.REJECTED,
+                    reason=(
+                        f"Too many active proposals "
+                        f"({len(self._active_proposals)}/{self._config.max_active_proposals}). "
+                        "Try again later."
+                    ),
+                )
+            self._active_proposals[proposal.id] = proposal
 
+        # All remaining steps are wrapped in try/finally so any unexpected
+        # exit (exception or early return) always removes the proposal from
+        # _active_proposals and never leaves it stranded.
+        try:
+            return await asyncio.wait_for(
+                self._run_pipeline(proposal, log),
+                timeout=self._config.pipeline_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            log.error(
+                "proposal_pipeline_timeout",
+                timeout_s=self._config.pipeline_timeout_s,
+            )
+            proposal.status = ProposalStatus.REJECTED
+            self._proposals_rejected += 1
+            async with self._proposals_lock:
+                self._active_proposals.pop(proposal.id, None)
+            self._invalidate_analytics()
+            return ProposalResult(
+                status=ProposalStatus.REJECTED,
+                reason=f"Pipeline timed out after {self._config.pipeline_timeout_s}s",
+            )
+        finally:
+            # Governance-approved proposals are intentionally left in
+            # _active_proposals (awaiting approve_governed_proposal call).
+            # All other terminal states remove themselves inside _run_pipeline;
+            # this is a safety net for any path we missed.
+            if proposal.status not in (
+                ProposalStatus.AWAITING_GOVERNANCE,
+                ProposalStatus.APPLIED,
+                ProposalStatus.ROLLED_BACK,
+            ):
+                async with self._proposals_lock:
+                    self._active_proposals.pop(proposal.id, None)
+
+    async def _run_pipeline(
+        self, proposal: EvolutionProposal, log: Any
+    ) -> ProposalResult:
+        """Inner pipeline body, always called from process_proposal's try/finally."""
         # ── STEP 1: Validate ────────────────────────────────────────────────
         if proposal.category in FORBIDDEN:
             proposal.status = ProposalStatus.REJECTED
@@ -912,7 +1007,8 @@ class SimulaService:
                 f"Iron rule: {self._get_iron_rule_for(proposal)}"
             )
             log.warning("proposal_rejected_forbidden", reason=reason)
-            self._active_proposals.pop(proposal.id, None)
+            async with self._proposals_lock:
+                self._active_proposals.pop(proposal.id, None)
             return ProposalResult(status=ProposalStatus.REJECTED, reason=reason)
 
         # ── STEP 1.5: Triage (fast-path for trivial cases) ──────────────────
@@ -942,7 +1038,8 @@ class SimulaService:
                 self._proposals_rejected += 1
                 reason = f"Simulation failed: {exc}"
                 log.error("simulation_error", error=str(exc))
-                self._active_proposals.pop(proposal.id, None)
+                async with self._proposals_lock:
+                    self._active_proposals.pop(proposal.id, None)
                 return ProposalResult(status=ProposalStatus.REJECTED, reason=reason)
         else:
             simulation = proposal.simulation
@@ -952,7 +1049,8 @@ class SimulaService:
             self._proposals_rejected += 1
             reason = f"Simulation shows unacceptable risk: {simulation.risk_summary}"
             log.warning("proposal_rejected_risk", risk_level=simulation.risk_level.value)
-            self._active_proposals.pop(proposal.id, None)
+            async with self._proposals_lock:
+                self._active_proposals.pop(proposal.id, None)
             return ProposalResult(status=ProposalStatus.REJECTED, reason=reason)
 
         # ── STEP 3: Governance gate ─────────────────────────────────────────
@@ -963,9 +1061,18 @@ class SimulaService:
                 governance_id = await self._submit_to_governance(proposal, simulation)
                 proposal.governance_record_id = governance_id
             except Exception as exc:
-                log.error("governance_submission_error", error=str(exc))
-                governance_id = f"gov_{new_id()}"
-                proposal.governance_record_id = governance_id
+                # Governance submission failure is a hard stop: without a
+                # governance record the change cannot be audited or approved.
+                log.error("governance_submission_failed", error=str(exc))
+                proposal.status = ProposalStatus.REJECTED
+                self._proposals_rejected += 1
+                self._proposals_awaiting_governance = max(0, self._proposals_awaiting_governance - 1)
+                async with self._proposals_lock:
+                    self._active_proposals.pop(proposal.id, None)
+                return ProposalResult(
+                    status=ProposalStatus.REJECTED,
+                    reason=f"Governance submission failed: {exc}",
+                )
 
             log.info("proposal_awaiting_governance", governance_id=governance_id)
             return ProposalResult(
@@ -1509,6 +1616,9 @@ class SimulaService:
                 log.warning("orchestration_error", error=str(exc))
 
         code_result, snapshot = await self._applicator.apply(proposal)
+        # Stamp the snapshot with the version that was current before this
+        # change was applied, so rollback audit trails show the correct target.
+        snapshot.config_version = self._current_version
 
         # ── Stage 5B: Neural repair agent (primary recovery before diffusion) ─
         if not code_result.success and self._repair_agent is not None:
@@ -1588,7 +1698,8 @@ class SimulaService:
             proposal.status = ProposalStatus.ROLLED_BACK
             self._proposals_rolled_back += 1
             log.warning("apply_failed_no_success", error=code_result.error)
-            self._active_proposals.pop(proposal.id, None)
+            async with self._proposals_lock:
+                self._active_proposals.pop(proposal.id, None)
             self._invalidate_analytics()
             return ProposalResult(
                 status=ProposalStatus.ROLLED_BACK,
@@ -1606,9 +1717,21 @@ class SimulaService:
             code_result.synthesis_speedup = synthesis_result_stash.speedup_vs_cegis
 
         # ── Health check (with Stage 2 formal verification) ────────────────
-        health = await self._health.check(
-            code_result.files_written, proposal=proposal,
-        )
+        try:
+            health = await self._health.check(
+                code_result.files_written, proposal=proposal,
+            )
+        except Exception as exc:
+            log.error("health_check_unhandled_error", error=str(exc))
+            proposal.status = ProposalStatus.REJECTED
+            self._proposals_rejected += 1
+            async with self._proposals_lock:
+                self._active_proposals.pop(proposal.id, None)
+            self._invalidate_analytics()
+            return ProposalResult(
+                status=ProposalStatus.REJECTED,
+                reason=f"Health check failed unexpectedly: {exc}",
+            )
 
         # Stash formal verification result for history recording
         if health.formal_verification is not None:
@@ -1735,7 +1858,8 @@ class SimulaService:
                     rollback_reason="; ".join(health.issues),
                 )
 
-                self._active_proposals.pop(proposal.id, None)
+                async with self._proposals_lock:
+                    self._active_proposals.pop(proposal.id, None)
                 self._invalidate_analytics()
                 return ProposalResult(
                     status=ProposalStatus.ROLLED_BACK,
@@ -1807,13 +1931,15 @@ class SimulaService:
         proposal.status = ProposalStatus.APPLIED
         self._proposals_approved += 1
 
-        from_version = self._current_version
-        self._current_version += 1
+        async with self._version_lock:
+            from_version = self._current_version
+            self._current_version += 1
 
         await self._record_evolution(
             proposal,
             code_result.files_written,
             rolled_back=False,
+            from_version=from_version,
         )
 
         # ── Stage 6A.1: Append to hash chain ─────────────────────────────────
@@ -1899,7 +2025,8 @@ class SimulaService:
                 log.warning("lilo_extraction_error", error=str(exc))
 
         # Clean up active proposals
-        self._active_proposals.pop(proposal.id, None)
+        async with self._proposals_lock:
+            self._active_proposals.pop(proposal.id, None)
         self._invalidate_analytics()
 
         log.info(
@@ -1983,12 +2110,21 @@ class SimulaService:
         files_changed: list[str],
         rolled_back: bool = False,
         rollback_reason: str = "",
+        from_version: int | None = None,
     ) -> None:
-        """Write an immutable evolution record and update the version chain."""
+        """Write an immutable evolution record and update the version chain.
+
+        from_version should be the pre-apply version captured atomically inside
+        _version_lock. If omitted it is derived from self._current_version for
+        backwards compatibility (rolled-back path, where the version was never
+        incremented).
+        """
         if self._history is None:
             return
 
-        from_version = self._current_version - (0 if rolled_back else 1)
+        if from_version is None:
+            # Rollback path: version was never incremented, so from == to.
+            from_version = self._current_version
         to_version = self._current_version
 
         risk_level = (

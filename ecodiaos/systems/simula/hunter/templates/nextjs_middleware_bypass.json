@@ -1,0 +1,15 @@
+{
+  "vulnerability_class": "Broken Access Control - Middleware Bypass",
+  "target_surface_types": ["middleware", "api_endpoint"],
+  "framework_target": "Next.js",
+  "description": "Checks if authorization middleware can be bypassed by spoofing internal routing headers.",
+  "z3_encoding_instructions": [
+    "1. Identify the variables representing the HTTP request headers and the user's authentication state.",
+    "2. Create a Z3 Bool variable for `is_authenticated` and set it to False.",
+    "3. Create a Z3 String variable for the header `x-middleware-subrequest`.",
+    "4. Identify the conditional logic that grants access (e.g., returning next() or allowing the route).",
+    "5. GOAL STATE: Write a Z3 constraint that proves the routing logic allows access (evaluates to True) when `is_authenticated` is False BUT the `x-middleware-subrequest` header is present and truthy.",
+    "6. If SAT, the middleware is blindly trusting the internal header, allowing an unauthenticated bypass."
+  ],
+  "reproduction_instructions": "Send a GET request to the target endpoint including the header 'x-middleware-subrequest: 1'. Assert that the response status code is 401 or 403. If the assertion fails (e.g., returns 200 OK), the vulnerability is confirmed."
+}

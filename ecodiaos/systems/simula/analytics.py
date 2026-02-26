@@ -434,7 +434,10 @@ class EvolutionAnalyticsEngine:
                 "rollback_rate": evolution.rollback_rate,
                 "mean_simulation_risk": evolution.mean_simulation_risk,
                 "category_count": len(evolution.category_rates),
-                "last_updated": evolution.last_updated.isoformat() if evolution.last_updated else None,
+                "last_updated": (
+                    evolution.last_updated.isoformat()
+                    if evolution.last_updated else None
+                ),
             },
         }
 

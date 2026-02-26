@@ -520,7 +520,7 @@ class VoxisService:
         self._voice_engine.derive(
             personality=self._personality_engine.current,  # type: ignore[union-attr]
             affect=current_affect,
-            strategy_register=expression.strategy.register if expression.strategy else "neutral",
+            strategy_register=expression.strategy.speech_register if expression.strategy else "neutral",
             urgency=urgency,
         )
 
@@ -564,7 +564,7 @@ class VoxisService:
             expression_id=expression.id,
             conversation_id=conv_state.conversation_id,
             content_summary=expression.content[:200] if expression.content else "",
-            strategy_register=expression.strategy.register if expression.strategy else "neutral",
+            strategy_register=expression.strategy.speech_register if expression.strategy else "neutral",
             personality_warmth=self._personality_engine.current.warmth if self._personality_engine else 0.0,
             affect_before_valence=self._affect_before_expression.valence if self._affect_before_expression else 0.0,
             trigger=trigger.value,
@@ -595,7 +595,7 @@ class VoxisService:
             trigger=trigger.value,
             conversation_id=conv_state.conversation_id,
             content_summary=expression.content[:200] if expression.content else "",
-            strategy_register=expression.strategy.register if expression.strategy else "neutral",
+            strategy_register=expression.strategy.speech_register if expression.strategy else "neutral",
             personality_warmth=self._personality_engine.current.warmth if self._personality_engine else 0.0,
             affect_before_valence=self._affect_before_expression.valence if self._affect_before_expression else 0.0,
             affect_after_valence=current_affect.valence,

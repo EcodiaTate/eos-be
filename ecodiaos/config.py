@@ -346,6 +346,9 @@ class SimulaConfig(BaseModel):
     symbolic_execution_domains: list[str] = Field(
         default_factory=lambda: ["budget_calculation", "risk_scoring"],
     )  # domains to target for symbolic execution
+    # Pipeline safety limits
+    max_active_proposals: int = 50  # reject new proposals when this many are in-flight
+    pipeline_timeout_s: float = 600.0  # hard timeout for the full process_proposal() pipeline (10 min)
     # Stage 7: Hunter — Zero-Day Discovery Engine
     hunter_enabled: bool = False  # opt-in vulnerability hunting
     hunter_max_workers: int = 4  # concurrent surface × goal analysis workers (1-16)

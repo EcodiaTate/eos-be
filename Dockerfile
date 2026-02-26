@@ -1,49 +1,89 @@
-FROM python:3.12-slim AS base
+# syntax=docker/dockerfile:1.5
+
+FROM python:3.12-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=0 \
+    VIRTUAL_ENV=/opt/venv \
+    ELAN_HOME="/opt/elan" \
+    PATH="/opt/venv/bin:/opt/elan/bin:${PATH}"
 
 WORKDIR /app
 
-# System dependencies (includes curl + git for elan/Lean 4 toolchain)
+# Build deps (only in builder)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
-# ── Stage 4A: Install Lean 4 toolchain via elan ──────────────────────────
-# elan is the Lean version manager (like rustup for Rust).
-# Installs to /root/.elan; the lean/lake binaries are symlinked into PATH.
-# Set ELAN_DEFAULT_TOOLCHAIN to pin the Lean version for reproducibility.
-ENV ELAN_HOME="/opt/elan" \
-    PATH="/opt/elan/bin:${PATH}"
+# ---- Lean toolchain (cached layer unless version changes) ----
 RUN curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- \
     --default-toolchain leanprover/lean4:v4.14.0 \
     --no-modify-path \
     -y \
-    && lean --version \
-    && lake --version
+ && lean --version \
+ && lake --version
 
-# Install Python dependencies (stub package for layer caching)
+# ---- Create venv ----
+RUN python -m venv "$VIRTUAL_ENV"
+
+# ---- 1) Copy ONLY dependency descriptors ----
 COPY pyproject.toml README.md ./
-RUN mkdir -p ecodiaos && touch ecodiaos/__init__.py
-RUN pip install --upgrade pip && pip install .
 
-# Copy real source and reinstall package (deps already cached)
+# ---- 2) Install deps into venv (layer cached + pip cache mounted) ----
+# Stub package to allow "pip install ." without copying your whole repo yet
+RUN mkdir -p ecodiaos && touch ecodiaos/__init__.py
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip \
+ && pip install .
+
+# ---- 3) Copy actual source AFTER deps are installed ----
 COPY ecodiaos/ ecodiaos/
 COPY config/ config/
-RUN pip install --no-deps --force-reinstall .
 
-# Pre-download the embedding model so it's baked into the image
+# Reinstall project code without re-resolving deps
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps --force-reinstall .
+
+# ---- 4) Pre-download embedding model (optional, but you asked for it) ----
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-mpnet-base-v2')"
 
-# Create non-root user with home directory for HF cache and elan access
-RUN groupadd -r ecodiaos && useradd -r -g ecodiaos -m ecodiaos
-RUN cp -r /root/.cache /home/ecodiaos/.cache && chown -R ecodiaos:ecodiaos /home/ecodiaos/.cache
-# Grant non-root user read access to Lean toolchain
-RUN chmod -R a+rX /opt/elan
+
+# ======================================================================
+
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/opt/venv \
+    ELAN_HOME="/opt/elan" \
+    PATH="/opt/venv/bin:/opt/elan/bin:${PATH}"
+
+WORKDIR /app
+
+# Runtime OS deps (keep minimal)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy venv + lean toolchain + app
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /opt/elan /opt/elan
+COPY --from=builder /app /app
+COPY --from=builder /root/.cache /root/.cache
+
+# Non-root user
+RUN groupadd -r ecodiaos && useradd -r -g ecodiaos -m ecodiaos \
+ && cp -r /root/.cache /home/ecodiaos/.cache \
+ && chown -R ecodiaos:ecodiaos /home/ecodiaos/.cache \
+ && chmod -R a+rX /opt/elan
+
 USER ecodiaos
 
 EXPOSE 8000 8001 8002

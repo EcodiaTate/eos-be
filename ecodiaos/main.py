@@ -427,6 +427,7 @@ async def lifespan(app: FastAPI):
         codebase_root=_Path(config.simula.codebase_root).resolve(),
         instance_name=config.instance_id,
         tsdb=tsdb_client,
+        redis=redis_client,
     )
     await simula.initialize()
     app.state.simula = simula
@@ -1304,6 +1305,14 @@ async def get_llm_metrics():
     budget_status = token_budget.get_status()
     cache_stats = llm.cache.get_stats() if llm.cache else {"hit_rate": 0.0}
 
+    import math
+
+    def _safe_float(v: float) -> float | None:
+        """Return None for inf/nan so the JSON encoder doesn't crash."""
+        if math.isfinite(v):
+            return round(v, 2)
+        return None
+
     return {
         "status": "ok",
         "budget": {
@@ -1312,8 +1321,8 @@ async def get_llm_metrics():
             "tokens_remaining": budget_status.tokens_remaining,
             "calls_made": budget_status.calls_made,
             "calls_remaining": budget_status.calls_remaining,
-            "burn_rate_tokens_per_sec": round(budget_status.tokens_per_sec, 2),
-            "hours_until_exhausted": round(budget_status.hours_until_exhausted, 2),
+            "burn_rate_tokens_per_sec": _safe_float(budget_status.tokens_per_sec),
+            "hours_until_exhausted": _safe_float(budget_status.hours_until_exhausted),
             "warning": budget_status.warning_message,
         },
         "cache": cache_stats,
@@ -1619,9 +1628,14 @@ async def chat_message(body: dict[str, Any]):
             # Atune ingestion is non-critical for chat — log and continue
             _chat_logger.warning("chat_atune_ingest_failed", error=str(atune_err))
 
-        # Generate expression via Voxis
+        # Generate expression via Voxis.
+        # NOTE: Do NOT pass the raw user message as content here — ingest_user_message()
+        # already appended it to conversation history, and express() appends content as
+        # an additional user turn. Passing message again would duplicate it in the LLM
+        # context, causing the model to see the same prompt twice and loop on the same
+        # defensive response. Pass a response directive instead.
         expression = await voxis.express(
-            content=message,
+            content="Respond to the conversation.",
             trigger=ExpressionTrigger.NOVA_RESPOND,
             conversation_id=conversation_id,
             addressee_id=speaker_id,

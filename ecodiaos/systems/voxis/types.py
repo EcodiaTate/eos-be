@@ -78,7 +78,7 @@ class StrategyParams(EOSBaseModel):
     pacing: str = "balanced"             # "energetic" | "balanced" | "reflective"
 
     # ── Tone & register ──
-    register: str = "neutral"            # "formal" | "casual" | "neutral"
+    speech_register: str = "neutral"     # "formal" | "casual" | "neutral"
     tone_markers: list[str] = Field(default_factory=list)  # e.g. ["warm", "attentive"]
     contraction_use: bool = True
     greeting_style: str = "neutral"      # "personal" | "professional" | "neutral"

@@ -16,9 +16,8 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# SQL for initialising the TimescaleDB schema on first boot.
-INIT_SQL = """
--- Metrics hypertable
+# Table DDL — works on any Postgres instance.
+TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS metrics (
     time        TIMESTAMPTZ NOT NULL,
     system      TEXT NOT NULL,
@@ -27,11 +26,8 @@ CREATE TABLE IF NOT EXISTS metrics (
     labels      JSONB DEFAULT '{}'
 );
 
-SELECT create_hypertable('metrics', 'time', if_not_exists => TRUE);
-
 CREATE INDEX IF NOT EXISTS idx_metrics_system_metric ON metrics (system, metric, time DESC);
 
--- Audit log (immutable)
 CREATE TABLE IF NOT EXISTS audit_log (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     time        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -43,11 +39,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     checksum    TEXT NOT NULL
 );
 
-SELECT create_hypertable('audit_log', 'time', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_audit_system ON audit_log (system, time DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_log (event_type, time DESC);
 
--- Affect state history
 CREATE TABLE IF NOT EXISTS affect_history (
     time              TIMESTAMPTZ NOT NULL,
     valence           DOUBLE PRECISION,
@@ -59,9 +53,6 @@ CREATE TABLE IF NOT EXISTS affect_history (
     source_event      TEXT
 );
 
-SELECT create_hypertable('affect_history', 'time', if_not_exists => TRUE);
-
--- Cycle performance log
 CREATE TABLE IF NOT EXISTS cycle_log (
     time            TIMESTAMPTZ NOT NULL,
     cycle_number    BIGINT NOT NULL,
@@ -71,9 +62,10 @@ CREATE TABLE IF NOT EXISTS cycle_log (
     salience_max    DOUBLE PRECISION,
     systems_acked   INTEGER
 );
-
-SELECT create_hypertable('cycle_log', 'time', if_not_exists => TRUE);
 """
+
+# Hypertable conversions — requires the timescaledb extension.
+HYPERTABLE_TABLES = ["metrics", "audit_log", "affect_history", "cycle_log"]
 
 
 class TimescaleDBClient:
@@ -103,20 +95,36 @@ class TimescaleDBClient:
         await self._init_schema()
 
     async def _init_schema(self) -> None:
-        """Create tables and hypertables if they don't exist."""
+        """Create tables (plain Postgres) then promote to hypertables if the extension exists."""
         async with self.pool.acquire() as conn:
-            # Execute each statement individually (hypertable creation can't be in a
-            # multi-statement transaction easily, so we split them)
-            for statement in INIT_SQL.split(";"):
-                statement = statement.strip()
-                if statement:
+            # 1. Create tables + indexes — pure Postgres, always succeeds.
+            for statement in TABLE_SQL.split(";"):
+                stmt = statement.strip()
+                if stmt:
+                    await conn.execute(stmt)
+
+            # 2. Check whether TimescaleDB is available before attempting hypertables.
+            has_timescaledb = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')"
+            )
+
+            if has_timescaledb:
+                for table in HYPERTABLE_TABLES:
                     try:
-                        await conn.execute(statement)
+                        await conn.execute(
+                            f"SELECT create_hypertable('{table}', 'time', if_not_exists => TRUE)"
+                        )
                     except Exception as e:
-                        # Ignore "already exists" type errors
                         if "already exists" not in str(e).lower():
-                            logger.warning("tsdb_init_statement_warning", error=str(e))
-        logger.info("timescaledb_schema_initialised")
+                            logger.warning("tsdb_hypertable_warning", table=table, error=str(e))
+                logger.info("timescaledb_schema_initialised", hypertables=True)
+            else:
+                logger.info(
+                    "timescaledb_schema_initialised",
+                    hypertables=False,
+                    note="timescaledb extension not available — tables created as plain Postgres",
+                )
+
 
     async def close(self) -> None:
         """Close the connection pool."""

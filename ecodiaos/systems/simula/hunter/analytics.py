@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -478,7 +478,9 @@ class _WeekBucket:
 def _iso_week_start(dt: datetime) -> datetime:
     """Return the Monday 00:00 UTC of the ISO week containing dt."""
     monday = dt - timedelta(days=dt.weekday())
-    return monday.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    return monday.replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=UTC,
+    )
 
 
 class HunterAnalyticsView:
@@ -614,7 +616,11 @@ class HunterAnalyticsView:
             "surfaces_mapped": surfaces,
             "duration_ms": duration_ms,
             "patch_count": len(patches),
-            "completed_at": completed_at.isoformat() if hasattr(completed_at, "isoformat") else str(completed_at),
+            "completed_at": (
+                completed_at.isoformat()
+                if hasattr(completed_at, "isoformat")
+                else str(completed_at)
+            ),
             "week": week_key,
         })
         if len(self._recent_results) > self._max_recent:
@@ -792,7 +798,8 @@ class HunterAnalyticsStore:
         async with self._tsdb.pool.acquire() as conn:
             await conn.executemany(
                 """
-                INSERT INTO hunter_events (time, hunt_id, event_type, target_url, hunting_version, payload)
+                INSERT INTO hunter_events
+                    (time, hunt_id, event_type, target_url, hunting_version, payload)
                 VALUES ($1, $2, $3, $4, $5, $6::jsonb)
                 """,
                 rows,
@@ -1038,7 +1045,11 @@ class HunterAnalyticsStore:
                 "time": row["time"].isoformat(),
                 "event_type": row["event_type"],
                 "target_url": row["target_url"],
-                "payload": json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"],
+                "payload": (
+                    json.loads(row["payload"])
+                    if isinstance(row["payload"], str)
+                    else row["payload"]
+                ),
             }
             for row in rows
         ]
@@ -1068,7 +1079,11 @@ class HunterAnalyticsStore:
             {
                 "time": row["time"].isoformat(),
                 "hunt_id": row["hunt_id"],
-                **(json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]),
+                **(
+                    json.loads(row["payload"])
+                    if isinstance(row["payload"], str)
+                    else row["payload"]
+                ),
             }
             for row in rows
         ]

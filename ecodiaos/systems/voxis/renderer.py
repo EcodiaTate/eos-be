@@ -544,7 +544,7 @@ class ContentRenderer:
             channel=strategy.channel.value,
             trigger=intent.trigger.value,
             context_type=context_type,
-            register=strategy.register,
+            speech_register=strategy.speech_register,
             target_length=strategy.target_length,
             temperature=temperature,
             personality_influence=context.personality.warmth,  # Use warmth as representative influence
