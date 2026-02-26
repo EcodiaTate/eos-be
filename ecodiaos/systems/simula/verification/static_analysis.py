@@ -66,8 +66,10 @@ class StaticAnalysisBridge:
         codebase_root: Path,
         bandit_timeout_s: float = 30.0,
         semgrep_timeout_s: float = 60.0,
+        # Hunter: allow overriding the workspace root for external target analysis
+        workspace_root: Path | None = None,
     ) -> None:
-        self._root = codebase_root
+        self._root = workspace_root or codebase_root
         self._bandit_timeout_s = bandit_timeout_s
         self._semgrep_timeout_s = semgrep_timeout_s
         self._log = logger

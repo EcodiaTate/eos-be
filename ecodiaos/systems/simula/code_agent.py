@@ -487,12 +487,14 @@ class SimulaCodeAgent:
         # Stage 2C: Static analysis post-generation gate
         static_analysis_bridge: object | None = None,
         static_analysis_max_fix_iterations: int = 3,
+        # Hunter: allow overriding the workspace root for external target analysis
+        workspace_root: Path | None = None,
     ) -> None:
         self._llm = llm
         self._thinking_llm = thinking_provider
         self._thinking_budget = thinking_budget_tokens
         self._embedding = embedding_client
-        self._root = codebase_root.resolve()
+        self._root = (workspace_root or codebase_root).resolve()
         self._max_turns = max_turns
         self._logger = logger.bind(system="simula.code_agent")
         self._files_written: list[str] = []

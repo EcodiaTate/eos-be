@@ -1771,40 +1771,232 @@ async def thread_health_endpoint():
     return await thread.health()
 
 
+@app.get("/api/v1/thread/identity")
+async def thread_identity():
+    """Complete narrative identity snapshot."""
+    thread: ThreadService = app.state.thread
+
+    # Gather schemas by strength
+    core_schemas = []
+    established_schemas = []
+    developing_schemas = []
+    nascent_schemas = []
+    total_idem = 0.0
+
+    for s in thread._schemas:
+        schema_data = {
+            "id": s.id,
+            "statement": s.statement,
+            "strength": getattr(s, 'strength', 'nascent').value if hasattr(getattr(s, 'strength', None), 'value') else 'nascent',
+            "valence": getattr(s, 'valence', 'ambivalent'),
+            "confirmation_count": getattr(s, 'confirmation_count', 0),
+            "disconfirmation_count": getattr(s, 'disconfirmation_count', 0),
+            "evidence_ratio": round(getattr(s, 'evidence_ratio', 0.5), 3),
+            "trigger_contexts": getattr(s, 'trigger_contexts', []),
+            "behavioral_tendency": getattr(s, 'behavioral_tendency', None),
+        }
+
+        strength = schema_data["strength"]
+        if strength == "core":
+            core_schemas.append(schema_data)
+        elif strength == "established":
+            established_schemas.append(schema_data)
+        elif strength == "developing":
+            developing_schemas.append(schema_data)
+        else:
+            nascent_schemas.append(schema_data)
+
+        confidence = s.confidence if hasattr(s, 'confidence') else 0.5
+        total_idem += confidence
+
+    idem_score = total_idem / len(thread._schemas) if thread._schemas else 0.0
+
+    # Gather active commitments
+    active_commitments = []
+    total_ipse = 0.0
+
+    for c in thread._commitments:
+        commitment_data = {
+            "id": c.id,
+            "statement": c.statement,
+            "source": c.drive_source or "explicit_declaration",
+            "status": c.type.value if hasattr(c, 'type') else "active",
+            "tests_faced": c.test_count if hasattr(c, 'test_count') else 0,
+            "tests_held": max(0, c.test_count - 1) if hasattr(c, 'test_count') and c.test_count > 0 else 0,
+            "fidelity": round(c.fidelity, 3),
+            "made_at": c.created_at.isoformat() if hasattr(c, 'created_at') else None,
+            "last_tested": None,
+        }
+        active_commitments.append(commitment_data)
+        total_ipse += c.fidelity
+
+    ipse_score = total_ipse / len(thread._commitments) if thread._commitments else 0.0
+
+    # Get current chapter
+    current_chapter_title = None
+    current_chapter_theme = None
+    if hasattr(thread, '_chapters') and thread._chapters:
+        latest_ch = thread._chapters[-1] if thread._chapters else None
+        if latest_ch:
+            current_chapter_title = latest_ch.title if hasattr(latest_ch, 'title') else "Forming..."
+            current_chapter_theme = latest_ch.theme if hasattr(latest_ch, 'theme') else None
+
+    # Get turning points (from latest chapter if available)
+    recent_turning_points = []
+    if hasattr(thread, '_chapters') and thread._chapters:
+        latest_ch = thread._chapters[-1]
+        # Attempt to extract turning points from the chapter
+        if hasattr(latest_ch, 'turning_points'):
+            for tp in latest_ch.turning_points:
+                recent_turning_points.append({
+                    "id": getattr(tp, 'id', f"tp_{len(recent_turning_points)}"),
+                    "type": getattr(tp, 'type', 'growth'),
+                    "description": getattr(tp, 'description', str(tp)),
+                    "surprise_magnitude": getattr(tp, 'surprise_magnitude', 0.5),
+                    "narrative_weight": getattr(tp, 'narrative_weight', 0.5),
+                })
+
+    # Get personality traits
+    key_personality_traits = {}
+    if hasattr(thread, '_personality_snapshot'):
+        key_personality_traits = thread._personality_snapshot if isinstance(thread._personality_snapshot, dict) else {}
+
+    # Get life story
+    life_story_summary = None
+    if hasattr(thread, '_life_story') and thread._life_story:
+        life_story_summary = getattr(thread._life_story, 'summary', None)
+
+    # Determine narrative coherence
+    narrative_coherence = "integrated"  # Default to integrated
+    if hasattr(thread, '_coherence_status'):
+        narrative_coherence = thread._coherence_status
+
+    return {
+        "core_schemas": core_schemas,
+        "established_schemas": established_schemas,
+        "active_commitments": active_commitments,
+        "current_chapter_title": current_chapter_title,
+        "current_chapter_theme": current_chapter_theme,
+        "life_story_summary": life_story_summary,
+        "key_personality_traits": key_personality_traits,
+        "recent_turning_points": recent_turning_points,
+        "narrative_coherence": narrative_coherence,
+        "idem_score": round(idem_score, 3),
+        "ipse_score": round(ipse_score, 3),
+    }
+
+
 @app.get("/api/v1/thread/commitments")
 async def thread_commitments():
     """All identity commitments — constitutional and emergent."""
     thread: ThreadService = app.state.thread
-    return [
-        {
+
+    commitments = []
+    strained = []
+    total_fidelity = 0.0
+
+    for c in thread._commitments:
+        commitment_data = {
             "id": c.id,
-            "type": c.type.value,
             "statement": c.statement,
-            "strength": c.strength.value,
-            "drive_source": c.drive_source,
+            "source": c.drive_source or "explicit_declaration",
+            "status": c.type.value if hasattr(c, 'type') else "active",
+            "tests_faced": c.test_count if hasattr(c, 'test_count') else 0,
+            "tests_held": max(0, c.test_count - 1) if hasattr(c, 'test_count') and c.test_count > 0 else 0,
             "fidelity": round(c.fidelity, 3),
-            "test_count": c.test_count,
-            "created_at": c.created_at.isoformat(),
+            "made_at": c.created_at.isoformat() if hasattr(c, 'created_at') else None,
+            "last_tested": None,
         }
-        for c in thread._commitments
-    ]
+        commitments.append(commitment_data)
+        total_fidelity += c.fidelity
+
+        if c.fidelity < 0.6:
+            strained.append(c.id)
+
+    ipse_score = total_fidelity / len(commitments) if commitments else 0.0
+
+    return {
+        "commitments": commitments,
+        "total": len(commitments),
+        "ipse_score": round(ipse_score, 3),
+        "strained": strained,
+    }
 
 
 @app.get("/api/v1/thread/schemas")
 async def thread_schemas():
     """All identity schemas — the organism's self-understanding."""
     thread: ThreadService = app.state.thread
-    return [
-        {
+
+    # Categorize schemas by strength
+    core_schemas = []
+    established_schemas = []
+    developing_schemas = []
+    nascent_schemas = []
+    total_confidence = 0.0
+
+    for s in thread._schemas:
+        schema_data = {
             "id": s.id,
             "statement": s.statement,
-            "status": s.status.value,
-            "confidence": round(s.confidence, 3),
-            "evidence_ratio": round(s.evidence_ratio, 3),
-            "created_at": s.created_at.isoformat(),
+            "strength": getattr(s, 'strength', 'nascent').value if hasattr(getattr(s, 'strength', None), 'value') else 'nascent',
+            "valence": getattr(s, 'valence', 'ambivalent'),
+            "confirmation_count": getattr(s, 'confirmation_count', 0),
+            "disconfirmation_count": getattr(s, 'disconfirmation_count', 0),
+            "evidence_ratio": round(getattr(s, 'evidence_ratio', s.confidence if hasattr(s, 'confidence') else 0.5), 3),
+            "trigger_contexts": getattr(s, 'trigger_contexts', []),
+            "behavioral_tendency": getattr(s, 'behavioral_tendency', None),
         }
-        for s in thread._schemas
+
+        strength = schema_data["strength"]
+        if strength == "core":
+            core_schemas.append(schema_data)
+        elif strength == "established":
+            established_schemas.append(schema_data)
+        elif strength == "developing":
+            developing_schemas.append(schema_data)
+        else:
+            nascent_schemas.append(schema_data)
+
+        confidence = s.confidence if hasattr(s, 'confidence') else 0.5
+        total_confidence += confidence
+
+    idem_score = total_confidence / len(thread._schemas) if thread._schemas else 0.0
+
+    return {
+        "schemas": {
+            "core": core_schemas,
+            "established": established_schemas,
+            "developing": developing_schemas,
+            "nascent": nascent_schemas,
+        },
+        "total": len(thread._schemas),
+        "idem_score": round(idem_score, 3),
+    }
+
+
+@app.get("/api/v1/thread/coherence")
+async def thread_coherence():
+    """Diachronic coherence — behavioral fingerprints over time."""
+    thread: ThreadService = app.state.thread
+
+    # Get recent fingerprints (last 50)
+    recent_fps = thread._fingerprints[-50:] if hasattr(thread, '_fingerprints') else []
+
+    fingerprints = [
+        {
+            "id": fp.id,
+            "epoch": len(recent_fps) - i - 1,  # Reverse numbering so newest is 0
+            "window_start": int(fp.created_at.timestamp()) if hasattr(fp, 'created_at') else 0,
+            "window_end": int(fp.created_at.timestamp()) + 3600 if hasattr(fp, 'created_at') else 0,
+        }
+        for i, fp in enumerate(recent_fps)
     ]
+
+    return {
+        "fingerprint_count": len(fingerprints),
+        "recent_fingerprints": fingerprints,
+    }
 
 
 @app.get("/api/v1/thread/fingerprints")
@@ -1843,6 +2035,48 @@ async def thread_chapters():
         }
         for ch in thread._chapters
     ]
+
+
+@app.get("/api/v1/thread/chapters/current")
+async def thread_current_chapter():
+    """Current narrative chapter context."""
+    thread: ThreadService = app.state.thread
+
+    # Get the latest chapter
+    current_ch = None
+    if hasattr(thread, '_chapters') and thread._chapters:
+        current_ch = thread._chapters[-1]
+
+    if not current_ch:
+        return {
+            "title": None,
+            "theme": None,
+            "arc_type": "unknown",
+            "episode_count": 0,
+            "scenes": [],
+            "turning_points": [],
+            "status": "forming",
+        }
+
+    # Extract scenes and turning points
+    scenes = []
+    turning_points = []
+
+    if hasattr(current_ch, 'scenes'):
+        scenes = [str(scene) for scene in current_ch.scenes] if isinstance(current_ch.scenes, list) else []
+
+    if hasattr(current_ch, 'turning_points'):
+        turning_points = [str(tp) for tp in current_ch.turning_points] if isinstance(current_ch.turning_points, list) else []
+
+    return {
+        "title": getattr(current_ch, 'title', "Forming..."),
+        "theme": getattr(current_ch, 'theme', None),
+        "arc_type": getattr(current_ch, 'arc_type', "unknown"),
+        "episode_count": 1,  # Placeholder
+        "scenes": scenes,
+        "turning_points": turning_points,
+        "status": getattr(current_ch, 'status', 'forming').value if hasattr(getattr(current_ch, 'status', None), 'value') else 'forming',
+    }
 
 
 @app.get("/api/v1/thread/past-self")

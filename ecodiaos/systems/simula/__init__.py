@@ -33,6 +33,13 @@ Stage 3 enhancements (Incremental & Learning):
   3A: Salsa incremental verification — dependency-aware memoization
   3B: SWE-grep agentic retrieval — multi-hop code search
   3C: LILO library learning — abstraction extraction from successful proposals
+
+Hunter — Zero-Day Discovery Engine:
+  TargetWorkspace      — workspace abstraction (internal/external)
+  AttackSurface        — discovered entry point
+  VulnerabilityReport  — proven vulnerability + PoC
+  HuntResult           — aggregated hunt results
+  HunterConfig         — authorization and resource limits
 """
 
 from ecodiaos.systems.simula.code_agent import SimulaCodeAgent
@@ -116,6 +123,17 @@ from ecodiaos.systems.simula.agents.test_executor import TestExecutorAgent
 from ecodiaos.systems.simula.verification.incremental import IncrementalVerificationEngine
 from ecodiaos.systems.simula.retrieval.swe_grep import SweGrepRetriever
 from ecodiaos.systems.simula.learning.lilo import LiloLibraryEngine
+# Hunter: Zero-Day Discovery Engine
+from ecodiaos.systems.simula.hunter import (
+    TargetWorkspace,
+    TargetType,
+    AttackSurface,
+    AttackSurfaceType,
+    VulnerabilityReport,
+    VulnerabilitySeverity,
+    HuntResult,
+    HunterConfig,
+)
 
 __all__ = [
     # Services
@@ -197,4 +215,13 @@ __all__ = [
     "AbstractionExtractionResult",
     "LibraryStats",
     "LiloLibraryEngine",
+    # Hunter: Zero-Day Discovery Engine
+    "TargetWorkspace",
+    "TargetType",
+    "AttackSurface",
+    "AttackSurfaceType",
+    "VulnerabilityReport",
+    "VulnerabilitySeverity",
+    "HuntResult",
+    "HunterConfig",
 ]
