@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from ecodiaos.systems.simula.rollback import RollbackError, RollbackManager
-from ecodiaos.systems.simula.types import FileSnapshot
+from ecodiaos.systems.simula.evolution_types import FileSnapshot
 
 
 # ─── Tests ────────────────────────────────────────────────────────────────────

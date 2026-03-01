@@ -10,15 +10,18 @@ services:
       uvicorn ecodiaos.main:app
       --host 0.0.0.0
       --port 8000
-      --reload
-      --reload-dir /app/src
       --log-level debug
     volumes:
-      - ./src:/app/src
+      - ./ecodiaos:/app/ecodiaos
       - ./config:/app/config
     environment:
       - ECODIAOS_CONFIG_PATH=/app/config/default.yaml
       - ECODIAOS_SEED_PATH=/app/config/seeds/example_seed.yaml
+
+  simula-worker:
+    volumes:
+      - ./ecodiaos:/app/ecodiaos
+      - ./config:/app/config
 
   timescaledb:
     ports:

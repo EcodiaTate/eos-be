@@ -20,6 +20,7 @@ from collections import deque
 
 import structlog
 
+from ecodiaos.systems.soma.base import BaseSomaPredictor
 from ecodiaos.systems.soma.types import (
     ALL_DIMENSIONS,
     HORIZONS,
@@ -31,7 +32,7 @@ from ecodiaos.systems.soma.types import (
 logger = structlog.get_logger("ecodiaos.systems.soma.predictor")
 
 
-class InteroceptivePredictor:
+class InteroceptivePredictor(BaseSomaPredictor):
     """
     Multi-horizon generative model for interoceptive state prediction.
 
@@ -369,3 +370,19 @@ class InteroceptivePredictor:
         matrix[a][tp] = 0.05    # Temporal pressure feeds arousal
 
         return matrix
+
+    # ─── ABC Bridge Properties ────────────────────────────────────
+
+    @property
+    def raw_trajectory(self) -> deque[dict[InteroceptiveDimension, float]]:
+        """Expose trajectory buffer for PhaseSpaceModel."""
+        return self._trajectory
+
+    def compute_velocity(self) -> dict[InteroceptiveDimension, float]:
+        """Public velocity accessor for PhaseSpaceModel heading."""
+        return self._compute_velocity()
+
+    @property
+    def dynamics_matrix(self) -> list[list[float]]:
+        """Expose dynamics matrix for CounterfactualEngine."""
+        return self._dynamics

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ecodiaos.systems.simula.code_agent import SimulaCodeAgent
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     ChangeCategory,
     ChangeSpec,
     EvolutionProposal,

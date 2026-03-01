@@ -14,6 +14,7 @@ dependencies = [
     # Web framework
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
+    "bs4",
     "websockets>=14.0",
     "httpx>=0.28.0",
 
@@ -40,14 +41,21 @@ dependencies = [
     "structlog>=24.4.0",
     "orjson>=3.10.0",
 
-    # Cryptography (Federation identity)
+    # Cryptography (Federation identity + wallet seed encryption)
     "cryptography>=44.0.0",
+
+    # Web3 — Coinbase Developer Platform SDK (Phase 2: Metabolic Layer)
+    "cdp-sdk>=0.14.0",
+    "web3>=7.0.0",
 
     # Utilities
     "python-ulid>=3.0.0",
 
     # Stage 2B: Z3 SMT solver for invariant verification
     "z3-solver>=4.13.0",
+
+    # Hunter dynamic execution — Docker SDK for live detonation chamber
+    "docker>=7.0.0",
 ]
 
 [project.optional-dependencies]
@@ -97,6 +105,12 @@ module = [
     "z3",
     "z3.*",
     "psutil",
+    "docker",
+    "docker.*",
+    "cdp",
+    "cdp.*",
+    "web3",
+    "web3.*",
 ]
 ignore_missing_imports = true
 

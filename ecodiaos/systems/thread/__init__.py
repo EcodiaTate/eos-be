@@ -11,10 +11,15 @@ maintains continuity through change. It manages:
 
 Public API:
   ThreadService
+  BaseNarrativeSynthesizer, BaseChapterDetector  (ABCs for hot-reload)
   CommitmentType, CommitmentStrength, SchemaStatus
   IdentitySchema, Commitment, IdentityFingerprint, NarrativeChapter
 """
 
+from ecodiaos.systems.thread.processors import (
+    BaseChapterDetector,
+    BaseNarrativeSynthesizer,
+)
 from ecodiaos.systems.thread.service import ThreadService
 from ecodiaos.systems.thread.types import (
     Commitment,
@@ -29,6 +34,8 @@ from ecodiaos.systems.thread.types import (
 
 __all__ = [
     "ThreadService",
+    "BaseChapterDetector",
+    "BaseNarrativeSynthesizer",
     "Commitment",
     "CommitmentStrength",
     "CommitmentType",

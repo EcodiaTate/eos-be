@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ecodiaos.systems.atune.types import SystemLoad
-from ecodiaos.systems.synapse.types import ClockState, CycleResult
+from ecodiaos.systems.synapse.types import ClockState, CycleResult, SomaticCycleState
 
 if TYPE_CHECKING:
     from ecodiaos.config import SynapseConfig
@@ -159,6 +159,27 @@ class CognitiveClock:
         """
         self._coherence_drag = max(0.0, min(1.0, drag))
 
+    def set_speed(self, hz: float) -> None:
+        """
+        Override the base cycle frequency (admin API).
+
+        Clamps to a safe range (1–20 Hz) to prevent either starvation or
+        runaway loops. The arousal modulation still operates on top of this
+        new base — this sets the resting period, not a hard cap.
+        """
+        hz = max(1.0, min(20.0, hz))
+        period_ms = 1000.0 / hz
+        self._base_period_ms = period_ms
+        self._min_period_ms = max(50.0, period_ms * 0.5)
+        self._max_period_ms = min(2000.0, period_ms * 3.0)
+        # Snap current period toward the new base immediately
+        self._current_period_ms = period_ms
+        self._logger.info(
+            "clock_speed_set",
+            hz=round(hz, 2),
+            period_ms=round(period_ms, 2),
+        )
+
     def set_on_cycle(self, callback: CycleCallback) -> None:
         """Register the per-cycle callback (set by SynapseService)."""
         self._on_cycle = callback
@@ -219,9 +240,31 @@ class CognitiveClock:
             try:
                 # 0. RUN SOMA FIRST (step 0 of theta cycle)
                 # Soma produces the AllostaticSignal that all downstream systems read.
+                somatic_state: SomaticCycleState | None = None
                 if self._soma is not None:
+                    soma_t0 = time.monotonic()
                     try:
                         await self._soma.run_cycle()
+                        soma_elapsed_ms = (time.monotonic() - soma_t0) * 1000.0
+                        # Snapshot signal immediately after Soma ran
+                        signal = self._soma.get_current_signal()
+                        sensed = signal.state.sensed
+                        from ecodiaos.systems.soma.types import InteroceptiveDimension
+                        somatic_state = SomaticCycleState(
+                            urgency=signal.urgency,
+                            dominant_error=signal.dominant_error.value
+                            if hasattr(signal.dominant_error, "value")
+                            else str(signal.dominant_error),
+                            arousal_sensed=sensed.get(InteroceptiveDimension.AROUSAL, 0.4),
+                            energy_sensed=sensed.get(InteroceptiveDimension.ENERGY, 0.6),
+                            precision_weights={
+                                k.value if hasattr(k, "value") else str(k): v
+                                for k, v in signal.precision_weights.items()
+                            },
+                            nearest_attractor=signal.nearest_attractor,
+                            trajectory_heading=signal.trajectory_heading,
+                            soma_cycle_ms=round(soma_elapsed_ms, 3),
+                        )
                     except Exception as soma_exc:
                         self._logger.error(
                             "soma_cycle_error",
@@ -269,6 +312,7 @@ class CognitiveClock:
                     salience_composite=(
                         broadcast.salience.composite if broadcast else 0.0
                     ),
+                    somatic=somatic_state,
                 )
 
                 # 7. Fire the on_cycle callback
@@ -309,13 +353,30 @@ class CognitiveClock:
         """
         Read the organism's current arousal and smooth with EMA.
 
+        Prefers Soma's interoceptive AROUSAL dimension (sensed directly from
+        compute/token throughput) over Atune's affective arousal (derived from
+        percept characteristics). Falls back to Atune when Soma hasn't run yet.
+
         High arousal = faster cycles (more alert, reactive).
         Low arousal = slower cycles (reflective, energy-conserving).
         """
-        try:
-            raw_arousal = self._atune.current_affect.arousal
-        except Exception:
-            raw_arousal = 0.1
+        raw_arousal = 0.1
+        # Prefer Soma's sensed arousal (interoceptive ground truth)
+        if self._soma is not None:
+            try:
+                signal = self._soma.get_current_signal()
+                from ecodiaos.systems.soma.types import InteroceptiveDimension
+                raw_arousal = signal.state.sensed.get(
+                    InteroceptiveDimension.AROUSAL, 0.1
+                )
+            except Exception:
+                pass
+        # Fall back to Atune's affective arousal
+        if raw_arousal == 0.1:
+            try:
+                raw_arousal = self._atune.current_affect.arousal
+            except Exception:
+                pass
 
         # Exponential moving average smoothing
         self._current_arousal = (

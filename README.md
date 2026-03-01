@@ -59,7 +59,7 @@ pip install -e ".[dev]"
 pytest
 
 # Run locally (requires Neo4j, TimescaleDB, Redis running)
-uvicorn ecodiaos.main:app --reload --port 8000
+uvicorn ecodiaos.main:app --port 8000
 ```
 
 ## Build Phases

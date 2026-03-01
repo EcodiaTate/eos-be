@@ -13,6 +13,7 @@ venv/
 env/
 ENV/
 .venv
+.venv-linux/
 pip-log.txt
 pip-delete-this-directory.txt
 

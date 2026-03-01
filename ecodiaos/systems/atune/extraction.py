@@ -10,6 +10,8 @@ workspace cycle (budget: ≤2 000 ms, performed outside the theta rhythm).
 
 from __future__ import annotations
 
+import json
+import re
 from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
@@ -29,7 +31,17 @@ logger = structlog.get_logger("ecodiaos.systems.atune.extraction")
 class ExtractionLLMClient(Protocol):
     """Minimal interface for the LLM client used by entity extraction."""
 
-    async def complete_json(self, prompt: str) -> dict[str, Any]: ...
+    async def generate(
+        self,
+        system_prompt: str,
+        messages: list[Any],
+        max_tokens: int = ...,
+        temperature: float = ...,
+        output_format: str | None = ...,
+        *,
+        cache_system: str = ...,
+        cache_method: str = ...,
+    ) -> Any: ...
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +108,21 @@ async def extract_entities_and_relations(
     )
 
     try:
-        result = await llm_client.complete_json(prompt)
+        from ecodiaos.clients.llm import Message
+
+        response = await llm_client.generate(
+            system_prompt="You are a precise entity extraction engine. Always respond with valid JSON only.",
+            messages=[Message(role="user", content=prompt)],
+            max_tokens=2000,
+            temperature=0.2,
+            output_format="json",
+            cache_system="atune.entity_extraction",
+            cache_method="extract",
+        )
+        raw_text = response.text or ""
+        # Strip markdown code fences if present
+        json_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
+        result: dict[str, Any] = json.loads(json_text)
     except Exception:
         logger.warning("extraction_llm_failed", percept_id=percept.id, exc_info=True)
         return ExtractionResult(source_percept_id=percept.id)

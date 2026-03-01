@@ -1,12 +1,12 @@
 """
-Regression tests: Simula self-evolution with Hunter loaded.
+Regression tests: Simula self-evolution with Inspector loaded.
 
-Verifies that loading the Hunter module (Phase 7) does not break any
+Verifies that loading the Inspector module (Phase 7) does not break any
 existing Simula self-evolution functionality. These tests import all
-Hunter sub-modules, wire them into SimulaService, and exercise the
+Inspector sub-modules, wire them into SimulaService, and exercise the
 core evolution pipeline to ensure no regressions.
 
-Phase 10.3 of HUNTER_IMPLEMENTATION_PLAN.md.
+Phase 10.3 of INSPECTOR_IMPLEMENTATION_PLAN.md.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import pytest
 
 from ecodiaos.config import SimulaConfig
 from ecodiaos.systems.simula.service import SimulaService
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     ChangeCategory,
     ChangeSpec,
     CodeChangeResult,
@@ -43,7 +43,7 @@ def _make_config(**overrides) -> SimulaConfig:
         "max_code_agent_turns": 5,
         "test_command": "pytest",
         "auto_apply_self_applicable": True,
-        "hunter_enabled": False,
+        "inspector_enabled": False,
     }
     defaults.update(overrides)
     return SimulaConfig(**defaults)
@@ -80,13 +80,13 @@ def _make_proposal(
     )
 
 
-async def _make_service_with_hunter_loaded() -> SimulaService:
+async def _make_service_with_inspector_loaded() -> SimulaService:
     """
-    Build a SimulaService and manually attach Hunter sub-system.
-    This simulates what initialize() does when hunter_enabled=True,
+    Build a SimulaService and manually attach Inspector sub-system.
+    This simulates what initialize() does when inspector_enabled=True,
     without requiring actual filesystem/network setup.
     """
-    config = _make_config(hunter_enabled=False)
+    config = _make_config(inspector_enabled=False)
     llm = _make_llm()
 
     service = SimulaService(
@@ -123,27 +123,27 @@ async def _make_service_with_hunter_loaded() -> SimulaService:
     service._initialized = True
     service._current_version = 0
 
-    # Now attach Hunter — import all modules to ensure they load cleanly
-    from ecodiaos.systems.simula.hunter.analytics import (
-        HunterAnalyticsEmitter,
-        HunterAnalyticsStore,
-        HunterAnalyticsView,
+    # Now attach Inspector — import all modules to ensure they load cleanly
+    from ecodiaos.systems.simula.inspector.analytics import (
+        InspectorAnalyticsEmitter,
+        InspectorAnalyticsStore,
+        InspectorAnalyticsView,
     )
-    from ecodiaos.systems.simula.hunter.ingestor import TargetIngestor
-    from ecodiaos.systems.simula.hunter.prover import VulnerabilityProver
-    from ecodiaos.systems.simula.hunter.remediation import HunterRepairOrchestrator
-    from ecodiaos.systems.simula.hunter.service import HunterService
-    from ecodiaos.systems.simula.hunter.types import HunterConfig
-    from ecodiaos.systems.simula.hunter.workspace import TargetWorkspace
+    from ecodiaos.systems.simula.inspector.ingestor import TargetIngestor
+    from ecodiaos.systems.simula.inspector.prover import VulnerabilityProver
+    from ecodiaos.systems.simula.inspector.remediation import InspectorRepairOrchestrator
+    from ecodiaos.systems.simula.inspector.service import InspectorService
+    from ecodiaos.systems.simula.inspector.types import InspectorConfig
+    from ecodiaos.systems.simula.inspector.workspace import TargetWorkspace
 
-    hunter_config = HunterConfig(
+    inspector_config = InspectorConfig(
         authorized_targets=["localhost"],
         max_workers=2,
     )
     mock_prover = MagicMock(spec=VulnerabilityProver)
-    service._hunter = HunterService(
+    service._inspector = InspectorService(
         prover=mock_prover,
-        config=hunter_config,
+        config=inspector_config,
     )
 
     return service
@@ -152,19 +152,19 @@ async def _make_service_with_hunter_loaded() -> SimulaService:
 # ── Import Regression ──────────────────────────────────────────────────────
 
 
-class TestHunterImportRegression:
-    """Loading Hunter modules must not break existing imports."""
+class TestInspectorImportRegression:
+    """Loading Inspector modules must not break existing imports."""
 
-    def test_all_hunter_modules_importable(self):
-        """All Hunter modules should import without errors."""
-        from ecodiaos.systems.simula.hunter import (
+    def test_all_inspector_modules_importable(self):
+        """All Inspector modules should import without errors."""
+        from ecodiaos.systems.simula.inspector import (
             AttackSurface,
             AttackSurfaceType,
-            HunterAnalyticsEmitter,
-            HunterAnalyticsView,
-            HunterConfig,
-            HunterRepairOrchestrator,
-            HunterService,
+            InspectorAnalyticsEmitter,
+            InspectorAnalyticsView,
+            InspectorConfig,
+            InspectorRepairOrchestrator,
+            InspectorService,
             HuntResult,
             RemediationResult,
             RemediationStatus,
@@ -178,17 +178,17 @@ class TestHunterImportRegression:
         )
 
         # Verify they are real classes/types, not None
-        assert HunterService is not None
+        assert InspectorService is not None
         assert VulnerabilityProver is not None
         assert TargetIngestor is not None
-        assert HunterRepairOrchestrator is not None
-        assert HunterAnalyticsEmitter is not None
-        assert HunterAnalyticsView is not None
+        assert InspectorRepairOrchestrator is not None
+        assert InspectorAnalyticsEmitter is not None
+        assert InspectorAnalyticsView is not None
 
-    def test_hunter_types_dont_conflict_with_simula_types(self):
-        """Hunter types should coexist cleanly with Simula types."""
-        from ecodiaos.systems.simula.hunter.types import HunterConfig as HC
-        from ecodiaos.systems.simula.types import EvolutionProposal as EP
+    def test_inspector_types_dont_conflict_with_simula_types(self):
+        """Inspector types should coexist cleanly with Simula types."""
+        from ecodiaos.systems.simula.inspector.types import InspectorConfig as HC
+        from ecodiaos.systems.simula.evolution_types import EvolutionProposal as EP
 
         # Both should instantiate independently
         hc = HC(authorized_targets=["localhost"])
@@ -212,14 +212,14 @@ class TestHunterImportRegression:
 
 class TestEvolutionPipelineRegression:
     """
-    Core evolution pipeline tests re-run with Hunter loaded.
-    These mirror the existing tests in test_service.py but with Hunter active.
+    Core evolution pipeline tests re-run with Inspector loaded.
+    These mirror the existing tests in test_service.py but with Inspector active.
     """
 
     @pytest.mark.asyncio
-    async def test_proposal_apply_with_hunter_loaded(self):
-        """Standard ADD_EXECUTOR should be applied with Hunter active."""
-        service = await _make_service_with_hunter_loaded()
+    async def test_proposal_apply_with_inspector_loaded(self):
+        """Standard ADD_EXECUTOR should be applied with Inspector active."""
+        service = await _make_service_with_inspector_loaded()
         proposal = _make_proposal()
         result = await service.process_proposal(proposal)
 
@@ -227,9 +227,9 @@ class TestEvolutionPipelineRegression:
         assert result.version == 1
 
     @pytest.mark.asyncio
-    async def test_forbidden_category_rejected_with_hunter(self):
+    async def test_forbidden_category_rejected_with_inspector(self):
         """MODIFY_EQUOR should still be forbidden."""
-        service = await _make_service_with_hunter_loaded()
+        service = await _make_service_with_inspector_loaded()
         proposal = _make_proposal(category=ChangeCategory.MODIFY_EQUOR)
         result = await service.process_proposal(proposal)
 
@@ -237,39 +237,39 @@ class TestEvolutionPipelineRegression:
         assert "forbidden" in result.reason.lower()
 
     @pytest.mark.asyncio
-    async def test_modify_constitution_rejected_with_hunter(self):
-        service = await _make_service_with_hunter_loaded()
+    async def test_modify_constitution_rejected_with_inspector(self):
+        service = await _make_service_with_inspector_loaded()
         proposal = _make_proposal(category=ChangeCategory.MODIFY_CONSTITUTION)
         result = await service.process_proposal(proposal)
         assert result.status == ProposalStatus.REJECTED
 
     @pytest.mark.asyncio
-    async def test_modify_invariants_rejected_with_hunter(self):
-        service = await _make_service_with_hunter_loaded()
+    async def test_modify_invariants_rejected_with_inspector(self):
+        service = await _make_service_with_inspector_loaded()
         proposal = _make_proposal(category=ChangeCategory.MODIFY_INVARIANTS)
         result = await service.process_proposal(proposal)
         assert result.status == ProposalStatus.REJECTED
 
     @pytest.mark.asyncio
-    async def test_modify_self_evolution_rejected_with_hunter(self):
-        service = await _make_service_with_hunter_loaded()
+    async def test_modify_self_evolution_rejected_with_inspector(self):
+        service = await _make_service_with_inspector_loaded()
         proposal = _make_proposal(category=ChangeCategory.MODIFY_SELF_EVOLUTION)
         result = await service.process_proposal(proposal)
         assert result.status == ProposalStatus.REJECTED
 
     @pytest.mark.asyncio
-    async def test_governance_gating_with_hunter(self):
-        """MODIFY_CONTRACT should route to governance with Hunter active."""
-        service = await _make_service_with_hunter_loaded()
+    async def test_governance_gating_with_inspector(self):
+        """MODIFY_CONTRACT should route to governance with Inspector active."""
+        service = await _make_service_with_inspector_loaded()
         proposal = _make_proposal(category=ChangeCategory.MODIFY_CONTRACT)
         result = await service.process_proposal(proposal)
 
         assert result.status == ProposalStatus.AWAITING_GOVERNANCE
 
     @pytest.mark.asyncio
-    async def test_simulation_rejection_with_hunter(self):
-        """Unacceptable risk should still reject with Hunter active."""
-        service = await _make_service_with_hunter_loaded()
+    async def test_simulation_rejection_with_inspector(self):
+        """Unacceptable risk should still reject with Inspector active."""
+        service = await _make_service_with_inspector_loaded()
         service._simulator.simulate = AsyncMock(return_value=SimulationResult(
             risk_level=RiskLevel.UNACCEPTABLE,
             risk_summary="Too many regressions",
@@ -280,9 +280,9 @@ class TestEvolutionPipelineRegression:
         assert result.status == ProposalStatus.REJECTED
 
     @pytest.mark.asyncio
-    async def test_health_check_rollback_with_hunter(self):
-        """Health check failure should trigger rollback with Hunter active."""
-        service = await _make_service_with_hunter_loaded()
+    async def test_health_check_rollback_with_inspector(self):
+        """Health check failure should trigger rollback with Inspector active."""
+        service = await _make_service_with_inspector_loaded()
         service._health.check = AsyncMock(return_value=HealthCheckResult(
             healthy=False,
             issues=["Syntax error in generated code"],
@@ -294,9 +294,9 @@ class TestEvolutionPipelineRegression:
         service._rollback.restore.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_apply_failure_rollback_with_hunter(self):
-        """Apply failure should rollback with Hunter active."""
-        service = await _make_service_with_hunter_loaded()
+    async def test_apply_failure_rollback_with_inspector(self):
+        """Apply failure should rollback with Inspector active."""
+        service = await _make_service_with_inspector_loaded()
         service._applicator.apply = AsyncMock(return_value=(
             CodeChangeResult(success=False, error="Code agent failed"),
             ConfigSnapshot(proposal_id="test", config_version=0),
@@ -307,9 +307,9 @@ class TestEvolutionPipelineRegression:
         assert result.status == ProposalStatus.ROLLED_BACK
 
     @pytest.mark.asyncio
-    async def test_version_increments_with_hunter(self):
-        """Version counter should work correctly with Hunter active."""
-        service = await _make_service_with_hunter_loaded()
+    async def test_version_increments_with_inspector(self):
+        """Version counter should work correctly with Inspector active."""
+        service = await _make_service_with_inspector_loaded()
 
         for i in range(3):
             proposal = _make_proposal()
@@ -325,9 +325,9 @@ class TestEvolutionPipelineRegression:
 
 class TestStatsRegression:
     @pytest.mark.asyncio
-    async def test_stats_structure_with_hunter(self):
-        """Stats should contain all expected keys with Hunter loaded."""
-        service = await _make_service_with_hunter_loaded()
+    async def test_stats_structure_with_inspector(self):
+        """Stats should contain all expected keys with Inspector loaded."""
+        service = await _make_service_with_inspector_loaded()
         stats = service.stats
 
         # Core Simula stats
@@ -338,15 +338,15 @@ class TestStatsRegression:
         assert "proposals_rejected" in stats
         assert "proposals_rolled_back" in stats
 
-        # Hunter-specific stats
+        # Inspector-specific stats
         assert "stage7" in stats
-        assert stats["stage7"]["hunter"] is True
-        assert "hunter_stats" in stats["stage7"]
+        assert stats["stage7"]["inspector"] is True
+        assert "inspector_stats" in stats["stage7"]
 
     @pytest.mark.asyncio
-    async def test_metrics_accumulate_with_hunter(self):
+    async def test_metrics_accumulate_with_inspector(self):
         """Proposal metrics should still accumulate correctly."""
-        service = await _make_service_with_hunter_loaded()
+        service = await _make_service_with_inspector_loaded()
 
         # Approve one
         proposal = _make_proposal()

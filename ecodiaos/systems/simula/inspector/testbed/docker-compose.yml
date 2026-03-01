@@ -1,0 +1,92 @@
+# Simula Inspector — Taint Propagation Testbed
+#
+# Minimal 3-service chain for cross-service taint tracking:
+#   A (attacker) → B (api) → C (db sink)
+#
+# Taint token format: TAINT=<uuid>;
+#
+# Usage:
+#   docker compose up --build          # boots B + C, then A sends & exits
+#   docker compose logs -f service-c   # watch C for taint tokens
+#   docker compose down -v             # teardown
+
+services:
+  # ── Service C: DB Sink (must start first) ──────────────────────────
+  service-c:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+    command: ["python3", "/app/service_c.py"]
+    environment:
+      LISTEN_PORT: "9090"
+    expose:
+      - "9090"
+    networks:
+      - testbed
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/health')",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  # ── Service B: API Gateway ─────────────────────────────────────────
+  service-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+    command: ["python3", "/app/service_b.py"]
+    environment:
+      LISTEN_PORT: "8080"
+      SERVICE_C_URL: "http://service-c:9090/db/query"
+    expose:
+      - "8080"
+    ports:
+      - "8080:8080"
+    networks:
+      - testbed
+    depends_on:
+      service-c:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  # ── Service A: Client / Attacker ───────────────────────────────────
+  service-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+    command:
+      [
+        "python3",
+        "/app/service_a.py",
+        "--target",
+        "http://service-b:8080/api/process",
+        "--loop",
+        "3",
+      ]
+    networks:
+      - testbed
+    depends_on:
+      service-b:
+        condition: service_healthy
+
+networks:
+  testbed:
+    driver: bridge

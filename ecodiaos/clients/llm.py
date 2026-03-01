@@ -27,9 +27,11 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# Retry configuration
-_MAX_RETRIES = 3
-_BASE_DELAY_S = 1.0
+# Retry configuration — reduced from 3 retries / 1s base to 2 retries / 0.5s base.
+# Old config: up to 7s of retry delays (1+2+4) which exceeded the 5s deliberation budget.
+# New config: up to 1.5s of retry delays (0.5+1) which fits within tight budgets.
+_MAX_RETRIES = 2
+_BASE_DELAY_S = 0.5
 _RETRYABLE_STATUS_CODES = {429, 503, 529}
 
 
@@ -238,6 +240,11 @@ class AnthropicProvider(LLMProvider):
         self._budget = token_budget
         # Strip whitespace/newlines — GCP Secret Manager can inject trailing \r\n
         clean_key = api_key.strip()
+        # Timeout reduced from 60s to 10s. The deliberation engine has a 5s
+        # end-to-end budget; a 60s httpx timeout meant a single hung request
+        # could starve the event loop for a full minute before asyncio.timeout
+        # could cancel it. 10s gives headroom for slow responses while still
+        # allowing the cancellation machinery to work within budget.
         self._client = httpx.AsyncClient(
             base_url="https://api.anthropic.com/v1",
             headers={
@@ -245,7 +252,7 @@ class AnthropicProvider(LLMProvider):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            timeout=60.0,
+            timeout=10.0,
         )
 
     async def _post_with_retry(
@@ -1078,8 +1085,9 @@ class BedrockProvider(LLMProvider):
             "anthropic_version": "bedrock-2023-05-31",
         }
 
-        # Bedrock InvokeModel is synchronous; wrap in thread pool
-        loop = asyncio.get_event_loop()
+        # Bedrock InvokeModel is synchronous; wrap in thread pool so
+        # the event loop is not blocked during the network call.
+        loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
             lambda: self._client.invoke_model(modelId=self._model, body=_json.dumps(body).encode())
@@ -1140,7 +1148,7 @@ class BedrockProvider(LLMProvider):
             "anthropic_version": "bedrock-2023-05-31",
         }
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
             lambda: self._client.invoke_model(modelId=self._model, body=_json.dumps(body).encode())

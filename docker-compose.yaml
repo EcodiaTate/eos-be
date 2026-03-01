@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ─── Core Service ───────────────────────────────────────────────
   ecodiaos-core:
@@ -8,15 +6,15 @@ services:
       dockerfile: Dockerfile
     container_name: ecodiaos-core
     ports:
-      - "8000:8000"   # HTTP API
-      - "8001:8001"   # WebSocket (Alive telemetry)
+      - "8000:8000" # HTTP API
+      - "8001:8001" # WebSocket (Alive telemetry)
       # 8002 — Federation (disabled by default)
     env_file: .env
     environment:
       - ECODIAOS_CONFIG_PATH=/app/config/default.yaml
       - ECODIAOS_SEED_PATH=/app/config/seeds/example_seed.yaml
     volumes:
-      - ./src:/app/src:ro
+      - ./ecodiaos:/app/ecodiaos:ro
       - ./config:/app/config:ro
     depends_on:
       timescaledb:
@@ -69,10 +67,40 @@ services:
     networks:
       - ecodiaos_network
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${ECODIAOS_REDIS_PASSWORD:-ecodiaos_dev}", "ping"]
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "-a",
+          "${ECODIAOS_REDIS_PASSWORD:-ecodiaos_dev}",
+          "ping",
+        ]
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
+
+  # ─── Simula Worker (Evolution pipeline) ─────────────────────────
+  simula-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecodiaos-simula-worker
+    command: python -m ecodiaos.simula_worker
+    env_file: .env
+    environment:
+      - ECODIAOS_CONFIG_PATH=/app/config/default.yaml
+    volumes:
+      - ./ecodiaos:/app/ecodiaos
+      - ./config:/app/config:ro
+      - ../.claude:/app/.claude:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ecodiaos_network
     restart: unless-stopped
 
   # ─── Frontend (Alive Visualization) ─────────────────────────────

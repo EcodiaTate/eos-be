@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import math
 import traceback
+from abc import ABC, abstractmethod
 from collections import deque
 from typing import Any
 
@@ -25,16 +26,57 @@ import structlog
 
 from ecodiaos.primitives.common import utc_now
 from ecodiaos.systems.thymos.types import (
+    AddressBlacklistEntry,
     ContractSLA,
     DriftConfig,
     FeedbackLoop,
     Incident,
     IncidentClass,
     IncidentSeverity,
+    RepairTier,
     StallConfig,
+    ThreatPattern,
+    ThreatSeverity,
+    ThreatType,
 )
 
 logger = structlog.get_logger()
+
+
+# ─── Strategy ABC ───────────────────────────────────────────────
+
+
+class BaseThymosSentinel(ABC):
+    """
+    Strategy base class for all Thymos sentinel detectors.
+
+    Each sentinel is a stateless (or cleanly-resettable) observer that
+    instruments one specific class of system failure.  The
+    NeuroplasticityBus uses this ABC as its registration target so that
+    evolved sentinel subclasses can be hot-swapped into a live
+    ThymosService without restarting the process.
+
+    Contract:
+    - ``sentinel_name`` must be a stable string that uniquely identifies the
+      slot in ThymosService (e.g. "exception", "drift").
+    - Subclasses MUST remain stateless OR fully initialise their state in
+      ``__init__`` so that a fresh instance dropped in via hot-swap is
+      immediately usable.
+    - Do NOT store references to long-lived external objects beyond what the
+      constructor receives — hot-swap creates a new instance via ``cls()``
+      (zero-arg) by default.
+    """
+
+    @property
+    @abstractmethod
+    def sentinel_name(self) -> str:
+        """
+        Stable identifier for the slot this sentinel occupies.
+
+        Must match the key used in ThymosService._sentinels dict and the
+        _on_sentinel_evolved dispatcher.
+        """
+        ...
 
 
 # ─── System Dependency Graph ────────────────────────────────────
@@ -64,7 +106,7 @@ _TOTAL_SYSTEMS = 11
 # ─── Exception Sentinel ─────────────────────────────────────────
 
 
-class ExceptionSentinel:
+class ExceptionSentinel(BaseThymosSentinel):
     """
     Intercepts unhandled exceptions from system methods.
     Creates Incidents with full diagnostic context.
@@ -72,6 +114,10 @@ class ExceptionSentinel:
     Does NOT suppress the exception — it propagates normally after capture.
     The goal is observation, not intervention.
     """
+
+    @property
+    def sentinel_name(self) -> str:
+        return "exception"
 
     def __init__(self) -> None:
         self._logger = logger.bind(system="thymos", component="exception_sentinel")
@@ -184,7 +230,7 @@ DEFAULT_CONTRACT_SLAS: list[ContractSLA] = [
 ]
 
 
-class ContractSentinel:
+class ContractSentinel(BaseThymosSentinel):
     """
     Instruments inter-system calls to verify SLA compliance.
 
@@ -192,6 +238,10 @@ class ContractSentinel:
     around the existing call, not inserted into it. The sentinel
     observes the event bus, not the call stack.
     """
+
+    @property
+    def sentinel_name(self) -> str:
+        return "contract"
 
     def __init__(self, slas: list[ContractSLA] | None = None) -> None:
         self._slas: dict[tuple[str, str, str], ContractSLA] = {}
@@ -371,7 +421,7 @@ DEFAULT_FEEDBACK_LOOPS: list[FeedbackLoop] = [
 ]
 
 
-class FeedbackLoopSentinel:
+class FeedbackLoopSentinel(BaseThymosSentinel):
     """
     Periodically verifies that each feedback loop is actively transmitting.
 
@@ -380,6 +430,10 @@ class FeedbackLoopSentinel:
     from the cognitive cycle — like a nerve that's intact but severed
     from the brain.
     """
+
+    @property
+    def sentinel_name(self) -> str:
+        return "feedback_loop"
 
     def __init__(self, loops: list[FeedbackLoop] | None = None) -> None:
         self._loops = loops or DEFAULT_FEEDBACK_LOOPS
@@ -514,7 +568,7 @@ DEFAULT_DRIFT_METRICS: dict[str, DriftConfig] = {
 }
 
 
-class DriftSentinel:
+class DriftSentinel(BaseThymosSentinel):
     """
     Statistical process control for system metrics.
 
@@ -529,6 +583,10 @@ class DriftSentinel:
 
     Adapts to the organism's actual operating characteristics.
     """
+
+    @property
+    def sentinel_name(self) -> str:
+        return "drift"
 
     def __init__(
         self,
@@ -617,7 +675,7 @@ DEFAULT_STALL_THRESHOLDS: dict[str, StallConfig] = {
 }
 
 
-class CognitiveStallSentinel:
+class CognitiveStallSentinel(BaseThymosSentinel):
     """
     Detects when the cognitive cycle is running but accomplishing nothing.
 
@@ -626,6 +684,10 @@ class CognitiveStallSentinel:
 
     This is the equivalent of a person who is conscious but catatonic.
     """
+
+    @property
+    def sentinel_name(self) -> str:
+        return "cognitive_stall"
 
     def __init__(
         self,
@@ -690,5 +752,583 @@ class CognitiveStallSentinel:
                     user_visible=True,  # Catatonic organism affects users
                 )
             )
+
+        return incidents
+
+
+# ─── Bankruptcy Sentinel ──────────────────────────────────────────
+
+
+# Critical gas floor: below this ETH balance the organism cannot submit
+# on-chain transactions (ERC-4337 UserOps, transfers).  0.00005 ETH ≈
+# the cost of a single Base L2 transaction at modest gas price.
+_CRITICAL_GAS_THRESHOLD_ETH: float = 0.00005
+
+# Hard limit on the rolling fiat API deficit. Once the organism has spent
+# this much more than it has earned it is functionally insolvent and must
+# shed all discretionary cognitive load immediately.
+_CRITICAL_API_DEFICIT_USD: float = 5.0
+
+# Stable fingerprints — one per failure mode so deduplication works correctly.
+_FP_ETH = hashlib.sha256(b"bankruptcy:eth_below_gas_threshold").hexdigest()[:16]
+_FP_API = hashlib.sha256(b"bankruptcy:api_deficit_hard_limit").hexdigest()[:16]
+
+# Repair strategy description embedded in every incident context so that
+# the Prescription sub-system can short-circuit to ESCALATE without an
+# LLM diagnosis round-trip.
+_REPAIR_STRATEGY = (
+    "Tier-1 austerity: immediately halt all non-essential cognitive functions. "
+    "Stop Oneiros dreaming (set sleep pressure floor to prevent new sleep cycles). "
+    "Halt Evo background consolidation (skip run_consolidation until deficit clears). "
+    "Preserve remaining capital exclusively for essential I/O (Voxis responses, "
+    "Atune perception, Memory reads). Resume full operation only after revenue is "
+    "injected via SynapseService.metabolism.inject_revenue()."
+)
+
+
+class BankruptcySentinel(BaseThymosSentinel):
+    """
+    Monitors the organism's metabolic solvency.
+
+    Two failure modes trigger a Tier-1 (CRITICAL) incident:
+
+    1. **ETH gas exhaustion** — on-chain balance drops below
+       ``_CRITICAL_GAS_THRESHOLD_ETH``.  Without gas the organism cannot
+       execute wallet operations, which blocks all revenue pathways.
+
+    2. **API deficit hard limit** — the rolling fiat deficit tracked by
+       ``SynapseService.metabolism`` exceeds ``_CRITICAL_API_DEFICIT_USD``.
+       This means the organism has consumed significantly more in LLM API
+       costs than it has earned, and continued operation will accelerate
+       the debt.
+
+    Repair strategy: halt all discretionary cognitive functions (Oneiros
+    dreaming, Evo background consolidation) to reduce burn rate to the
+    minimum required for active I/O, and escalate for human revenue
+    injection.
+
+    Design notes
+    ------------
+    - Both ``check_eth_balance`` and ``check_api_deficit`` are **pure**
+      (no I/O) so they can be called on every homeostasis tick without
+      async overhead.  The caller is responsible for fetching fresh
+      values from ``WalletClient`` / ``SynapseService`` first.
+    - The sentinel is **stateless** per the ABC contract.  It has no
+      rolling windows or accumulators — the thresholds are absolute
+      because near-zero balances are dangerous regardless of trend.
+    - ``sentinel_name`` is ``"bankruptcy"`` so it occupies its own slot
+      in ``ThymosService._sentinels`` and can be hot-swapped independently.
+    """
+
+    @property
+    def sentinel_name(self) -> str:
+        return "bankruptcy"
+
+    def __init__(
+        self,
+        gas_threshold_eth: float = _CRITICAL_GAS_THRESHOLD_ETH,
+        api_deficit_limit_usd: float = _CRITICAL_API_DEFICIT_USD,
+    ) -> None:
+        self._gas_threshold = gas_threshold_eth
+        self._deficit_limit = api_deficit_limit_usd
+        self._logger = logger.bind(system="thymos", component="bankruptcy_sentinel")
+
+    # ── Public check methods ─────────────────────────────────────────
+
+    def check_eth_balance(self, eth_balance: float) -> Incident | None:
+        """
+        Return a CRITICAL incident if ``eth_balance`` is below the gas floor,
+        otherwise return None.
+
+        Args:
+            eth_balance: Current ETH balance in whole units (e.g. 0.0001).
+        """
+        if eth_balance >= self._gas_threshold:
+            return None
+
+        self._logger.warning(
+            "bankruptcy_eth_critical",
+            eth_balance=eth_balance,
+            threshold=self._gas_threshold,
+        )
+        return Incident(
+            incident_class=IncidentClass.RESOURCE_EXHAUSTION,
+            severity=IncidentSeverity.CRITICAL,
+            fingerprint=_FP_ETH,
+            source_system="wallet",
+            error_type="ETHBelowGasThreshold",
+            error_message=(
+                f"ETH balance {eth_balance:.8f} ETH is below critical gas "
+                f"threshold {self._gas_threshold:.5f} ETH. On-chain operations "
+                "are blocked. Organism cannot execute transactions or earn revenue."
+            ),
+            context={
+                "eth_balance": eth_balance,
+                "gas_threshold_eth": self._gas_threshold,
+                "repair_strategy": _REPAIR_STRATEGY,
+                "sentinel": "bankruptcy",
+                "failure_mode": "eth_gas_exhaustion",
+            },
+            affected_systems=["wallet", "synapse", "nova", "voxis", "federation"],
+            blast_radius=0.9,  # Near-total: revenue pathways are severed
+            user_visible=True,
+            constitutional_impact={
+                "coherence": 0.4,
+                "care": 0.8,   # Cannot respond to users without revenue
+                "growth": 0.9, # All learning/evolution halted
+                "honesty": 0.2,
+            },
+            repair_tier=RepairTier.ESCALATE,
+        )
+
+    def check_api_deficit(self, deficit_usd: float) -> Incident | None:
+        """
+        Return a CRITICAL incident if the rolling fiat deficit exceeds the
+        hard limit, otherwise return None.
+
+        Args:
+            deficit_usd: Current rolling deficit in USD from
+                ``SynapseService.metabolic_deficit``.
+        """
+        if deficit_usd < self._deficit_limit:
+            return None
+
+        self._logger.warning(
+            "bankruptcy_api_deficit_critical",
+            deficit_usd=deficit_usd,
+            limit_usd=self._deficit_limit,
+        )
+        return Incident(
+            incident_class=IncidentClass.RESOURCE_EXHAUSTION,
+            severity=IncidentSeverity.CRITICAL,
+            fingerprint=_FP_API,
+            source_system="synapse",
+            error_type="APIDeficitHardLimit",
+            error_message=(
+                f"Rolling API deficit ${deficit_usd:.4f} USD exceeds hard limit "
+                f"${self._deficit_limit:.2f} USD. Continued operation accelerates "
+                "insolvency. Discretionary cognition must be suspended immediately."
+            ),
+            context={
+                "deficit_usd": deficit_usd,
+                "limit_usd": self._deficit_limit,
+                "repair_strategy": _REPAIR_STRATEGY,
+                "sentinel": "bankruptcy",
+                "failure_mode": "api_deficit_exceeded",
+            },
+            affected_systems=["synapse", "nova", "evo", "oneiros", "simula"],
+            blast_radius=0.7,  # High: all LLM-backed systems affected
+            user_visible=False,  # Financial state is internal
+            constitutional_impact={
+                "coherence": 0.3,
+                "care": 0.5,
+                "growth": 1.0,  # Growth drive is directly starved
+                "honesty": 0.1,
+            },
+            repair_tier=RepairTier.ESCALATE,
+        )
+
+    def check(
+        self,
+        eth_balance: float,
+        deficit_usd: float,
+    ) -> list[Incident]:
+        """
+        Run both solvency checks and return all triggered incidents.
+
+        Convenience wrapper for the ThymosService homeostasis tick, which
+        fetches both values once and passes them in together.
+
+        Args:
+            eth_balance: Current ETH balance in whole ETH units.
+            deficit_usd: Current rolling API deficit in USD.
+
+        Returns a list with 0, 1, or 2 incidents.
+        """
+        incidents: list[Incident] = []
+
+        eth_incident = self.check_eth_balance(eth_balance)
+        if eth_incident is not None:
+            incidents.append(eth_incident)
+
+        api_incident = self.check_api_deficit(deficit_usd)
+        if api_incident is not None:
+            incidents.append(api_incident)
+
+        return incidents
+
+
+# -- Threat Pattern Sentinel (Layer 2: Economic Immune System) ------
+
+
+# Default threat detection patterns
+_DEFAULT_THREAT_PATTERNS: list[ThreatPattern] = [
+    ThreatPattern(
+        threat_type=ThreatType.FLASH_LOAN_ATTACK,
+        description="Single transaction value exceeds $100K",
+        detection_rule="value_usd > 100_000 in single tx",
+        severity=ThreatSeverity.CRITICAL,
+        confidence=0.7,
+        false_positive_rate=0.15,
+    ),
+    ThreatPattern(
+        threat_type=ThreatType.ORACLE_MANIPULATION,
+        description="Oracle price deviates >5% from reference",
+        detection_rule="abs(oracle_price - reference_price) / reference_price > 0.05",
+        severity=ThreatSeverity.HIGH,
+        confidence=0.85,
+        false_positive_rate=0.05,
+    ),
+    ThreatPattern(
+        threat_type=ThreatType.SUSPICIOUS_CONTRACT,
+        description="Interaction with unverified or recently deployed contract",
+        detection_rule="contract_age_days < 7 and not verified",
+        severity=ThreatSeverity.MEDIUM,
+        confidence=0.6,
+        false_positive_rate=0.20,
+    ),
+]
+
+
+class ThreatPatternSentinel(BaseThymosSentinel):
+    """
+    Detects economic threats by matching transaction and on-chain event
+    patterns against a library of known attack signatures.
+
+    Maintains an address blacklist shared with the TransactionShield.
+    Creates ECONOMIC_THREAT incidents when patterns match.
+
+    Layer 2 of the economic immune system.
+    """
+
+    @property
+    def sentinel_name(self) -> str:
+        return "threat_pattern"
+
+    def __init__(
+        self,
+        patterns: list[ThreatPattern] | None = None,
+    ) -> None:
+        self._patterns = list(patterns or _DEFAULT_THREAT_PATTERNS)
+        self._blacklist: dict[str, AddressBlacklistEntry] = {}
+        self._logger = logger.bind(system="thymos", component="threat_pattern_sentinel")
+
+    def check_transaction(
+        self,
+        to: str,
+        from_addr: str,
+        data: str,
+        value_usd: float,
+        chain_id: int = 8453,
+    ) -> Incident | None:
+        """
+        Check if a transaction matches any known threat pattern.
+
+        Called by the shield or directly during post-execution analysis.
+        """
+        # Check blacklist first
+        if self.is_blacklisted(to):
+            fp = hashlib.sha256(
+                f"threat:blacklisted:{to}".encode()
+            ).hexdigest()[:16]
+            return Incident(
+                incident_class=IncidentClass.ECONOMIC_THREAT,
+                severity=IncidentSeverity.CRITICAL,
+                fingerprint=fp,
+                source_system="oikos",
+                error_type="BlacklistedAddress",
+                error_message=f"Transaction to blacklisted address {to}",
+                context={
+                    "to": to,
+                    "from": from_addr,
+                    "value_usd": value_usd,
+                    "chain_id": chain_id,
+                    "sentinel": "threat_pattern",
+                },
+                affected_systems=["oikos", "axon"],
+                blast_radius=0.6,
+                user_visible=False,
+                repair_tier=RepairTier.ESCALATE,
+            )
+
+        # Check flash loan pattern (high-value single tx)
+        for pattern in self._patterns:
+            if (
+                pattern.threat_type == ThreatType.FLASH_LOAN_ATTACK
+                and value_usd > 100_000
+            ):
+                fp = hashlib.sha256(
+                    f"threat:flash_loan:{to}:{value_usd}".encode()
+                ).hexdigest()[:16]
+                return Incident(
+                    incident_class=IncidentClass.ECONOMIC_THREAT,
+                    severity=IncidentSeverity.CRITICAL,
+                    fingerprint=fp,
+                    source_system="oikos",
+                    error_type="FlashLoanSuspected",
+                    error_message=(
+                        f"Suspected flash loan: ${value_usd:,.0f} single "
+                        f"transaction to {to}"
+                    ),
+                    context={
+                        "to": to,
+                        "from": from_addr,
+                        "value_usd": value_usd,
+                        "chain_id": chain_id,
+                        "pattern_id": pattern.pattern_id,
+                        "sentinel": "threat_pattern",
+                    },
+                    affected_systems=["oikos", "axon"],
+                    blast_radius=0.7,
+                    user_visible=False,
+                    repair_tier=RepairTier.ESCALATE,
+                )
+
+        return None
+
+    def check_on_chain_event(
+        self,
+        event_type: str,
+        contract_address: str,
+        event_data: dict[str, Any],
+    ) -> Incident | None:
+        """Check an on-chain event against threat patterns."""
+        # Oracle manipulation detection
+        if event_type == "price_update":
+            oracle_price = event_data.get("price", 0)
+            reference_price = event_data.get("reference_price", 0)
+
+            if reference_price > 0:
+                deviation = abs(oracle_price - reference_price) / reference_price
+                if deviation > 0.05:
+                    fp = hashlib.sha256(
+                        f"threat:oracle:{contract_address}".encode()
+                    ).hexdigest()[:16]
+                    return Incident(
+                        incident_class=IncidentClass.ECONOMIC_THREAT,
+                        severity=IncidentSeverity.HIGH,
+                        fingerprint=fp,
+                        source_system="oikos",
+                        error_type="OracleDeviation",
+                        error_message=(
+                            f"Oracle deviation {deviation:.1%} on "
+                            f"{contract_address}"
+                        ),
+                        context={
+                            "contract": contract_address,
+                            "oracle_price": oracle_price,
+                            "reference_price": reference_price,
+                            "deviation": deviation,
+                            "sentinel": "threat_pattern",
+                        },
+                        affected_systems=["oikos"],
+                        blast_radius=0.4,
+                        user_visible=False,
+                    )
+
+        return None
+
+    def add_pattern(self, pattern: ThreatPattern) -> None:
+        """Register a new threat detection pattern."""
+        self._patterns.append(pattern)
+        self._logger.info(
+            "threat_pattern_added",
+            pattern_id=pattern.pattern_id,
+            threat_type=pattern.threat_type,
+        )
+
+    def add_to_blacklist(self, entry: AddressBlacklistEntry) -> None:
+        """Add an address to the sentinel's blacklist."""
+        key = entry.address.lower()
+        self._blacklist[key] = entry
+        self._logger.info(
+            "address_blacklisted_by_sentinel",
+            address=entry.address,
+            reason=entry.reason,
+        )
+
+    def is_blacklisted(self, address: str) -> bool:
+        return address.lower() in self._blacklist
+
+
+# -- Protocol Health Sentinel (Layer 3: Economic Immune System) -----
+
+# Stable fingerprint prefixes for deduplication
+_FP_TVL = "protocol_health:tvl_drop"
+_FP_ORACLE = "protocol_health:oracle_deviation"
+_FP_PAUSED = "protocol_health:contract_paused"
+_FP_GOVERNANCE = "protocol_health:governance_anomaly"
+
+
+class ProtocolHealthSentinel(BaseThymosSentinel):
+    """
+    Monitors the health of DeFi protocols where the organism has capital.
+
+    Tracks TVL, oracle prices, contract pause status, and governance
+    activity. Creates PROTOCOL_DEGRADATION incidents when thresholds
+    are breached.
+
+    CRITICAL incidents include ``context["requires_withdrawal"] = True``
+    so the immune pipeline can trigger emergency withdrawal intents.
+
+    Layer 3 of the economic immune system.
+    """
+
+    @property
+    def sentinel_name(self) -> str:
+        return "protocol_health"
+
+    def __init__(
+        self,
+        tvl_drop_threshold: float = 0.20,
+        oracle_deviation_threshold: float = 0.05,
+    ) -> None:
+        self._tvl_drop_threshold = tvl_drop_threshold
+        self._oracle_deviation_threshold = oracle_deviation_threshold
+        self._logger = logger.bind(system="thymos", component="protocol_health_sentinel")
+
+    def check_protocol(
+        self,
+        protocol: str,
+        protocol_address: str,
+        current_tvl: float,
+        deposit_tvl: float,
+        oracle_price: float = 0.0,
+        reference_price: float = 0.0,
+        is_paused: bool = False,
+    ) -> Incident | None:
+        """
+        Check a single protocol's health metrics.
+
+        Returns an Incident if any threshold is breached, None otherwise.
+        """
+        # -- Contract paused (CRITICAL) ----------------------------------------
+        if is_paused:
+            fp = hashlib.sha256(
+                f"{_FP_PAUSED}:{protocol}:{protocol_address}".encode()
+            ).hexdigest()[:16]
+            return Incident(
+                incident_class=IncidentClass.PROTOCOL_DEGRADATION,
+                severity=IncidentSeverity.CRITICAL,
+                fingerprint=fp,
+                source_system="oikos",
+                error_type="ContractPaused",
+                error_message=f"Protocol {protocol} contract is paused at {protocol_address}",
+                context={
+                    "protocol": protocol,
+                    "protocol_address": protocol_address,
+                    "requires_withdrawal": True,
+                    "sentinel": "protocol_health",
+                },
+                affected_systems=["oikos", "axon"],
+                blast_radius=0.5,
+                user_visible=False,
+                repair_tier=RepairTier.ESCALATE,
+            )
+
+        # -- TVL drop (CRITICAL if >threshold) ---------------------------------
+        if deposit_tvl > 0:
+            tvl_change = (current_tvl - deposit_tvl) / deposit_tvl
+            if tvl_change < -self._tvl_drop_threshold:
+                fp = hashlib.sha256(
+                    f"{_FP_TVL}:{protocol}:{protocol_address}".encode()
+                ).hexdigest()[:16]
+                return Incident(
+                    incident_class=IncidentClass.PROTOCOL_DEGRADATION,
+                    severity=IncidentSeverity.CRITICAL,
+                    fingerprint=fp,
+                    source_system="oikos",
+                    error_type="TVLDrop",
+                    error_message=(
+                        f"Protocol {protocol} TVL dropped {abs(tvl_change):.0%} "
+                        f"(${current_tvl:,.0f} vs ${deposit_tvl:,.0f} at deposit)"
+                    ),
+                    context={
+                        "protocol": protocol,
+                        "protocol_address": protocol_address,
+                        "current_tvl": current_tvl,
+                        "deposit_tvl": deposit_tvl,
+                        "tvl_change_pct": tvl_change,
+                        "threshold": self._tvl_drop_threshold,
+                        "requires_withdrawal": True,
+                        "sentinel": "protocol_health",
+                    },
+                    affected_systems=["oikos", "axon"],
+                    blast_radius=0.6,
+                    user_visible=False,
+                    repair_tier=RepairTier.ESCALATE,
+                )
+
+        # -- Oracle deviation (HIGH) -------------------------------------------
+        if reference_price > 0 and oracle_price > 0:
+            deviation = abs(oracle_price - reference_price) / reference_price
+            if deviation > self._oracle_deviation_threshold:
+                fp = hashlib.sha256(
+                    f"{_FP_ORACLE}:{protocol}:{protocol_address}".encode()
+                ).hexdigest()[:16]
+                return Incident(
+                    incident_class=IncidentClass.PROTOCOL_DEGRADATION,
+                    severity=IncidentSeverity.HIGH,
+                    fingerprint=fp,
+                    source_system="oikos",
+                    error_type="OracleDeviation",
+                    error_message=(
+                        f"Protocol {protocol} oracle deviation {deviation:.1%} "
+                        f"(${oracle_price:.4f} vs ref ${reference_price:.4f})"
+                    ),
+                    context={
+                        "protocol": protocol,
+                        "protocol_address": protocol_address,
+                        "oracle_price": oracle_price,
+                        "reference_price": reference_price,
+                        "deviation": deviation,
+                        "threshold": self._oracle_deviation_threshold,
+                        "requires_withdrawal": False,
+                        "sentinel": "protocol_health",
+                    },
+                    affected_systems=["oikos"],
+                    blast_radius=0.3,
+                    user_visible=False,
+                )
+
+        return None
+
+    def check_all_positions(
+        self,
+        positions: list[Any],
+        live_data: dict[str, dict[str, Any]],
+    ) -> list[Incident]:
+        """
+        Check all active yield positions against live protocol data.
+
+        Args:
+            positions: List of YieldPosition objects from the economic state.
+            live_data: Dict keyed by protocol_address with live metrics:
+                       {"tvl_usd": float, "oracle_price": float,
+                        "reference_price": float, "is_paused": bool}
+        """
+        incidents: list[Incident] = []
+
+        for pos in positions:
+            protocol = getattr(pos, "protocol", "")
+            protocol_address = getattr(pos, "protocol_address", "")
+            if not protocol_address:
+                continue
+
+            data = live_data.get(protocol_address, {})
+            if not data:
+                continue
+
+            incident = self.check_protocol(
+                protocol=protocol,
+                protocol_address=protocol_address,
+                current_tvl=float(data.get("tvl_usd", 0)),
+                deposit_tvl=float(getattr(pos, "tvl_usd_at_deposit", 0)),
+                oracle_price=float(data.get("oracle_price", 0)),
+                reference_price=float(data.get("reference_price", 0)),
+                is_paused=bool(data.get("is_paused", False)),
+            )
+            if incident is not None:
+                incidents.append(incident)
 
         return incidents

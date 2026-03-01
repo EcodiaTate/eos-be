@@ -20,7 +20,7 @@ from ecodiaos.clients.context_compression import (
 )
 from ecodiaos.clients.embedding import cosine_similarity, MockEmbeddingClient
 from ecodiaos.systems.simula.history import EvolutionHistoryManager
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     ChangeCategory,
     EvolutionRecord,
     RiskLevel,

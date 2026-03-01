@@ -13,7 +13,7 @@ import pytest
 
 from ecodiaos.config import SimulaConfig
 from ecodiaos.systems.simula.simulation import ChangeSimulator
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     ChangeCategory,
     ChangeSpec,
     EvolutionProposal,

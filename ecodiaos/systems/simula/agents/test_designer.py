@@ -39,7 +39,7 @@ from ecodiaos.systems.simula.verification.types import TestDesignResult
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from ecodiaos.systems.simula.types import EvolutionProposal
+    from ecodiaos.systems.simula.evolution_types import EvolutionProposal
 
 logger = structlog.get_logger().bind(system="simula.agents.test_designer")
 
@@ -92,7 +92,7 @@ _TEST_DESIGNER_TOOLS: list[ToolDefinition] = [
                 },
                 "directory": {
                     "type": "string",
-                    "description": "Directory to search in (default: src/)",
+                    "description": "Directory to search in (default: ecodiaos/)",
                 },
             },
             "required": ["pattern"],
@@ -357,7 +357,7 @@ class TestDesignerAgent:
         elif name == "search_code":
             return await self._tool_search_code(
                 args.get("pattern", ""),
-                args.get("directory", "src/"),
+                args.get("directory", "ecodiaos/"),
             )
         elif name == "read_spec":
             return self._tool_read_spec(args.get("spec_name", ""))

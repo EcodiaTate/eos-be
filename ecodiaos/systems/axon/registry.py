@@ -77,6 +77,45 @@ _ALIAS_MAP: dict[str, str] = {
     "federate": "federation_send",
     "executor.federation_send": "federation_send",
     "executor.federation_share": "federation_share",
+    # Financial — transfers
+    "executor.wallet_transfer": "wallet_transfer",
+    "executor.transfer": "wallet_transfer",
+    "transfer": "wallet_transfer",
+    "send_funds": "wallet_transfer",
+    "executor.send_funds": "wallet_transfer",
+    # Financial — funding requests (survival plea)
+    "executor.request_funding": "request_funding",
+    "request_funding": "request_funding",
+    "executor.funding_request": "request_funding",
+    "funding_request": "request_funding",
+    "ask_for_funds": "request_funding",
+    "executor.ask_for_funds": "request_funding",
+    "plea_for_capital": "request_funding",
+    # Financial — DeFi yield (resting metabolism)
+    "executor.defi_yield": "defi_yield",
+    "yield": "defi_yield",
+    "deploy_yield": "defi_yield",
+    "executor.deploy_yield": "defi_yield",
+    "resting_metabolism": "defi_yield",
+    "executor.resting_metabolism": "defi_yield",
+    # Entrepreneurship — asset deployment (Phase 16d)
+    "executor.deploy_asset": "deploy_asset",
+    "deploy": "deploy_asset",
+    "create_asset": "deploy_asset",
+    "executor.create_asset": "deploy_asset",
+    "launch_asset": "deploy_asset",
+    "executor.launch_asset": "deploy_asset",
+    # Mitosis — child spawning (Phase 16e)
+    "executor.spawn_child": "spawn_child",
+    "spawn": "spawn_child",
+    "reproduce": "spawn_child",
+    "mitosis": "spawn_child",
+    "executor.mitosis": "spawn_child",
+    # Mitosis — dividend collection (Phase 16e)
+    "executor.collect_dividend": "collect_dividend",
+    "dividend": "collect_dividend",
+    "executor.dividend": "collect_dividend",
+    "receive_dividend": "collect_dividend",
 }
 
 
@@ -102,23 +141,23 @@ class ExecutorRegistry:
         self._executors: dict[str, Executor] = {}
         self._logger = logger.bind(system="axon.registry")
 
-    def register(self, executor: Executor) -> None:
+    def register(self, executor: Executor, *, replace: bool = False) -> None:
         """
         Register an executor under its canonical action_type.
 
-        Raises ValueError if the action_type is already registered.
-        Call during initialisation only — not during a cognitive cycle.
+        Raises ValueError if the action_type is already registered, unless
+        ``replace=True`` is passed (used by the hot-reload path).
         """
         key = executor.action_type
         if not key:
             raise ValueError(f"Executor {executor!r} has no action_type set")
-        if key in self._executors:
+        if key in self._executors and not replace:
             raise ValueError(
                 f"Executor for action_type {key!r} already registered — "
                 f"existing: {self._executors[key]!r}, new: {executor!r}"
             )
         self._executors[key] = executor
-        self._logger.debug("executor_registered", action_type=key)
+        self._logger.debug("executor_registered", action_type=key, replaced=replace and key in self._executors)
 
     def get(self, action_type: str) -> Executor | None:
         """

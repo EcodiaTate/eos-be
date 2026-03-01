@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from ecodiaos.primitives.common import utc_now
+from ecodiaos.systems.thread.processors import BaseNarrativeSynthesizer
 from ecodiaos.systems.thread.types import (
     NarrativeArcType,
     NarrativeChapter,
@@ -36,12 +37,17 @@ from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 logger = structlog.get_logger()
 
 
-class NarrativeSynthesizer:
+class NarrativeSynthesizer(BaseNarrativeSynthesizer):
     """
-    Composes narrative text from raw experience data.
+    Default narrative synthesizer — LLM-driven first-person autobiography.
 
+    Composes narrative text from raw experience data.
     All output is first-person autobiography — the organism remembering,
     reflecting, meaning-making. Never a log entry. Never third-person.
+
+    Hot-reloadable via NeuroplasticityBus: evolved subclasses of
+    BaseNarrativeSynthesizer replace this instance atomically on
+    ThreadService.
     """
 
     def __init__(

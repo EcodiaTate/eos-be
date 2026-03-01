@@ -43,6 +43,8 @@ class IncidentClass(enum.StrEnum):
     PREDICTION_FAILURE = "prediction_failure"  # Active inference errors elevated
     RESOURCE_EXHAUSTION = "resource_exhaustion"  # Budget exceeded
     COGNITIVE_STALL = "cognitive_stall"  # Workspace cycle blocked or empty
+    ECONOMIC_THREAT = "economic_threat"  # Malicious on-chain activity detected
+    PROTOCOL_DEGRADATION = "protocol_degradation"  # DeFi protocol health declining
 
 
 class RepairTier(int, enum.Enum):
@@ -115,6 +117,77 @@ class StallConfig(EOSBaseModel):
 
     min_value: float  # Rate must be above this
     window_cycles: int  # Number of cycles to observe
+
+
+# ─── Economic Immune Types ───────────────────────────────────────
+
+
+class ThreatType(enum.StrEnum):
+    """Categories of economic threats the immune system detects."""
+
+    FLASH_LOAN_ATTACK = "flash_loan_attack"
+    PRICE_MANIPULATION = "price_manipulation"
+    SUSPICIOUS_CONTRACT = "suspicious_contract"
+    MEMPOOL_POISONING = "mempool_poisoning"
+    RUG_PULL = "rug_pull"
+    ORACLE_MANIPULATION = "oracle_manipulation"
+    GOVERNANCE_ATTACK = "governance_attack"
+
+
+class ThreatSeverity(enum.StrEnum):
+    """Severity classification for economic threats."""
+
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class ProtocolAlert(EOSBaseModel):
+    """Alert raised when a DeFi protocol's health degrades."""
+
+    protocol: str
+    alert_type: str  # "tvl_drop" | "oracle_deviation" | "contract_paused" | "governance_anomaly"
+    current_value: float
+    threshold_value: float
+    deviation_percent: float
+    requires_withdrawal: bool = False
+
+
+class ThreatPattern(EOSBaseModel):
+    """A detection pattern for recognising on-chain threats."""
+
+    pattern_id: str = Field(default_factory=new_id)
+    threat_type: ThreatType
+    description: str
+    detection_rule: str  # Human-readable rule description
+    severity: ThreatSeverity
+    confidence: float = Field(0.8, ge=0.0, le=1.0)
+    false_positive_rate: float = Field(0.05, ge=0.0, le=1.0)
+
+
+class AddressBlacklistEntry(EOSBaseModel):
+    """A blacklisted on-chain address with provenance tracking."""
+
+    address: str
+    chain_id: int = 8453  # Base L2
+    reason: str
+    threat_type: ThreatType
+    source: str = "local"  # "local" | "federation" | "external"
+    source_instance_id: str = ""
+    confirmed: bool = False
+
+
+class SimulationResult(EOSBaseModel):
+    """Result of pre-simulating a transaction before broadcast."""
+
+    passed: bool = True
+    revert_reason: str = ""
+    gas_used: int = 0
+    value_delta_usd: float = 0.0
+    slippage_bps: int = 0
+    mev_risk_detected: bool = False
+    warnings: list[str] = Field(default_factory=list)
 
 
 # ─── Incident ────────────────────────────────────────────────────

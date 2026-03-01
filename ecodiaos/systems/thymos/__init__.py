@@ -18,6 +18,8 @@ from ecodiaos.systems.thymos.governor import HealingGovernor
 from ecodiaos.systems.thymos.prescription import RepairPrescriber, RepairValidator
 from ecodiaos.systems.thymos.prophylactic import HomeostasisController, ProphylacticScanner
 from ecodiaos.systems.thymos.sentinels import (
+    BankruptcySentinel,
+    BaseThymosSentinel,
     CognitiveStallSentinel,
     ContractSentinel,
     DriftSentinel,
@@ -62,6 +64,8 @@ __all__ = [
     "ThymosService",
     # Sub-systems
     "AntibodyLibrary",
+    "BankruptcySentinel",
+    "BaseThymosSentinel",
     "CausalAnalyzer",
     "CognitiveStallSentinel",
     "ContractSentinel",

@@ -31,12 +31,16 @@ import structlog
 from ecodiaos.primitives.affect import AffectState
 from ecodiaos.systems.atune.prediction import BeliefPrediction
 from ecodiaos.systems.atune.types import ActiveGoalSummary, WorkspaceBroadcast
+from ecodiaos.core.hotreload import NeuroplasticityBus
 from ecodiaos.systems.nova.belief_updater import BeliefUpdater
 from ecodiaos.systems.nova.deliberation_engine import DeliberationEngine
 from ecodiaos.systems.nova.efe_evaluator import EFEEvaluator
 from ecodiaos.systems.nova.goal_manager import GoalManager
 from ecodiaos.systems.nova.intent_router import IntentRouter
-from ecodiaos.systems.nova.policy_generator import PolicyGenerator
+from ecodiaos.systems.nova.policy_generator import (
+    BasePolicyGenerator,
+    PolicyGenerator,
+)
 from ecodiaos.systems.nova.types import (
     DecisionRecord,
     EFEWeights,
@@ -84,12 +88,14 @@ class NovaService:
         voxis: VoxisService,
         llm: LLMProvider,
         config: NovaConfig,
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
     ) -> None:
         self._memory = memory
         self._equor = equor
         self._voxis = voxis
         self._llm = llm
         self._config = config
+        self._bus = neuroplasticity_bus
         self._logger = logger.bind(system="nova")
 
         # Instance metadata
@@ -101,7 +107,7 @@ class NovaService:
         # Sub-components — built in initialize()
         self._belief_updater: BeliefUpdater = BeliefUpdater()
         self._goal_manager: GoalManager | None = None
-        self._policy_generator: PolicyGenerator | None = None
+        self._policy_generator: BasePolicyGenerator | None = None
         self._efe_evaluator: EFEEvaluator | None = None
         self._deliberation_engine: DeliberationEngine | None = None
         self._intent_router: IntentRouter | None = None
@@ -204,6 +210,15 @@ class NovaService:
             drive_weights=self._drive_weights,
         )
 
+        # Register with the NeuroplasticityBus for hot-reload of BasePolicyGenerator subclasses.
+        if self._bus is not None:
+            self._bus.register(
+                base_class=BasePolicyGenerator,
+                registration_callback=self._on_policy_generator_evolved,
+                system_id="nova",
+                instance_factory=self._build_policy_generator,
+            )
+
     def set_soma(self, soma: Any) -> None:
         """Wire Soma service for allostatic urgency-based deliberation."""
         self._soma = soma
@@ -231,11 +246,55 @@ class NovaService:
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
+        if self._bus is not None:
+            self._bus.deregister(BasePolicyGenerator)
         self._logger.info(
             "nova_shutdown",
             total_broadcasts=self._total_broadcasts,
             total_intents_issued=self._total_intents_issued,
             active_goals=len(self._goal_manager.active_goals) if self._goal_manager else 0,
+        )
+
+    # ─── Hot-reload callbacks ─────────────────────────────────────
+
+    def _build_policy_generator(self, cls: type[BasePolicyGenerator]) -> BasePolicyGenerator:
+        """
+        Factory used by NeuroplasticityBus to instantiate a newly discovered
+        BasePolicyGenerator subclass with the services it needs.
+
+        Passes the live LLM client and current instance name so the evolved
+        generator can call the LLM without maintaining its own client ref.
+        Passes a ``max_policies`` upper-bound from config.
+        Falls back to the default ``PolicyGenerator`` signature — evolved
+        subclasses may accept fewer kwargs; extra ones are silently ignored
+        via ``**kwargs`` if they choose to.
+        """
+        try:
+            return cls(
+                llm=self._llm,
+                instance_name=self._instance_name,
+                max_policies=self._config.max_policies_per_deliberation,
+                timeout_ms=self._config.slow_path_timeout_ms - 2000,
+            )  # type: ignore[call-arg]
+        except TypeError:
+            # Evolved subclass has a different signature — try zero-arg
+            return cls()  # type: ignore[call-arg]
+
+    def _on_policy_generator_evolved(self, generator: BasePolicyGenerator) -> None:
+        """
+        Registration callback for NeuroplasticityBus.
+
+        Atomically swaps the active PolicyGenerator on both ``NovaService``
+        and the live ``DeliberationEngine`` so new broadcasts immediately use
+        the evolved generator.  Any in-flight slow-path call that already
+        captured a reference to the old generator completes normally.
+        """
+        self._policy_generator = generator
+        if self._deliberation_engine is not None:
+            self._deliberation_engine.set_policy_generator(generator)
+        self._logger.info(
+            "nova_policy_generator_hot_reloaded",
+            generator=type(generator).__name__,
         )
 
     # ─── BroadcastSubscriber Interface ───────────────────────────
@@ -256,6 +315,10 @@ class NovaService:
         self._total_broadcasts += 1
         self._current_affect = broadcast.affect
 
+        # Yield immediately so the Synapse clock is not blocked if
+        # the previous broadcast's fire-and-forget tasks haven't drained.
+        await asyncio.sleep(0)
+
         # ── Belief update (≤50ms) ──
         delta = self._belief_updater.update_from_broadcast(broadcast)
 
@@ -271,6 +334,16 @@ class NovaService:
                 if signal.urgency > self._soma.urgency_threshold:
                     allostatic_mode = True
                     dominant_error_dim = signal.dominant_error
+                # Shift EFE deliberation thresholds based on somatic arousal + urgency
+                if self._deliberation_engine is not None:
+                    from ecodiaos.systems.soma.types import InteroceptiveDimension
+                    arousal_sensed = signal.state.sensed.get(
+                        InteroceptiveDimension.AROUSAL, 0.4
+                    )
+                    self._deliberation_engine.update_somatic_thresholds(
+                        urgency=signal.urgency,
+                        arousal=arousal_sensed,
+                    )
             except Exception as exc:
                 self._logger.debug("soma_urgency_check_error", error=str(exc))
 

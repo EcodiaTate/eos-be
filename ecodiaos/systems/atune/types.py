@@ -139,6 +139,7 @@ class WorkspaceBroadcast(BaseModel):
     affect: AffectState
     context: WorkspaceContext = Field(default_factory=WorkspaceContext)
     precision: float = Field(ge=0.0, le=1.0, default=0.5)
+    source: str = ""  # e.g. "internal:axon", "spontaneous_recall", percept channel_id
 
 
 class WorkspaceContribution(BaseModel):

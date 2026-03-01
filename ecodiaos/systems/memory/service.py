@@ -29,6 +29,7 @@ from ecodiaos.primitives import (
 )
 from ecodiaos.systems.memory.birth import birth_instance
 from ecodiaos.systems.memory.consolidation import run_consolidation
+from ecodiaos.systems.memory.financial_encoder import FinancialEncoder
 from ecodiaos.systems.memory.episodic import (
     count_episodes,
     link_episode_sequence,
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from ecodiaos.clients.embedding import EmbeddingClient
     from ecodiaos.clients.neo4j import Neo4jClient
     from ecodiaos.config import SeedConfig
+    from ecodiaos.systems.synapse.event_bus import EventBus
 
 logger = structlog.get_logger()
 
@@ -77,6 +79,8 @@ class MemoryService:
         self._last_episode_time: float | None = None  # monotonic seconds
         # Soma for somatic marker stamping and reranking
         self._soma: Any = None
+        # Financial encoder — wired after Synapse is up via set_event_bus()
+        self._financial_encoder = FinancialEncoder(neo4j, embedding_client)
 
     # ─── Lifecycle ────────────────────────────────────────────────
 
@@ -89,6 +93,17 @@ class MemoryService:
         """Wire Soma for somatic marker stamping and reranking."""
         self._soma = soma
         logger.info("soma_wired_to_memory")
+
+    def set_event_bus(self, event_bus: "EventBus") -> None:
+        """
+        Wire the Synapse event bus into the FinancialEncoder.
+
+        Call after both MemoryService and SynapseService are initialised.
+        The encoder subscribes to WALLET_TRANSFER_CONFIRMED and REVENUE_INJECTED
+        and will encode those events as salience=1.0 episodes directly in Neo4j.
+        """
+        self._financial_encoder.attach(event_bus)
+        logger.info("financial_encoder_wired", system="memory")
 
     async def get_self(self) -> SelfNode | None:
         """Get the current instance's Self node, or None if not yet born."""
@@ -169,6 +184,13 @@ class MemoryService:
         """
         import time as _time
 
+        # Re-sync sequence state from FinancialEncoder in case a financial
+        # event was encoded between the last store_percept and this one.
+        enc_id, enc_time = self._financial_encoder.get_sequence_state()
+        if enc_id is not None and enc_id != self._last_episode_id:
+            self._last_episode_id = enc_id
+            self._last_episode_time = enc_time
+
         # Compute embedding if not already present
         embedding = percept.content.embedding
         if not embedding and percept.content.raw:
@@ -225,6 +247,10 @@ class MemoryService:
 
         self._last_episode_id = episode_id
         self._last_episode_time = now
+
+        # Keep FinancialEncoder in sync so financial episodes slot into
+        # the temporal chain after any percept store_percept just recorded.
+        self._financial_encoder.set_sequence_state(episode_id, now)
 
         return episode_id
 

@@ -52,6 +52,7 @@ from ecodiaos.primitives.federation import (
     KnowledgeRequest,
     KnowledgeResponse,
     KnowledgeType,
+    ThreatAdvisory,
     TrustLevel,
     TrustPolicy,
 )
@@ -60,6 +61,7 @@ from ecodiaos.systems.federation.coordination import CoordinationManager
 from ecodiaos.systems.federation.identity import IdentityManager
 from ecodiaos.systems.federation.knowledge import KnowledgeExchangeManager
 from ecodiaos.systems.federation.privacy import PrivacyFilter
+from ecodiaos.systems.federation.threat_intelligence import ThreatIntelligenceManager
 from ecodiaos.systems.federation.trust import TrustManager
 
 if TYPE_CHECKING:
@@ -113,6 +115,7 @@ class FederationService:
         self._knowledge: KnowledgeExchangeManager | None = None
         self._coordination: CoordinationManager | None = None
         self._channels: ChannelManager | None = None
+        self._threat_intel: ThreatIntelligenceManager | None = None
 
         # Active federation links (link_id → FederationLink)
         self._links: dict[str, FederationLink] = {}
@@ -120,6 +123,14 @@ class FederationService:
         # Interaction history (for audit, limited ring buffer)
         self._interaction_history: list[FederationInteraction] = []
         self._max_history: int = 1000
+
+        # Phase 16g: Certificate validation for inbound communications
+        self._certificate_manager: Any = None  # CertificateManager, wired post-init
+
+    def set_certificate_manager(self, cert_mgr: Any) -> None:
+        """Wire CertificateManager for inbound certificate validation."""
+        self._certificate_manager = cert_mgr
+        self._logger.info("certificate_manager_wired_to_federation")
 
     def set_atune(self, atune: Any) -> None:
         """Wire Atune so federated knowledge becomes perceived input."""
@@ -208,6 +219,13 @@ class FederationService:
             trust_policy=trust_policy,
             private_key_path=private_key_path,
             tls_cert_path=tls_cert,
+        )
+
+        # Threat intelligence manager (Layer 4: Economic Immune System)
+        self._threat_intel = ThreatIntelligenceManager(
+            identity=self._identity,
+            channels=self._channels,
+            instance_id=self._instance_id,
         )
 
         # Load persisted links from Redis
@@ -440,9 +458,14 @@ class FederationService:
     async def handle_knowledge_request(
         self,
         request: KnowledgeRequest,
+        sender_certificate: Any = None,
     ) -> KnowledgeResponse:
         """
         Handle an inbound knowledge request from a remote instance.
+
+        Phase 16g: If a CertificateManager is wired, the sender's
+        EcodianCertificate is validated. Requests with invalid or missing
+        certificates are rejected.
 
         This is called by the API router when a federated instance
         sends a knowledge request to us.
@@ -452,6 +475,17 @@ class FederationService:
                 request_id=request.id,
                 granted=False,
                 reason="Federation not initialized",
+            )
+
+        # Phase 16g: Certificate validation gate
+        cert_rejection = self._validate_sender_certificate(
+            request.requesting_instance_id, sender_certificate,
+        )
+        if cert_rejection is not None:
+            return KnowledgeResponse(
+                request_id=request.id,
+                granted=False,
+                reason=cert_rejection,
             )
 
         # Find the link for this requesting instance
@@ -648,6 +682,58 @@ class FederationService:
 
         return await channel.request_assistance(request)
 
+    # ─── Threat Intelligence ────────────────────────────────────
+
+    async def broadcast_threat_advisory(
+        self,
+        advisory: ThreatAdvisory,
+    ) -> dict[str, bool]:
+        """
+        Broadcast a threat advisory to all active federation links.
+
+        Signs the advisory and sends to peers whose trust level permits it.
+        Returns {link_id: delivered}.
+        """
+        if not self._threat_intel:
+            return {}
+        return await self._threat_intel.broadcast_advisory(
+            advisory, self.active_links
+        )
+
+    def handle_threat_advisory(
+        self,
+        advisory: ThreatAdvisory,
+        source_instance_id: str,
+        sender_certificate: Any = None,
+    ) -> tuple[bool, str]:
+        """
+        Handle an inbound threat advisory from a remote instance.
+
+        Phase 16g: If a CertificateManager is wired, the sender's
+        EcodianCertificate is validated first. Missing or invalid
+        certificates cause rejection.
+
+        Trust-gated: PARTNER/ALLY auto-apply, COLLEAGUE recommend verify,
+        ACQUAINTANCE verify signature, NONE reject.
+
+        Returns (accepted, reason).
+        """
+        if not self._threat_intel:
+            return False, "Federation threat intelligence not initialized"
+
+        link = self._find_link_by_instance(source_instance_id)
+        if not link:
+            return False, "No active federation link with this instance"
+
+        # Phase 16g: Certificate validation gate
+        cert_rejection = self._validate_sender_certificate(
+            source_instance_id, sender_certificate,
+        )
+        if cert_rejection is not None:
+            return False, cert_rejection
+
+        return self._threat_intel.handle_inbound_advisory(advisory, link)
+
     # ─── Identity ───────────────────────────────────────────────────
 
     @property
@@ -721,6 +807,7 @@ class FederationService:
             "knowledge": self._knowledge.stats if self._knowledge else {},
             "coordination": self._coordination.stats if self._coordination else {},
             "channels": self._channels.stats if self._channels else {},
+            "threat_intel": self._threat_intel.stats if self._threat_intel else {},
             "privacy": self._privacy.stats if self._privacy else {},
             "interaction_history_size": len(self._interaction_history),
             "links": [
@@ -740,6 +827,53 @@ class FederationService:
                 for lnk in self._links.values()
             ],
         }
+
+    # ─── Phase 16g: Certificate Validation Gate ────────────────────
+
+    def _validate_sender_certificate(
+        self,
+        source_instance_id: str,
+        sender_certificate: Any,
+    ) -> str | None:
+        """
+        Validate the sender's EcodianCertificate. Returns an error string
+        if the certificate is invalid/missing, or None if valid.
+
+        When no CertificateManager is wired, certificate validation is
+        skipped (backward-compatible with pre-16g instances).
+        """
+        if self._certificate_manager is None:
+            return None  # No certificate validation configured
+
+        if sender_certificate is None:
+            self._logger.warning(
+                "inbound_rejected_no_certificate",
+                source_instance_id=source_instance_id,
+            )
+            return "Sender has no EcodianCertificate -- rejected"
+
+        from ecodiaos.systems.identity.certificate import EcodianCertificate
+
+        # Accept both EcodianCertificate objects and raw dicts
+        if isinstance(sender_certificate, dict):
+            try:
+                sender_certificate = EcodianCertificate.model_validate(sender_certificate)
+            except Exception as exc:
+                return f"Invalid certificate format: {exc}"
+
+        if not isinstance(sender_certificate, EcodianCertificate):
+            return "Invalid certificate type"
+
+        result = self._certificate_manager.validate_certificate(sender_certificate)
+        if not result.valid:
+            self._logger.warning(
+                "inbound_rejected_invalid_certificate",
+                source_instance_id=source_instance_id,
+                errors=result.errors,
+            )
+            return f"Invalid certificate: {'; '.join(result.errors)}"
+
+        return None
 
     # ─── Internal ───────────────────────────────────────────────────
 

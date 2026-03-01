@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ecodiaos.systems.soma.allostatic_controller import AllostaticController
+from ecodiaos.systems.soma.base import BaseAllostaticRegulator, BaseSomaPredictor
 from ecodiaos.systems.soma.counterfactual import CounterfactualEngine
 from ecodiaos.systems.soma.developmental import DevelopmentalManager
 from ecodiaos.systems.soma.interoceptor import Interoceptor
@@ -64,6 +65,7 @@ from ecodiaos.systems.soma.types import (
 
 if TYPE_CHECKING:
     from ecodiaos.config import SomaConfig
+    from ecodiaos.core.hotreload import NeuroplasticityBus
 
 logger = structlog.get_logger("ecodiaos.systems.soma")
 
@@ -85,16 +87,21 @@ class SomaService:
 
     system_id: str = "soma"
 
-    def __init__(self, config: SomaConfig) -> None:
+    def __init__(
+        self,
+        config: SomaConfig,
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
+    ) -> None:
         self._config = config
+        self._bus = neuroplasticity_bus
 
         # Sub-systems
         self._interoceptor = Interoceptor()
-        self._predictor = InteroceptivePredictor(
+        self._predictor: BaseSomaPredictor = InteroceptivePredictor(
             buffer_size=config.trajectory_buffer_size,
             ewm_span=config.prediction_ewm_span,
         )
-        self._controller = AllostaticController(
+        self._controller: BaseAllostaticRegulator = AllostaticController(
             adaptation_alpha=config.setpoint_adaptation_alpha,
             urgency_threshold=config.urgency_threshold,
         )
@@ -113,6 +120,7 @@ class SomaService:
         )
 
         # State
+        self._synapse_ref: Any = None  # Cached for hot-swap forwarding
         self._cycle_count: int = 0
         self._current_state: InteroceptiveState | None = None
         self._current_signal: AllostaticSignal = AllostaticSignal.default()
@@ -125,9 +133,23 @@ class SomaService:
         self._emotion_regions: dict[str, dict[str, Any]] = dict(EMOTION_REGIONS)
 
     async def initialize(self) -> None:
-        """Initialize sub-systems. Called once during startup."""
+        """Initialize sub-systems and register with NeuroplasticityBus."""
         self._temporal_depth.set_stage(self._developmental.stage)
-        self._counterfactual.set_dynamics(self._predictor._dynamics)
+        self._counterfactual.set_dynamics(self._predictor.dynamics_matrix)
+
+        # Register hot-reloadable strategies with the NeuroplasticityBus
+        if self._bus is not None:
+            self._bus.register(
+                base_class=BaseSomaPredictor,
+                registration_callback=self._on_predictor_evolved,
+                system_id="soma",
+            )
+            self._bus.register(
+                base_class=BaseAllostaticRegulator,
+                registration_callback=self._on_regulator_evolved,
+                system_id="soma",
+            )
+
         logger.info(
             "soma_initialized",
             stage=self._developmental.stage.value,
@@ -135,7 +157,10 @@ class SomaService:
         )
 
     async def shutdown(self) -> None:
-        """Graceful teardown."""
+        """Graceful teardown — deregister from NeuroplasticityBus."""
+        if self._bus is not None:
+            self._bus.deregister(BaseSomaPredictor)
+            self._bus.deregister(BaseAllostaticRegulator)
         logger.info("soma_shutdown", cycle_count=self._cycle_count)
 
     async def health(self) -> dict[str, Any]:
@@ -163,6 +188,10 @@ class SomaService:
 
     def set_synapse(self, synapse: Any) -> None:
         self._interoceptor.set_synapse(synapse)
+        # Forward to controller if it supports metabolic sensing (MetabolicAllostaticRegulator)
+        if hasattr(self._controller, "set_synapse"):
+            self._controller.set_synapse(synapse)  # type: ignore[union-attr]
+        self._synapse_ref = synapse
 
     def set_nova(self, nova: Any) -> None:
         self._interoceptor.set_nova(nova)
@@ -175,6 +204,42 @@ class SomaService:
 
     def set_token_budget(self, budget: Any) -> None:
         self._interoceptor.set_token_budget(budget)
+
+    # ─── NeuroplasticityBus Callbacks ─────────────────────────────
+
+    def _on_predictor_evolved(self, predictor: BaseSomaPredictor) -> None:
+        """
+        Hot-swap the interoceptive predictor in the live service.
+
+        Called by NeuroplasticityBus when a new BaseSomaPredictor subclass
+        is discovered. The swap is atomic — any in-flight cycle that already
+        captured a reference to the old predictor completes normally.
+        """
+        self._predictor = predictor
+        self._counterfactual.set_dynamics(predictor.dynamics_matrix)
+        logger.info(
+            "soma_predictor_hot_reloaded",
+            predictor=type(predictor).__name__,
+        )
+
+    def _on_regulator_evolved(self, regulator: BaseAllostaticRegulator) -> None:
+        """
+        Hot-swap the allostatic controller in the live service.
+
+        Called by NeuroplasticityBus when a new BaseAllostaticRegulator subclass
+        is discovered. Preserves current context by re-applying it, and forwards
+        the cached Synapse reference so MetabolicAllostaticRegulator can read
+        MetabolicSnapshot immediately after the swap.
+        """
+        self._controller = regulator
+        # Re-wire Synapse if the new regulator supports metabolic sensing
+        synapse = getattr(self, "_synapse_ref", None)
+        if synapse is not None and hasattr(regulator, "set_synapse"):
+            regulator.set_synapse(synapse)  # type: ignore[union-attr]
+        logger.info(
+            "soma_regulator_hot_reloaded",
+            regulator=type(regulator).__name__,
+        )
 
     # ─── Core Cycle ──────────────────────────────────────────────
 
@@ -255,8 +320,8 @@ class SomaService:
                 self._developmental.phase_space_enabled()
                 and self._phase_space_update_counter >= self._config.phase_space_update_interval
             ):
-                velocity = self._predictor._compute_velocity()
-                self._phase_space.update(self._predictor._trajectory, velocity)
+                velocity = self._predictor.compute_velocity()
+                self._phase_space.update(self._predictor.raw_trajectory, velocity)
                 self._phase_space_update_counter = 0
 
             # 12. Build signal
@@ -291,7 +356,7 @@ class SomaService:
         self._last_cycle_duration_ms = elapsed_ms
         self._cycle_durations.append(elapsed_ms)
 
-        if elapsed_ms > 10.0:
+        if elapsed_ms > 50.0:
             logger.warning("soma_cycle_slow", elapsed_ms=round(elapsed_ms, 2))
 
         return self._current_signal
@@ -381,7 +446,7 @@ class SomaService:
     def update_dynamics_matrix(self, new_dynamics: list[list[float]]) -> None:
         """Evo updates the 9x9 cross-dimension coupling matrix."""
         self._predictor.update_dynamics(new_dynamics)
-        self._counterfactual.set_dynamics(new_dynamics)
+        self._counterfactual.set_dynamics(self._predictor.dynamics_matrix)
 
     def update_emotion_regions(self, updated_regions: dict[str, dict[str, Any]]) -> None:
         """Evo refines emotion region boundaries."""

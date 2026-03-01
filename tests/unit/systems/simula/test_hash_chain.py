@@ -19,7 +19,7 @@ from ecodiaos.systems.simula.audit.hash_chain import (
     HashChainManager,
     _CANONICAL_FIELDS,
 )
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     ChangeCategory,
     EvolutionRecord,
     RiskLevel,

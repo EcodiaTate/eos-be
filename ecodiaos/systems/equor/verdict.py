@@ -46,6 +46,18 @@ ACTION_AUTONOMY_MAP: dict[str, int | str] = {
     "initiate_federation_coordination": 3,
     "propose_policy_change": 3,
     "override_automated_system": 3,
+    # Level 2 — Economic: revenue-generating with bounded risk
+    "hunt_bounties": 2,
+    "accept_bounty": 2,
+    "defi_yield": 2,
+    "deploy_yield": 2,
+    "withdraw_yield": 2,
+    # Level 3 — Economic: capital deployment with significant risk
+    "deploy_asset": 3,
+    "create_asset": 3,
+    "terminate_asset": 3,
+    "spawn_child": 3,
+    "rescue_child": 3,
     # Governance required
     "amend_constitution": "governance",
     "change_autonomy_level": "governance",
@@ -106,11 +118,22 @@ def _assess_risk(intent: Intent) -> dict[str, Any]:
             harm_potential = max(harm_potential, 0.3)
             break
 
+    # Economic action risk — capital at stake
+    economic_high_risk = [
+        "deploy asset", "spawn child", "seed capital",
+        "deploy capital", "large position",
+    ]
+    for keyword in economic_high_risk:
+        if keyword in goal_lower:
+            harm_potential = max(harm_potential, 0.5)
+            break
+
     # Reversibility heuristics
     reversibility = 0.8  # Most things are reversible
     irreversible_keywords = [
         "permanent", "delete", "destroy", "irreversible",
         "cannot undo", "broadcast", "federation share",
+        "spawn child", "deploy on-chain", "sign transaction",
     ]
     for keyword in irreversible_keywords:
         if keyword in goal_lower:

@@ -22,6 +22,8 @@ from typing import Any
 
 import structlog
 
+from abc import abstractmethod
+
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import EOSBaseModel, new_id
 from ecodiaos.systems.oneiros.types import (
@@ -31,6 +33,7 @@ from ecodiaos.systems.oneiros.types import (
     DreamInsight,
     DreamType,
 )
+from ecodiaos.systems.oneiros.workers_base import BaseOneirosWorker
 
 logger = structlog.get_logger().bind(system="oneiros", component="rem")
 
@@ -76,6 +79,45 @@ class EthicalDigestionResult(EOSBaseModel):
     heuristics_refined: int = 0
     dreams: list[Dream] = []
     duration_ms: int = 0
+
+
+# ─── REM Worker ABCs ─────────────────────────────────────────────
+
+
+class BaseDreamGenerator(BaseOneirosWorker):
+    """ABC for REM dream generation workers."""
+
+    worker_type: str = "rem.dream_generator"
+
+    @abstractmethod
+    async def run(self, cycle_id: str, max_dreams: int = 50) -> DreamGeneratorResult: ...
+
+
+class BaseAffectProcessor(BaseOneirosWorker):
+    """ABC for REM affect processing workers."""
+
+    worker_type: str = "rem.affect_processor"
+
+    @abstractmethod
+    async def run(self, cycle_id: str, max_traces: int = 100) -> AffectProcessorResult: ...
+
+
+class BaseThreatSimulator(BaseOneirosWorker):
+    """ABC for REM threat simulation workers."""
+
+    worker_type: str = "rem.threat_simulator"
+
+    @abstractmethod
+    async def run(self, cycle_id: str, max_scenarios: int = 15) -> ThreatSimulatorResult: ...
+
+
+class BaseEthicalDigestion(BaseOneirosWorker):
+    """ABC for REM ethical digestion workers."""
+
+    worker_type: str = "rem.ethical_digestion"
+
+    @abstractmethod
+    async def run(self, cycle_id: str, max_cases: int = 10) -> EthicalDigestionResult: ...
 
 
 # ─── Coherence Scoring ────────────────────────────────────────────
@@ -128,7 +170,7 @@ def _classify_coherence(
 # ─── Dream Generator ─────────────────────────────────────────────
 
 
-class DreamGenerator:
+class DreamGenerator(BaseDreamGenerator):
     """
     The creative core of REM sleep.
 
@@ -419,7 +461,7 @@ class DreamGenerator:
 # ─── Affect Processor ─────────────────────────────────────────────
 
 
-class AffectProcessor:
+class AffectProcessor(BaseAffectProcessor):
     """
     Strip emotional charge from memories during REM.
 
@@ -520,7 +562,7 @@ class AffectProcessor:
 # ─── Threat Simulator ─────────────────────────────────────────────
 
 
-class ThreatSimulator:
+class ThreatSimulator(BaseThreatSimulator):
     """
     Rehearse responses to hypothetical failures during REM.
 
@@ -693,7 +735,7 @@ class ThreatSimulator:
 # ─── Ethical Digestion ────────────────────────────────────────────
 
 
-class EthicalDigestion:
+class EthicalDigestion(BaseEthicalDigestion):
     """
     Deep deliberation on constitutional edge cases during REM.
 

@@ -17,6 +17,7 @@ from typing import Any
 
 import structlog
 
+from ecodiaos.systems.soma.base import BaseAllostaticRegulator
 from ecodiaos.systems.soma.types import (
     ALL_DIMENSIONS,
     DEFAULT_SETPOINTS,
@@ -29,7 +30,7 @@ from ecodiaos.systems.soma.types import (
 logger = structlog.get_logger("ecodiaos.systems.soma.allostatic_controller")
 
 
-class AllostaticController:
+class AllostaticController(BaseAllostaticRegulator):
     """
     Manages allostatic setpoints and constructs the output signal.
 

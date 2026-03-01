@@ -30,7 +30,7 @@ import enum
 from pydantic import Field
 
 from ecodiaos.primitives.common import EOSBaseModel, utc_now
-from ecodiaos.systems.simula.types import ChangeCategory
+from ecodiaos.systems.simula.evolution_types import ChangeCategory
 
 
 # ── Stage 2A: Dafny Proof-Carrying Code ──────────────────────────────────────
@@ -1001,7 +1001,7 @@ class GovernanceCredentialResult(EOSBaseModel):
 # ── Stage 6B: Co-Evolving Agents ─────────────────────────────────────────────
 
 
-class HardNegativeSource(enum.StrEnum):
+class FailureCaseSource(enum.StrEnum):
     """Where a hard negative training example originated."""
 
     ROLLBACK_HISTORY = "rollback_history"
@@ -1010,7 +1010,7 @@ class HardNegativeSource(enum.StrEnum):
     ADVERSARIAL_GENERATION = "adversarial_generation"
 
 
-class HardNegativeExample(EOSBaseModel):
+class FailureCaseExample(EOSBaseModel):
     """
     A hard negative example for GRPO training.
 
@@ -1018,7 +1018,7 @@ class HardNegativeExample(EOSBaseModel):
     to avoid: rollbacks, verification failures, health check crashes.
     """
 
-    source: HardNegativeSource
+    source: FailureCaseSource
     proposal_id: str = ""
     category: str = ""
     failure_reason: str = ""
@@ -1028,7 +1028,7 @@ class HardNegativeExample(EOSBaseModel):
     mined_at: datetime = Field(default_factory=utc_now)
 
 
-class AdversarialTestResult(EOSBaseModel):
+class RobustnessTestResult(EOSBaseModel):
     """Result of one adversarial test generation cycle."""
 
     tests_generated: int = 0

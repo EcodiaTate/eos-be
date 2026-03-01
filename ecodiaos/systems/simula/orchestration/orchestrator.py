@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from ecodiaos.systems.simula.agents.test_executor import TestExecutorAgent
     from ecodiaos.systems.simula.code_agent import SimulaCodeAgent
     from ecodiaos.systems.simula.orchestration.task_planner import TaskPlanner
-    from ecodiaos.systems.simula.types import EvolutionProposal
+    from ecodiaos.systems.simula.evolution_types import EvolutionProposal
 
 logger = structlog.get_logger().bind(system="simula.orchestration")
 

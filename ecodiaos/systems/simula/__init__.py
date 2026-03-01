@@ -34,12 +34,12 @@ Stage 3 enhancements (Incremental & Learning):
   3B: SWE-grep agentic retrieval — multi-hop code search
   3C: LILO library learning — abstraction extraction from successful proposals
 
-Hunter — Zero-Day Discovery Engine:
+Inspector — Zero-Day Discovery Engine:
   TargetWorkspace      — workspace abstraction (internal/external)
   AttackSurface        — discovered entry point
   VulnerabilityReport  — proven vulnerability + PoC
-  HuntResult           — aggregated hunt results
-  HunterConfig         — authorization and resource limits
+  InspectionResult           — aggregated hunt results
+  InspectorConfig         — authorization and resource limits
 """
 
 # Stage 2D: AgentCoder agents
@@ -50,12 +50,12 @@ from ecodiaos.systems.simula.bridge import EvoSimulaBridge
 from ecodiaos.systems.simula.code_agent import SimulaCodeAgent
 from ecodiaos.systems.simula.history import EvolutionHistoryManager
 
-# Hunter: Zero-Day Discovery Engine
-from ecodiaos.systems.simula.hunter import (
+# Inspector: Zero-Day Discovery Engine
+from ecodiaos.systems.simula.inspector import (
     AttackSurface,
     AttackSurfaceType,
-    HunterConfig,
-    HuntResult,
+    InspectorConfig,
+    InspectionResult,
     TargetType,
     TargetWorkspace,
     VulnerabilityReport,
@@ -65,7 +65,7 @@ from ecodiaos.systems.simula.learning.lilo import LiloLibraryEngine
 from ecodiaos.systems.simula.proposal_intelligence import ProposalIntelligence
 from ecodiaos.systems.simula.retrieval.swe_grep import SweGrepRetriever
 from ecodiaos.systems.simula.service import SimulaService
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     FORBIDDEN,
     GOVERNANCE_REQUIRED,
     SELF_APPLICABLE,
@@ -219,13 +219,13 @@ __all__ = [
     "AbstractionExtractionResult",
     "LibraryStats",
     "LiloLibraryEngine",
-    # Hunter: Zero-Day Discovery Engine
+    # Inspector: Zero-Day Discovery Engine
     "TargetWorkspace",
     "TargetType",
     "AttackSurface",
     "AttackSurfaceType",
     "VulnerabilityReport",
     "VulnerabilitySeverity",
-    "HuntResult",
-    "HunterConfig",
+    "InspectionResult",
+    "InspectorConfig",
 ]

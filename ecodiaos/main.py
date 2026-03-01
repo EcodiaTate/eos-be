@@ -9,6 +9,7 @@ Infrastructure Architecture specification.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager, suppress
 from typing import Any
@@ -22,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 
 from ecodiaos.clients.embedding import create_embedding_client
+from ecodiaos.core.hotreload import NeuroplasticityBus
 from ecodiaos.clients.llm import create_llm_provider
 from ecodiaos.clients.neo4j import Neo4jClient
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
@@ -29,6 +31,7 @@ from ecodiaos.clients.prompt_cache import PromptCache
 from ecodiaos.clients.redis import RedisClient
 from ecodiaos.clients.timescaledb import TimescaleDBClient
 from ecodiaos.clients.token_budget import TokenBudget
+from ecodiaos.clients.wallet import WalletClient
 from ecodiaos.config import load_config, load_seed
 from ecodiaos.systems.atune.service import AtuneConfig, AtuneService
 from ecodiaos.systems.atune.types import InputChannel, RawInput
@@ -47,7 +50,7 @@ from ecodiaos.systems.thymos.service import ThymosService
 from ecodiaos.systems.voxis.service import VoxisService
 from ecodiaos.systems.voxis.types import ExpressionTrigger
 from ecodiaos.telemetry.llm_metrics import LLMMetricsCollector
-from ecodiaos.telemetry.logging import setup_logging
+from ecodiaos.telemetry.logging import setup_logging, subscribe_logs, unsubscribe_logs
 from ecodiaos.telemetry.metrics import MetricCollector
 
 logger = structlog.get_logger()
@@ -89,6 +92,14 @@ async def lifespan(app: FastAPI):
     redis_client = RedisClient(config.redis)
     await redis_client.connect()
     app.state.redis = redis_client
+
+    # ── 3b. Start the Neuroplasticity Bus ─────────────────────
+    # Single Redis subscriber for the entire process. All cognitive systems
+    # register their hot-reload handlers here; changed files are imported
+    # once and dispatched to every matching handler.
+    neuroplasticity_bus = NeuroplasticityBus(redis_client=redis_client)
+    neuroplasticity_bus.start()
+    app.state.neuroplasticity_bus = neuroplasticity_bus
 
     # ── 4. Initialize LLM and embedding clients ───────────────
     # Create base LLM provider
@@ -145,6 +156,7 @@ async def lifespan(app: FastAPI):
         llm=llm_client,
         config=config.equor,
         governance_config=governance_config,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     await equor.initialize()
     app.state.equor = equor
@@ -165,6 +177,7 @@ async def lifespan(app: FastAPI):
         llm_client=llm_client,  # type: ignore[arg-type]
         belief_state=None,  # Wired in step 9c after Nova initializes
         config=atune_config,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     await atune.startup()
     app.state.atune = atune
@@ -175,6 +188,7 @@ async def lifespan(app: FastAPI):
         redis=redis_client,
         llm=llm_client,
         config=config.voxis,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     await voxis.initialize()
     app.state.voxis = voxis
@@ -186,6 +200,7 @@ async def lifespan(app: FastAPI):
         voxis=voxis,
         llm=llm_client,
         config=config.nova,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     await nova.initialize()
     nova.set_embed_fn(embedding_client.embed)
@@ -202,7 +217,9 @@ async def lifespan(app: FastAPI):
         config=config.axon,
         memory=memory,
         voxis=voxis,
+        neuroplasticity_bus=neuroplasticity_bus,
         redis_client=redis_client,
+        wallet=None,  # Will be set to wallet_client after it's initialized in step 15b
         instance_id=config.instance_id,
     )
     await axon.initialize()
@@ -385,6 +402,7 @@ async def lifespan(app: FastAPI):
         llm=llm_client,
         memory=memory,
         instance_name=config.instance_id,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     await evo.initialize()
     evo.schedule_consolidation_loop()
@@ -405,6 +423,7 @@ async def lifespan(app: FastAPI):
     thread = ThreadService(
         memory=memory,
         instance_name=config.instance_id,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     await thread.initialize()
     # Wire cross-system references for 29D fingerprint aggregation
@@ -418,18 +437,44 @@ async def lifespan(app: FastAPI):
     app.state.thread = thread
 
     # ── 12. Initialize Simula (Self-Evolution) ────────────────
-    from pathlib import Path as _Path
-    simula = SimulaService(
-        config=config.simula,
-        llm=llm_client,
-        neo4j=neo4j_client,
-        memory=memory,
-        codebase_root=_Path(config.simula.codebase_root).resolve(),
-        instance_name=config.instance_id,
-        tsdb=tsdb_client,
-        redis=redis_client,
-    )
-    await simula.initialize()
+    # SIMULA_MODE=proxy offloads the heavy pipeline to an out-of-process
+    # worker via Redis Streams. The proxy is non-blocking: callers still
+    # await process_proposal() but the Synapse 150ms clock is never stalled.
+    _simula_mode = os.getenv("SIMULA_MODE", "local")
+    if _simula_mode == "proxy":
+        from ecodiaos.systems.simula.proxy import InspectorProxy, SimulaProxy
+
+        simula = SimulaProxy(
+            redis=redis_client,
+            timeout_s=config.simula.pipeline_timeout_s,
+            neo4j=neo4j_client,
+        )
+        await simula.initialize()
+
+        inspector_proxy = InspectorProxy(
+            redis=redis_client,
+            timeout_s=config.simula.pipeline_timeout_s,
+        )
+        await inspector_proxy.initialize()
+
+        app.state.inspector_proxy = inspector_proxy
+        logger.info("simula_mode", mode="proxy", inspector="proxy")
+    else:
+        from pathlib import Path as _Path
+
+        simula = SimulaService(
+            config=config.simula,
+            llm=llm_client,
+            neo4j=neo4j_client,
+            memory=memory,
+            codebase_root=_Path(config.simula.codebase_root).resolve(),
+            instance_name=config.instance_id,
+            tsdb=tsdb_client,
+            redis=redis_client,
+        )
+        await simula.initialize()
+        app.state.inspector_proxy = None
+        logger.info("simula_mode", mode="local")
     app.state.simula = simula
 
     # ── 13. Initialize Synapse — The Heartbeat ────────────────────
@@ -438,6 +483,7 @@ async def lifespan(app: FastAPI):
         config=config.synapse,
         redis=redis_client,
         metrics=metrics,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     await synapse.initialize()
 
@@ -455,6 +501,13 @@ async def lifespan(app: FastAPI):
     await synapse.start_health_monitor()
     app.state.synapse = synapse
 
+    # Wire metabolic cost tracking: every real LLM call now reports its
+    # token usage to the MetabolicTracker.  The callback is injected here
+    # (not at llm_client construction) to avoid a circular dependency —
+    # llm_client is built in step 4, Synapse is initialized in step 13.
+    llm_client.set_metabolic_callback(synapse.metabolism.log_usage)
+    logger.info("metabolic_tracking_wired", system="llm_client→synapse.metabolism")
+
     # Loop 10: rhythm state → Nova drive weight adaptation
     from ecodiaos.systems.synapse.types import SynapseEventType
     synapse.event_bus.subscribe(
@@ -471,6 +524,7 @@ async def lifespan(app: FastAPI):
         neo4j=neo4j_client,
         llm=llm_client,
         metrics=metrics,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     # Wire cross-system references
     thymos.set_equor(equor)
@@ -493,6 +547,7 @@ async def lifespan(app: FastAPI):
         llm=llm_client,
         embed_fn=embedding_client,
         metrics=metrics,
+        neuroplasticity_bus=neuroplasticity_bus,
     )
     # Wire cross-system references
     oneiros.set_equor(equor)
@@ -509,7 +564,7 @@ async def lifespan(app: FastAPI):
     # Must come after Synapse, Atune, Nova, Thymos, Equor, Oneiros.
     # Soma reads from all systems to compose interoceptive state and
     # emits AllostaticSignal consumed by Atune, Nova, Voxis, Evo, etc.
-    soma = SomaService(config=config.soma)
+    soma = SomaService(config=config.soma, neuroplasticity_bus=neuroplasticity_bus)
     # Wire interoceptor system references
     soma.set_atune(atune)
     soma.set_synapse(synapse)
@@ -556,10 +611,107 @@ async def lifespan(app: FastAPI):
     app.state.federation = federation
     # Loop 9: federated knowledge → perceived input
     federation.set_atune(atune)
+    # Wire federation into Thymos for Layer 4 threat intelligence
+    thymos.set_federation(federation)
 
     if config.federation.enabled:
         # Register with Synapse for health monitoring
         synapse.register_system(federation)
+
+    # ── 15b. Initialize Wallet (Phase 2: Metabolic Layer) ──────────
+    # On-chain financial identity via Coinbase Developer Platform.
+    # Only connects if CDP credentials are configured — otherwise the
+    # organism operates without a wallet (pre-metabolic mode).
+    wallet_client: WalletClient | None = None
+    if config.wallet.cdp_api_key_id:
+        wallet_client = WalletClient(config.wallet)
+        await wallet_client.connect()
+        app.state.wallet = wallet_client
+        # Wire wallet into Axon for metabolic actions (spending, transfers, etc.)
+        axon.set_wallet(wallet_client)
+        logger.info(
+            "ecodiaos_ready",
+            phase="15b_wallet",
+            address=wallet_client.address,
+            network=wallet_client.network,
+        )
+    else:
+        app.state.wallet = None
+        logger.info("wallet_skipped", reason="no CDP credentials configured")
+
+    # ── 15c. Wire financial memory encoding ────────────────────────
+    # MemoryService and AxonService both need the Synapse event bus so that
+    # wallet transfers and revenue injections are encoded as salience=1.0
+    # episodes in Neo4j.  Must come after both Synapse (step 13) and the
+    # wallet client (step 15b) are initialised.
+    memory.set_event_bus(synapse.event_bus)
+    axon.set_event_bus(synapse.event_bus)
+    logger.info("financial_memory_encoding_wired")
+
+    # ── 15d. Initialize Certificate Manager (Phase 16g: Civilization Layer) ──
+    # The CertificateManager re-uses the Federation IdentityManager's Ed25519
+    # keypair for signing. It issues birth certificates for children (Mitosis),
+    # validates inbound certificates (Federation), and tracks expiry (Oikos).
+    from ecodiaos.systems.identity.manager import CertificateManager
+
+    certificate_manager = CertificateManager()
+    _fed_identity = federation._identity if federation._identity else None
+    if _fed_identity is not None:
+        await certificate_manager.initialize(
+            identity=_fed_identity,
+            instance_id=config.instance_id,
+            validity_days=config.oikos.certificate_validity_days,
+            expiry_warning_days=config.oikos.certificate_expiry_warning_days,
+            ca_address=config.oikos.certificate_ca_address,
+            data_dir=config.federation.identity_data_dir,
+        )
+        certificate_manager.set_event_bus(synapse.event_bus)
+        # Wire into Federation for inbound certificate validation
+        federation.set_certificate_manager(certificate_manager)
+        app.state.certificate_manager = certificate_manager
+        logger.info(
+            "ecodiaos_ready",
+            phase="15d_certificate_manager",
+            certified=certificate_manager.is_certified,
+            remaining_days=f"{certificate_manager.certificate_remaining_days:.1f}",
+        )
+    else:
+        app.state.certificate_manager = None
+        logger.info(
+            "certificate_manager_skipped",
+            reason="federation identity not initialized",
+        )
+
+    # ── 15e. Initialize Oikos — The Economic Engine ─────────────────
+    # OikosService owns all sub-engines: AssetFactory, MitosisEngine,
+    # DerivativesManager, OrganLifecycleManager, KnowledgeMarket, and
+    # TollboothManager. It subscribes to Synapse events for metabolic
+    # data and polls the wallet for on-chain balance.
+    from ecodiaos.systems.oikos.service import OikosService
+
+    oikos = OikosService(
+        config=config.oikos,
+        wallet=wallet_client,
+        metabolism=synapse.metabolism if hasattr(synapse, "metabolism") else None,
+        instance_id=config.instance_id,
+        redis=redis_client,
+    )
+    oikos.initialize(bus=neuroplasticity_bus)
+    await oikos.load_state()  # Restore durable ledger from Redis (no-op if first boot)
+    oikos.attach(synapse.event_bus)
+
+    # Wire CertificateManager into Oikos for certificate expiry tracking
+    if app.state.certificate_manager is not None:
+        oikos.set_certificate_manager(app.state.certificate_manager)
+
+    synapse.register_system(oikos)
+    app.state.oikos = oikos
+    logger.info(
+        "ecodiaos_ready",
+        phase="15e_oikos",
+        cost_model=oikos._cost_model.model_name,
+        runway_days=str(oikos.snapshot().runway_days),
+    )
 
     # ── 16. Start internal percept generator ───────────────────────
     # Without external input, the workspace is empty every cycle.
@@ -826,15 +978,52 @@ async def lifespan(app: FastAPI):
         _inner_life_loop(), name="inner_life_generator"
     )
 
+    # ── 17. Start multi-channel perception ────────────────────────
+    # File watcher: drop .txt/.md into config/percepts/ to inject percepts
+    # Scheduler: register cron-like tasks that poll external sources
+    from pathlib import Path as _PPath
+    from ecodiaos.clients.file_watcher import FileWatcher
+    from ecodiaos.clients.scheduler import PerceptionScheduler
+
+    _percepts_dir = _PPath(
+        os.environ.get("ECODIAOS_PERCEPTS_DIR", "config/percepts")
+    ).resolve()
+    _file_watcher = FileWatcher(watch_dir=_percepts_dir, atune=atune)
+    await _file_watcher.start()
+    app.state.file_watcher = _file_watcher
+
+    _scheduler = PerceptionScheduler(atune=atune)
+    await _scheduler.start()
+    app.state.scheduler = _scheduler
+
     logger.info(
         "ecodiaos_ready",
-        phase="12_thymos",
+        phase="17_multi_channel_perception",
         federation_enabled=config.federation.enabled,
         immune_system="active",
         inner_life="active",
+        file_watcher=str(_percepts_dir),
     )
 
+    # ── 18. Start distributed shield listener ─────────────────────
+    from ecodiaos.systems.simula.distributed_shield import FleetShieldManager
+
+    fleet_shield = FleetShieldManager(redis_client)
+    fleet_shield.start()
+    app.state.fleet_shield = fleet_shield
+    logger.info("ecodiaos_ready", phase="18_fleet_shield_listener")
+
+    # ── 19. Start metrics publisher ───────────────────────────────
+    metrics_queue: asyncio.Queue[dict] = asyncio.Queue()
+    app.state.metrics_queue = metrics_queue
+    metrics_task = asyncio.create_task(publish_metrics_loop(redis_client, metrics_queue))
+    logger.info("ecodiaos_ready", phase="19_metrics_publisher")
+
     yield
+
+    metrics_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await metrics_task
 
     # Cancel inner life before shutdown
     if _inner_life_task is not None:
@@ -844,9 +1033,13 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────
     logger.info("ecodiaos_shutting_down")
+    await neuroplasticity_bus.stop()
+    await _scheduler.stop()
+    await _file_watcher.stop()
     await federation.shutdown()
     await alive_ws.stop()
     await thymos.shutdown()
+    await oikos.shutdown()
     await synapse.stop()
     await simula.shutdown()
     await thread.shutdown()
@@ -855,6 +1048,10 @@ async def lifespan(app: FastAPI):
     await nova.shutdown()
     await voxis.shutdown()
     await atune.shutdown()
+    await equor.shutdown()
+    await fleet_shield.shutdown()
+    if wallet_client is not None:
+        await wallet_client.close()
     await metrics.stop()
     await embedding_client.close()
     await llm_client.close()
@@ -1036,6 +1233,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Oikos & Identity Router ─────────────────────────────────────
+from ecodiaos.api.routers.oikos import router as oikos_router
+
+app.include_router(oikos_router)
+
 
 # ─── Alive WebSocket on port 8000 (for Cloud Run) ────────────────
 # Cloud Run only exposes one port per container. The standalone ws_server
@@ -1138,8 +1340,93 @@ async def alive_websocket(ws: WebSocket):
             msg = await queue.get()
             await ws.send_text(msg)
 
+    async def _workspace_poller() -> None:
+        """Poll Atune workspace snapshot at ~1 Hz for the perception page."""
+        while running:
+            try:
+                ws_snapshot = atune.workspace_snapshot
+                affect = atune.current_affect
+                workspace_items = []
+                for b in ws_snapshot.recent_broadcasts:
+                    workspace_items.append({
+                        "broadcast_id": b.broadcast_id,
+                        "salience": round(b.salience, 4),
+                        "ts": b.timestamp.isoformat() if hasattr(b, "timestamp") and b.timestamp else None,
+                    })
+                msg = _ws_json({
+                    "stream": "workspace",
+                    "payload": {
+                        "cycle_count": atune.cycle_count,
+                        "dynamic_threshold": round(atune.workspace_threshold, 4),
+                        "meta_attention_mode": atune.meta_attention_mode,
+                        "recent_broadcasts": workspace_items,
+                        "affect": {
+                            "valence": round(affect.valence, 4),
+                            "arousal": round(affect.arousal, 4),
+                            "curiosity": round(affect.curiosity, 4),
+                            "coherence_stress": round(affect.coherence_stress, 4),
+                        },
+                    },
+                })
+                try:
+                    queue.put_nowait(msg)
+                except _ws_asyncio.QueueFull:
+                    pass
+            except Exception:
+                pass
+            await _ws_asyncio.sleep(1.0)  # 1 Hz — workspace state changes slowly
+
+    async def _outcomes_poller() -> None:
+        """Poll Axon recent outcomes at ~0.5 Hz for the decisions page."""
+        last_count = 0
+        while running:
+            try:
+                axon_svc = app.state.axon
+                total = getattr(axon_svc, "_total_executions", 0)
+                if total != last_count:
+                    last_count = total
+                    outcomes = axon_svc.recent_outcomes[:10]
+                    msg = _ws_json({
+                        "stream": "outcomes",
+                        "payload": {
+                            "outcomes": [
+                                {
+                                    "execution_id": o.execution_id,
+                                    "intent_id": o.intent_id,
+                                    "success": o.success,
+                                    "partial": o.partial,
+                                    "status": o.status.value,
+                                    "failure_reason": o.failure_reason or None,
+                                    "duration_ms": o.duration_ms,
+                                    "steps": [
+                                        {
+                                            "action_type": s.action_type,
+                                            "description": s.description[:80],
+                                            "success": s.result.success,
+                                        }
+                                        for s in o.step_outcomes
+                                    ],
+                                    "world_state_changes": o.world_state_changes[:3],
+                                }
+                                for o in outcomes
+                            ],
+                            "total": total,
+                            "successful": getattr(axon_svc, "_successful_executions", 0),
+                            "failed": getattr(axon_svc, "_failed_executions", 0),
+                        },
+                    })
+                    try:
+                        queue.put_nowait(msg)
+                    except _ws_asyncio.QueueFull:
+                        pass
+            except Exception:
+                pass
+            await _ws_asyncio.sleep(2.0)  # 0.5 Hz — poll on change
+
     poller_task = _ws_asyncio.create_task(_affect_poller())
     subscriber_task = _ws_asyncio.create_task(_redis_subscriber())
+    workspace_task = _ws_asyncio.create_task(_workspace_poller())
+    outcomes_task = _ws_asyncio.create_task(_outcomes_poller())
     sender_task = _ws_asyncio.create_task(_sender())
 
     try:
@@ -1152,6 +1439,8 @@ async def alive_websocket(ws: WebSocket):
         running = False
         poller_task.cancel()
         subscriber_task.cancel()
+        workspace_task.cancel()
+        outcomes_task.cancel()
         sender_task.cancel()
 
 
@@ -1182,8 +1471,11 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         # Public endpoints — no auth required
         if path in ("/health", "/docs", "/openapi.json", "/redoc", "/api/v1/admin/llm/metrics", "/api/v1/admin/llm/summary"):
             return await call_next(request)
-        # Federation identity is public (used during link establishment)
-        if path == "/api/v1/federation/identity":
+        # Federation endpoints accessible to peers (trust-gated at service level)
+        if path in (
+            "/api/v1/federation/identity",
+            "/api/v1/federation/threat-advisory",
+        ):
             return await call_next(request)
 
         # Only protect /api/v1/* paths
@@ -1404,13 +1696,11 @@ async def perceive_event(body: dict[str, Any]):
     if percept_id is None:
         return {"percept_id": None, "accepted": False, "reason": "queue_full"}
 
-    # Run a workspace cycle immediately (until Synapse drives the clock)
-    broadcast = await atune.run_cycle()
-
+    # Percept is enqueued — Synapse clock will pick it up on the next tick.
     return {
         "percept_id": percept_id,
         "accepted": True,
-        "broadcast": broadcast.broadcast_id if broadcast else None,
+        "queued": True,
         "salience_threshold": round(atune.workspace_threshold, 4),
         "affect": {
             "valence": round(atune.current_affect.valence, 4),
@@ -1618,12 +1908,11 @@ async def chat_message(body: dict[str, Any]):
             speaker_id=speaker_id,
         )
 
-        # Also feed through Atune (updates affect, workspace state)
+        # Also feed through Atune (updates affect, workspace state).
+        # No manual run_cycle() needed — Synapse clock picks up the percept.
         try:
             raw = RawInput(data=message, channel_id=conversation_id or "", metadata={})
-            percept_id = await atune.ingest(raw, InputChannel.TEXT_CHAT)
-            if percept_id:
-                await atune.run_cycle()
+            await atune.ingest(raw, InputChannel.TEXT_CHAT)
         except Exception as atune_err:
             # Atune ingestion is non-critical for chat — log and continue
             _chat_logger.warning("chat_atune_ingest_failed", error=str(atune_err))
@@ -2180,7 +2469,7 @@ async def submit_evolution_proposal(body: dict[str, Any]):
       risk_assessment: str
     }
     """
-    from ecodiaos.systems.simula.types import (
+    from ecodiaos.systems.simula.evolution_types import (
         ChangeCategory,
         ChangeSpec,
         EvolutionProposal,
@@ -2371,6 +2660,242 @@ async def get_synapse_stats():
     """Full Synapse system statistics."""
     synapse: SynapseService = app.state.synapse
     return synapse.stats
+
+
+@app.post("/api/v1/admin/clock/pause")
+async def pause_clock():
+    """Pause the cognitive cycle clock."""
+    synapse: SynapseService = app.state.synapse
+    synapse.pause_clock()
+    return {"paused": True, "cycle_count": synapse.clock_state.cycle_count}
+
+
+@app.post("/api/v1/admin/clock/resume")
+async def resume_clock():
+    """Resume the cognitive cycle clock after a pause."""
+    synapse: SynapseService = app.state.synapse
+    synapse.resume_clock()
+    return {"paused": False, "cycle_count": synapse.clock_state.cycle_count}
+
+
+@app.post("/api/v1/admin/clock/speed")
+async def set_clock_speed(body: dict[str, Any]):
+    """
+    Set the base clock frequency.
+
+    Body: {hz: float}  — clamped to 1–20 Hz.
+    Arousal modulation still operates on top of this base frequency.
+    """
+    hz = body.get("hz")
+    if hz is None:
+        return {"error": "hz required"}
+    try:
+        hz = float(hz)
+    except (TypeError, ValueError):
+        return {"error": "hz must be a number"}
+    synapse: SynapseService = app.state.synapse
+    synapse.set_clock_speed(hz)
+    state = synapse.clock_state
+    return {
+        "hz_requested": hz,
+        "period_ms": round(state.current_period_ms, 2),
+        "actual_rate_hz": round(state.actual_rate_hz, 2),
+    }
+
+
+@app.get("/api/v1/debug/cycle-status")
+async def get_cycle_status():
+    """
+    Lightweight cycle health snapshot for development and monitoring.
+
+    Returns cycle count, current Hz, paused state, and whether the clock
+    is running — the minimum needed to confirm the continuous cycle is live.
+    """
+    synapse: SynapseService = app.state.synapse
+    clock = synapse.clock_state
+    return {
+        "running": clock.running,
+        "paused": clock.paused,
+        "cycle_count": clock.cycle_count,
+        "hz": round(clock.actual_rate_hz, 2),
+        "period_ms": round(clock.current_period_ms, 2),
+        "jitter_ms": round(clock.jitter_ms, 2),
+        "overrun_count": clock.overrun_count,
+        "arousal": round(clock.arousal, 4),
+    }
+
+
+# ─── Phase 2: Multi-Channel Perception Endpoints ─────────────────
+
+
+@app.get("/api/v1/perception/file-watcher")
+async def get_file_watcher_status():
+    """
+    File watcher status — directory being watched, ingestion counts.
+    """
+    from ecodiaos.clients.file_watcher import FileWatcher
+
+    watcher: FileWatcher = app.state.file_watcher
+    return watcher.stats
+
+
+@app.get("/api/v1/perception/scheduler")
+async def get_scheduler_status():
+    """
+    Perception scheduler status — registered tasks, run counts, intervals.
+    """
+    from ecodiaos.clients.scheduler import PerceptionScheduler
+
+    sched: PerceptionScheduler = app.state.scheduler
+    return sched.stats
+
+
+@app.post("/api/v1/perception/scheduler/register")
+async def register_scheduler_task(body: dict[str, Any]):
+    """
+    Dynamically register a built-in named scheduler task at runtime.
+
+    Body: {name: str, task: str}
+
+    Currently supported built-in tasks:
+    - "self_clock" — injects a periodic time-awareness percept (every 300s)
+    """
+    from ecodiaos.clients.scheduler import PerceptionScheduler
+    from ecodiaos.systems.atune.types import InputChannel
+
+    name = body.get("name")
+    task_key = body.get("task")
+    if not name or not task_key:
+        return {"error": "name and task required"}
+
+    sched: PerceptionScheduler = app.state.scheduler
+
+    # ── Built-in tasks ────────────────────────────────────────────
+    if task_key == "self_clock":
+        import datetime as _dt
+
+        async def _self_clock_fn() -> str:
+            now = _dt.datetime.now(_dt.timezone.utc)
+            return (
+                f"The current time is {now.strftime('%Y-%m-%d %H:%M UTC')}. "
+                f"I am aware of the passage of time."
+            )
+
+        sched.register(
+            name=name,
+            interval_seconds=300,
+            channel=InputChannel.SYSTEM_EVENT,
+            fn=_self_clock_fn,
+            metadata={"built_in": "self_clock"},
+        )
+        return {"registered": True, "name": name, "task": task_key}
+
+    return {"error": f"Unknown built-in task: {task_key!r}"}
+
+
+# ─── Phase 3: Frontend Data Integration Endpoints ─────────────────
+
+
+@app.get("/api/v1/axon/outcomes")
+async def get_axon_outcomes(limit: int = 20):
+    """
+    Recent Axon execution outcomes for the Decisions page.
+
+    Returns the last N action verdicts (newest first): intent_id, success,
+    status, action types executed, duration_ms, and world_state_changes.
+    This is the observable footprint of the Nova→Equor→Axon pipeline.
+    """
+    from ecodiaos.systems.axon.service import AxonService
+
+    axon: AxonService = app.state.axon
+    outcomes = axon.recent_outcomes[:limit]
+
+    return {
+        "outcomes": [
+            {
+                "execution_id": o.execution_id,
+                "intent_id": o.intent_id,
+                "success": o.success,
+                "partial": o.partial,
+                "status": o.status.value,
+                "failure_reason": o.failure_reason or None,
+                "duration_ms": o.duration_ms,
+                "steps": [
+                    {
+                        "action_type": s.action_type,
+                        "description": s.description[:120],
+                        "success": s.result.success,
+                        "duration_ms": s.duration_ms,
+                    }
+                    for s in o.step_outcomes
+                ],
+                "world_state_changes": o.world_state_changes[:5],
+                "new_observations": o.new_observations[:3],
+            }
+            for o in outcomes
+        ],
+        "total": axon._total_executions,
+        "successful": axon._successful_executions,
+        "failed": axon._failed_executions,
+    }
+
+
+@app.get("/api/v1/atune/workspace-detail")
+async def get_workspace_detail():
+    """
+    Detailed workspace state — ignited percepts with content, salience, and channel.
+
+    Used by the /perception page WorkspaceStream component to show what the
+    organism is currently considering at this cognitive moment.
+    """
+    atune: AtuneService = app.state.atune
+
+    # Collect ignited percepts from the workspace buffer
+    workspace_items: list[dict[str, Any]] = []
+    try:
+        # Access the workspace buffer directly (ring buffer of recent broadcasts)
+        broadcasts = getattr(atune, "_workspace_broadcasts", []) or []
+        for b in list(broadcasts)[-20:]:  # Last 20
+            workspace_items.append({
+                "broadcast_id": getattr(b, "broadcast_id", str(id(b))),
+                "content": getattr(b, "content", "")[:200] if hasattr(b, "content") else "",
+                "salience": round(getattr(b, "salience", 0.0), 4),
+                "channel": getattr(b, "channel", "unknown"),
+                "timestamp": b.timestamp.isoformat() if hasattr(b, "timestamp") and b.timestamp else None,
+                "source": getattr(b, "source", "unknown"),
+            })
+    except Exception:
+        pass
+
+    # If workspace_broadcasts not available, fall back to recent_broadcasts from workspace
+    if not workspace_items:
+        try:
+            ws_snapshot = atune.workspace_snapshot
+            for b in ws_snapshot.recent_broadcasts:
+                workspace_items.append({
+                    "broadcast_id": b.broadcast_id,
+                    "content": "",
+                    "salience": round(b.salience, 4),
+                    "channel": "unknown",
+                    "timestamp": b.timestamp.isoformat() if hasattr(b, "timestamp") else None,
+                    "source": "workspace",
+                })
+        except Exception:
+            pass
+
+    affect = atune.current_affect
+    return {
+        "cycle_count": atune.cycle_count,
+        "dynamic_threshold": round(atune.workspace_threshold, 4),
+        "meta_attention_mode": atune.meta_attention_mode,
+        "workspace_items": workspace_items,
+        "affect": {
+            "valence": round(affect.valence, 4),
+            "arousal": round(affect.arousal, 4),
+            "curiosity": round(affect.curiosity, 4),
+            "coherence_stress": round(affect.coherence_stress, 4),
+        },
+    }
 
 
 # ─── Phase 12: Thymos (Immune System) Endpoints ──────────────────
@@ -2787,6 +3312,32 @@ async def get_federation_trust(link_id: str):
     }
 
 
+@app.post("/api/v1/federation/threat-advisory")
+async def receive_threat_advisory(body: dict[str, Any]):
+    """
+    Receive a threat advisory from a federated peer.
+
+    Layer 4 of the Economic Immune System: trust-gated threat
+    intelligence sharing between instances.
+
+    Body: ThreatAdvisory payload (source_instance_id, threat_type,
+          severity, affected_protocols, affected_addresses, etc.)
+    """
+    from ecodiaos.primitives.federation import ThreatAdvisory as ThreatAdvisoryModel
+
+    try:
+        advisory = ThreatAdvisoryModel.model_validate(body)
+    except Exception as exc:
+        return {"accepted": False, "reason": f"Invalid advisory format: {exc}"}
+
+    federation: FederationService = app.state.federation
+    accepted, reason = federation.handle_threat_advisory(
+        advisory, advisory.source_instance_id
+    )
+
+    return {"accepted": accepted, "reason": reason}
+
+
 # ── Soma (Interoceptive Predictive Substrate) ──────────────────────
 
 
@@ -2898,3 +3449,832 @@ async def get_soma_errors():
         horizon: {d.value: round(v, 4) for d, v in dims.items()}
         for horizon, dims in errors.items()
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command Center — Phantom + Inspector pipeline (SSE streaming)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json as _cc_json
+import re as _cc_re
+import signal as _cc_signal
+import sys as _cc_sys
+import uuid as _cc_uuid
+from pathlib import Path as _CCPath
+
+from fastapi.responses import StreamingResponse as _CCStreamingResponse
+from pydantic import BaseModel as _CCBaseModel
+
+
+def _cc_try_parse_json(s: str | None) -> dict:
+    """Parse a Z3 counterexample string as JSON, falling back to raw string."""
+    if not s:
+        return {}
+    try:
+        return _cc_json.loads(s)
+    except (_cc_json.JSONDecodeError, ValueError):
+        return {"raw": s}
+
+_CC_BACKEND_DIR = _CCPath(__file__).parent.parent  # ecodiaos/../../ = backend/
+_CC_PHANTOM = _CC_BACKEND_DIR / "phantom_recon.py"
+_CC_INSPECTOR = _CCPath(__file__).parent / "systems" / "simula" / "run_inspector.py"
+_CC_FILE_RE = _cc_re.compile(r"file:///tmp/[^\s]+")
+
+# ── Active subprocess registry (task_id → asyncio.subprocess.Process) ─────
+# Only tracks child processes spawned by the pipeline, never the parent uvicorn.
+_cc_active_procs: dict[str, "asyncio.subprocess.Process"] = {}
+
+
+class _CCEngagePayload(_CCBaseModel):
+    target_url: str
+
+
+def _cc_sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {_cc_json.dumps(data)}\n\n"
+
+
+async def _cc_stream_proc(
+    cmd: list[str],
+    stdin_data: bytes | None = None,
+    task_id: str | None = None,
+):
+    """Async subprocess stream — yields ``(source, line)``.  No ``shell=True``.
+
+    When *task_id* is given the child process is registered in
+    ``_cc_active_procs`` so it can be terminated via
+    ``POST /api/v1/command-center/terminate/{task_id}``.
+    Only the spawned child is tracked — never the parent uvicorn process.
+    """
+    import asyncio as _aio
+    import os as _os
+
+    proc = await _aio.create_subprocess_exec(
+        *cmd,
+        stdin=_aio.subprocess.PIPE if stdin_data is not None else None,
+        stdout=_aio.subprocess.PIPE,
+        stderr=_aio.subprocess.PIPE,
+        env=_os.environ.copy(),
+    )
+
+    # Register so terminate endpoint can reach this child.
+    if task_id is not None:
+        _cc_active_procs[task_id] = proc
+
+    # Feed stdin then close it so input() unblocks
+    if stdin_data is not None and proc.stdin is not None:
+        proc.stdin.write(stdin_data)
+        await proc.stdin.drain()
+        proc.stdin.close()
+
+    q: _aio.Queue = _aio.Queue()
+
+    async def _feed(stream, label: str) -> None:
+        while True:
+            raw = await stream.readline()
+            if not raw:
+                break
+            await q.put((label, raw.decode(errors="replace").rstrip()))
+        await q.put(None)
+
+    assert proc.stdout and proc.stderr
+    tasks = [
+        _aio.create_task(_feed(proc.stdout, "stdout")),
+        _aio.create_task(_feed(proc.stderr, "stderr")),
+    ]
+
+    done = 0
+    while done < 2:
+        item = await q.get()
+        if item is None:
+            done += 1
+        else:
+            yield item
+
+    await _aio.gather(*tasks)
+    await proc.wait()
+
+    # Unregister once the child exits naturally.
+    if task_id is not None:
+        _cc_active_procs.pop(task_id, None)
+
+
+async def _cc_pipeline(target_url: str, task_id: str):
+    def log(phase: str, text: str) -> str:
+        return _cc_sse("log", {"phase": phase, "text": text})
+
+    def phase_ev(name: str, status: str) -> str:
+        return _cc_sse("phase", {"name": name, "status": status})
+
+    # Emit task_id to the client so the UI can target this run for termination.
+    yield _cc_sse("task_id", {"task_id": task_id})
+
+    for script, label in [(_CC_PHANTOM, "phantom_recon.py"), (_CC_INSPECTOR, "run_inspector.py")]:
+        if not script.exists():
+            yield _cc_sse("error", {"message": f"Missing script: {label} (expected at {script})"})
+            yield _cc_sse("done", {"success": False, "message": "Aborted — missing scripts"})
+            return
+
+    # ── Phase 1: Phantom Harvester ─────────────────────────────────────────
+    yield phase_ev("phantom", "started")
+    yield log("phantom", f"[PHANTOM] Initiating black-box recon on {target_url}")
+
+    repo_path = None
+    phantom_ok = True
+
+    try:
+        async for src, line in _cc_stream_proc([_cc_sys.executable, str(_CC_PHANTOM)], stdin_data=(target_url + chr(10)).encode(), task_id=task_id):
+            pfx = "[PHANTOM] " if src == "stdout" else "[PHANTOM·ERR] "
+            yield log("phantom", f"{pfx}{line}")
+
+            # Try to parse JSON output from phantom_recon.py
+            if src == "stdout" and repo_path is None:
+                try:
+                    payload = _cc_json.loads(line)
+                    if isinstance(payload, dict) and "repo_path" in payload:
+                        repo_path = payload.get("repo_path")
+                        if repo_path:
+                            yield _cc_sse("result", {"repo_path": repo_path})
+                            yield log("phantom", f"[PHANTOM] Repo path extracted → {repo_path}")
+                except (_cc_json.JSONDecodeError, ValueError):
+                    # Not JSON, continue streaming
+                    pass
+    except Exception as exc:
+        yield _cc_sse("error", {"message": str(exc)})
+        phantom_ok = False
+
+    if not phantom_ok or repo_path is None:
+        yield phase_ev("phantom", "failed")
+        yield _cc_sse("done", {"success": False, "message": "Phantom recon failed or produced invalid output"})
+        return
+
+    yield phase_ev("phantom", "completed")
+
+    # ── Phase 2: Inspector (AST + Z3 + XDP) ──────────────────────────────────
+    yield phase_ev("inspector", "started")
+    yield log("inspector", f"[INSPECTOR] Loading analysis target: {repo_path}")
+
+    inspector_ok = True
+    _boundary_evidence: list[dict] = []
+
+    # Branch: proxy mode offloads Z3 to the worker; local mode spawns
+    # run_inspector.py as a subprocess on this process.
+    _iproxy = getattr(app.state, "inspector_proxy", None)
+
+    if _iproxy is not None:
+        # ── PROXY PATH: non-blocking call to the worker ───────────
+        yield log("inspector", "[INSPECTOR] Routing hunt to Simula worker via Redis proxy")
+        yield phase_ev("ast", "started")
+
+        try:
+            _hunt_result = await _iproxy.hunt_external_repo(
+                repo_path,
+                generate_pocs=True,
+                generate_patches=True,
+            )
+        except Exception as exc:
+            yield _cc_sse("error", {"message": str(exc)})
+            inspector_ok = False
+            _hunt_result = None
+
+        if inspector_ok and _hunt_result is not None:
+            yield phase_ev("ast", "completed")
+            yield phase_ev("z3", "started")
+
+            # Synthesise boundary_test SSE events from the InspectionResult
+            # so the UI and Phase 3 receive the same data shape.
+            for vuln in _hunt_result.vulnerabilities_found:
+                try:
+                    bt = {
+                        "status": "sat",
+                        "details": {
+                            "vuln_id": vuln.id,
+                            "endpoint": vuln.attack_surface.entry_point,
+                            "file_path": vuln.attack_surface.file_path,
+                            "line_number": vuln.attack_surface.line_number,
+                            "vulnerability_class": vuln.vulnerability_class.value,
+                            "severity": vuln.severity.value,
+                            "attack_goal": vuln.attack_goal,
+                            "edge_case_input": _cc_try_parse_json(vuln.z3_counterexample),
+                            "surface_type": vuln.attack_surface.surface_type.value,
+                            "context_code": vuln.attack_surface.context_code,
+                            "z3_constraints": vuln.z3_constraints_code,
+                        },
+                    }
+                except Exception as _bt_err:
+                    yield log("inspector", f"[Z3·EVIDENCE] Failed to build boundary_test for {vuln.id}: {_bt_err}")
+                    continue
+                _boundary_evidence.append(bt)
+                yield _cc_sse("boundary_test", bt)
+                yield log(
+                    "inspector",
+                    f"[Z3·EVIDENCE] {vuln.vulnerability_class.value.upper()} "
+                    f"at {vuln.attack_surface.file_path}:{vuln.attack_surface.line_number}",
+                )
+
+            yield phase_ev("z3", "completed")
+            yield log(
+                "inspector",
+                f"[INSPECTOR] Hunt complete — {_hunt_result.surfaces_mapped} surfaces, "
+                f"{len(_hunt_result.vulnerabilities_found)} vulns, "
+                f"{_hunt_result.total_duration_ms}ms",
+            )
+            yield phase_ev("inspector", "completed")
+        else:
+            yield phase_ev("inspector", "failed")
+            yield _cc_sse("done", {"success": False, "message": "Inspector proxy hunt failed"})
+            return
+
+    else:
+        # ── LOCAL PATH: subprocess (original behavior) ────────────
+        ast_seen = z3_seen = xdp_seen = False
+
+        try:
+            async for src, line in _cc_stream_proc([_cc_sys.executable, str(_CC_INSPECTOR), "--target", repo_path], task_id=task_id):
+                pfx = "[INSPECTOR] " if src == "stdout" else "[INSPECTOR·ERR] "
+                ll = line.lower()
+
+                if src == "stdout":
+                    try:
+                        _parsed = _cc_json.loads(line)
+                        if isinstance(_parsed, dict) and "boundary_test" in _parsed:
+                            bt = _parsed["boundary_test"]
+                            _boundary_evidence.append(bt)
+                            yield _cc_sse("boundary_test", bt)
+                            yield log("inspector", f"[Z3·EVIDENCE] Boundary test result emitted for {bt.get('details', {}).get('endpoint', 'unknown')}")
+                            continue
+                    except (_cc_json.JSONDecodeError, ValueError):
+                        pass
+
+                yield log("inspector", f"{pfx}{line}")
+
+                if not ast_seen and any(k in ll for k in ("ast", "slic", "pars", "context")):
+                    ast_seen = True
+                    yield phase_ev("ast", "started")
+
+                if not z3_seen and any(k in ll for k in ("z3", "smt", "prov", "satisf", "constraint", "formal")):
+                    z3_seen = True
+                    if ast_seen:
+                        yield phase_ev("ast", "completed")
+                    yield phase_ev("z3", "started")
+
+                if not xdp_seen and any(k in ll for k in ("xdp", "ebpf", "bpf", "shield", "kernel", "layer 2")):
+                    xdp_seen = True
+                    if z3_seen:
+                        yield phase_ev("z3", "completed")
+                    elif ast_seen:
+                        yield phase_ev("ast", "completed")
+                    yield phase_ev("xdp", "started")
+
+        except Exception as exc:
+            yield _cc_sse("error", {"message": str(exc)})
+            inspector_ok = False
+
+        if inspector_ok:
+            for name, seen in [("ast", ast_seen), ("z3", z3_seen), ("xdp", xdp_seen)]:
+                if seen:
+                    yield phase_ev(name, "completed")
+            yield phase_ev("inspector", "completed")
+        else:
+            yield phase_ev("inspector", "failed")
+            yield _cc_sse("done", {"success": False, "message": "Inspector engine crashed"})
+            return
+
+    # ── Phase 3: Deterministic Shield Deployment ─────────────────────────────
+    # Generate a verifier-compliant XDP filter from the boundary_test evidence,
+    # attach it live, and stream kernel telemetry back over this SSE connection.
+
+    if not _boundary_evidence:
+        yield log("shield", "[SHIELD] No boundary_test evidence collected — skipping filter deployment")
+        yield _cc_sse("done", {"success": True, "message": "Pipeline complete — no exploits proven, shield skipped"})
+        return
+
+    yield phase_ev("shield", "started")
+
+    # 3a. Extract edge_case_input from the first evidence payload and generate C.
+    try:
+        from ecodiaos.systems.simula.filter_generator import generate_xdp_filter as _gen_filter
+
+        _edge_input = _boundary_evidence[0].get("details", {}).get("edge_case_input", {})
+        if not _edge_input:
+            yield log("shield", "[SHIELD] boundary_test evidence has no edge_case_input — skipping")
+            yield phase_ev("shield", "skipped")
+            yield _cc_sse("done", {"success": True, "message": "Pipeline complete — edge_case_input empty"})
+            return
+
+        _generated_c = _gen_filter(_edge_input)
+        yield log("shield", f"[SHIELD] Deterministic XDP filter generated ({len(_generated_c)} bytes, {len(_boundary_evidence)} evidence payloads)")
+        yield _cc_sse("filter_generated", {
+            "code_size": len(_generated_c),
+            "evidence_count": len(_boundary_evidence),
+        })
+
+    except Exception as exc:
+        yield _cc_sse("error", {"message": f"Filter generation failed: {exc}"})
+        yield phase_ev("shield", "failed")
+        yield _cc_sse("done", {"success": False, "message": "Filter generation failed"})
+        return
+
+    # 3b. Broadcast the filter to the entire fleet via Redis Pub/Sub.
+    #     The local node is also subscribed, so it will receive its own
+    #     broadcast and deploy the filter — unifying local and remote logic.
+    try:
+        from ecodiaos.systems.simula.distributed_shield import FleetShieldManager as _Fleet
+
+        _fleet: _Fleet = app.state.fleet_shield
+        _receivers = await _fleet.broadcast_filter(_generated_c)
+        yield log("shield", f"[SHIELD] Filter broadcast to fleet ({_receivers} subscriber(s))")
+        yield _cc_sse("shield_broadcast", {
+            "receivers": _receivers,
+            "code_bytes": len(_generated_c),
+        })
+        yield phase_ev("shield", "deployed")
+
+    except Exception as exc:
+        yield _cc_sse("error", {"message": f"Fleet broadcast failed: {exc}"})
+        yield phase_ev("shield", "failed")
+        yield _cc_sse("done", {"success": False, "message": "Fleet broadcast failed"})
+        return
+
+    yield phase_ev("shield", "completed")
+
+    # ── Phase 4: Automated Remediation ───────────────────────────────────────
+    # Launch the RepairAgent against each boundary test evidence payload.
+    # The agent generates a code patch, re-verifies it via Z3, and streams
+    # the verified diff back as a `verified_patch` SSE event.
+
+    yield phase_ev("remediation", "started")
+    yield log("remediation", "[REPAIR] Phase 4 — Automated Remediation initiated")
+
+    _remediation_count = 0
+    _remediation_failures = 0
+
+    try:
+        from ecodiaos.clients.llm import create_llm_provider as _create_llm
+        from ecodiaos.config import LLMConfig as _LLMConfig
+        from ecodiaos.systems.simula.inspector.prover import VulnerabilityProver as _Prover
+        from ecodiaos.systems.simula.inspector.remediation import RepairAgent as _RepairAgent
+        from ecodiaos.systems.simula.inspector.types import (
+            AttackSurface as _AttackSurface,
+            AttackSurfaceType as _AttackSurfaceType,
+            VulnerabilityClass as _VulnClass,
+            VulnerabilityReport as _VulnReport,
+            VulnerabilitySeverity as _VulnSeverity,
+        )
+        from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge as _Z3Bridge
+        import difflib as _difflib
+
+        _llm_cfg = _LLMConfig(
+            provider=os.environ.get("ECODIAOS_LLM__PROVIDER", "bedrock"),
+            model=os.environ.get("ECODIAOS_LLM__MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
+        )
+        _repair_llm = _create_llm(_llm_cfg)
+        _z3 = _Z3Bridge(check_timeout_ms=10_000)
+        _prover = _Prover(z3_bridge=_z3, llm=_repair_llm)
+        _repair_agent = _RepairAgent(llm=_repair_llm, prover=_prover, max_retries=3)
+
+        for _idx, _ev in enumerate(_boundary_evidence):
+            _details = _ev.get("details", {})
+            _file_path = _details.get("file_path", "")
+            _vuln_id = _details.get("vuln_id", f"unknown_{_idx}")
+
+            if not _file_path:
+                yield log("remediation", f"[REPAIR] Evidence #{_idx} has no file_path — skipping")
+                continue
+
+            yield log("remediation", f"[REPAIR] Processing {_vuln_id} — {_file_path}")
+
+            # Reconstruct a VulnerabilityReport from the boundary evidence
+            # so the RepairAgent can consume it.
+            try:
+                _surface = _AttackSurface(
+                    entry_point=_details.get("entry_point", "unknown"),
+                    surface_type=_AttackSurfaceType(_details.get("surface_type", "api_endpoint")),
+                    file_path=_file_path,
+                    line_number=_details.get("line_number"),
+                    context_code=_details.get("context_code", ""),
+                )
+                _report = _VulnReport(
+                    id=_vuln_id,
+                    target_url=target_url,
+                    vulnerability_class=_VulnClass(_details.get("vulnerability_class", "other")),
+                    severity=_VulnSeverity(_details.get("severity", "medium")),
+                    attack_surface=_surface,
+                    attack_goal=_details.get("attack_goal", ""),
+                    z3_counterexample=_cc_json.dumps(_details.get("edge_case_input", {})),
+                    z3_constraints_code=_details.get("z3_constraints", ""),
+                )
+            except Exception as _build_err:
+                yield log("remediation", f"[REPAIR] Failed to build report for {_vuln_id}: {_build_err}")
+                _remediation_failures += 1
+                continue
+
+            # Run the RepairAgent — generate patch + Z3 re-verification
+            try:
+                _patched_code = await _repair_agent.generate_and_verify_patch(_report)
+            except Exception as _repair_err:
+                yield log("remediation", f"[REPAIR] RepairAgent error for {_vuln_id}: {_repair_err}")
+                _remediation_failures += 1
+                continue
+
+            if _patched_code is None:
+                yield log("remediation", f"[REPAIR] RepairAgent exhausted retries for {_vuln_id} — no verified patch")
+                _remediation_failures += 1
+                continue
+
+            # Generate unified diff
+            _original_lines = (_surface.context_code or "").splitlines(keepends=True)
+            _patched_lines = _patched_code.splitlines(keepends=True)
+            _diff = "".join(_difflib.unified_diff(
+                _original_lines,
+                _patched_lines,
+                fromfile=f"a/{_file_path}",
+                tofile=f"b/{_file_path}",
+                lineterm="",
+            ))
+
+            yield _cc_sse("verified_patch", {
+                "vuln_id": _vuln_id,
+                "file_path": _file_path,
+                "diff": _diff,
+                "patched_code": _patched_code,
+                "vulnerability_class": _details.get("vulnerability_class", ""),
+                "severity": _details.get("severity", ""),
+            })
+            yield log("remediation", f"[REPAIR] Verified patch emitted for {_vuln_id} — {_file_path}")
+            _remediation_count += 1
+
+        # Cleanup LLM client
+        try:
+            await _repair_llm.close()
+        except Exception:
+            pass
+
+    except ImportError as _imp_err:
+        yield _cc_sse("error", {"message": f"Remediation import error: {_imp_err}"})
+        yield log("remediation", f"[REPAIR] Import failed — skipping Phase 4: {_imp_err}")
+    except Exception as _rem_err:
+        yield _cc_sse("error", {"message": f"Remediation error: {_rem_err}"})
+        yield log("remediation", f"[REPAIR] Unexpected error: {_rem_err}")
+
+    if _remediation_count > 0:
+        yield log("remediation", f"[REPAIR] Phase 4 complete — {_remediation_count} verified patch(es), {_remediation_failures} failure(s)")
+        yield phase_ev("remediation", "completed")
+    elif _remediation_failures > 0:
+        yield log("remediation", f"[REPAIR] Phase 4 failed — 0 patches verified, {_remediation_failures} failure(s)")
+        yield phase_ev("remediation", "failed")
+    else:
+        yield log("remediation", "[REPAIR] Phase 4 — no evidence to remediate")
+        yield phase_ev("remediation", "completed")
+
+    yield _cc_sse("done", {
+        "success": True,
+        "message": f"Pipeline complete — shield deployed, {_remediation_count} verified patch(es)",
+    })
+
+
+@app.post("/api/v1/command-center/engage")
+async def command_center_engage(payload: _CCEngagePayload) -> _CCStreamingResponse:
+    """Stream the Phantom + Inspector pipeline as Server-Sent Events."""
+    task_id = str(_cc_uuid.uuid4())
+
+    async def gen():
+        try:
+            async for chunk in _cc_pipeline(payload.target_url, task_id=task_id):
+                yield chunk.encode()
+        except Exception as _gen_err:
+            # Emit a done event so the UI knows the pipeline crashed
+            # instead of hanging indefinitely.
+            yield _cc_sse("error", {"message": str(_gen_err)}).encode()
+            yield _cc_sse("done", {"success": False, "message": f"Pipeline error: {_gen_err}"}).encode()
+        finally:
+            # Guarantee cleanup even if the client disconnects mid-stream.
+            _cc_active_procs.pop(task_id, None)
+
+    return _CCStreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.post("/api/v1/command-center/terminate/{task_id}")
+async def command_center_terminate(task_id: str) -> dict:
+    """Gracefully terminate a running Command Center subprocess.
+
+    Sends SIGINT first (allowing cleanup), then SIGKILL after 5 s
+    if the child is still alive.  Only targets child processes in
+    ``_cc_active_procs`` — never the parent uvicorn server.
+    """
+    import asyncio as _aio
+
+    proc = _cc_active_procs.get(task_id)
+    if proc is None:
+        return {"status": "not_found", "message": f"No active task with id {task_id}"}
+
+    if proc.returncode is not None:
+        _cc_active_procs.pop(task_id, None)
+        return {"status": "already_exited", "returncode": proc.returncode}
+
+    # Phase 1: graceful — SIGINT (Ctrl-C) lets the child clean up.
+    try:
+        proc.send_signal(_cc_signal.SIGINT)
+    except (OSError, ProcessLookupError):
+        _cc_active_procs.pop(task_id, None)
+        return {"status": "already_exited", "returncode": proc.returncode}
+
+    # Wait up to 5 s for a clean exit.
+    try:
+        await _aio.wait_for(proc.wait(), timeout=5.0)
+    except _aio.TimeoutError:
+        # Phase 2: forceful — SIGKILL.
+        try:
+            proc.kill()
+            await proc.wait()
+        except (OSError, ProcessLookupError):
+            pass
+
+    _cc_active_procs.pop(task_id, None)
+    return {
+        "status": "terminated",
+        "returncode": proc.returncode,
+        "task_id": task_id,
+    }
+
+
+@app.get("/api/v1/command-center/health")
+async def command_center_health() -> dict:
+    return {
+        "phantom": _CC_PHANTOM.exists(),
+        "inspector": _CC_INSPECTOR.exists(),
+    }
+
+
+# ─── Log Stream SSE ──────────────────────────────────────────────────────────
+
+import json as _json
+from fastapi.responses import StreamingResponse as _LogStreamingResponse
+
+
+@app.get("/api/v1/admin/logs/stream")
+async def stream_logs():
+    """
+    Server-Sent Events stream of all structlog/stdlib log records.
+
+    Each event is: ``data: <json>\\n\\n``
+
+    Fields: ts, level, logger, event, + any extra structlog context keys.
+    Connect from the browser with EventSource or a fetch+ReadableStream.
+    The endpoint sends a heartbeat comment every 15 s to keep proxies alive.
+    """
+    q = subscribe_logs()
+
+    async def generate():
+        try:
+            # Initial ping so the browser knows the stream is open
+            yield ": connected\n\n".encode()
+            heartbeat_interval = 15.0
+            while True:
+                try:
+                    entry = await asyncio.wait_for(q.get(), timeout=heartbeat_interval)
+                    yield f"data: {_json.dumps(entry)}\n\n".encode()
+                except asyncio.TimeoutError:
+                    # SSE keep-alive comment
+                    yield ": heartbeat\n\n".encode()
+        finally:
+            unsubscribe_logs(q)
+
+    return _LogStreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ─── Metrics Pub/Sub + SSE ───────────────────────────────────────────────────
+
+_METRICS_CHANNEL = "ecodiaos:system:metrics"
+
+
+async def publish_metrics_loop(redis_client: RedisClient, metrics_queue: asyncio.Queue) -> None:
+    """
+    Continuously reads dicts from metrics_queue and publishes them
+    to the Redis metrics channel. Runs until cancelled.
+    """
+    while True:
+        try:
+            payload: dict = await metrics_queue.get()
+            await redis_client.client.publish(_METRICS_CHANNEL, _json.dumps(payload))
+            metrics_queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("metrics_publish_error")
+
+
+@app.get("/api/v1/command-center/metrics")
+async def command_center_metrics_stream():
+    """
+    Server-Sent Events stream of system metrics published to the
+    ecodiaos:system:metrics Redis channel.
+    """
+    redis = app.state.redis.client
+
+    async def generate():
+        async with redis.pubsub() as pubsub:
+            await pubsub.subscribe(_METRICS_CHANNEL)
+            try:
+                yield ": connected\n\n".encode()
+                async for message in pubsub.listen():
+                    if message["type"] != "message":
+                        continue
+                    data = message["data"]
+                    try:
+                        _json.loads(data)  # validate before forwarding
+                        yield f"data: {data}\n\n".encode()
+                    except (_json.JSONDecodeError, TypeError):
+                        logger.warning("metrics_invalid_payload")
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await pubsub.unsubscribe(_METRICS_CHANNEL)
+
+    return _LogStreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ─── Oikos (Economic Engine) ───────────────────────────────────────
+
+
+@app.get("/api/v1/oikos/status")
+async def oikos_status() -> dict[str, Any]:
+    """Full Oikos economic snapshot — the organism's financial truth."""
+    oikos = app.state.oikos
+    s = oikos.snapshot()
+
+    cert_mgr = getattr(oikos, "_certificate_manager", None)
+    cert = cert_mgr.certificate if cert_mgr else None
+
+    return {
+        "total_net_worth": str(s.total_net_worth),
+        "liquid_balance": str(s.liquid_balance),
+        "survival_reserve": str(s.survival_reserve),
+        "survival_reserve_target": str(s.survival_reserve_target),
+        "total_deployed": str(s.total_deployed),
+        "total_receivables": str(s.total_receivables),
+        "total_asset_value": str(s.total_asset_value),
+        "total_fleet_equity": str(s.total_fleet_equity),
+        "bmr_usd_per_day": str(s.basal_metabolic_rate.usd_per_day),
+        "burn_rate_usd_per_day": str(s.current_burn_rate.usd_per_day),
+        "runway_days": str(s.runway_days),
+        "starvation_level": s.starvation_level.value,
+        "metabolic_efficiency": str(s.metabolic_efficiency),
+        "is_metabolically_positive": s.is_metabolically_positive,
+        "revenue_24h": str(s.revenue_24h),
+        "revenue_7d": str(s.revenue_7d),
+        "costs_24h": str(s.costs_24h),
+        "costs_7d": str(s.costs_7d),
+        "net_income_24h": str(s.net_income_24h),
+        "net_income_7d": str(s.net_income_7d),
+        "survival_probability_30d": str(s.survival_probability_30d),
+        "certificate": {
+            "status": cert.status.value if cert else "none",
+            "type": cert.certificate_type.value if cert else None,
+            "issued_at": cert.issued_at.isoformat() if cert else None,
+            "expires_at": cert.expires_at.isoformat() if cert else None,
+            "remaining_days": round(oikos.certificate_validity_days, 1),
+            "lineage_hash": cert.lineage_hash if cert else None,
+            "instance_id": cert.instance_id if cert else None,
+        },
+        "timestamp": s.timestamp.isoformat(),
+    }
+
+
+@app.get("/api/v1/oikos/organs")
+async def oikos_organs() -> dict[str, Any]:
+    """Economic morphogenesis — active organs and their lifecycle states."""
+    oikos = app.state.oikos
+    organs = oikos._morphogenesis.all_organs
+
+    return {
+        "organs": [
+            {
+                "organ_id": o.organ_id,
+                "category": o.category.value,
+                "specialisation": o.specialisation,
+                "maturity": o.maturity.value,
+                "resource_allocation_pct": str(o.resource_allocation_pct),
+                "efficiency": str(o.efficiency),
+                "revenue_30d": str(o.revenue_30d),
+                "cost_30d": str(o.cost_30d),
+                "days_since_last_revenue": o.days_since_last_revenue,
+                "is_active": o.is_active,
+                "created_at": o.created_at.isoformat(),
+            }
+            for o in organs
+        ],
+        "active_count": len([o for o in organs if o.is_active]),
+        "total_count": len(organs),
+        "stats": oikos._morphogenesis.stats,
+    }
+
+
+@app.get("/api/v1/oikos/assets")
+async def oikos_assets() -> dict[str, Any]:
+    """Owned autonomous assets and child fleet positions."""
+    oikos = app.state.oikos
+    s = oikos.snapshot()
+
+    return {
+        "owned_assets": [
+            {
+                "asset_id": a.asset_id,
+                "name": a.name,
+                "description": a.description,
+                "asset_type": a.asset_type,
+                "status": a.status.value,
+                "monthly_revenue_usd": str(a.monthly_revenue_usd),
+                "monthly_cost_usd": str(a.monthly_cost_usd),
+                "total_revenue_usd": str(a.total_revenue_usd),
+                "development_cost_usd": str(a.development_cost_usd),
+                "break_even_reached": a.break_even_reached,
+                "projected_break_even_days": a.projected_break_even_days,
+                "days_since_deployment": a.days_since_deployment,
+                "is_profitable": a.is_profitable,
+                "deployed_at": a.deployed_at.isoformat() if a.deployed_at else None,
+                "compute_provider": a.compute_provider,
+            }
+            for a in s.owned_assets
+        ],
+        "child_instances": [
+            {
+                "instance_id": c.instance_id,
+                "niche": c.niche,
+                "status": c.status.value,
+                "seed_capital_usd": str(c.seed_capital_usd),
+                "current_net_worth_usd": str(c.current_net_worth_usd),
+                "current_runway_days": str(c.current_runway_days),
+                "current_efficiency": str(c.current_efficiency),
+                "dividend_rate": str(c.dividend_rate),
+                "total_dividends_paid_usd": str(c.total_dividends_paid_usd),
+                "is_independent": c.is_independent,
+                "spawned_at": c.spawned_at.isoformat(),
+            }
+            for c in s.child_instances
+        ],
+        "total_asset_value": str(s.total_asset_value),
+        "total_fleet_equity": str(s.total_fleet_equity),
+    }
+
+
+@app.post("/api/v1/oikos/genesis-spark")
+async def oikos_genesis_spark() -> dict[str, Any]:
+    """Inject the Genesis Trigger into the live organism, waking its metabolism."""
+    from genesis_trigger import inject_into_live_organism
+
+    atune = app.state.atune
+    evo = app.state.evo
+    oikos = app.state.oikos
+    synapse = app.state.synapse
+    nova = app.state.nova
+    axon = app.state.axon
+
+    try:
+        result = await inject_into_live_organism(
+            atune=atune,
+            evo=evo,
+            oikos=oikos,
+            synapse=synapse,
+            nova=nova,
+            axon=axon,
+            skip_dream=False,
+        )
+        phases = result.get("phases", {})
+        passed = sum(1 for v in phases.values() if v)
+        total = len(phases)
+        return {
+            "status": "ok",
+            "message": f"Genesis complete: {passed}/{total} phases succeeded",
+            "phases": phases,
+        }
+    except Exception as e:
+        logger.error("genesis_spark_failed", error=str(e))
+        return {
+            "status": "error",
+            "message": f"Genesis failed: {e}",
+            "phases": {},
+        }

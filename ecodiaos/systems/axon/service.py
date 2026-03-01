@@ -25,15 +25,20 @@ Interface contracts (from spec):
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ecodiaos.core.hotreload import NeuroplasticityBus
 from ecodiaos.systems.axon.audit import AuditLogger
 from ecodiaos.systems.axon.credentials import CredentialStore
+from ecodiaos.systems.axon.executor import Executor
 from ecodiaos.systems.axon.executors import build_default_registry
 from ecodiaos.systems.axon.pipeline import ExecutionPipeline
 from ecodiaos.systems.axon.safety import BudgetTracker, CircuitBreaker, RateLimiter
+from ecodiaos.systems.axon.shield import TransactionShield
 from ecodiaos.systems.axon.types import AxonOutcome, ExecutionRequest
 
 if TYPE_CHECKING:
@@ -41,6 +46,7 @@ if TYPE_CHECKING:
     from ecodiaos.systems.axon.registry import ExecutorRegistry
     from ecodiaos.systems.memory.service import MemoryService
     from ecodiaos.systems.nova.service import NovaService
+    from ecodiaos.systems.synapse.event_bus import EventBus
     from ecodiaos.systems.voxis.service import VoxisService
 
 logger = structlog.get_logger()
@@ -70,18 +76,24 @@ class AxonService:
         config: AxonConfig,
         memory: MemoryService | None = None,
         voxis: VoxisService | None = None,
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
         redis_client: Any = None,
+        wallet: Any = None,
+        synapse: Any = None,
         instance_id: str = "eos-default",
     ) -> None:
         self._config = config
         self._memory = memory
         self._voxis = voxis
+        self._bus = neuroplasticity_bus
         self._redis = redis_client
+        self._wallet = wallet
+        self._synapse = synapse
         self._instance_id = instance_id
         self._logger = logger.bind(system="axon")
         self._initialized = False
 
-        # Sub-systems — built in initialize()
+        # Sub-systems -- built in initialize()
         self._registry: ExecutorRegistry | None = None
         self._pipeline: ExecutionPipeline | None = None
         self._budget: BudgetTracker | None = None
@@ -89,11 +101,17 @@ class AxonService:
         self._circuit_breaker: CircuitBreaker | None = None
         self._credential_store: CredentialStore | None = None
         self._audit: AuditLogger | None = None
+        self._shield: TransactionShield | None = None
 
         # Metrics
         self._total_executions: int = 0
         self._successful_executions: int = 0
         self._failed_executions: int = 0
+
+        # Recent outcomes ring buffer — last 50 executions for /api/v1/axon/outcomes
+        self._recent_outcomes: deque[AxonOutcome] = deque(maxlen=50)
+
+        # NeuroplasticityBus registration — done in initialize() when bus is available
 
     async def initialize(self) -> None:
         """
@@ -122,11 +140,19 @@ class AxonService:
         # Audit logger
         self._audit = AuditLogger(memory=self._memory)
 
+        # Transaction shield (Layer 1: Economic Immune System)
+        self._shield = TransactionShield(
+            wallet=self._wallet,
+            max_slippage_bps=50,
+        )
+
         # Build executor registry with all built-in executors
         self._registry = build_default_registry(
             memory=self._memory,
             voxis=self._voxis,
             redis_client=self._redis,
+            wallet=self._wallet,
+            synapse=self._synapse,
         )
 
         # Execution pipeline
@@ -138,6 +164,7 @@ class AxonService:
             credential_store=self._credential_store,
             audit_logger=self._audit,
             instance_id=self._instance_id,
+            shield=self._shield,
         )
 
         self._initialized = True
@@ -146,6 +173,16 @@ class AxonService:
             executors=len(self._registry),
             executor_types=self._registry.list_types(),
         )
+
+        # Register with the NeuroplasticityBus for hot-reload of Executor subclasses.
+        if self._bus is not None:
+            self._bus.register(
+                base_class=Executor,
+                registration_callback=self._on_executor_evolved,
+                system_id="axon",
+                # Skip abstract stubs that have no action_type set
+                instance_qualifier=lambda cls: bool(cls.action_type),
+            )
 
     def set_nova(self, nova: NovaService) -> None:
         """
@@ -170,6 +207,45 @@ class AxonService:
             raise RuntimeError("AxonService.initialize() must be called before set_atune()")
         self._pipeline.set_atune(atune)
         self._logger.info("atune_wired", system="axon")
+
+    def set_wallet(self, wallet: Any) -> None:
+        """
+        Wire the Wallet client for metabolic actions.
+
+        Enables Axon to execute financial actions: spending, transfers,
+        on-chain transactions, and cost tracking against the energy budget.
+        """
+        self._wallet = wallet
+        self._logger.info("wallet_wired", system="axon")
+
+    def set_synapse(self, synapse: Any) -> None:
+        """
+        Wire the SynapseService so funding-request executors can read live
+        metabolic state (rolling_deficit, burn_rate) and emit events.
+
+        Call this after both AxonService and SynapseService are initialised,
+        before the first cognitive cycle begins.
+        """
+        self._synapse = synapse
+        # Propagate into the already-registered RequestFundingExecutor if the
+        # registry has been built (i.e. initialize() was called before this).
+        if self._registry is not None:
+            executor = self._registry.get("request_funding")
+            if executor is not None:
+                # duck-type update — avoids importing RequestFundingExecutor here
+                executor._synapse = synapse  # type: ignore[attr-defined]
+        self._logger.info("synapse_wired", system="axon")
+
+    def set_event_bus(self, event_bus: "EventBus") -> None:
+        """
+        Wire the Synapse event bus so Axon can emit financial events.
+
+        Call this after both AxonService and the event bus are initialised.
+        When a wallet_transfer succeeds, Axon emits WALLET_TRANSFER_CONFIRMED
+        which the Memory system picks up and encodes as a salience=1.0 episode.
+        """
+        self._event_bus = event_bus
+        self._logger.info("event_bus_wired", system="axon")
 
     def configure_credentials(self, credentials: dict[str, str]) -> None:
         """
@@ -242,10 +318,40 @@ class AxonService:
 
         if outcome.success:
             self._successful_executions += 1
+            # Emit WALLET_TRANSFER_CONFIRMED so Memory encodes it at salience=1.0
+            if self._event_bus is not None:
+                await self._emit_financial_events(outcome)
         else:
             self._failed_executions += 1
 
+        self._recent_outcomes.append(outcome)
         return outcome
+
+    async def _emit_financial_events(self, outcome: AxonOutcome) -> None:
+        """Emit WALLET_TRANSFER_CONFIRMED for any successful wallet_transfer steps."""
+        from ecodiaos.systems.synapse.types import SynapseEvent, SynapseEventType
+
+        for step in outcome.step_outcomes:
+            if step.action_type == "wallet_transfer" and step.result.success:
+                data = dict(step.result.data)
+                data["execution_id"] = outcome.execution_id
+                event = SynapseEvent(
+                    event_type=SynapseEventType.WALLET_TRANSFER_CONFIRMED,
+                    data=data,
+                    source_system="axon",
+                )
+                try:
+                    await self._event_bus.emit(event)
+                    self._logger.info(
+                        "wallet_transfer_event_emitted",
+                        tx_hash=data.get("tx_hash", ""),
+                        token=data.get("token", ""),
+                        amount=data.get("amount", ""),
+                    )
+                except Exception as exc:
+                    self._logger.error(
+                        "wallet_transfer_event_emit_failed", error=str(exc)
+                    )
 
     def register_executor(self, executor: Any) -> None:
         """
@@ -274,6 +380,9 @@ class AxonService:
 
     async def shutdown(self) -> None:
         """Graceful shutdown — log final stats."""
+        if self._bus is not None:
+            self._bus.deregister(Executor)
+
         self._logger.info(
             "axon_shutdown",
             total_executions=self._total_executions,
@@ -283,6 +392,28 @@ class AxonService:
             if self._circuit_breaker else 0,
             audit_stats=self._audit.stats if self._audit else {},
         )
+
+    def _on_executor_evolved(self, executor: Executor) -> None:
+        """
+        Registration callback for NeuroplasticityBus.
+
+        Called once per Executor subclass found in a hot-reloaded file.
+        Registers the new instance into the live ExecutorRegistry with
+        replace=True so the existing entry (if any) is atomically replaced.
+        """
+        if self._registry is None:
+            return
+        self._registry.register(executor, replace=True)
+        self._logger.info(
+            "axon_executor_hot_reloaded",
+            action_type=executor.action_type,
+            executor=type(executor).__name__,
+        )
+
+    @property
+    def recent_outcomes(self) -> list[AxonOutcome]:
+        """Return recent execution outcomes (newest first), up to 50."""
+        return list(reversed(self._recent_outcomes))
 
     @property
     def stats(self) -> dict[str, Any]:

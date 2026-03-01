@@ -359,6 +359,7 @@ class GlobalWorkspace:
                 prediction_error=winner.prediction_error,
             ),
             precision=winner.salience.composite,
+            source=winner.source,
         )
 
         # Fan out to all subscribers in parallel

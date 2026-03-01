@@ -59,11 +59,15 @@ from ecodiaos.systems.thymos.governor import HealingGovernor
 from ecodiaos.systems.thymos.prescription import RepairPrescriber, RepairValidator
 from ecodiaos.systems.thymos.prophylactic import HomeostasisController, ProphylacticScanner
 from ecodiaos.systems.thymos.sentinels import (
+    BaseThymosSentinel,
+    BankruptcySentinel,
     CognitiveStallSentinel,
     ContractSentinel,
     DriftSentinel,
     ExceptionSentinel,
     FeedbackLoopSentinel,
+    ProtocolHealthSentinel,
+    ThreatPatternSentinel,
 )
 from ecodiaos.systems.thymos.triage import (
     IncidentDeduplicator,
@@ -84,6 +88,7 @@ if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.clients.neo4j import Neo4jClient
     from ecodiaos.config import ThymosConfig
+    from ecodiaos.core.hotreload import NeuroplasticityBus
     from ecodiaos.systems.synapse.health import HealthMonitor
     from ecodiaos.systems.synapse.service import SynapseService
     from ecodiaos.telemetry.metrics import MetricCollector
@@ -103,6 +108,16 @@ _SUBSCRIBED_EVENTS: frozenset[SynapseEventType] = frozenset({
     SynapseEventType.SYSTEM_OVERLOADED,
     SynapseEventType.CLOCK_OVERRUN,
     SynapseEventType.RESOURCE_PRESSURE,
+    # Economic immune system (Phase 16f)
+    SynapseEventType.TRANSACTION_SHIELDED,
+    SynapseEventType.THREAT_DETECTED,
+    SynapseEventType.PROTOCOL_ALERT,
+    SynapseEventType.EMERGENCY_WITHDRAWAL,
+    SynapseEventType.THREAT_ADVISORY_RECEIVED,
+    SynapseEventType.ADDRESS_BLACKLISTED,
+    # Certificate lifecycle (Phase 16g: Civilization Layer)
+    SynapseEventType.CERTIFICATE_EXPIRING,
+    SynapseEventType.CERTIFICATE_EXPIRED,
 })
 
 # How often to run homeostatic checks (in seconds)
@@ -150,12 +165,14 @@ class ThymosService:
         neo4j: Neo4jClient | None = None,
         llm: LLMProvider | None = None,
         metrics: MetricCollector | None = None,
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
     ) -> None:
         self._config = config
         self._synapse = synapse
         self._neo4j = neo4j
         self._llm = llm
         self._metrics = metrics
+        self._neuroplasticity_bus: NeuroplasticityBus | None = neuroplasticity_bus
         self._initialized: bool = False
         self._logger = logger.bind(system="thymos")
 
@@ -164,7 +181,9 @@ class ThymosService:
         self._evo: Any = None       # EvoService — error pattern learning
         self._atune: Any = None     # AtuneService — incident-as-percept
         self._health_monitor: HealthMonitor | None = None  # Synapse health records
-        self._soma: Any = None      # SomaService — integrity precision gating
+        self._soma: Any = None      # SomaService -- integrity precision gating
+        self._oikos: Any = None     # OikosService -- economic state for protocol health checks
+        self._federation: Any = None  # FederationService -- threat advisory broadcast
 
         # ── Sub-systems (built in initialize()) ──
         # Sentinels
@@ -173,6 +192,9 @@ class ThymosService:
         self._feedback_loop_sentinel: FeedbackLoopSentinel | None = None
         self._drift_sentinel: DriftSentinel | None = None
         self._cognitive_stall_sentinel: CognitiveStallSentinel | None = None
+        self._bankruptcy_sentinel: BankruptcySentinel | None = None
+        self._threat_pattern_sentinel: ThreatPatternSentinel | None = None
+        self._protocol_health_sentinel: ProtocolHealthSentinel | None = None
 
         # Triage
         self._deduplicator: IncidentDeduplicator | None = None
@@ -264,6 +286,59 @@ class ThymosService:
         self._soma = soma
         self._logger.info("soma_wired_to_thymos")
 
+    def set_oikos(self, oikos: Any) -> None:
+        """Wire Oikos so protocol health sentinel can read yield positions."""
+        self._oikos = oikos
+        self._logger.info("oikos_wired_to_thymos")
+
+    def set_federation(self, federation: Any) -> None:
+        """Wire Federation for threat advisory broadcast and receipt."""
+        self._federation = federation
+        self._logger.info("federation_wired_to_thymos")
+
+    # ─── NeuroplasticityBus callback ────────────────────────────────────
+
+    def _on_sentinel_evolved(self, new_sentinel: BaseThymosSentinel) -> None:
+        """
+        Hot-swap a sentinel instance when Simula evolves its class.
+
+        Called by the NeuroplasticityBus whenever a new concrete subclass of
+        BaseThymosSentinel is discovered in a changed file.  The swap is
+        surgical: only the sentinel whose ``sentinel_name`` matches is
+        replaced; all others are untouched.
+
+        The old sentinel is simply dropped — its in-memory state (rolling
+        baselines, loop statuses, etc.) is lost intentionally.  The new
+        instance starts fresh, which is the correct behaviour for an evolved
+        detector with new logic.
+        """
+        name = new_sentinel.sentinel_name
+        slot_map: dict[str, str] = {
+            "exception": "_exception_sentinel",
+            "contract": "_contract_sentinel",
+            "feedback_loop": "_feedback_loop_sentinel",
+            "drift": "_drift_sentinel",
+            "cognitive_stall": "_cognitive_stall_sentinel",
+            "bankruptcy": "_bankruptcy_sentinel",
+            "threat_pattern": "_threat_pattern_sentinel",
+            "protocol_health": "_protocol_health_sentinel",
+        }
+        attr = slot_map.get(name)
+        if attr is None:
+            self._logger.warning(
+                "sentinel_evolved_unknown_name",
+                sentinel_name=name,
+                known=list(slot_map),
+            )
+            return
+
+        setattr(self, attr, new_sentinel)
+        self._logger.info(
+            "sentinel_hot_swapped",
+            sentinel_name=name,
+            new_class=type(new_sentinel).__name__,
+        )
+
     # ─── Lifecycle ─────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
@@ -280,6 +355,9 @@ class ThymosService:
         self._feedback_loop_sentinel = FeedbackLoopSentinel()
         self._drift_sentinel = DriftSentinel()
         self._cognitive_stall_sentinel = CognitiveStallSentinel()
+        self._bankruptcy_sentinel = BankruptcySentinel()
+        self._threat_pattern_sentinel = ThreatPatternSentinel()
+        self._protocol_health_sentinel = ProtocolHealthSentinel()
 
         # ── Triage ──
         self._deduplicator = IncidentDeduplicator()
@@ -324,6 +402,14 @@ class ThymosService:
             name="thymos_homeostasis",
         )
 
+        # ── Register with NeuroplasticityBus for sentinel hot-reload ──
+        if self._neuroplasticity_bus is not None:
+            self._neuroplasticity_bus.register(
+                base_class=BaseThymosSentinel,
+                registration_callback=self._on_sentinel_evolved,
+                system_id="thymos",
+            )
+
         self._initialized = True
 
         antibody_count = len(self._antibody_library._all) if self._antibody_library else 0
@@ -346,6 +432,10 @@ class ThymosService:
 
         self._sentinel_task = None
         self._homeostasis_task = None
+
+        # Deregister from NeuroplasticityBus so no callbacks fire after teardown
+        if self._neuroplasticity_bus is not None:
+            self._neuroplasticity_bus.deregister(BaseThymosSentinel)
 
         self._logger.info(
             "thymos_shutdown",
@@ -433,6 +523,15 @@ class ThymosService:
             # Recovery events — no incident created
             SynapseEventType.SYSTEM_RECOVERED: (None, IncidentClass.CRASH),
             SynapseEventType.SAFE_MODE_EXITED: (None, IncidentClass.CRASH),
+            # Certificate lifecycle (Phase 16g: Civilization Layer)
+            SynapseEventType.CERTIFICATE_EXPIRED: (
+                IncidentSeverity.CRITICAL,
+                IncidentClass.CONTRACT_VIOLATION,
+            ),
+            SynapseEventType.CERTIFICATE_EXPIRING: (
+                IncidentSeverity.HIGH,
+                IncidentClass.CONTRACT_VIOLATION,
+            ),
         }
         return mapping.get(
             event.event_type,
@@ -1346,6 +1445,27 @@ class ThymosService:
 
                 # Cognitive stall sentinel is fed per-cycle by Synapse,
                 # not scanned here. It fires incidents from record_cycle().
+
+                # Protocol health sentinel: check active yield positions
+                if (
+                    self._protocol_health_sentinel is not None
+                    and self._oikos is not None
+                ):
+                    try:
+                        state = self._oikos.snapshot()
+                        positions = getattr(state, "yield_positions", [])
+                        if positions:
+                            health_incidents = (
+                                self._protocol_health_sentinel.check_all_positions(
+                                    positions, live_data={}
+                                )
+                            )
+                            for incident in health_incidents:
+                                await self.on_incident(incident)
+                    except Exception as exc:
+                        self._logger.debug(
+                            "protocol_health_scan_error", error=str(exc)
+                        )
 
             except asyncio.CancelledError:
                 return

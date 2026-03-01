@@ -60,6 +60,7 @@ class FailureReason(enum.StrEnum):
     BUDGET_EXCEEDED = "budget_exceeded"
     CREDENTIAL_ERROR = "credential_error"
     EXECUTION_EXCEPTION = "execution_exception"
+    TRANSACTION_SHIELD_REJECTED = "transaction_shield_rejected"
 
 
 class CircuitStatus(enum.StrEnum):

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     FORBIDDEN,
     FORBIDDEN_WRITE_PATHS,
     GOVERNANCE_REQUIRED,

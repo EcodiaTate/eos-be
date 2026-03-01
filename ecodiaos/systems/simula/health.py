@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from ecodiaos.systems.simula.types import HealthCheckResult
+from ecodiaos.systems.simula.evolution_types import HealthCheckResult
 from ecodiaos.systems.simula.verification.types import (
     LEAN_PROOF_CATEGORIES,
     DafnyVerificationResult,
@@ -56,7 +56,7 @@ from ecodiaos.systems.simula.verification.types import (
 if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.systems.simula.egraph.equality_saturation import EqualitySaturationEngine
-    from ecodiaos.systems.simula.types import EvolutionProposal
+    from ecodiaos.systems.simula.evolution_types import EvolutionProposal
     from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
     from ecodiaos.systems.simula.verification.lean_bridge import LeanBridge
     from ecodiaos.systems.simula.verification.static_analysis import StaticAnalysisBridge

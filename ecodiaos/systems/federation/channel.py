@@ -118,6 +118,32 @@ class FederationChannel:
             self._logger.error("assistance_request_error", error=str(exc))
             return None
 
+    async def send_message(
+        self, message_type: str, payload: dict[str, Any]
+    ) -> bool:
+        """Send a typed message to the remote instance."""
+        endpoint_map: dict[str, str] = {
+            "threat_advisory": "/api/v1/federation/threat-advisory",
+        }
+        path = endpoint_map.get(message_type)
+        if not path:
+            self._logger.warning("unknown_message_type", message_type=message_type)
+            return False
+        try:
+            response = await self._client.post(
+                f"{self.link.remote_endpoint}{path}",
+                json=payload,
+                timeout=5.0,
+            )
+            return response.status_code == 200
+        except Exception as exc:
+            self._logger.error(
+                "send_message_failed",
+                message_type=message_type,
+                error=str(exc),
+            )
+            return False
+
     async def send_greeting(self) -> bool:
         """Send a greeting/heartbeat to verify the connection is alive."""
         try:

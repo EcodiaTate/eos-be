@@ -13,14 +13,14 @@ Key metrics:
     categories with high recent rollback rates)
 
 Phase 9 addition:
-  - Hunter security analytics integration (vulnerability discovery
+  - Inspector security analytics integration (vulnerability discovery
     metrics surfaced alongside evolution metrics for unified observability)
 
 Used by:
   - ChangeSimulator: dynamic risk threshold adjustment
   - SimulaService: enhanced stats reporting
   - ProposalIntelligence: cost/risk estimation
-  - HunterService: unified analytics surface (Phase 9)
+  - InspectorService: unified analytics surface (Phase 9)
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ecodiaos.primitives.common import utc_now
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     CategorySuccessRate,
     CautionAdjustment,
     ChangeCategory,
@@ -41,9 +41,9 @@ from ecodiaos.systems.simula.types import (
 
 if TYPE_CHECKING:
     from ecodiaos.systems.simula.history import EvolutionHistoryManager
-    from ecodiaos.systems.simula.hunter.analytics import (
-        HunterAnalyticsStore,
-        HunterAnalyticsView,
+    from ecodiaos.systems.simula.inspector.analytics import (
+        InspectorAnalyticsStore,
+        InspectorAnalyticsView,
     )
 
 logger = structlog.get_logger().bind(system="simula.analytics")
@@ -76,8 +76,8 @@ class EvolutionAnalyticsEngine:
         self,
         history: EvolutionHistoryManager | None = None,
         *,
-        hunter_view: HunterAnalyticsView | None = None,
-        hunter_store: HunterAnalyticsStore | None = None,
+        inspector_view: InspectorAnalyticsView | None = None,
+        inspector_store: InspectorAnalyticsStore | None = None,
     ) -> None:
         self._history = history
         self._log = logger
@@ -85,9 +85,9 @@ class EvolutionAnalyticsEngine:
         self._cache_ttl_seconds: int = 300  # 5 minutes
         self._last_computed: datetime | None = None
 
-        # Phase 9: Hunter analytics integration
-        self._hunter_view = hunter_view
-        self._hunter_store = hunter_store
+        # Phase 9: Inspector analytics integration
+        self._inspector_view = inspector_view
+        self._inspector_store = inspector_store
 
     async def compute_analytics(self) -> EvolutionAnalytics:
         """
@@ -308,31 +308,31 @@ class EvolutionAnalyticsEngine:
             reasoning=" | ".join(reasoning_parts),
         )
 
-    # ── Phase 9: Hunter Integration ──────────────────────────────────────────
+    # ── Phase 9: Inspector Integration ──────────────────────────────────────────
 
-    def set_hunter_view(self, view: HunterAnalyticsView) -> None:
-        """Attach a Hunter analytics view for unified querying."""
-        self._hunter_view = view
+    def set_inspector_view(self, view: InspectorAnalyticsView) -> None:
+        """Attach a Inspector analytics view for unified querying."""
+        self._inspector_view = view
 
-    def set_hunter_store(self, store: HunterAnalyticsStore) -> None:
-        """Attach a Hunter analytics store for durable historical queries."""
-        self._hunter_store = store
+    def set_inspector_store(self, store: InspectorAnalyticsStore) -> None:
+        """Attach a Inspector analytics store for durable historical queries."""
+        self._inspector_store = store
 
-    def get_hunter_summary(self) -> dict[str, Any]:
+    def get_inspector_summary(self) -> dict[str, Any]:
         """
-        Return in-memory Hunter analytics summary.
+        Return in-memory Inspector analytics summary.
 
         Provides: total vulnerabilities, severity distribution, most common
         classes, patch success rate, weekly trends, rolling windows, and
         throughput metrics.
 
-        Returns empty dict if Hunter analytics view is not attached.
+        Returns empty dict if Inspector analytics view is not attached.
         """
-        if self._hunter_view is None:
+        if self._inspector_view is None:
             return {}
-        return self._hunter_view.summary
+        return self._inspector_view.summary
 
-    async def get_hunter_weekly_trends(
+    async def get_inspector_weekly_trends(
         self,
         *,
         weeks: int = 12,
@@ -350,28 +350,28 @@ class EvolutionAnalyticsEngine:
         Returns:
             List of weekly buckets with vulnerability counts + severity breakdown.
         """
-        if self._hunter_store is not None:
+        if self._inspector_store is not None:
             try:
-                return await self._hunter_store.get_vulnerabilities_per_week(
+                return await self._inspector_store.get_vulnerabilities_per_week(
                     weeks=weeks, target_url=target_url,
                 )
             except Exception as exc:
                 self._log.warning(
-                    "hunter_store_query_failed",
+                    "inspector_store_query_failed",
                     query="weekly_trends",
                     error=str(exc),
                 )
 
         # Fallback to in-memory view
-        if self._hunter_view is not None:
+        if self._inspector_view is not None:
             if target_url:
-                return self._hunter_view.get_target_weekly_trend(target_url)
-            trends = self._hunter_view.summary.get("weekly_trends", [])
+                return self._inspector_view.get_target_weekly_trend(target_url)
+            trends = self._inspector_view.summary.get("weekly_trends", [])
             return trends[-weeks:] if isinstance(trends, list) else []
 
         return []
 
-    async def get_hunter_severity_distribution(
+    async def get_inspector_severity_distribution(
         self,
         *,
         days: int = 30,
@@ -382,36 +382,36 @@ class EvolutionAnalyticsEngine:
 
         Falls back to in-memory view (all-time) if store is unavailable.
         """
-        if self._hunter_store is not None:
+        if self._inspector_store is not None:
             try:
-                return await self._hunter_store.get_severity_distribution(
+                return await self._inspector_store.get_severity_distribution(
                     days=days, target_url=target_url,
                 )
             except Exception as exc:
                 self._log.warning(
-                    "hunter_store_query_failed",
+                    "inspector_store_query_failed",
                     query="severity_distribution",
                     error=str(exc),
                 )
 
-        if self._hunter_view is not None:
-            dist: dict[str, int] = self._hunter_view.summary.get("severity_distribution", {})
+        if self._inspector_view is not None:
+            dist: dict[str, int] = self._inspector_view.summary.get("severity_distribution", {})
             return dist
 
         return {}
 
-    async def get_hunter_error_summary(self, *, days: int = 7) -> list[dict[str, Any]]:
+    async def get_inspector_error_summary(self, *, days: int = 7) -> list[dict[str, Any]]:
         """
         Query aggregated pipeline errors from TimescaleDB.
 
-        Only available when a Hunter analytics store is attached.
+        Only available when a Inspector analytics store is attached.
         """
-        if self._hunter_store is not None:
+        if self._inspector_store is not None:
             try:
-                return await self._hunter_store.get_error_summary(days=days)
+                return await self._inspector_store.get_error_summary(days=days)
             except Exception as exc:
                 self._log.warning(
-                    "hunter_store_query_failed",
+                    "inspector_store_query_failed",
                     query="error_summary",
                     error=str(exc),
                 )
@@ -420,7 +420,7 @@ class EvolutionAnalyticsEngine:
     async def get_unified_analytics(self) -> dict[str, Any]:
         """
         Return a unified analytics payload combining evolution metrics
-        and Hunter security metrics for comprehensive observability.
+        and Inspector security metrics for comprehensive observability.
 
         This is the single entry point for dashboard consumers that want
         the complete system health picture.
@@ -441,20 +441,20 @@ class EvolutionAnalyticsEngine:
             },
         }
 
-        # Hunter security analytics
-        hunter_summary = self.get_hunter_summary()
-        if hunter_summary:
-            result["hunter"] = {
-                "total_vulnerabilities": hunter_summary.get("total_vulnerabilities", 0),
-                "total_hunts": hunter_summary.get("total_hunts", 0),
-                "severity_distribution": hunter_summary.get("severity_distribution", {}),
-                "patch_success_rate": hunter_summary.get("patch_success_rate", 0),
-                "avg_vulns_per_hunt": hunter_summary.get("avg_vulns_per_hunt", 0),
-                "rolling_7d": hunter_summary.get("rolling_7d", {}),
-                "rolling_30d": hunter_summary.get("rolling_30d", {}),
+        # Inspector security analytics
+        inspector_summary = self.get_inspector_summary()
+        if inspector_summary:
+            result["inspector"] = {
+                "total_vulnerabilities": inspector_summary.get("total_vulnerabilities", 0),
+                "total_hunts": inspector_summary.get("total_hunts", 0),
+                "severity_distribution": inspector_summary.get("severity_distribution", {}),
+                "patch_success_rate": inspector_summary.get("patch_success_rate", 0),
+                "avg_vulns_per_hunt": inspector_summary.get("avg_vulns_per_hunt", 0),
+                "rolling_7d": inspector_summary.get("rolling_7d", {}),
+                "rolling_30d": inspector_summary.get("rolling_30d", {}),
             }
         else:
-            result["hunter"] = None
+            result["inspector"] = None
 
         return result
 

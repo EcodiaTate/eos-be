@@ -33,7 +33,7 @@ from ecodiaos.systems.simula.orchestration.types import (
 
 if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
-    from ecodiaos.systems.simula.types import EvolutionProposal
+    from ecodiaos.systems.simula.evolution_types import EvolutionProposal
 
 logger = structlog.get_logger().bind(system="simula.orchestration.planner")
 
@@ -171,7 +171,7 @@ class TaskPlanner:
 
     def _module_to_file(self, module: str) -> str:
         """Convert a Python module path to a relative file path."""
-        # e.g. "ecodiaos.systems.simula.types" → "ecodiaos/systems/simula/types.py"
+        # e.g. "ecodiaos.systems.simula.evolution_types" → "ecodiaos/systems/simula/evolution_types.py"
         parts = module.split(".")
         candidate = Path(*parts).with_suffix(".py")
         full = self._root / candidate

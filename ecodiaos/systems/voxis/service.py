@@ -41,7 +41,11 @@ from ecodiaos.systems.voxis.dynamics import ConversationDynamicsEngine
 from ecodiaos.systems.voxis.expression_queue import ExpressionQueue
 from ecodiaos.systems.voxis.personality import PersonalityEngine
 from ecodiaos.systems.voxis.reception import ReceptionEngine
-from ecodiaos.systems.voxis.renderer import ContentRenderer
+from ecodiaos.core.hotreload import NeuroplasticityBus
+from ecodiaos.systems.voxis.renderer import (
+    BaseContentRenderer,
+    ContentRenderer,
+)
 from ecodiaos.systems.voxis.silence import SilenceEngine
 from ecodiaos.systems.voxis.types import (
     AudienceProfile,
@@ -95,11 +99,13 @@ class VoxisService:
         redis: RedisClient,
         llm: LLMProvider,
         config: VoxisConfig,
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
     ) -> None:
         self._memory = memory
         self._redis = redis
         self._llm = llm
         self._config = config
+        self._bus = neuroplasticity_bus
         self._logger = logger.bind(system="voxis")
 
         # Sub-components -- initialised in initialize()
@@ -110,7 +116,7 @@ class VoxisService:
             min_expression_interval_minutes=config.min_expression_interval_minutes,
         )
         self._conversation_manager: ConversationManager | None = None
-        self._renderer: ContentRenderer | None = None
+        self._renderer: BaseContentRenderer | None = None
 
         # New sub-components -- expression queue, diversity, reception, dynamics, voice
         self._expression_queue = ExpressionQueue(
@@ -274,8 +280,20 @@ class VoxisService:
             drive_weights=self._drive_weights,
         )
 
+        # Register with the NeuroplasticityBus for hot-reload of BaseContentRenderer subclasses.
+        if self._bus is not None:
+            self._bus.register(
+                base_class=BaseContentRenderer,
+                registration_callback=self._on_renderer_evolved,
+                system_id="voxis",
+                instance_factory=self._build_renderer,
+            )
+
     async def shutdown(self) -> None:
         """Graceful shutdown -- cancel background loops, log final metrics."""
+        if self._bus is not None:
+            self._bus.deregister(BaseContentRenderer)
+
         # Cancel background loops
         if self._queue_drain_task and not self._queue_drain_task.done():
             self._queue_drain_task.cancel()
@@ -289,6 +307,47 @@ class VoxisService:
             total_queued=self._total_queued,
             total_queue_delivered=self._total_queue_delivered,
             diversity_rejections=self._diversity_rejections,
+        )
+
+    # --- Hot-reload callbacks ---------------------------------------------
+
+    def _build_renderer(self, cls: type[BaseContentRenderer]) -> BaseContentRenderer:
+        """
+        Factory used by NeuroplasticityBus to instantiate a newly discovered
+        BaseContentRenderer subclass with the sub-components it needs.
+
+        Passes the live LLM, personality engine, affect engine, and audience
+        profiler so the evolved renderer operates with the same configured
+        sub-systems.  Falls back to zero-arg instantiation if the evolved
+        subclass has a different signature.
+        """
+        try:
+            return cls(
+                llm=self._llm,
+                personality_engine=self._personality_engine,
+                affect_engine=self._affect_engine,
+                audience_profiler=self._audience_profiler,
+                base_temperature=self._config.temperature_base,
+                honesty_check_enabled=self._config.honesty_check_enabled,
+                max_expression_length=self._config.max_expression_length,
+            )  # type: ignore[call-arg]
+        except TypeError:
+            # Evolved subclass has a different signature — try zero-arg
+            return cls()  # type: ignore[call-arg]
+
+    def _on_renderer_evolved(self, renderer: BaseContentRenderer) -> None:
+        """
+        Registration callback for NeuroplasticityBus.
+
+        Atomically swaps the active ContentRenderer on VoxisService so new
+        expression pipeline calls immediately use the evolved renderer.
+        Any in-flight ``render()`` call that already captured a reference to
+        the old renderer completes normally.
+        """
+        self._renderer = renderer
+        self._logger.info(
+            "voxis_renderer_hot_reloaded",
+            renderer=type(renderer).__name__,
         )
 
     # --- BroadcastSubscriber Interface ------------------------------------

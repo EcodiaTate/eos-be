@@ -7,6 +7,7 @@ Thymos gave the organism a will to live. Oneiros gives it an inner life.
 """
 
 from ecodiaos.systems.oneiros.service import OneirosService
+from ecodiaos.systems.oneiros.workers_base import BaseOneirosWorker
 from ecodiaos.systems.oneiros.types import (
     CircadianPhase,
     Dream,
@@ -28,6 +29,7 @@ from ecodiaos.systems.oneiros.types import (
 
 __all__ = [
     "OneirosService",
+    "BaseOneirosWorker",
     "SleepStage",
     "DreamType",
     "DreamCoherence",

@@ -41,6 +41,7 @@ class SystemID(enum.StrEnum):
     ONEIROS = "oneiros"
     THREAD = "thread"
     SOMA = "soma"
+    OIKOS = "oikos"
     API = "api"
 
 

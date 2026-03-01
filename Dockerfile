@@ -40,7 +40,7 @@ RUN mkdir -p ecodiaos && touch ecodiaos/__init__.py
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip \
- && pip install .
+ && pip install ".[dev]"
 
 # ---- 3) Copy actual source AFTER deps are installed ----
 COPY ecodiaos/ ecodiaos/
@@ -53,6 +53,44 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # ---- 4) Pre-download embedding model (optional, but you asked for it) ----
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-mpnet-base-v2')"
 
+
+# ======================================================================
+# Dev stage: editable install so /app/ecodiaos bind-mount is live source
+# ======================================================================
+
+FROM python:3.12-slim AS dev
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/opt/venv \
+    ELAN_HOME="/opt/elan" \
+    PATH="/opt/venv/bin:/opt/elan/bin:${PATH}"
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy venv + lean toolchain from builder (deps already installed)
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /opt/elan /opt/elan
+COPY --from=builder /root/.cache /root/.cache
+
+# Copy pyproject so pip knows the package metadata
+COPY pyproject.toml README.md ./
+
+# Editable install: registers /app/ecodiaos as the source tree.
+# The bind-mount in docker-compose.dev.yaml overlays /app/ecodiaos at
+# runtime, so any file Simula writes on the host is immediately visible
+# to the running process (the NeuroplasticityBus handles hot-reload via Redis pub/sub).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps -e .
+
+EXPOSE 8000 8001 8002
+
+CMD ["uvicorn", "ecodiaos.main:app", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop"]
 
 # ======================================================================
 

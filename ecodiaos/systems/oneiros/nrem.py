@@ -23,8 +23,11 @@ from typing import Any
 
 import structlog
 
+from abc import abstractmethod
+
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import EOSBaseModel
+from ecodiaos.systems.oneiros.workers_base import BaseOneirosWorker
 
 logger = structlog.get_logger().bind(system="oneiros", component="nrem")
 
@@ -69,10 +72,49 @@ class HypothesisPruneResult(EOSBaseModel):
     duration_ms: int = 0
 
 
+# ─── NREM Worker ABCs ────────────────────────────────────────────
+
+
+class BaseEpisodicReplay(BaseOneirosWorker):
+    """ABC for NREM episodic replay workers."""
+
+    worker_type: str = "nrem.episodic_replay"
+
+    @abstractmethod
+    async def run(self, cycle_id: str) -> EpisodicReplayResult: ...
+
+
+class BaseSynapticDownscaler(BaseOneirosWorker):
+    """ABC for NREM synaptic downscaling workers."""
+
+    worker_type: str = "nrem.synaptic_downscaler"
+
+    @abstractmethod
+    async def run(self) -> SynapticDownscaleResult: ...
+
+
+class BaseBeliefCompressor(BaseOneirosWorker):
+    """ABC for NREM belief compression workers."""
+
+    worker_type: str = "nrem.belief_compressor"
+
+    @abstractmethod
+    async def run(self) -> BeliefCompressionResult: ...
+
+
+class BaseHypothesisPruner(BaseOneirosWorker):
+    """ABC for NREM hypothesis pruning workers."""
+
+    worker_type: str = "nrem.hypothesis_pruner"
+
+    @abstractmethod
+    async def run(self) -> HypothesisPruneResult: ...
+
+
 # ─── Episodic Replay ──────────────────────────────────────────────
 
 
-class EpisodicReplay:
+class EpisodicReplay(BaseEpisodicReplay):
     """
     Select high-value episodes and extract semantic patterns.
 
@@ -286,7 +328,7 @@ class EpisodicReplay:
 # ─── Synaptic Downscaler ─────────────────────────────────────────
 
 
-class SynapticDownscaler:
+class SynapticDownscaler(BaseSynapticDownscaler):
     """
     Renormalize salience scores to prevent memory saturation.
 
@@ -388,7 +430,7 @@ class SynapticDownscaler:
 # ─── Belief Compressor ────────────────────────────────────────────
 
 
-class BeliefCompressor:
+class BeliefCompressor(BaseBeliefCompressor):
     """
     Simplify Nova's belief set during NREM sleep.
 
@@ -537,7 +579,7 @@ class BeliefCompressor:
 # ─── Hypothesis Pruner ────────────────────────────────────────────
 
 
-class HypothesisPruner:
+class HypothesisPruner(BaseHypothesisPruner):
     """
     Clean Evo's hypothesis pool during NREM sleep.
 

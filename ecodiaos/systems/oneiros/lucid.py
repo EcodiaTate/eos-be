@@ -23,6 +23,8 @@ from typing import Any
 
 import structlog
 
+from abc import abstractmethod
+
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
 from ecodiaos.primitives.common import EOSBaseModel, new_id
 from ecodiaos.systems.oneiros.types import (
@@ -31,6 +33,7 @@ from ecodiaos.systems.oneiros.types import (
     DreamInsight,
     DreamType,
 )
+from ecodiaos.systems.oneiros.workers_base import BaseOneirosWorker
 
 logger = structlog.get_logger().bind(system="oneiros", component="lucid")
 
@@ -60,10 +63,35 @@ class MetaCognitionResult(EOSBaseModel):
     duration_ms: int = 0
 
 
+# ─── Lucid Worker ABCs ──────────────────────────────────────────
+
+
+class BaseDirectedExploration(BaseOneirosWorker):
+    """ABC for lucid directed exploration workers."""
+
+    worker_type: str = "lucid.directed_exploration"
+
+    @abstractmethod
+    async def run(
+        self,
+        cycle_id: str,
+        trigger: DreamInsight | str | None = None,
+    ) -> DirectedExplorationResult: ...
+
+
+class BaseMetaCognition(BaseOneirosWorker):
+    """ABC for lucid metacognition workers."""
+
+    worker_type: str = "lucid.metacognition"
+
+    @abstractmethod
+    async def run(self, cycle_id: str) -> MetaCognitionResult: ...
+
+
 # ─── Directed Exploration ─────────────────────────────────────────
 
 
-class DirectedExploration:
+class DirectedExploration(BaseDirectedExploration):
     """
     Systematic creative variation of high-value insights.
 
@@ -321,7 +349,7 @@ class DirectedExploration:
 # ─── MetaCognition ────────────────────────────────────────────────
 
 
-class MetaCognition:
+class MetaCognition(BaseMetaCognition):
     """
     The organism observes its own dream patterns.
 

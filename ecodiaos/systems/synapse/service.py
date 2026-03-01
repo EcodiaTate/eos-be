@@ -40,13 +40,18 @@ from ecodiaos.systems.synapse.coherence import CoherenceMonitor
 from ecodiaos.systems.synapse.degradation import DegradationManager
 from ecodiaos.systems.synapse.event_bus import EventBus
 from ecodiaos.systems.synapse.health import HealthMonitor
+from ecodiaos.systems.synapse.metabolism import MetabolicTracker
 from ecodiaos.systems.synapse.resources import ResourceAllocator
 from ecodiaos.systems.synapse.rhythm import EmergentRhythmDetector
 from ecodiaos.systems.synapse.types import (
+    BaseResourceAllocator,
+    BaseRhythmStrategy,
     ClockState,
     CoherenceSnapshot,
     CycleResult,
+    MetabolicSnapshot,
     RhythmSnapshot,
+    SomaTickEvent,
     SynapseEvent,
     SynapseEventType,
 )
@@ -54,6 +59,7 @@ from ecodiaos.systems.synapse.types import (
 if TYPE_CHECKING:
     from ecodiaos.clients.redis import RedisClient
     from ecodiaos.config import SynapseConfig
+    from ecodiaos.core.hotreload import NeuroplasticityBus
     from ecodiaos.systems.atune.service import AtuneService
     from ecodiaos.telemetry.metrics import MetricCollector
 
@@ -67,6 +73,12 @@ _RESOURCE_SNAPSHOT_INTERVAL: int = 33
 
 # How often to rebalance resource allocations (in cycles)
 _REBALANCE_INTERVAL: int = 100
+
+# How often to snapshot metabolic state and emit pressure events (in cycles)
+_METABOLIC_INTERVAL: int = 50
+
+# Burn rate threshold (USD/hour) above which METABOLIC_PRESSURE fires
+_METABOLIC_PRESSURE_THRESHOLD_USD_HR: float = 1.0
 
 
 class SynapseService:
@@ -91,11 +103,13 @@ class SynapseService:
         config: SynapseConfig,
         redis: RedisClient | None = None,
         metrics: MetricCollector | None = None,
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
     ) -> None:
         self._atune = atune
         self._config = config
         self._redis = redis
         self._metrics = metrics
+        self._neuroplasticity_bus = neuroplasticity_bus
         self._logger = logger.bind(system="synapse")
         self._initialized: bool = False
 
@@ -110,6 +124,7 @@ class SynapseService:
         )
         self._rhythm = EmergentRhythmDetector(event_bus=self._event_bus)
         self._coherence = CoherenceMonitor(event_bus=self._event_bus)
+        self._metabolism = MetabolicTracker()
 
         # Cycle counter for periodic sub-system triggers
         self._cycle_count: int = 0
@@ -126,6 +141,19 @@ class SynapseService:
 
         # Set the per-cycle callback on the clock
         self._clock.set_on_cycle(self._on_cycle)
+
+        # Register with NeuroplasticityBus for hot-reload of allocators & rhythm strategies
+        if self._neuroplasticity_bus is not None:
+            self._neuroplasticity_bus.register(
+                base_class=BaseResourceAllocator,
+                registration_callback=self._on_allocator_evolved,
+                system_id="synapse",
+            )
+            self._neuroplasticity_bus.register(
+                base_class=BaseRhythmStrategy,
+                registration_callback=self._on_rhythm_strategy_evolved,
+                system_id="synapse",
+            )
 
         self._initialized = True
         self._logger.info("synapse_initialized")
@@ -181,6 +209,11 @@ class SynapseService:
         """Graceful shutdown of all sub-systems."""
         self._logger.info("synapse_stopping")
 
+        # Deregister from NeuroplasticityBus
+        if self._neuroplasticity_bus is not None:
+            self._neuroplasticity_bus.deregister(BaseResourceAllocator)
+            self._neuroplasticity_bus.deregister(BaseRhythmStrategy)
+
         await self._clock.stop()
         await self._health.stop()
 
@@ -206,6 +239,8 @@ class SynapseService:
             "safe_mode": self._health.is_safe_mode,
             "rhythm_state": self._rhythm.current_state.value,
             "coherence_composite": self._coherence.latest.composite,
+            "metabolic_deficit_usd": round(self._metabolism.rolling_deficit_usd, 6),
+            "burn_rate_usd_per_hour": round(self._metabolism.burn_rate_usd_per_hour, 4),
         }
 
     # ─── Safe Mode ───────────────────────────────────────────────────
@@ -221,6 +256,20 @@ class SynapseService:
             self._clock.pause()
         else:
             self._clock.resume()
+
+    # ─── Clock Control (admin API) ───────────────────────────────────
+
+    def pause_clock(self) -> None:
+        """Pause the cognitive cycle clock (e.g., for maintenance)."""
+        self._clock.pause()
+
+    def resume_clock(self) -> None:
+        """Resume the cognitive cycle clock."""
+        self._clock.resume()
+
+    def set_clock_speed(self, hz: float) -> None:
+        """Override base clock frequency (1–20 Hz)."""
+        self._clock.set_speed(hz)
 
     # ─── Accessors ───────────────────────────────────────────────────
 
@@ -240,6 +289,55 @@ class SynapseService:
     def event_bus(self) -> EventBus:
         return self._event_bus
 
+    @property
+    def metabolic_snapshot(self) -> MetabolicSnapshot:
+        return self._metabolism.snapshot()
+
+    @property
+    def metabolic_deficit(self) -> float:
+        """Current rolling deficit in USD — how much the organism owes."""
+        return self._metabolism.rolling_deficit_usd
+
+    @property
+    def metabolism(self) -> MetabolicTracker:
+        """Direct access for callers that need log_usage or inject_revenue."""
+        return self._metabolism
+
+
+    async def inject_revenue(
+        self,
+        amount_usd: float,
+        source: str = "external",
+    ) -> None:
+        """
+        Record incoming revenue and emit REVENUE_INJECTED on the event bus.
+
+        This is the preferred entry point for revenue injections. It keeps
+        the MetabolicTracker updated AND ensures Memory encodes the event as
+        a salience=1.0 episode so the organism learns what actions lead to income.
+
+        Args:
+            amount_usd: Revenue amount in USD.
+            source: Human-readable label for the revenue origin
+                    (e.g. "stripe", "on-chain-fee", "client-payment").
+        """
+        from ecodiaos.systems.synapse.types import SynapseEvent, SynapseEventType
+
+        self._metabolism.inject_revenue(amount_usd)
+
+        event = SynapseEvent(
+            event_type=SynapseEventType.REVENUE_INJECTED,
+            data={
+                "amount_usd": round(amount_usd, 8),
+                "source": source,
+                "new_deficit_usd": round(self._metabolism.rolling_deficit_usd, 6),
+            },
+            source_system="synapse",
+        )
+        try:
+            await self._event_bus.emit(event)
+        except Exception as exc:
+            logger.error("revenue_injected_event_emit_failed", error=str(exc))
     # ─── Stats ───────────────────────────────────────────────────────
 
     @property
@@ -253,8 +351,42 @@ class SynapseService:
             "resources": self._resources.stats,
             "rhythm": self._rhythm.stats,
             "coherence": self._coherence.stats,
+            "metabolism": self._metabolism.stats,
             "event_bus": self._event_bus.stats,
         }
+
+    # ─── NeuroplasticityBus callbacks ────────────────────────────────
+
+    def _on_allocator_evolved(self, new_allocator: BaseResourceAllocator) -> None:
+        """
+        Hot-swap the resource allocator when Simula evolves a new one.
+
+        The old allocator's accumulated load observations are intentionally
+        discarded — evolved logic starts with fresh observations.  The swap
+        happens between cycles so the active theta tick is never disrupted.
+        """
+        old_name = self._resources.allocator_name if isinstance(self._resources, BaseResourceAllocator) else "unknown"
+        self._resources = new_allocator
+        self._logger.info(
+            "resource_allocator_evolved",
+            old=old_name,
+            new=new_allocator.allocator_name,
+        )
+
+    def _on_rhythm_strategy_evolved(self, new_strategy: BaseRhythmStrategy) -> None:
+        """
+        Hot-swap the rhythm classification strategy.
+
+        The EmergentRhythmDetector's rolling window and hysteresis state
+        are preserved — only the classification algorithm changes.  This
+        means the new strategy immediately has a full 100-cycle window
+        of data to classify against, rather than starting cold.
+        """
+        self._rhythm.set_strategy(new_strategy)
+        self._logger.info(
+            "rhythm_strategy_evolved",
+            new=new_strategy.strategy_name,
+        )
 
     # ─── Per-Cycle Callback ──────────────────────────────────────────
 
@@ -315,6 +447,22 @@ class SynapseService:
         if self._cycle_count % _REBALANCE_INTERVAL == 0:
             self._resources.rebalance(self._clock.state.current_period_ms)
 
+        # ── 5b. Periodic: metabolic snapshot + pressure event ──
+        if self._cycle_count % _METABOLIC_INTERVAL == 0:
+            meta_snap = self._metabolism.snapshot()
+            if meta_snap.burn_rate_usd_per_hour > _METABOLIC_PRESSURE_THRESHOLD_USD_HR:
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.METABOLIC_PRESSURE,
+                    data={
+                        "rolling_deficit_usd": meta_snap.rolling_deficit_usd,
+                        "burn_rate_usd_per_hour": meta_snap.burn_rate_usd_per_hour,
+                        "total_calls": meta_snap.total_calls,
+                        "per_system_cost_usd": meta_snap.per_system_cost_usd,
+                    },
+                ))
+            # Reset window accumulator so next interval is a clean delta
+            self._metabolism.reset_window()
+
         # ── 6. Record telemetry ──
         if self._metrics is not None:
             try:
@@ -335,15 +483,40 @@ class SynapseService:
                 pass  # Telemetry failures must never block the cycle
 
         # ── 7. Emit cycle event to Redis for Alive ──
+        cycle_data: dict[str, Any] = {
+            "cycle": result.cycle_number,
+            "elapsed_ms": result.elapsed_ms,
+            "period_ms": result.budget_ms,
+            "arousal": result.arousal,
+            "had_broadcast": result.had_broadcast,
+            "salience": result.salience_composite,
+            "rhythm": self._rhythm.current_state.value,
+            "metabolic_deficit_usd": self._metabolism.rolling_deficit_usd,
+            "burn_rate_usd_per_hour": round(
+                self._metabolism.burn_rate_usd_per_hour, 6,
+            ),
+        }
+        if result.somatic is not None:
+            cycle_data["soma"] = {
+                "urgency": result.somatic.urgency,
+                "dominant_error": result.somatic.dominant_error,
+                "arousal_sensed": result.somatic.arousal_sensed,
+                "energy_sensed": result.somatic.energy_sensed,
+                "nearest_attractor": result.somatic.nearest_attractor,
+                "trajectory_heading": result.somatic.trajectory_heading,
+            }
+
         await self._event_bus.emit(SynapseEvent(
             event_type=SynapseEventType.CYCLE_COMPLETED,
-            data={
-                "cycle": result.cycle_number,
-                "elapsed_ms": result.elapsed_ms,
-                "period_ms": result.budget_ms,
-                "arousal": result.arousal,
-                "had_broadcast": result.had_broadcast,
-                "salience": result.salience_composite,
-                "rhythm": self._rhythm.current_state.value,
-            },
+            data=cycle_data,
         ))
+
+        # ── 8. Emit SomaTickEvent for stateless consumers ──
+        if result.somatic is not None:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.SOMA_TICK,
+                data=SomaTickEvent(
+                    cycle_number=result.cycle_number,
+                    somatic_state=result.somatic,
+                ).model_dump(),
+            ))

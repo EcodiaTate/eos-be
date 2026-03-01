@@ -18,7 +18,7 @@ from typing import Any
 
 from pydantic import Field
 
-from ecodiaos.primitives.common import EOSBaseModel, Identified, utc_now
+from ecodiaos.primitives.common import EOSBaseModel, Identified, new_id, utc_now
 
 # ─── Trust Levels ─────────────────────────────────────────────────
 
@@ -169,6 +169,7 @@ class KnowledgeType(enum.StrEnum):
     HYPOTHESES = "hypotheses"
     ANONYMISED_PATTERNS = "anonymised_patterns"
     SCHEMA_STRUCTURES = "schema_structures"
+    THREAT_ADVISORY = "threat_advisory"
 
 
 class PrivacyLevel(enum.StrEnum):
@@ -245,6 +246,7 @@ SHARING_PERMISSIONS: dict[TrustLevel, list[KnowledgeType]] = {
         KnowledgeType.PROCEDURES,
         KnowledgeType.HYPOTHESES,
         KnowledgeType.ANONYMISED_PATTERNS,
+        KnowledgeType.THREAT_ADVISORY,
     ],
     TrustLevel.ALLY: [
         KnowledgeType.PUBLIC_ENTITIES,
@@ -254,6 +256,7 @@ SHARING_PERMISSIONS: dict[TrustLevel, list[KnowledgeType]] = {
         KnowledgeType.HYPOTHESES,
         KnowledgeType.ANONYMISED_PATTERNS,
         KnowledgeType.SCHEMA_STRUCTURES,
+        KnowledgeType.THREAT_ADVISORY,
     ],
 }
 
@@ -280,6 +283,34 @@ class AssistanceResponse(EOSBaseModel):
     reason: str = ""
     estimated_completion_ms: int | None = None
     timestamp: datetime = Field(default_factory=utc_now)
+
+
+# ─── Threat Advisory (Phase 16f: Economic Immune System) ─────────
+
+
+class ThreatAdvisory(Identified):
+    """
+    A threat advisory broadcasted between federated instances.
+
+    When an organism detects a malicious contract, protocol exploit, or
+    economic attack, it packages the evidence into a ThreatAdvisory and
+    broadcasts it to trusted federation partners. Recipients can then
+    preemptively blacklist addresses or withdraw from affected protocols.
+    """
+
+    source_instance_id: str
+    threat_type: str  # ThreatType value
+    severity: str  # ThreatSeverity value
+    description: str
+    affected_protocols: list[str] = Field(default_factory=list)
+    affected_addresses: list[str] = Field(default_factory=list)
+    chain_id: int = 8453
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    recommended_action: str = ""  # "withdraw" | "blacklist" | "monitor"
+    signature: str = ""  # Ed25519 signature over the advisory content
+    confirmed_by: list[str] = Field(default_factory=list)  # Instance IDs that confirmed
+    timestamp: datetime = Field(default_factory=utc_now)
+    expires_at: datetime | None = None
 
 
 # ─── Trust Thresholds ────────────────────────────────────────────

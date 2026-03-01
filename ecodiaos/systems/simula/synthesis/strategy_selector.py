@@ -27,7 +27,7 @@ from ecodiaos.systems.simula.synthesis.types import (
     SynthesisStatus,
     SynthesisStrategy,
 )
-from ecodiaos.systems.simula.types import ChangeCategory
+from ecodiaos.systems.simula.evolution_types import ChangeCategory
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from ecodiaos.systems.simula.synthesis.chopchop import ChopChopEngine
     from ecodiaos.systems.simula.synthesis.hysynth import HySynthEngine
     from ecodiaos.systems.simula.synthesis.sketch_solver import SketchSolver
-    from ecodiaos.systems.simula.types import ChangeSpec, EvolutionProposal
+    from ecodiaos.systems.simula.evolution_types import ChangeSpec, EvolutionProposal
 
 logger = structlog.get_logger().bind(system="simula.synthesis.selector")
 

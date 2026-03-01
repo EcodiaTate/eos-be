@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     GOVERNANCE_REQUIRED,
     SELF_APPLICABLE,
     CautionAdjustment,
@@ -89,14 +89,14 @@ _RESOURCE_COST_HEURISTICS: dict[ChangeCategory, dict[str, int | float]] = {
 
 # System directories for dependency analysis
 _SYSTEM_DIRS: dict[str, str] = {
-    "memory": "src/ecodiaos/systems/memory",
-    "equor": "src/ecodiaos/systems/equor",
-    "atune": "src/ecodiaos/systems/atune",
-    "voxis": "src/ecodiaos/systems/voxis",
-    "nova": "src/ecodiaos/systems/nova",
-    "axon": "src/ecodiaos/systems/axon",
-    "evo": "src/ecodiaos/systems/evo",
-    "simula": "src/ecodiaos/systems/simula",
+    "memory": "ecodiaos/systems/memory",
+    "equor": "ecodiaos/systems/equor",
+    "atune": "ecodiaos/systems/atune",
+    "voxis": "ecodiaos/systems/voxis",
+    "nova": "ecodiaos/systems/nova",
+    "axon": "ecodiaos/systems/axon",
+    "evo": "ecodiaos/systems/evo",
+    "simula": "ecodiaos/systems/simula",
 }
 
 
@@ -148,7 +148,7 @@ class ChangeSimulator:
 
         # Forbidden categories are rejected before reaching simulation,
         # but defend in depth
-        from ecodiaos.systems.simula.types import FORBIDDEN
+        from ecodiaos.systems.simula.evolution_types import FORBIDDEN
         if proposal.category in FORBIDDEN:
             return EnrichedSimulationResult(
                 risk_level=RiskLevel.UNACCEPTABLE,
@@ -612,7 +612,7 @@ class ChangeSimulator:
         impacts: list[DependencyImpact] = []
 
         for sys_name in affected_systems:
-            sys_dir = self._root / _SYSTEM_DIRS.get(sys_name, f"src/ecodiaos/systems/{sys_name}")
+            sys_dir = self._root / _SYSTEM_DIRS.get(sys_name, f"ecodiaos/systems/{sys_name}")
             if not sys_dir.exists():
                 continue
 

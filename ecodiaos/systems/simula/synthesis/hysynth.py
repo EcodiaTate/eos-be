@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from ecodiaos.clients.llm import LLMProvider
-    from ecodiaos.systems.simula.types import ChangeSpec
+    from ecodiaos.systems.simula.evolution_types import ChangeSpec
 
 logger = structlog.get_logger().bind(system="simula.synthesis.hysynth")
 

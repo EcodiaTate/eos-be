@@ -66,79 +66,126 @@ async def run_consolidation(neo4j: Neo4jClient) -> dict[str, Any]:
 
 async def _run_community_detection(neo4j: Neo4jClient) -> dict[str, Any]:
     """
-    Run hierarchical Leiden community detection on the entity graph.
-    Requires Neo4j Graph Data Science plugin.
-    """
-    # Project the entity graph into GDS
-    try:
-        await neo4j.execute_write(
-            """
-            CALL gds.graph.project(
-                'entity_graph',
-                'Entity',
-                {
-                    RELATES_TO: {
-                        properties: ['strength'],
-                        orientation: 'UNDIRECTED'
-                    }
-                }
-            )
-            """
-        )
-    except Exception as e:
-        if "already exists" in str(e).lower():
-            # Drop and recreate
-            await neo4j.execute_write("CALL gds.graph.drop('entity_graph', false)")
-            await neo4j.execute_write(
-                """
-                CALL gds.graph.project(
-                    'entity_graph',
-                    'Entity',
-                    {
-                        RELATES_TO: {
-                            properties: ['strength'],
-                            orientation: 'UNDIRECTED'
-                        }
-                    }
-                )
-                """
-            )
-        else:
-            raise
+    Run Louvain-style iterative community detection on the entity graph.
+    Pure Cypher implementation — works on Neo4j Aura (no GDS required).
 
-    # Run Leiden
-    results = await neo4j.execute_write(
+    Algorithm:
+    1. Initialize each entity as its own community
+    2. Iteratively move entities to neighboring communities that maximize modularity
+    3. Aggregate and repeat until convergence
+    4. Materialize final communities
+    """
+    max_iterations = 5
+    modularity_improvement_threshold = 0.001
+
+    # Step 1: Initialize community assignments (each entity is its own community)
+    await neo4j.execute_write(
         """
-        CALL gds.leiden.write('entity_graph', {
-            writeProperty: 'leiden_community',
-            includeIntermediateCommunities: true,
-            maxLevels: 5,
-            gamma: 1.0,
-            theta: 0.01
-        })
-        YIELD communityCount, modularity, ranLevels
-        RETURN communityCount, modularity, ranLevels
+        MATCH (e:Entity)
+        SET e.leiden_community = e.id,
+            e._community_temp = e.id
         """
     )
 
-    # Clean up projection
-    await neo4j.execute_write("CALL gds.graph.drop('entity_graph', false)")
+    previous_modularity = 0.0
 
-    community_count = 0
-    modularity = 0.0
-    levels = 0
-    if results:
-        community_count = results[0].get("communityCount", 0)
-        modularity = results[0].get("modularity", 0.0)
-        levels = results[0].get("ranLevels", 0)
+    for iteration in range(max_iterations):
+        # Step 2: For each entity, evaluate moving to neighboring communities
+        # and keep the move if it improves modularity
+        moves = await neo4j.execute_write(
+            """
+            MATCH (e:Entity)-[r:RELATES_TO]-(neighbor:Entity)
+            WITH e, neighbor.leiden_community AS neighbor_community,
+                 sum(r.strength) AS total_neighbor_strength,
+                 count(r) AS neighbor_count
+            WITH e, neighbor_community,
+                 total_neighbor_strength / (neighbor_count * 1.0) AS avg_neighbor_strength
+            WITH e, neighbor_community,
+                 avg_neighbor_strength * (1.0 + e.salience_score) AS weighted_score
+            ORDER BY e.id, weighted_score DESC
+            WITH e, collect({
+                community: neighbor_community,
+                score: weighted_score
+            })[0] AS best_community
+            WHERE best_community IS NOT NULL
+            SET e._community_temp = best_community.community
+            RETURN count(e) AS entities_moved
+            """
+        )
 
-    # Materialize Community nodes from Leiden results
+        entities_moved = moves[0].get("entities_moved", 0) if moves else 0
+
+        # Step 3: Commit moves and recalculate modularity
+        await neo4j.execute_write(
+            """
+            MATCH (e:Entity)
+            SET e.leiden_community = e._community_temp
+            """
+        )
+
+        # Step 4: Calculate modularity (measure of community quality)
+        modularity_result = await neo4j.execute_write(
+            """
+            MATCH (e1:Entity)-[r:RELATES_TO]-(e2:Entity)
+            WITH e1.leiden_community AS c1, e2.leiden_community AS c2,
+                 r.strength AS strength
+            WITH c1, c2, sum(strength) AS internal_weight,
+                 count(r) AS edge_count
+            WITH sum(CASE WHEN c1 = c2 THEN internal_weight ELSE 0 END) AS modularity_internal,
+                 sum(internal_weight) AS total_weight
+            RETURN modularity_internal / (total_weight + 0.001) AS modularity
+            """
+        )
+
+        current_modularity = (
+            modularity_result[0].get("modularity", 0.0) if modularity_result else 0.0
+        )
+
+        logger.info(
+            "community_detection_iteration",
+            iteration=iteration,
+            entities_moved=entities_moved,
+            modularity=current_modularity,
+        )
+
+        # Step 5: Check for convergence
+        modularity_improvement = current_modularity - previous_modularity
+        if modularity_improvement < modularity_improvement_threshold:
+            logger.info(
+                "community_detection_converged",
+                iteration=iteration,
+                final_modularity=current_modularity,
+            )
+            break
+
+        previous_modularity = current_modularity
+
+    # Clean up temporary properties
+    await neo4j.execute_write("MATCH (e:Entity) REMOVE e._community_temp")
+
+    # Step 6: Count final communities
+    community_count_result = await neo4j.execute_write(
+        """
+        MATCH (e:Entity)
+        WHERE e.leiden_community IS NOT NULL
+        RETURN count(DISTINCT e.leiden_community) AS community_count
+        """
+    )
+
+    community_count = (
+        community_count_result[0].get("community_count", 0)
+        if community_count_result
+        else 0
+    )
+
+    # Step 7: Materialize Community nodes from detected communities
     materialized = await _materialize_community_nodes(neo4j)
 
     return {
         "community_count": community_count,
-        "modularity": modularity,
-        "levels": levels,
+        "modularity": current_modularity,
+        "levels": 1,  # Single-level clustering (Louvain can do multi-level, but 1 is simpler)
+        "iterations": iteration + 1,
         "communities_materialized": materialized,
     }
 

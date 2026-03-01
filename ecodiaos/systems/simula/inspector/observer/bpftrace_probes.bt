@@ -1,0 +1,81 @@
+#!/usr/bin/env bpftrace
+/*
+ * Simula Observer — Quick Validation Probes
+ *
+ * Prints PID/comm for every TCP connect, send, and recv on the host.
+ * Fastest path to validating eBPF probe attachment and event reception.
+ *
+ * Usage:
+ *   bpftrace /opt/simula/observer/bpftrace_probes.bt
+ *
+ * Iron Rules:
+ *   - Read-only probes only — no kernel writes, no function return overrides.
+ *   - Never modify kernel memory or redirect packets.
+ */
+
+BEGIN
+{
+    printf("=== Simula Observer — bpftrace mode ===\n");
+    printf("Attaching: tcp_sendmsg, tcp_recvmsg, security_socket_connect, sys_exit_read\n");
+    printf("%-6s %-6s %-16s %-8s %s\n",
+           "TYPE", "PID", "COMM", "SIZE", "DETAIL");
+    printf("--------------------------------------------------------------\n");
+}
+
+kprobe:tcp_sendmsg
+/pid != 0/
+{
+    printf("[SEND] %-6d %-16s %-8d\n",
+           pid, comm, arg2);
+}
+
+kprobe:tcp_recvmsg
+/pid != 0/
+{
+    printf("[RECV] %-6d %-16s\n",
+           pid, comm);
+}
+
+kprobe:security_socket_connect
+/pid != 0/
+{
+    printf("[CONN] %-6d %-16s\n",
+           pid, comm);
+}
+
+// ── Inbound payload capture ───────────────────────────────────────────────
+// Stash the user buffer pointer on enter; read actual bytes on exit.
+// Uses a @map keyed by tid so enter and exit halves correlate correctly.
+
+tracepoint:syscalls:sys_enter_read
+/pid != 0 && args->fd > 2 && args->count >= 4/
+{
+    @read_buf[tid] = args->buf;
+    @read_cnt[tid] = args->count;
+}
+
+tracepoint:syscalls:sys_exit_read
+/pid != 0 && args->ret >= 4 && @read_buf[tid] != 0/
+{
+    // Capture first 256 bytes — bpftrace str() reads a null-terminated C string
+    // from the user buffer, which is sufficient to spot TAINT=<uuid> tokens.
+    $buf  = @read_buf[tid];
+    $ret  = (uint64)args->ret;
+    $cap  = $ret < 256 ? $ret : 256;
+    printf("[RINB] %-6d %-16s size=%-8llu cap=%llu bytes=[%s]\n",
+           pid, comm, $ret, $cap, str($buf, $cap));
+    delete(@read_buf[tid]);
+    delete(@read_cnt[tid]);
+}
+
+interval:s:10
+{
+    printf("--- observer alive (10s heartbeat) ---\n");
+}
+
+END
+{
+    clear(@read_buf);
+    clear(@read_cnt);
+    printf("=== Simula Observer — detaching probes ===\n");
+}

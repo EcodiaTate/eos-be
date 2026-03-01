@@ -15,6 +15,7 @@ from typing import Any
 import structlog
 
 from ecodiaos.systems.synapse.types import (
+    BaseResourceAllocator,
     ResourceAllocation,
     ResourceSnapshot,
     SystemBudget,
@@ -44,7 +45,7 @@ _DEFAULT_BUDGETS: dict[str, SystemBudget] = {
 }
 
 
-class ResourceAllocator:
+class ResourceAllocator(BaseResourceAllocator):
     """
     Manages per-system resource budgets and tracks actual utilisation.
 
@@ -55,6 +56,10 @@ class ResourceAllocator:
     The allocator is passive — it computes allocations but does not enforce them.
     Systems are expected to respect their budgets voluntarily.
     """
+
+    @property
+    def allocator_name(self) -> str:
+        return "default"
 
     def __init__(self) -> None:
         self._logger = logger.bind(component="resource_allocator")

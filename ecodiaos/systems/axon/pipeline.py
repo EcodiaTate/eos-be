@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from ecodiaos.systems.axon.credentials import CredentialStore
     from ecodiaos.systems.axon.registry import ExecutorRegistry
     from ecodiaos.systems.axon.safety import BudgetTracker, CircuitBreaker, RateLimiter
+    from ecodiaos.systems.axon.shield import TransactionShield
     from ecodiaos.systems.nova.service import NovaService
 
 logger = structlog.get_logger()
@@ -67,6 +68,7 @@ class ExecutionPipeline:
         credential_store: CredentialStore,
         audit_logger: AuditLogger,
         instance_id: str = "eos-default",
+        shield: TransactionShield | None = None,
     ) -> None:
         self._registry = registry
         self._budget = budget
@@ -75,9 +77,10 @@ class ExecutionPipeline:
         self._credential_store = credential_store
         self._audit = audit_logger
         self._instance_id = instance_id
+        self._shield = shield
         self._logger = logger.bind(system="axon.pipeline")
         self._nova: NovaService | None = None
-        self._atune = None  # AtuneService — for feeding outcomes as percepts
+        self._atune = None  # AtuneService -- for feeding outcomes as percepts
 
     def set_nova(self, nova: NovaService) -> None:
         self._nova = nova
@@ -194,6 +197,33 @@ class ExecutionPipeline:
             credentials=credentials,
             instance_id=self._instance_id,
         )
+
+        # ── STAGE 5.5: Transaction shield ────────────────────────
+        if self._shield is not None:
+            from ecodiaos.systems.axon.shield import SHIELDED_EXECUTORS
+
+            for step in intent.plan.steps:
+                if step.executor in SHIELDED_EXECUTORS:
+                    sim = await self._shield.evaluate(
+                        action_type=step.executor,
+                        params=step.parameters,
+                        context=context,
+                    )
+                    if not sim.passed:
+                        self._logger.warning(
+                            "shield_rejected",
+                            execution_id=execution_id,
+                            executor=step.executor,
+                            reason=sim.revert_reason,
+                        )
+                        return self._fast_fail(
+                            intent_id=intent.id,
+                            execution_id=execution_id,
+                            status=ExecutionStatus.FAILURE,
+                            failure_reason=FailureReason.TRANSACTION_SHIELD_REJECTED.value,
+                            error=f"Transaction shield rejected: {sim.revert_reason}",
+                            start_time=start_time,
+                        )
 
         # ── STAGE 6: Step execution ───────────────────────────────
         self._budget.begin_execution()

@@ -9,7 +9,7 @@ best action is no action (observe and wait). This prevents hyperactivity
 and ensures Nova can choose inaction when uncertainty is high or the
 situation is resolving on its own.
 
-Policy generation uses the full slow-path budget (up to 3000ms for LLM call).
+Policy generation uses the full slow-path budget (up to 10000ms for LLM call).
 For fast-path decisions, pattern-matching against known procedure templates
 is used instead, which must complete in ≤100ms.
 """
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import time
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -41,6 +42,40 @@ if TYPE_CHECKING:
     from ecodiaos.primitives.affect import AffectState
 
 logger = structlog.get_logger()
+
+
+# ─── Base Class (hot-reload contract) ────────────────────────────
+
+class BasePolicyGenerator(ABC):
+    """
+    Abstract base for all Nova policy generators.
+
+    Simula-evolved generators subclass this.  The hot-reload engine discovers
+    subclasses of this ABC in changed files and replaces the live
+    ``PolicyGenerator`` instance on ``NovaService`` atomically.
+
+    Evolved subclasses **must** implement ``generate_candidates``.
+    They can accept any constructor args they need — the ``NovaService``
+    ``instance_factory`` callback handles instantiation.
+    """
+
+    @abstractmethod
+    async def generate_candidates(
+        self,
+        goal: Goal,
+        situation_summary: str,
+        beliefs: BeliefState,
+        affect: AffectState,
+        memory_traces: list[dict[str, Any]] | None = None,
+    ) -> list[Policy]:
+        """
+        Generate 2-5 candidate policies for achieving *goal*.
+
+        Must always return at least one policy (the do-nothing fallback).
+        Must never raise — return ``[make_do_nothing_policy()]`` on failure.
+        """
+        ...
+
 
 # ─── Do-Nothing Policy ───────────────────────────────────────────
 
@@ -125,6 +160,20 @@ _PROCEDURE_TEMPLATES: list[dict[str, Any]] = [
         "effort": "low",
         "time_horizon": "immediate",
     },
+    # Catch-all for broadcasts that reached the fast path but didn't match
+    # a specific template above. If routing assessed this as non-deliberative
+    # (low novelty, low risk, low emotional, no belief conflict), it's safe
+    # to handle with a generic routine response rather than escalating to the
+    # full LLM slow path.
+    {
+        "name": "Routine processing",
+        "condition": lambda broadcast: True,  # Always matches — lowest priority (lowest success_rate)
+        "domain": "general",
+        "steps": [{"action_type": "express", "description": "Process and respond to routine input"}],
+        "success_rate": 0.75,
+        "effort": "low",
+        "time_horizon": "immediate",
+    },
 ]
 
 
@@ -167,15 +216,15 @@ def procedure_to_policy(procedure: dict[str, Any]) -> Policy:
 # ─── Policy Generator ─────────────────────────────────────────────
 
 
-class PolicyGenerator:
+class PolicyGenerator(BasePolicyGenerator):
     """
-    Generates candidate policies via LLM reasoning.
+    Default Nova policy generator — uses LLM reasoning.
 
     For the slow path (deliberative processing), generates 2-5 distinct
     candidate policies grounded in the current belief state and goal.
     Always appends the DoNothing policy as the null baseline.
 
-    The LLM call budget is up to 3000ms (within the 5000ms slow-path budget).
+    The LLM call budget is up to 10000ms (within the 15000ms slow-path budget).
     """
 
     def __init__(
@@ -183,7 +232,7 @@ class PolicyGenerator:
         llm: LLMProvider,
         instance_name: str = "EOS",
         max_policies: int = 5,
-        timeout_ms: int = 3000,
+        timeout_ms: int = 10000,
     ) -> None:
         self._llm = llm
         self._instance_name = instance_name

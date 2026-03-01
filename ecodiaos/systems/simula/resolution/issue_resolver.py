@@ -443,7 +443,7 @@ class IssueResolver:
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
 
-        from ecodiaos.systems.simula.types import (
+        from ecodiaos.systems.simula.evolution_types import (
             ChangeCategory,
             ChangeSpec,
             EvolutionProposal,

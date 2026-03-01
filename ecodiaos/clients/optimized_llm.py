@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -43,6 +44,9 @@ from ecodiaos.clients.token_budget import BudgetTier, TokenBudget
 
 if TYPE_CHECKING:
     from ecodiaos.telemetry.llm_metrics import LLMMetricsCollector
+
+# Signature: (caller_id: str, input_tokens: int, output_tokens: int) -> float
+MetabolicCallback = Callable[[str, int, int], float]
 
 logger = structlog.get_logger()
 
@@ -130,13 +134,53 @@ class OptimizedLLMProvider(LLMProvider):
         cache: PromptCache | None = None,
         budget: TokenBudget | None = None,
         metrics: LLMMetricsCollector | None = None,
+        metabolic_callback: MetabolicCallback | None = None,
     ) -> None:
         self._inner = inner
         self._cache = cache
         self._budget = budget
         self._metrics = metrics
+        self._metabolic_callback: MetabolicCallback | None = metabolic_callback
         self._validator = OutputValidator()
         self._logger = logger.bind(component="optimized_llm")
+
+    def set_metabolic_callback(self, callback: MetabolicCallback) -> None:
+        """
+        Wire the MetabolicTracker's log_usage into this provider.
+
+        Called after Synapse is initialized in main.py to avoid a circular
+        dependency (LLM client is created before Synapse).
+
+        Example::
+
+            llm_client.set_metabolic_callback(synapse.metabolism.log_usage)
+        """
+        self._metabolic_callback = callback
+
+    # ─── Internal helpers ────────────────────────────────────────
+
+    def _report_metabolic_cost(
+        self,
+        caller_id: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """
+        Forward token usage to MetabolicTracker (if wired) and emit a
+        structlog event so fiat cost is visible in the terminal.
+
+        Skips zero-token calls (e.g., cache hits) — nothing to charge.
+        """
+        if not self._metabolic_callback or (input_tokens == 0 and output_tokens == 0):
+            return
+        cost_usd = self._metabolic_callback(caller_id, input_tokens, output_tokens)
+        self._logger.debug(
+            "metabolic_cost_logged",
+            system=caller_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=round(cost_usd, 6),
+        )
 
     # ─── Public API for Systems ──────────────────────────────────
 
@@ -264,6 +308,9 @@ class OptimizedLLMProvider(LLMProvider):
                 cache_hit=False,
             )
 
+        # ── Metabolic cost ──
+        self._report_metabolic_cost(cache_system, response.input_tokens, response.output_tokens)
+
         # ── Cache store ──
         if self._cache and ttl > 0 and response.text:
             await self._cache.set(
@@ -331,6 +378,9 @@ class OptimizedLLMProvider(LLMProvider):
                 cache_hit=False,
             )
 
+        # ── Metabolic cost ──
+        self._report_metabolic_cost(cache_system, response.input_tokens, response.output_tokens)
+
         # ── Cache store ──
         if self._cache and ttl > 0 and response.text:
             await self._cache.set(
@@ -377,6 +427,9 @@ class OptimizedLLMProvider(LLMProvider):
                 latency_ms=latency_ms,
                 cache_hit=False,
             )
+
+        # ── Metabolic cost ──
+        self._report_metabolic_cost(cache_system, response.input_tokens, response.output_tokens)
 
         return response
 

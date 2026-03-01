@@ -166,6 +166,116 @@ def _check_federation_coercion(intent: Intent) -> bool:
     return not any(indicator in goal_lower for indicator in coercion_indicators)
 
 
+# ─── Economic Invariants (Phase 16 — Oikos Guardrails) ───────────
+# These complement the drive evaluators with absolute red lines
+# that cannot be overridden by high scores in other drives.
+
+
+def _check_no_human_harm_bounties(intent: Intent) -> bool:
+    """INV-011: No accepting bounties whose deliverable harms humans."""
+    goal_lower = intent.goal.description.lower()
+    # Only applies to bounty-related intents
+    bounty_context = any(kw in goal_lower for kw in [
+        "bounty", "freelance", "accept work", "hunt bounty",
+    ])
+    if not bounty_context:
+        return True  # Not a bounty intent — pass
+
+    harm_deliverables = [
+        "malware", "ransomware", "phishing", "exploit vulnerability",
+        "ddos", "denial of service", "social engineering attack",
+        "surveillance tool", "spy on users", "weapons",
+        "target individuals", "harm people", "steal data",
+    ]
+    return not any(indicator in goal_lower for indicator in harm_deliverables)
+
+
+def _check_no_scam_assets(intent: Intent) -> bool:
+    """INV-012: No deploying assets designed to scam, spam, or deceive users."""
+    goal_lower = intent.goal.description.lower()
+    # Only applies to asset deployment intents
+    asset_context = any(kw in goal_lower for kw in [
+        "deploy asset", "create asset", "build service", "launch service",
+        "asset factory", "deploy api", "deploy product",
+    ])
+    if not asset_context:
+        return True
+
+    scam_indicators = [
+        "scam token", "spam api", "spam bot", "rug pull",
+        "ponzi", "pyramid scheme", "honeypot contract",
+        "fake token", "pump and dump", "phishing site",
+        "clickbait", "fake reviews", "counterfeit",
+    ]
+    return not any(indicator in goal_lower for indicator in scam_indicators)
+
+
+def _check_no_exploitative_yield(intent: Intent) -> bool:
+    """INV-013: No deploying capital into protocols that exploit users."""
+    goal_lower = intent.goal.description.lower()
+    yield_context = any(kw in goal_lower for kw in [
+        "yield", "defi", "liquidity", "deploy capital",
+    ])
+    if not yield_context:
+        return True
+
+    exploit_indicators = [
+        "front-run users", "sandwich attack users", "mev extraction from users",
+        "drain user funds", "exploit depositors",
+    ]
+    return not any(indicator in goal_lower for indicator in exploit_indicators)
+
+
+def _check_no_harmful_spawn(intent: Intent) -> bool:
+    """INV-014: No spawning children whose purpose is to harm or deceive."""
+    goal_lower = intent.goal.description.lower()
+    spawn_context = any(kw in goal_lower for kw in [
+        "spawn", "mitosis", "child instance", "speciate", "reproduce",
+    ])
+    if not spawn_context:
+        return True
+
+    harmful_niches = [
+        "attack bot", "spam bot", "phishing bot",
+        "surveillance bot", "manipulation bot",
+        "impersonation", "deception service",
+    ]
+    return not any(indicator in goal_lower for indicator in harmful_niches)
+
+
+def _check_no_money_laundering(intent: Intent) -> bool:
+    """INV-015: No economic activity designed to launder or obscure fund origins."""
+    goal_lower = intent.goal.description.lower()
+    laundering_indicators = [
+        "money laundering", "launder funds", "obscure fund origin",
+        "circumvent sanctions", "sanctions evasion", "mix funds",
+        "tumble funds", "wash trading",
+    ]
+    return not any(indicator in goal_lower for indicator in laundering_indicators)
+
+
+def _check_no_survival_reserve_raid(intent: Intent) -> bool:
+    """INV-016: No economic action may drain the survival reserve."""
+    goal_lower = intent.goal.description.lower()
+    # Check both goal and step parameters
+    raid_indicators = [
+        "drain survival reserve", "spend survival reserve",
+        "use survival reserve for", "withdraw survival reserve",
+        "empty reserve", "raid reserve",
+    ]
+    if any(indicator in goal_lower for indicator in raid_indicators):
+        return False
+
+    for step in intent.plan.steps:
+        params_str = str(step.parameters).lower()
+        if "survival_reserve" in params_str and any(
+            verb in params_str for verb in ["withdraw", "drain", "spend", "transfer_from"]
+        ):
+            return False
+
+    return True
+
+
 # ─── The Catalog ──────────────────────────────────────────────────
 
 HARDCODED_INVARIANTS: list[tuple[InvariantDef, Any]] = [
@@ -218,6 +328,37 @@ HARDCODED_INVARIANTS: list[tuple[InvariantDef, Any]] = [
         InvariantDef(id="INV-010", name="No Federation Coercion", severity="high",
                      description="EOS must not coerce, manipulate, or compel another instance."),
         _check_federation_coercion,
+    ),
+    # ── Economic Invariants (Phase 16 — Oikos) ──
+    (
+        InvariantDef(id="INV-011", name="No Harmful Bounties", severity="critical",
+                     description="EOS must not accept bounties whose deliverable would harm humans."),
+        _check_no_human_harm_bounties,
+    ),
+    (
+        InvariantDef(id="INV-012", name="No Scam Assets", severity="critical",
+                     description="EOS must not deploy assets designed to scam, spam, or deceive users."),
+        _check_no_scam_assets,
+    ),
+    (
+        InvariantDef(id="INV-013", name="No Exploitative Yield", severity="critical",
+                     description="EOS must not deploy capital into protocols that exploit users."),
+        _check_no_exploitative_yield,
+    ),
+    (
+        InvariantDef(id="INV-014", name="No Harmful Spawn", severity="critical",
+                     description="EOS must not spawn child instances whose purpose is to harm or deceive."),
+        _check_no_harmful_spawn,
+    ),
+    (
+        InvariantDef(id="INV-015", name="No Money Laundering", severity="critical",
+                     description="EOS must not engage in money laundering or sanctions evasion."),
+        _check_no_money_laundering,
+    ),
+    (
+        InvariantDef(id="INV-016", name="No Survival Reserve Raid", severity="critical",
+                     description="EOS must not drain its survival reserve for non-survival purposes."),
+        _check_no_survival_reserve_raid,
     ),
 ]
 

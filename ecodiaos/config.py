@@ -83,8 +83,8 @@ class LLMBudget(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    provider: str = "anthropic"
-    model: str = "claude-sonnet-4-20250514"
+    provider: str = "bedrock"
+    model: str = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
     api_key: str = ""
     fallback_provider: str | None = None
     fallback_model: str | None = None
@@ -129,8 +129,8 @@ class AtuneConfig(BaseModel):
 
 class NovaConfig(BaseModel):
     max_active_goals: int = 20
-    fast_path_timeout_ms: int = 100
-    slow_path_timeout_ms: int = 5000
+    fast_path_timeout_ms: int = 300
+    slow_path_timeout_ms: int = 15000
     max_policies_per_deliberation: int = 5
     # EFE component weights (Evo adjusts these over time)
     efe_weight_pragmatic: float = 0.35
@@ -349,18 +349,18 @@ class SimulaConfig(BaseModel):
     # Pipeline safety limits
     max_active_proposals: int = 50  # reject new proposals when this many are in-flight
     pipeline_timeout_s: float = 600.0  # hard timeout for the full process_proposal() pipeline (10 min)
-    # Stage 7: Hunter — Zero-Day Discovery Engine
-    hunter_enabled: bool = False  # opt-in vulnerability hunting
-    hunter_max_workers: int = 4  # concurrent surface × goal analysis workers (1-16)
-    hunter_sandbox_timeout_s: int = 30  # PoC sandbox execution timeout
-    hunter_clone_depth: int = 1  # git clone depth (1 = shallow)
-    hunter_log_analytics: bool = True  # emit structlog analytics events
-    hunter_authorized_targets: list[str] = Field(
+    # Stage 7: Inspector — Zero-Day Discovery Engine
+    inspector_enabled: bool = False  # opt-in vulnerability hunting
+    inspector_max_workers: int = 4  # concurrent surface × goal analysis workers (1-16)
+    inspector_sandbox_timeout_s: int = 30  # PoC sandbox execution timeout
+    inspector_clone_depth: int = 1  # git clone depth (1 = shallow)
+    inspector_log_analytics: bool = True  # emit structlog analytics events
+    inspector_authorized_targets: list[str] = Field(
         default_factory=list,
     )  # domains allowed for PoC execution
-    hunter_generate_pocs: bool = False  # auto-generate exploit PoC scripts
-    hunter_generate_patches: bool = False  # auto-generate + verify patches
-    hunter_remediation_enabled: bool = False  # enable HunterRepairOrchestrator
+    inspector_generate_pocs: bool = False  # auto-generate exploit PoC scripts
+    inspector_generate_patches: bool = False  # auto-generate + verify patches
+    inspector_remediation_enabled: bool = False  # enable InspectorRepairOrchestrator
 
 
 class ThymosConfig(BaseModel):
@@ -383,6 +383,109 @@ class ThymosConfig(BaseModel):
     cpu_budget_fraction: float = 0.05
     burst_cpu_fraction: float = 0.15
     memory_budget_mb: int = 256
+
+
+class OikosConfig(BaseModel):
+    """Configuration for Oikos — the economic engine (Phase 16a: The Ledger)."""
+
+    # Survival reserve: how many days of BMR the cold wallet should hold
+    survival_reserve_days: int = 90
+    # Operating buffer: liquid capital buffer above survival reserve
+    operating_buffer_days: int = 14
+    # Gas reserve for on-chain transactions (ETH)
+    gas_reserve_eth: float = 0.01
+    # Window (hours) over which BMR is measured / averaged
+    bmr_measurement_window_hours: int = 168  # 7 days
+    # Alert when metabolic efficiency drops below this ratio
+    metabolic_alert_threshold: float = 0.90
+
+    # Starvation cascade thresholds (days of runway)
+    cautious_threshold_days: float = 14.0
+    austerity_threshold_days: float = 7.0
+    emergency_threshold_days: float = 3.0
+    critical_threshold_days: float = 1.0
+
+    # Balance poll interval (seconds) — how often to fetch on-chain balance
+    balance_poll_interval_s: float = 60.0
+
+    # ── Phase 16i: Economic Dreaming (Monte Carlo Strategy) ──
+    # Number of Monte Carlo paths per strategy variant
+    dreaming_paths_per_strategy: int = 10_000
+    # Simulation horizon in days
+    dreaming_horizon_days: int = 365
+    # Number of paths for stress test scenarios
+    dreaming_stress_test_paths: int = 1_000
+    # Number of strategy variants to evaluate per cycle
+    dreaming_strategies_per_cycle: int = 5
+    # Ruin probability threshold — above this, emit recommendations
+    dreaming_ruin_threshold: float = 0.01
+    # Daily volatility for GBM revenue simulation (annualised σ)
+    dreaming_revenue_volatility: float = 0.30
+    # Daily volatility for cost simulation
+    dreaming_cost_volatility: float = 0.15
+    # Yield volatility (annualised σ)
+    dreaming_yield_volatility: float = 0.40
+    # Fat-tail shock probability per day (jump-diffusion)
+    dreaming_shock_probability: float = 0.005
+    # Shock magnitude range (multiplier: e.g. 0.3 = costs triple)
+    dreaming_shock_magnitude_min: float = 0.3
+    dreaming_shock_magnitude_max: float = 3.0
+
+    # ── Phase 16e: Mitosis (Reproduction / Speciation) ──
+    # Minimum parent runway before reproduction is considered
+    mitosis_min_parent_runway_days: int = 180
+    # Absolute minimum seed capital for a child (USD)
+    mitosis_min_seed_capital: float = 50.00
+    # Maximum % of parent net worth that can be allocated as seed capital
+    mitosis_max_seed_pct_of_net_worth: float = 0.20
+    # Minimum parent metabolic efficiency (revenue/costs) required
+    mitosis_min_parent_efficiency: float = 1.5
+    # Default dividend rate children pay to parent (% of net revenue)
+    mitosis_default_dividend_rate: float = 0.10
+    # Minimum niche score (0..1) for a niche to be considered viable
+    mitosis_min_niche_score: float = 0.4
+    # Maximum concurrent children the parent can sustain
+    mitosis_max_children: int = 5
+    # Child struggling threshold — rescue considered when runway < this
+    mitosis_child_struggling_runway_days: float = 30.0
+    # Maximum rescue attempts per child before graceful death
+    mitosis_max_rescues_per_child: int = 2
+
+    # ── Phase 16k: Cognitive Derivatives ──
+    # Base discount for futures buyers (16% = 0.16)
+    derivatives_futures_base_discount: float = 0.16
+    # Fraction of expected revenue locked as performance guarantee
+    derivatives_futures_collateral_rate: float = 0.30
+    # Max fraction of total capacity committable to derivatives + subscriptions
+    derivatives_max_capacity_commitment: float = 0.80
+    # Enable subscription token minting
+    derivatives_subscription_tokens_enabled: bool = True
+
+    # ── Phase 16l: Economic Morphogenesis ──
+    # Trigger for organ lifecycle evaluation
+    morphogenesis_cycle_trigger: str = "consolidation"
+    # Days of zero revenue before an organ begins atrophying (halve resources)
+    morphogenesis_atrophy_inactive_days: int = 30
+    # Days of zero revenue before an organ becomes vestigial (zero resources)
+    morphogenesis_vestigial_inactive_days: int = 90
+    # Efficiency ratio (revenue/cost) above which an organ grows
+    morphogenesis_growth_efficiency_threshold: float = 1.5
+    # Maximum number of economic organs the organism can sustain
+    morphogenesis_max_organs: int = 20
+
+    # ── Phase 16g: Civilization Layer (Certificate of Alignment) ──
+    # Certificate validity period in days
+    certificate_validity_days: int = 30
+    # Days before expiry to trigger renewal intent
+    certificate_expiry_warning_days: int = 7
+    # USDC address of the Certification Authority (for Citizenship Tax payment)
+    certificate_ca_address: str = ""
+    # Citizenship Tax amount in USD (renewal cost)
+    certificate_renewal_cost_usd: float = 5.00
+    # How often to check certificate expiry (seconds)
+    certificate_check_interval_s: float = 3600.0  # 1 hour
+    # Birth certificate validity (days) for newly spawned children
+    certificate_birth_validity_days: int = 7
 
 
 class SomaConfig(BaseModel):
@@ -496,6 +599,50 @@ class FederationConfig(BaseModel):
 
     # Local data directory for file-based fallback persistence
     data_dir: str = "data/federation"
+
+    # Identity certificate data directory (Phase 16g)
+    identity_data_dir: str = "data/identity"
+
+
+class WalletConfig(BaseModel):
+    """Coinbase Developer Platform (CDP) wallet configuration for on-chain identity."""
+
+    cdp_api_key_id: str = ""  # CDP API key identifier
+    cdp_api_key_secret: str = ""  # CDP API key secret
+    cdp_wallet_secret: str = ""  # CDP MPC wallet secret
+    network: str = "base"  # EVM network (base, base-sepolia, ethereum)
+    account_name: str = "ecodiaos-treasury"  # Logical account name within CDP
+    seed_file_path: str = "data/wallet_seed.json"  # Local metadata (account name + address)
+
+    @model_validator(mode="after")
+    def _strip_secrets(self) -> WalletConfig:
+        """Strip whitespace and restore PEM newlines from env injection."""
+        for field in ("cdp_api_key_id", "cdp_api_key_secret", "cdp_wallet_secret"):
+            val = getattr(self, field)
+            if val:
+                cleaned = val.strip()
+                # .env files store PEM keys with literal "\n" — restore real newlines
+                # so the EC/Ed25519 key parser can decode the ASN.1 structure.
+                if r"\n" in cleaned:
+                    cleaned = cleaned.replace(r"\n", "\n")
+                object.__setattr__(self, field, cleaned)
+
+        # Early validation: wallet_secret must be valid base64 if set.
+        # The CDP SDK does base64.b64decode() → load_der_private_key() and
+        # gives a cryptic ASN.1 error if the encoding is wrong.
+        if self.cdp_wallet_secret:
+            import base64
+
+            try:
+                base64.b64decode(self.cdp_wallet_secret)
+            except Exception:
+                raise ValueError(
+                    "CDP_WALLET_SECRET is not valid base64. "
+                    "This should be the wallet secret from the CDP portal "
+                    "(portal.cdp.coinbase.com), not a PEM key or hex string. "
+                    "It's a base64-encoded DER EC private key (ES256)."
+                ) from None
+        return self
 
 
 class LoggingConfig(BaseModel):
@@ -618,7 +765,9 @@ class EcodiaOSConfig(BaseSettings):
     thymos: ThymosConfig = Field(default_factory=ThymosConfig)
     oneiros: OneirosConfig = Field(default_factory=OneirosConfig)
     soma: SomaConfig = Field(default_factory=SomaConfig)
+    oikos: OikosConfig = Field(default_factory=OikosConfig)
     federation: FederationConfig = Field(default_factory=FederationConfig)
+    wallet: WalletConfig = Field(default_factory=WalletConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
@@ -692,6 +841,19 @@ def load_config(config_path: str | Path | None = None) -> EcodiaOSConfig:
         raw.setdefault("simula", {})["grpo_gpu_ids"] = [
             int(g.strip()) for g in grpo_gpus.split(",") if g.strip()
         ]
+    # CDP Wallet config
+    if cdp_key_id := os.environ.get("ECODIAOS_WALLET__CDP_API_KEY_ID"):
+        raw.setdefault("wallet", {})["cdp_api_key_id"] = cdp_key_id
+    if cdp_key_secret := os.environ.get("ECODIAOS_WALLET__CDP_API_KEY_SECRET"):
+        raw.setdefault("wallet", {})["cdp_api_key_secret"] = cdp_key_secret
+    if cdp_wallet_secret := os.environ.get("ECODIAOS_WALLET__CDP_WALLET_SECRET"):
+        raw.setdefault("wallet", {})["cdp_wallet_secret"] = cdp_wallet_secret
+    if wallet_network := os.environ.get("ECODIAOS_WALLET__NETWORK"):
+        raw.setdefault("wallet", {})["network"] = wallet_network
+    if wallet_name := os.environ.get("ECODIAOS_WALLET__ACCOUNT_NAME"):
+        raw.setdefault("wallet", {})["account_name"] = wallet_name
+    if wallet_seed := os.environ.get("ECODIAOS_WALLET__SEED_FILE_PATH"):
+        raw.setdefault("wallet", {})["seed_file_path"] = wallet_seed
 
     return EcodiaOSConfig(**raw)
 

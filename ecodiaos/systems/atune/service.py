@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ecodiaos.core.hotreload import NeuroplasticityBus
 from ecodiaos.primitives.percept import Percept
 
 from .affect import AffectManager
@@ -126,6 +127,7 @@ class AtuneService:
         belief_state: BeliefStateReader | None = None,
         config: AtuneConfig | None = None,
         memory_service: Any = None,
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
     ) -> None:
         cfg = config or AtuneConfig()
 
@@ -135,6 +137,7 @@ class AtuneService:
         self._llm_client = llm_client
         self._belief_state = belief_state
         self._memory_service = memory_service  # Full MemoryService for entity storage
+        self._bus = neuroplasticity_bus
         self._soma = None  # Soma service for allostatic signal reading
 
         # Sub-components
@@ -166,10 +169,22 @@ class AtuneService:
         """Initialise Atune. Called during application startup."""
         self._logger.info("atune_starting")
         await self._refresh_caches(force=True)
+
+        # Register with the NeuroplasticityBus for hot-reload of SalienceHead subclasses.
+        if self._bus is not None:
+            self._bus.register(
+                base_class=SalienceHead,
+                registration_callback=self._on_salience_head_evolved,
+                system_id="atune",
+            )
+
         self._logger.info("atune_started")
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
+        if self._bus is not None:
+            self._bus.deregister(SalienceHead)
+
         self._logger.info("atune_shutting_down")
         # Persist final affect state
         if self._memory_service is not None:
@@ -563,6 +578,36 @@ class AtuneService:
     def set_soma(self, soma: Any) -> None:
         """Wire Soma service for allostatic signal reading."""
         self._soma = soma
+
+    # ------------------------------------------------------------------
+    # Hot-reload callbacks
+    # ------------------------------------------------------------------
+
+    def _on_salience_head_evolved(self, head: SalienceHead) -> None:
+        """
+        Registration callback for NeuroplasticityBus.
+
+        Called once per SalienceHead subclass found in a hot-reloaded file.
+        Replaces any existing head with the same name, or appends if new.
+        """
+        existing_names = [h.name for h in self._heads]
+        if head.name in existing_names:
+            self._heads = [
+                head if h.name == head.name else h
+                for h in self._heads
+            ]
+            self._logger.info(
+                "salience_head_replaced",
+                name=head.name,
+                total_heads=len(self._heads),
+            )
+        else:
+            self._heads.append(head)
+            self._logger.info(
+                "salience_head_added",
+                name=head.name,
+                total_heads=len(self._heads),
+            )
 
     # ------------------------------------------------------------------
     # Read-only accessors

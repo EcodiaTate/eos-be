@@ -1,0 +1,8 @@
+# Minimal Python image — stdlib only, no pip required.
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY service_a.py service_b.py service_c.py /app/
+
+# No dependencies beyond stdlib — all three services use only:
+#   http.server, urllib.request, json, uuid, re, os, sys, time

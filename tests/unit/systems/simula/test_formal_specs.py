@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ecodiaos.systems.simula.formal_specs.spec_generator import FormalSpecGenerator
-from ecodiaos.systems.simula.types import ChangeCategory, ChangeSpec, EvolutionProposal
+from ecodiaos.systems.simula.evolution_types import ChangeCategory, ChangeSpec, EvolutionProposal
 from ecodiaos.systems.simula.verification.types import (
     AlloyCheckResult,
     FormalSpecGenerationResult,

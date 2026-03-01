@@ -58,7 +58,7 @@ from ecodiaos.systems.simula.proposal_intelligence import ProposalIntelligence
 from ecodiaos.systems.simula.retrieval.swe_grep import SweGrepRetriever
 from ecodiaos.systems.simula.rollback import RollbackManager
 from ecodiaos.systems.simula.simulation import ChangeSimulator
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     FORBIDDEN,
     GOVERNANCE_REQUIRED,
     ConfigVersion,
@@ -81,9 +81,9 @@ if TYPE_CHECKING:
     from ecodiaos.clients.timescaledb import TimescaleDBClient
     from ecodiaos.config import SimulaConfig
     from ecodiaos.systems.memory.service import MemoryService
-    from ecodiaos.systems.simula.hunter.analytics import HunterAnalyticsEmitter
-    from ecodiaos.systems.simula.hunter.service import HunterService
-    from ecodiaos.systems.simula.hunter.types import HuntResult
+    from ecodiaos.systems.simula.inspector.analytics import InspectorAnalyticsEmitter
+    from ecodiaos.systems.simula.inspector.service import InspectorService
+    from ecodiaos.systems.simula.inspector.types import InspectionResult
 
 logger = structlog.get_logger()
 
@@ -159,15 +159,15 @@ class SimulaService:
         self._hash_chain: object | None = None  # HashChainManager (lazy import)
         self._content_credentials: object | None = None  # ContentCredentialManager (lazy import)
         self._governance_credentials: object | None = None  # GovernanceCredentialManager (lazy import)
-        self._hard_negative_miner: object | None = None  # HardNegativeMiner (lazy import)
-        self._adversarial_tester: object | None = None  # AdversarialTestGenerator (lazy import)
+        self._hard_negative_miner: object | None = None  # FailureAnalyzer (lazy import)
+        self._adversarial_tester: object | None = None  # RobustnessTestGenerator (lazy import)
         self._formal_spec_generator: object | None = None  # FormalSpecGenerator (lazy import)
         self._egraph: object | None = None  # EqualitySaturationEngine (lazy import)
         self._symbolic_execution: object | None = None  # SymbolicExecutionEngine (lazy import)
 
-        # Stage 7 sub-systems (Hunter — lazy runtime imports in initialize())
-        self._hunter: HunterService | None = None
-        self._hunter_analytics: HunterAnalyticsEmitter | None = None
+        # Stage 7 sub-systems (Inspector — lazy runtime imports in initialize())
+        self._inspector: InspectorService | None = None
+        self._inspector_analytics: InspectorAnalyticsEmitter | None = None
 
         # State
         self._current_version: int = 0
@@ -588,9 +588,9 @@ class SimulaService:
 
         # ── Stage 6B: Co-evolving agents ──────────────────────────────────────
         if self._config.coevolution_enabled:
-            from ecodiaos.systems.simula.coevolution.hard_negative_miner import HardNegativeMiner
+            from ecodiaos.systems.simula.coevolution.hard_negative_miner import FailureAnalyzer
 
-            self._hard_negative_miner = HardNegativeMiner(
+            self._hard_negative_miner = FailureAnalyzer(
                 neo4j=self._neo4j,
                 llm=self._llm,
                 max_negatives_per_cycle=self._config.adversarial_max_tests_per_cycle,
@@ -599,10 +599,10 @@ class SimulaService:
 
             if self._config.adversarial_test_generation_enabled:
                 from ecodiaos.systems.simula.coevolution.adversarial_tester import (
-                    AdversarialTestGenerator,
+                    RobustnessTestGenerator,
                 )
 
-                self._adversarial_tester = AdversarialTestGenerator(
+                self._adversarial_tester = RobustnessTestGenerator(
                     llm=self._llm,
                     codebase_root=self._root,
                     max_tests_per_cycle=self._config.adversarial_max_tests_per_cycle,
@@ -662,68 +662,68 @@ class SimulaService:
         if self._bridge is not None and self._swe_grep is not None:
             self._bridge.set_swe_grep(self._swe_grep)
 
-        # ── Stage 7: Hunter — Zero-Day Discovery Engine ─────────────────────
-        if self._config.hunter_enabled and z3_bridge is not None:
-            from ecodiaos.systems.simula.hunter.analytics import HunterAnalyticsEmitter
-            from ecodiaos.systems.simula.hunter.prover import VulnerabilityProver
-            from ecodiaos.systems.simula.hunter.service import HunterService
-            from ecodiaos.systems.simula.hunter.types import HunterConfig
+        # ── Stage 7: Inspector — Zero-Day Discovery Engine ─────────────────────
+        if self._config.inspector_enabled and z3_bridge is not None:
+            from ecodiaos.systems.simula.inspector.analytics import InspectorAnalyticsEmitter
+            from ecodiaos.systems.simula.inspector.prover import VulnerabilityProver
+            from ecodiaos.systems.simula.inspector.service import InspectorService
+            from ecodiaos.systems.simula.inspector.types import InspectorConfig
 
-            hunter_config = HunterConfig(
-                authorized_targets=self._config.hunter_authorized_targets,
-                max_workers=self._config.hunter_max_workers,
-                sandbox_timeout_seconds=self._config.hunter_sandbox_timeout_s,
-                log_vulnerability_analytics=self._config.hunter_log_analytics,
-                clone_depth=self._config.hunter_clone_depth,
+            inspector_config = InspectorConfig(
+                authorized_targets=self._config.inspector_authorized_targets,
+                max_workers=self._config.inspector_max_workers,
+                sandbox_timeout_seconds=self._config.inspector_sandbox_timeout_s,
+                log_vulnerability_analytics=self._config.inspector_log_analytics,
+                clone_depth=self._config.inspector_clone_depth,
             )
 
-            hunter_prover = VulnerabilityProver(
+            inspector_prover = VulnerabilityProver(
                 z3_bridge=z3_bridge,
                 llm=self._llm,
             )
 
             # Phase 9: Build analytics emitter with optional TSDB persistence
-            hunter_analytics: HunterAnalyticsEmitter | None = None
-            if self._config.hunter_log_analytics:
-                hunter_analytics = HunterAnalyticsEmitter(tsdb=self._tsdb)
-                self._hunter_analytics = hunter_analytics
-                # Initialize TSDB schema (creates hunter_events hypertable)
-                await hunter_analytics.initialize()
+            inspector_analytics: InspectorAnalyticsEmitter | None = None
+            if self._config.inspector_log_analytics:
+                inspector_analytics = InspectorAnalyticsEmitter(tsdb=self._tsdb)
+                self._inspector_analytics = inspector_analytics
+                # Initialize TSDB schema (creates inspector_events hypertable)
+                await inspector_analytics.initialize()
 
             # Build optional remediation orchestrator
-            hunter_remediation = None
-            if self._config.hunter_remediation_enabled and self._repair_agent is not None:
-                from ecodiaos.systems.simula.hunter.remediation import HunterRepairOrchestrator
-                from ecodiaos.systems.simula.hunter.workspace import TargetWorkspace
+            inspector_remediation = None
+            if self._config.inspector_remediation_enabled and self._repair_agent is not None:
+                from ecodiaos.systems.simula.inspector.remediation import InspectorRepairOrchestrator
+                from ecodiaos.systems.simula.inspector.workspace import TargetWorkspace
 
-                # Remediation needs a workspace; it's set per-hunt by HunterService
+                # Remediation needs a workspace; it's set per-hunt by InspectorService
                 placeholder_workspace = TargetWorkspace.internal(self._root)
-                hunter_remediation = HunterRepairOrchestrator(
+                inspector_remediation = InspectorRepairOrchestrator(
                     repair_agent=self._repair_agent,  # type: ignore[arg-type]
-                    prover=hunter_prover,
+                    prover=inspector_prover,
                     workspace=placeholder_workspace,
                 )
 
-            self._hunter = HunterService(
-                prover=hunter_prover,
-                config=hunter_config,
+            self._inspector = InspectorService(
+                prover=inspector_prover,
+                config=inspector_config,
                 eos_root=self._root,
-                analytics=hunter_analytics,
-                remediation=hunter_remediation,
+                analytics=inspector_analytics,
+                remediation=inspector_remediation,
             )
 
-            # Phase 9: Wire Hunter analytics into the unified EvolutionAnalyticsEngine
-            if self._analytics is not None and self._hunter is not None:
-                self._analytics.set_hunter_view(self._hunter.analytics_view)
-                if hunter_analytics is not None and hunter_analytics._store is not None:
-                    self._analytics.set_hunter_store(hunter_analytics._store)
+            # Phase 9: Wire Inspector analytics into the unified EvolutionAnalyticsEngine
+            if self._analytics is not None and self._inspector is not None:
+                self._analytics.set_inspector_view(self._inspector.analytics_view)
+                if inspector_analytics is not None and inspector_analytics._store is not None:
+                    self._analytics.set_inspector_store(inspector_analytics._store)
 
             self._logger.info(
-                "hunter_initialized",
-                hunter="active",
-                max_workers=hunter_config.max_workers,
-                authorized_targets=len(hunter_config.authorized_targets),
-                remediation=hunter_remediation is not None,
+                "inspector_initialized",
+                inspector="active",
+                max_workers=inspector_config.max_workers,
+                authorized_targets=len(inspector_config.authorized_targets),
+                remediation=inspector_remediation is not None,
                 tsdb_persistence=self._tsdb is not None,
             )
 
@@ -770,7 +770,7 @@ class SimulaService:
                 "formal_spec_generator" if self._formal_spec_generator else "formal_spec_generator(disabled)",
                 "egraph" if self._egraph else "egraph(disabled)",
                 "symbolic_execution" if self._symbolic_execution else "symbolic_execution(disabled)",
-                "hunter" if self._hunter else "hunter(disabled)",
+                "inspector" if self._inspector else "inspector(disabled)",
             ],
             stage1_extended_thinking=thinking_provider is not None,
             stage1_embeddings=embedding_client is not None,
@@ -799,8 +799,8 @@ class SimulaService:
             stage6_formal_specs=self._formal_spec_generator is not None,
             stage6_egraph=self._egraph is not None,
             stage6_symbolic_execution=self._symbolic_execution is not None,
-            stage7_hunter=self._hunter is not None,
-            stage9_hunter_analytics=self._hunter_analytics is not None,
+            stage7_inspector=self._inspector is not None,
+            stage9_inspector_analytics=self._inspector_analytics is not None,
             stage9_tsdb_persistence=self._tsdb is not None,
         )
 
@@ -1259,41 +1259,41 @@ class SimulaService:
 
         # Stage 7 subsystem status
         base["stage7"] = {
-            "hunter": self._hunter is not None,
+            "inspector": self._inspector is not None,
         }
-        if self._hunter is not None:
-            base["stage7"]["hunter_stats"] = self._hunter.stats
+        if self._inspector is not None:
+            base["stage7"]["inspector_stats"] = self._inspector.stats
 
-        # Phase 9: Hunter analytics observability
+        # Phase 9: Inspector analytics observability
         base["stage9_analytics"] = {
-            "hunter_analytics_emitter": self._hunter_analytics is not None,
-            "hunter_tsdb_persistence": (
-                self._hunter_analytics is not None
-                and self._hunter_analytics._store is not None
+            "inspector_analytics_emitter": self._inspector_analytics is not None,
+            "inspector_tsdb_persistence": (
+                self._inspector_analytics is not None
+                and self._inspector_analytics._store is not None
             ),
-            "hunter_view_attached": (
+            "inspector_view_attached": (
                 self._analytics is not None
-                and self._analytics._hunter_view is not None
+                and self._analytics._inspector_view is not None
             ),
-            "hunter_store_attached": (
+            "inspector_store_attached": (
                 self._analytics is not None
-                and self._analytics._hunter_store is not None
+                and self._analytics._inspector_store is not None
             ),
         }
-        if self._hunter_analytics is not None:
-            base["stage9_analytics"]["emitter_stats"] = self._hunter_analytics.stats
+        if self._inspector_analytics is not None:
+            base["stage9_analytics"]["emitter_stats"] = self._inspector_analytics.stats
 
         return base
 
-    # ─── Hunter API ───────────────────────────────────────────────────────────
+    # ─── Inspector API ───────────────────────────────────────────────────────────
 
-    def _ensure_hunter(self) -> HunterService:
-        """Validate that Hunter is enabled and return the typed service."""
-        if self._hunter is None:
+    def _ensure_inspector(self) -> InspectorService:
+        """Validate that Inspector is enabled and return the typed service."""
+        if self._inspector is None:
             raise RuntimeError(
-                "Hunter is not enabled. Set hunter_enabled=True in SimulaConfig."
+                "Inspector is not enabled. Set inspector_enabled=True in SimulaConfig."
             )
-        return self._hunter
+        return self._inspector
 
     async def hunt_external_target(
         self,
@@ -1303,11 +1303,11 @@ class SimulaService:
         attack_goals: list[str] | None = None,
         generate_pocs: bool | None = None,
         generate_patches: bool | None = None,
-    ) -> HuntResult:
+    ) -> InspectionResult:
         """
-        Run Hunter against an external GitHub repository.
+        Run Inspector against an external GitHub repository.
 
-        Hunter is purely additive — it never modifies EOS files and all
+        Inspector is purely additive — it never modifies EOS files and all
         analysis happens in temporary workspaces.
 
         Args:
@@ -1319,20 +1319,20 @@ class SimulaService:
             generate_patches: Generate + verify patches (default from config).
 
         Returns:
-            HuntResult with discovered vulnerabilities and optional patches.
+            InspectionResult with discovered vulnerabilities and optional patches.
 
         Raises:
-            RuntimeError: If Hunter is not enabled.
+            RuntimeError: If Inspector is not enabled.
         """
-        hunter = self._ensure_hunter()
+        inspector = self._ensure_inspector()
 
         # Scope-safe authorized target override: create a copy of the config
         # so concurrent hunts don't corrupt each other's authorization lists.
         if authorized_targets is not None:
-            from ecodiaos.systems.simula.hunter.types import HunterConfig
+            from ecodiaos.systems.simula.inspector.types import InspectorConfig
 
-            original_config = hunter._config
-            hunter._config = HunterConfig(
+            original_config = inspector._config
+            inspector._config = InspectorConfig(
                 authorized_targets=authorized_targets,
                 max_workers=original_config.max_workers,
                 sandbox_timeout_seconds=original_config.sandbox_timeout_seconds,
@@ -1340,20 +1340,20 @@ class SimulaService:
                 clone_depth=original_config.clone_depth,
             )
             try:
-                return await hunter.hunt_external_repo(
+                return await inspector.hunt_external_repo(
                     github_url=github_url,
                     attack_goals=attack_goals,
-                    generate_pocs=generate_pocs if generate_pocs is not None else self._config.hunter_generate_pocs,
-                    generate_patches=generate_patches if generate_patches is not None else self._config.hunter_generate_patches,
+                    generate_pocs=generate_pocs if generate_pocs is not None else self._config.inspector_generate_pocs,
+                    generate_patches=generate_patches if generate_patches is not None else self._config.inspector_generate_patches,
                 )
             finally:
-                hunter._config = original_config
+                inspector._config = original_config
 
-        return await hunter.hunt_external_repo(
+        return await inspector.hunt_external_repo(
             github_url=github_url,
             attack_goals=attack_goals,
-            generate_pocs=generate_pocs if generate_pocs is not None else self._config.hunter_generate_pocs,
-            generate_patches=generate_patches if generate_patches is not None else self._config.hunter_generate_patches,
+            generate_pocs=generate_pocs if generate_pocs is not None else self._config.inspector_generate_pocs,
+            generate_patches=generate_patches if generate_patches is not None else self._config.inspector_generate_patches,
         )
 
     async def hunt_internal(
@@ -1362,9 +1362,9 @@ class SimulaService:
         attack_goals: list[str] | None = None,
         generate_pocs: bool | None = None,
         generate_patches: bool | None = None,
-    ) -> HuntResult:
+    ) -> InspectionResult:
         """
-        Run Hunter against the internal EOS codebase for self-testing.
+        Run Inspector against the internal EOS codebase for self-testing.
 
         Args:
             attack_goals: Custom attack goals (defaults to predefined set).
@@ -1372,22 +1372,22 @@ class SimulaService:
             generate_patches: Generate + verify patches (default from config).
 
         Returns:
-            HuntResult with discovered vulnerabilities.
+            InspectionResult with discovered vulnerabilities.
 
         Raises:
-            RuntimeError: If Hunter is not enabled.
+            RuntimeError: If Inspector is not enabled.
         """
-        hunter = self._ensure_hunter()
+        inspector = self._ensure_inspector()
 
-        return await hunter.hunt_internal_eos(
+        return await inspector.hunt_internal_eos(
             attack_goals=attack_goals,
-            generate_pocs=generate_pocs if generate_pocs is not None else self._config.hunter_generate_pocs,
-            generate_patches=generate_patches if generate_patches is not None else self._config.hunter_generate_patches,
+            generate_pocs=generate_pocs if generate_pocs is not None else self._config.inspector_generate_pocs,
+            generate_patches=generate_patches if generate_patches is not None else self._config.inspector_generate_patches,
         )
 
     async def generate_patches_for_hunt(
         self,
-        hunt_result: HuntResult,
+        hunt_result: InspectionResult,
     ) -> dict[str, str]:
         """
         Generate patches for vulnerabilities found in a completed hunt.
@@ -1396,52 +1396,52 @@ class SimulaService:
         to retroactively generate patches for the discovered vulnerabilities.
 
         Args:
-            hunt_result: A completed HuntResult from hunt_external_target
+            hunt_result: A completed InspectionResult from hunt_external_target
                          or hunt_internal.
 
         Returns:
             Dict mapping vulnerability ID → unified diff patch string.
 
         Raises:
-            RuntimeError: If Hunter or remediation is not enabled.
+            RuntimeError: If Inspector or remediation is not enabled.
         """
-        hunter = self._ensure_hunter()
-        return await hunter.generate_patches(hunt_result)
+        inspector = self._ensure_inspector()
+        return await inspector.generate_patches(hunt_result)
 
-    def get_hunter_analytics(self) -> dict[str, Any]:
-        """Return aggregate Hunter analytics if available."""
-        hunter = self._ensure_hunter()
-        return hunter.analytics_view.summary
+    def get_inspector_analytics(self) -> dict[str, Any]:
+        """Return aggregate Inspector analytics if available."""
+        inspector = self._ensure_inspector()
+        return inspector.analytics_view.summary
 
     async def get_unified_analytics(self) -> dict[str, Any]:
         """
-        Return unified analytics combining evolution metrics and Hunter
+        Return unified analytics combining evolution metrics and Inspector
         security metrics. This is the Phase 9 observability entry point.
         """
         if self._analytics is None:
             return {}
         return await self._analytics.get_unified_analytics()
 
-    async def get_hunter_weekly_trends(
+    async def get_inspector_weekly_trends(
         self,
         *,
         weeks: int = 12,
         target_url: str | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Query weekly Hunter vulnerability trends from TSDB or in-memory view.
+        Query weekly Inspector vulnerability trends from TSDB or in-memory view.
         """
         if self._analytics is None:
             return []
-        return await self._analytics.get_hunter_weekly_trends(
+        return await self._analytics.get_inspector_weekly_trends(
             weeks=weeks, target_url=target_url,
         )
 
-    async def get_hunter_error_summary(self, *, days: int = 7) -> list[dict[str, Any]]:
-        """Query Hunter pipeline error summary from TSDB."""
+    async def get_inspector_error_summary(self, *, days: int = 7) -> list[dict[str, Any]]:
+        """Query Inspector pipeline error summary from TSDB."""
         if self._analytics is None:
             return []
-        return await self._analytics.get_hunter_error_summary(days=days)
+        return await self._analytics.get_inspector_error_summary(days=days)
 
     # ─── Evo Bridge Callback ──────────────────────────────────────────────────
 
@@ -1949,7 +1949,7 @@ class SimulaService:
 
                 if isinstance(self._hash_chain, HashChainManager):
                     # Build a record-like object for hashing (use the same fields as the recording)
-                    from ecodiaos.systems.simula.types import EvolutionRecord as ERec
+                    from ecodiaos.systems.simula.evolution_types import EvolutionRecord as ERec
 
                     hash_record = ERec(
                         proposal_id=proposal.id,
@@ -2373,19 +2373,19 @@ class SimulaService:
         if self._hard_negative_miner is None:
             return
         try:
-            from ecodiaos.systems.simula.coevolution.hard_negative_miner import HardNegativeMiner
+            from ecodiaos.systems.simula.coevolution.hard_negative_miner import FailureAnalyzer
 
-            if not isinstance(self._hard_negative_miner, HardNegativeMiner):
+            if not isinstance(self._hard_negative_miner, FailureAnalyzer):
                 return
 
             # Import adversarial tester if available
             adversarial_gen = None
             if self._adversarial_tester is not None:
                 from ecodiaos.systems.simula.coevolution.adversarial_tester import (
-                    AdversarialTestGenerator,
+                    RobustnessTestGenerator,
                 )
 
-                if isinstance(self._adversarial_tester, AdversarialTestGenerator):
+                if isinstance(self._adversarial_tester, RobustnessTestGenerator):
                     adversarial_gen = self._adversarial_tester
 
             cycle_result = await self._hard_negative_miner.run_cycle(

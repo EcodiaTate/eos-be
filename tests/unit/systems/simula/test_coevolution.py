@@ -14,14 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ecodiaos.systems.simula.coevolution.adversarial_tester import (
-    AdversarialTestGenerator,
+    RobustnessTestGenerator,
 )
-from ecodiaos.systems.simula.coevolution.hard_negative_miner import HardNegativeMiner
+from ecodiaos.systems.simula.coevolution.hard_negative_miner import FailureAnalyzer
 from ecodiaos.systems.simula.verification.types import (
-    AdversarialTestResult,
+    RobustnessTestResult,
     CoevolutionCycleResult,
-    HardNegativeExample,
-    HardNegativeSource,
+    FailureCaseExample,
+    FailureCaseSource,
 )
 
 # The types module uses `from __future__ import annotations` with `datetime`
@@ -32,8 +32,8 @@ from datetime import datetime as _datetime  # noqa: E402
 import ecodiaos.systems.simula.verification.types as _vtypes
 
 _vtypes.datetime = _datetime  # type: ignore[attr-defined]
-HardNegativeExample.model_rebuild()
-AdversarialTestResult.model_rebuild()
+FailureCaseExample.model_rebuild()
+RobustnessTestResult.model_rebuild()
 CoevolutionCycleResult.model_rebuild()
 
 
@@ -41,14 +41,14 @@ CoevolutionCycleResult.model_rebuild()
 
 
 def _make_negative(
-    source: HardNegativeSource = HardNegativeSource.ROLLBACK_HISTORY,
+    source: FailureCaseSource = FailureCaseSource.ROLLBACK_HISTORY,
     proposal_id: str = "prop-1",
     category: str = "modify_config",
     failure_reason: str = "test failed",
     code_context: str = "def broken(): pass",
     adversarial_input: str = "",
-) -> HardNegativeExample:
-    return HardNegativeExample(
+) -> FailureCaseExample:
+    return FailureCaseExample(
         source=source,
         proposal_id=proposal_id,
         category=category,
@@ -81,14 +81,14 @@ def _make_llm_mock(response_text: str = "") -> AsyncMock:
     return llm
 
 
-# ── TestHardNegativeMiner ───────────────────────────────────────────────────
+# ── TestFailureAnalyzer ───────────────────────────────────────────────────
 
 
-class TestHardNegativeMiner:
+class TestFailureAnalyzer:
     @pytest.mark.asyncio
     async def test_mine_from_history_no_neo4j_returns_empty(self):
         """When neo4j is None, mine_from_history should return empty list."""
-        miner = HardNegativeMiner(neo4j=None, llm=None)
+        miner = FailureAnalyzer(neo4j=None, llm=None)
 
         result = await miner.mine_from_history()
 
@@ -113,11 +113,11 @@ class TestHardNegativeMiner:
         ]
         neo4j = _make_neo4j_mock(rollback_rows=rollback_rows, verification_rows=[])
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
         result = await miner.mine_from_history()
 
         assert len(result) == 2
-        assert result[0].source == HardNegativeSource.ROLLBACK_HISTORY
+        assert result[0].source == FailureCaseSource.ROLLBACK_HISTORY
         assert result[0].proposal_id == "prop-101"
         assert result[0].failure_reason == "Broke YAML loading"
         assert result[0].code_context == "Changed config parser"
@@ -137,12 +137,12 @@ class TestHardNegativeMiner:
         ]
         neo4j = _make_neo4j_mock(rollback_rows=[], verification_rows=verification_rows)
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
         result = await miner.mine_from_history()
 
         assert len(result) == 1
         neg = result[0]
-        assert neg.source == HardNegativeSource.FORMAL_VERIFICATION_FAILURE
+        assert neg.source == FailureCaseSource.FORMAL_VERIFICATION_FAILURE
         assert neg.proposal_id == "prop-201"
         assert "failed" in neg.failure_reason
         assert neg.code_context == "Updated risk scoring"
@@ -172,13 +172,13 @@ class TestHardNegativeMiner:
             verification_rows=verification_rows,
         )
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
         result = await miner.mine_from_history()
 
         assert len(result) == 2
         sources = {neg.source for neg in result}
-        assert HardNegativeSource.ROLLBACK_HISTORY in sources
-        assert HardNegativeSource.FORMAL_VERIFICATION_FAILURE in sources
+        assert FailureCaseSource.ROLLBACK_HISTORY in sources
+        assert FailureCaseSource.FORMAL_VERIFICATION_FAILURE in sources
 
     @pytest.mark.asyncio
     async def test_mine_from_history_respects_max_cap(self):
@@ -194,7 +194,7 @@ class TestHardNegativeMiner:
         ]
         neo4j = _make_neo4j_mock(rollback_rows=rollback_rows, verification_rows=[])
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None, max_negatives_per_cycle=3)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None, max_negatives_per_cycle=3)
         result = await miner.mine_from_history()
 
         assert len(result) == 3
@@ -211,7 +211,7 @@ class TestHardNegativeMiner:
         ]
         neo4j = _make_neo4j_mock(rollback_rows=rollback_rows, verification_rows=[])
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
         result = await miner.mine_from_history()
 
         assert len(result) == 1
@@ -223,14 +223,14 @@ class TestHardNegativeMiner:
         """GRPO batch should have reward=0.0, source as string value, and all fields."""
         negatives = [
             _make_negative(
-                source=HardNegativeSource.ROLLBACK_HISTORY,
+                source=FailureCaseSource.ROLLBACK_HISTORY,
                 proposal_id="prop-1",
                 category="modify_config",
                 code_context="def broken(): pass",
                 failure_reason="import error",
             ),
             _make_negative(
-                source=HardNegativeSource.ADVERSARIAL_GENERATION,
+                source=FailureCaseSource.ADVERSARIAL_GENERATION,
                 proposal_id="prop-2",
                 category="add_feature",
                 code_context="class Bad: ...",
@@ -238,7 +238,7 @@ class TestHardNegativeMiner:
             ),
         ]
 
-        miner = HardNegativeMiner(neo4j=None, llm=None)
+        miner = FailureAnalyzer(neo4j=None, llm=None)
         batch = await miner.prepare_grpo_batch(negatives)
 
         assert len(batch) == 2
@@ -258,19 +258,19 @@ class TestHardNegativeMiner:
     @pytest.mark.asyncio
     async def test_prepare_grpo_batch_empty_input(self):
         """An empty list of negatives should produce an empty GRPO batch."""
-        miner = HardNegativeMiner(neo4j=None, llm=None)
+        miner = FailureAnalyzer(neo4j=None, llm=None)
         batch = await miner.prepare_grpo_batch([])
 
         assert batch == []
 
     @pytest.mark.asyncio
-    async def test_mine_from_adversarial_converts_bugs_to_negatives(self):
+    async def test_mine_from_robustness_converts_bugs_to_negatives(self):
         """Adversarial bugs should be converted to ADVERSARIAL_GENERATION negatives."""
-        miner = HardNegativeMiner(neo4j=None, llm=None)
+        miner = FailureAnalyzer(neo4j=None, llm=None)
 
-        mock_generator = AsyncMock(spec=AdversarialTestGenerator)
-        mock_generator.generate_adversarial_tests = AsyncMock(
-            return_value=AdversarialTestResult(
+        mock_generator = AsyncMock(spec=RobustnessTestGenerator)
+        mock_generator.generate_robustness_tests = AsyncMock(
+            return_value=RobustnessTestResult(
                 tests_generated=5,
                 tests_executed=5,
                 tests_found_bugs=2,
@@ -278,24 +278,24 @@ class TestHardNegativeMiner:
             ),
         )
 
-        result = await miner.mine_from_adversarial(mock_generator, files=["app.py"])
+        result = await miner.mine_from_robustness(mock_generator, files=["app.py"])
 
         assert len(result) == 2
         assert all(
-            neg.source == HardNegativeSource.ADVERSARIAL_GENERATION for neg in result
+            neg.source == FailureCaseSource.ADVERSARIAL_GENERATION for neg in result
         )
         assert result[0].failure_reason == "FAILED test_edge_case"
         assert result[0].adversarial_input == "FAILED test_edge_case"
         assert result[1].failure_reason == "FAILED test_overflow"
 
     @pytest.mark.asyncio
-    async def test_mine_from_adversarial_no_bugs_returns_empty(self):
+    async def test_mine_from_robustness_no_bugs_returns_empty(self):
         """When adversarial tests find no bugs, result should be empty."""
-        miner = HardNegativeMiner(neo4j=None, llm=None)
+        miner = FailureAnalyzer(neo4j=None, llm=None)
 
-        mock_generator = AsyncMock(spec=AdversarialTestGenerator)
-        mock_generator.generate_adversarial_tests = AsyncMock(
-            return_value=AdversarialTestResult(
+        mock_generator = AsyncMock(spec=RobustnessTestGenerator)
+        mock_generator.generate_robustness_tests = AsyncMock(
+            return_value=RobustnessTestResult(
                 tests_generated=5,
                 tests_executed=5,
                 tests_found_bugs=0,
@@ -303,13 +303,13 @@ class TestHardNegativeMiner:
             ),
         )
 
-        result = await miner.mine_from_adversarial(mock_generator, files=["app.py"])
+        result = await miner.mine_from_robustness(mock_generator, files=["app.py"])
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_mine_from_adversarial_passes_history_to_generator(self):
-        """mine_from_adversarial should pass past_failures from mine_from_history."""
+    async def test_mine_from_robustness_passes_history_to_generator(self):
+        """mine_from_robustness should pass past_failures from mine_from_history."""
         rollback_rows = [
             {
                 "proposal_id": "prop-500",
@@ -320,11 +320,11 @@ class TestHardNegativeMiner:
         ]
         neo4j = _make_neo4j_mock(rollback_rows=rollback_rows, verification_rows=[])
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
 
-        mock_generator = AsyncMock(spec=AdversarialTestGenerator)
-        mock_generator.generate_adversarial_tests = AsyncMock(
-            return_value=AdversarialTestResult(
+        mock_generator = AsyncMock(spec=RobustnessTestGenerator)
+        mock_generator.generate_robustness_tests = AsyncMock(
+            return_value=RobustnessTestResult(
                 tests_generated=1,
                 tests_executed=1,
                 tests_found_bugs=0,
@@ -332,9 +332,9 @@ class TestHardNegativeMiner:
             ),
         )
 
-        await miner.mine_from_adversarial(mock_generator, files=["a.py"])
+        await miner.mine_from_robustness(mock_generator, files=["a.py"])
 
-        call_args = mock_generator.generate_adversarial_tests.call_args
+        call_args = mock_generator.generate_robustness_tests.call_args
         past_failures = call_args.kwargs.get(
             "past_failures", call_args.args[1] if len(call_args.args) > 1 else None
         )
@@ -344,10 +344,10 @@ class TestHardNegativeMiner:
         assert past_failures[0].proposal_id == "prop-500"
 
 
-# ── TestAdversarialTestGenerator ────────────────────────────────────────────
+# ── TestRobustnessTestGenerator ────────────────────────────────────────────
 
 
-class TestAdversarialTestGenerator:
+class TestRobustnessTestGenerator:
     @pytest.mark.asyncio
     async def test_generate_tests_with_llm(self, tmp_path: Path):
         """LLM-generated test code should be written, parsed, and executed."""
@@ -360,7 +360,7 @@ class TestAdversarialTestGenerator:
         )
         llm = _make_llm_mock(response_text=test_code)
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
             max_tests_per_cycle=10,
@@ -368,7 +368,7 @@ class TestAdversarialTestGenerator:
         )
 
         # Patch _run_tests to avoid actual subprocess calls
-        mock_result = AdversarialTestResult(
+        mock_result = RobustnessTestResult(
             tests_generated=2,
             tests_executed=2,
             tests_found_bugs=1,
@@ -377,7 +377,7 @@ class TestAdversarialTestGenerator:
         )
         generator._run_tests = AsyncMock(return_value=mock_result)
 
-        result = await generator.generate_adversarial_tests(
+        result = await generator.generate_robustness_tests(
             files=["module_a.py"],
             past_failures=[
                 _make_negative(failure_reason="NoneType error"),
@@ -400,15 +400,15 @@ class TestAdversarialTestGenerator:
         )
         llm = _make_llm_mock(response_text=test_code_with_fences)
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
 
-        mock_result = AdversarialTestResult(tests_generated=1, tests_executed=1)
+        mock_result = RobustnessTestResult(tests_generated=1, tests_executed=1)
         generator._run_tests = AsyncMock(return_value=mock_result)
 
-        result = await generator.generate_adversarial_tests(files=["a.py"])
+        result = await generator.generate_robustness_tests(files=["a.py"])
 
         # _run_tests should have been called with stripped code (no fences)
         called_code = generator._run_tests.call_args.args[0]
@@ -421,12 +421,12 @@ class TestAdversarialTestGenerator:
         llm = AsyncMock()
         llm.complete = AsyncMock(side_effect=RuntimeError("API down"))
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
 
-        result = await generator.generate_adversarial_tests(files=["a.py"])
+        result = await generator.generate_robustness_tests(files=["a.py"])
 
         assert result.tests_generated == 0
         assert result.tests_executed == 0
@@ -437,15 +437,15 @@ class TestAdversarialTestGenerator:
         """When past_failures is empty, prompt should mention exploratory tests."""
         llm = _make_llm_mock(response_text="def test_explore(): pass")
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
         generator._run_tests = AsyncMock(
-            return_value=AdversarialTestResult(tests_generated=1),
+            return_value=RobustnessTestResult(tests_generated=1),
         )
 
-        await generator.generate_adversarial_tests(files=["a.py"], past_failures=None)
+        await generator.generate_robustness_tests(files=["a.py"], past_failures=None)
 
         call_args = llm.complete.call_args
         messages = call_args.kwargs["messages"]
@@ -457,16 +457,16 @@ class TestAdversarialTestGenerator:
         """Only the first 5 files should be included in the LLM prompt."""
         llm = _make_llm_mock(response_text="def test_x(): pass")
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
         generator._run_tests = AsyncMock(
-            return_value=AdversarialTestResult(tests_generated=1),
+            return_value=RobustnessTestResult(tests_generated=1),
         )
 
         many_files = [f"file_{i}.py" for i in range(20)]
-        await generator.generate_adversarial_tests(files=many_files)
+        await generator.generate_robustness_tests(files=many_files)
 
         call_args = llm.complete.call_args
         messages = call_args.kwargs["messages"]
@@ -481,12 +481,12 @@ class TestAdversarialTestGenerator:
         """Only the first 10 past failures should be included in the prompt."""
         llm = _make_llm_mock(response_text="def test_x(): pass")
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
         generator._run_tests = AsyncMock(
-            return_value=AdversarialTestResult(tests_generated=1),
+            return_value=RobustnessTestResult(tests_generated=1),
         )
 
         many_failures = [
@@ -497,7 +497,7 @@ class TestAdversarialTestGenerator:
             for i in range(20)
         ]
 
-        await generator.generate_adversarial_tests(
+        await generator.generate_robustness_tests(
             files=["a.py"],
             past_failures=many_failures,
         )
@@ -514,20 +514,20 @@ class TestAdversarialTestGenerator:
         """Lifetime stats should accumulate across multiple generation calls."""
         llm = _make_llm_mock(response_text="def test_x(): pass")
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
         generator._run_tests = AsyncMock(
-            return_value=AdversarialTestResult(
+            return_value=RobustnessTestResult(
                 tests_generated=4,
                 tests_executed=4,
                 tests_found_bugs=1,
             ),
         )
 
-        await generator.generate_adversarial_tests(files=["a.py"])
-        await generator.generate_adversarial_tests(files=["b.py"])
+        await generator.generate_robustness_tests(files=["a.py"])
+        await generator.generate_robustness_tests(files=["b.py"])
 
         assert generator._total_tests_generated == 8
         assert generator._total_bugs_found == 2
@@ -536,7 +536,7 @@ class TestAdversarialTestGenerator:
     async def test_coverage_growth_zero_when_no_tests(self, tmp_path: Path):
         """Coverage growth should be 0.0 when no tests have been generated."""
         llm = _make_llm_mock()
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
@@ -550,7 +550,7 @@ class TestAdversarialTestGenerator:
         """Coverage growth = bugs_found / tests_generated."""
         llm = _make_llm_mock(response_text="def test_x(): pass")
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
@@ -568,7 +568,7 @@ class TestAdversarialTestGenerator:
         """Syntax errors in generated test code should be handled gracefully."""
         llm = _make_llm_mock(response_text="def test_bad(:\n    pass")
 
-        generator = AdversarialTestGenerator(
+        generator = RobustnessTestGenerator(
             llm=llm,
             codebase_root=tmp_path,
         )
@@ -598,7 +598,7 @@ class TestCoevolutionCycle:
         ]
         neo4j = _make_neo4j_mock(rollback_rows=rollback_rows, verification_rows=[])
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
         result = await miner.run_cycle(adversarial_generator=None, files=None)
 
         assert isinstance(result, CoevolutionCycleResult)
@@ -619,7 +619,7 @@ class TestCoevolutionCycle:
                 "rollback_reason": "reason",
             },
         ]
-        # mine_from_history is called twice: once in run_cycle, once inside mine_from_adversarial
+        # mine_from_history is called twice: once in run_cycle, once inside mine_from_robustness
         # Each call invokes _mine_rollbacks then _mine_verification_failures (2 neo4j queries each)
         neo4j = AsyncMock()
         neo4j.execute_read = AsyncMock(
@@ -627,17 +627,17 @@ class TestCoevolutionCycle:
                 # First call to mine_from_history (in run_cycle)
                 rollback_rows,  # _mine_rollbacks
                 [],             # _mine_verification_failures
-                # Second call to mine_from_history (inside mine_from_adversarial)
+                # Second call to mine_from_history (inside mine_from_robustness)
                 rollback_rows,  # _mine_rollbacks
                 [],             # _mine_verification_failures
             ],
         )
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
 
-        mock_generator = AsyncMock(spec=AdversarialTestGenerator)
-        mock_generator.generate_adversarial_tests = AsyncMock(
-            return_value=AdversarialTestResult(
+        mock_generator = AsyncMock(spec=RobustnessTestGenerator)
+        mock_generator.generate_robustness_tests = AsyncMock(
+            return_value=RobustnessTestResult(
                 tests_generated=3,
                 tests_executed=3,
                 tests_found_bugs=2,
@@ -661,7 +661,7 @@ class TestCoevolutionCycle:
     @pytest.mark.asyncio
     async def test_full_cycle_no_neo4j_no_adversarial(self):
         """Cycle with no neo4j and no adversarial generator: zero results."""
-        miner = HardNegativeMiner(neo4j=None, llm=None)
+        miner = FailureAnalyzer(neo4j=None, llm=None)
         result = await miner.run_cycle()
 
         assert isinstance(result, CoevolutionCycleResult)
@@ -686,7 +686,7 @@ class TestCoevolutionCycle:
             verification_rows=[],
         )
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
         result = await miner.run_cycle(adversarial_generator=None)
 
         assert result.coverage_growth_percent == 0.0
@@ -705,7 +705,7 @@ class TestCoevolutionCycle:
         ]
         neo4j = _make_neo4j_mock(rollback_rows=rollback_rows, verification_rows=[])
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
         negatives = await miner.mine_from_history()
         batch = await miner.prepare_grpo_batch(negatives)
 
@@ -733,7 +733,7 @@ class TestCoevolutionCycle:
             verification_rows=[],
         )
 
-        miner = HardNegativeMiner(neo4j=neo4j, llm=None)
+        miner = FailureAnalyzer(neo4j=neo4j, llm=None)
         result = await miner.run_cycle()
 
         assert result.grpo_examples_produced == result.hard_negatives_mined

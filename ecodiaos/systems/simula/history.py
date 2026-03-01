@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.systems.simula.types import ConfigVersion, EvolutionRecord
+from ecodiaos.systems.simula.evolution_types import ConfigVersion, EvolutionRecord
 
 if TYPE_CHECKING:
     from ecodiaos.clients.embedding import EmbeddingClient

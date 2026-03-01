@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     ChangeCategory,
     ChangeSpec,
     EvolutionProposal,

@@ -2,7 +2,7 @@
 EcodiaOS — External Service Clients
 
 Connection management for Neo4j, TimescaleDB, Redis, LLM, Embedding,
-and context compression (Stage 1C).
+context compression (Stage 1C), and CDP Wallet (Phase 2 Metabolic Layer).
 """
 
 from ecodiaos.clients.context_compression import CompressionMetrics, ContextCompressor
@@ -22,6 +22,7 @@ from ecodiaos.clients.llm import (
 from ecodiaos.clients.neo4j import Neo4jClient
 from ecodiaos.clients.redis import RedisClient
 from ecodiaos.clients.timescaledb import TimescaleDBClient
+from ecodiaos.clients.wallet import WalletClient
 
 __all__ = [
     "Neo4jClient",
@@ -38,4 +39,5 @@ __all__ = [
     "cosine_similarity",
     "ContextCompressor",
     "CompressionMetrics",
+    "WalletClient",
 ]

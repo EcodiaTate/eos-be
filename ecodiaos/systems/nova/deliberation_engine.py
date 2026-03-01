@@ -5,14 +5,14 @@ The dual-process decision engine. Implements the System 1 / System 2 split
 from cognitive architecture — not as a performance trick, but as a genuine
 model of how deliberation works.
 
-Fast path (System 1, ≤150ms total):
+Fast path (System 1, ≤200ms total):
   - Pattern-match against known procedure templates
   - Build intent directly from matched procedure
   - Submit to Equor for critical-path review (≤50ms)
   - If denied, escalate to slow path
 
-Slow path (System 2, ≤5000ms total):
-  - Generate 2-5 candidate policies via LLM (≤3000ms)
+Slow path (System 2, ≤15000ms total):
+  - Generate 2-5 candidate policies via LLM (≤10000ms)
   - Evaluate EFE for each candidate in parallel (≤200ms per policy)
   - Select minimum-EFE policy
   - Formulate Intent from selected policy
@@ -46,7 +46,8 @@ from ecodiaos.primitives.intent import (
     GoalDescriptor,
     Intent,
 )
-from ecodiaos.systems.nova.policy_generator import (
+from ecodiaos.systems.nova.policy_generator import (  # noqa: F401
+    BasePolicyGenerator,
     PolicyGenerator,
     find_matching_procedure,
     procedure_to_policy,
@@ -86,19 +87,19 @@ class DeliberationEngine:
     deliberation, and returns a constitutional Intent (or None for do-nothing).
 
     Performance targets:
-      - Fast path: ≤150ms total (≤100ms procedure + ≤50ms Equor critical)
-      - Slow path: ≤5000ms total (≤3000ms generation + ≤500ms Equor + overhead)
+      - Fast path: ≤200ms total (≤150ms procedure + ≤50ms Equor critical)
+      - Slow path: ≤15000ms total (≤10000ms generation + ≤500ms Equor + overhead)
     """
 
     def __init__(
         self,
         goal_manager: GoalManager,
-        policy_generator: PolicyGenerator,
+        policy_generator: BasePolicyGenerator,
         efe_evaluator: EFEEvaluator,
         equor: EquorService,
         drive_weights: dict[str, float] | None = None,
-        fast_path_timeout_ms: int = 100,
-        slow_path_timeout_ms: int = 5000,
+        fast_path_timeout_ms: int = 300,
+        slow_path_timeout_ms: int = 15000,
     ) -> None:
         self._goals = goal_manager
         self._policy_gen = policy_generator
@@ -112,9 +113,75 @@ class DeliberationEngine:
         self._last_equor_check: ConstitutionalCheck | None = None
         self._logger = logger.bind(system="nova.deliberation_engine")
 
+        # Allostatic EFE threshold modulation (updated by update_somatic_thresholds())
+        # Stored as *deltas* applied to the module-level defaults at assessment time.
+        self._novelty_threshold_delta: float = 0.0
+        self._precision_threshold_delta: float = 0.0
+        # Do-nothing EFE override: when urgency is high, the baseline rises so
+        # inaction has to beat a higher bar. None = use DO_NOTHING_EFE constant.
+        self._do_nothing_efe_override: float | None = None
+
     def update_drive_weights(self, weights: dict[str, float]) -> None:
         """Called by NovaService when constitution changes."""
         self._drive_weights = weights
+
+    def set_policy_generator(self, generator: BasePolicyGenerator) -> None:
+        """
+        Hot-swap the active policy generator.
+
+        Called by NovaService when HotReloader discovers a new
+        BasePolicyGenerator subclass.  The swap is atomic at Python's
+        reference level — any in-flight slow-path call using the old
+        generator will complete normally; new calls get the new generator.
+        """
+        self._policy_gen = generator
+
+    def update_somatic_thresholds(self, urgency: float, arousal: float) -> None:
+        """
+        Shift EFE deliberation thresholds based on Soma's somatic state.
+
+        Called by NovaService.receive_broadcast() before deliberation when
+        Soma is wired and has produced a signal.
+
+        Mapping (all deltas are negative = thresholds lowered = more sensitive):
+
+        High arousal (>0.6):
+          - Lowers _PRECISION_THRESHOLD by up to -0.15 at arousal=1.0.
+            Under physiological stress, even moderately precise broadcasts
+            warrant slow deliberation.
+
+        High urgency (>threshold):
+          - Lowers _NOVELTY_THRESHOLD by up to -0.20 at urgency=1.0.
+            When something is wrong, almost any novel event needs attention.
+          - Raises do-nothing EFE baseline by up to +0.15 at urgency=1.0.
+            Inaction is harder to justify when the organism is far from setpoints.
+
+        The deltas are clamped so they cannot push thresholds below 0.1
+        (prevents pathological always-slow-path under sustained stress).
+        """
+        # Arousal → precision threshold lowering
+        if arousal > 0.6:
+            self._precision_threshold_delta = -min(0.15, (arousal - 0.6) * 0.375)
+        else:
+            self._precision_threshold_delta = 0.0
+
+        # Urgency → novelty threshold lowering + do-nothing EFE raising
+        if urgency > 0.3:
+            urgency_excess = (urgency - 0.3) / 0.7  # 0→1 as urgency 0.3→1.0
+            self._novelty_threshold_delta = -min(0.20, urgency_excess * 0.20)
+            self._do_nothing_efe_override = -0.10 + min(0.15, urgency_excess * 0.15)
+        else:
+            self._novelty_threshold_delta = 0.0
+            self._do_nothing_efe_override = None
+
+        self._logger.debug(
+            "somatic_thresholds_updated",
+            urgency=round(urgency, 3),
+            arousal=round(arousal, 3),
+            novelty_threshold=round(_NOVELTY_THRESHOLD + self._novelty_threshold_delta, 3),
+            precision_threshold=round(_PRECISION_THRESHOLD + self._precision_threshold_delta, 3),
+            do_nothing_efe=self._do_nothing_efe_override,
+        )
 
     @property
     def last_equor_check(self) -> ConstitutionalCheck | None:
@@ -198,6 +265,10 @@ class DeliberationEngine:
             situation_assessment=assessment,
         )
 
+        # Yield control briefly so the Synapse clock and other coroutines
+        # don't starve while we begin the potentially long deliberation.
+        await asyncio.sleep(0)
+
         # Route to appropriate path
         if assessment.requires_deliberation:
             self._logger.debug("deliberation_slow_path", broadcast_id=broadcast.broadcast_id)
@@ -208,7 +279,8 @@ class DeliberationEngine:
             intent, escalated = await self._fast_path(broadcast, assessment, belief_state, affect)
             path = "slow" if escalated else "fast"
             if escalated and intent is None:
-                # Fast path escalated and slow path succeeded
+                # Fast path escalated — yield before entering the heavy slow path
+                await asyncio.sleep(0)
                 intent = await self._slow_path(broadcast, assessment, belief_state, affect, memory_traces)
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -284,6 +356,10 @@ class DeliberationEngine:
         """
         Determine if deliberative (slow) or habitual (fast) processing is needed.
         Must complete in ≤20ms.
+
+        Thresholds are modulated by somatic state via update_somatic_thresholds():
+          - High arousal lowers _PRECISION_THRESHOLD (stress → more broadcasts warrant slow path)
+          - High urgency lowers _NOVELTY_THRESHOLD (allostatic pressure → more novelty triggers deliberation)
         """
         salience_scores = broadcast.salience.scores if broadcast.salience.scores else {}
         novelty = salience_scores.get("novelty", 0.0)
@@ -291,12 +367,16 @@ class DeliberationEngine:
         emotional = salience_scores.get("emotional", 0.0)
         precision = broadcast.precision
 
+        # Apply somatic threshold deltas (clamped to minimum 0.1)
+        effective_novelty_threshold = max(0.1, _NOVELTY_THRESHOLD + self._novelty_threshold_delta)
+        effective_precision_threshold = max(0.1, _PRECISION_THRESHOLD + self._precision_threshold_delta)
+
         requires_deliberation = (
-            novelty > _NOVELTY_THRESHOLD
+            novelty > effective_novelty_threshold
             or risk > _RISK_THRESHOLD
             or emotional > _EMOTIONAL_THRESHOLD
             or belief_conflict
-            or precision > _PRECISION_THRESHOLD
+            or precision > effective_precision_threshold
         )
 
         has_procedure = find_matching_procedure(broadcast) is not None
@@ -341,8 +421,8 @@ class DeliberationEngine:
 
                 intent = _policy_to_intent(policy, goal, path="fast", confidence=procedure["success_rate"])
 
-                # Equor critical-path review (≤50ms budget within fast path)
-                check = await self._equor.review(intent)
+                # Equor critical-path review (≤50ms, cache-only, no DB/LLM I/O)
+                check = await self._equor.review_critical(intent)
 
                 if check.verdict == Verdict.APPROVED:
                     self._last_equor_check = check
@@ -375,6 +455,9 @@ class DeliberationEngine:
     ) -> Intent | None:
         """
         System 2: Generate → EFE score → select → Equor standard review.
+
+        Yield points (asyncio.sleep(0)) are inserted between major phases
+        to prevent event loop starvation during the slow path budget.
         """
         try:
             async with asyncio.timeout(self._slow_timeout):
@@ -400,6 +483,9 @@ class DeliberationEngine:
                 if not candidates:
                     return None
 
+                # Yield after the heaviest LLM call so the clock can tick
+                await asyncio.sleep(0)
+
                 # ── Evaluate EFE for all candidates (parallelised) ──
                 scored = await self._efe.evaluate_all(
                     policies=candidates,
@@ -410,14 +496,33 @@ class DeliberationEngine:
                 )
 
                 # scored is sorted: lowest EFE first
+                # Apply somatic do-nothing EFE override: high urgency raises the
+                # do-nothing baseline, making inaction harder to justify.
+                if self._do_nothing_efe_override is not None:
+                    scored = [
+                        (
+                            policy,
+                            score.model_copy(update={"total": self._do_nothing_efe_override})
+                            if policy.id == "do_nothing"
+                            else score,
+                        )
+                        for policy, score in scored
+                    ]
+                    # Re-sort after override
+                    scored.sort(key=lambda x: x[1].total)
+
                 # If do-nothing wins, return None
                 if scored and scored[0][0].id == "do_nothing":
                     self._logger.info(
                         "do_nothing_policy_selected",
                         goal=goal.description[:60],
                         do_nothing_efe=scored[0][1].total,
+                        somatic_override=self._do_nothing_efe_override,
                     )
                     return None
+
+                # Yield before the Equor review loop
+                await asyncio.sleep(0)
 
                 # ── Equor review with retry on denial ──
                 for policy, efe_score in scored:
@@ -450,6 +555,8 @@ class DeliberationEngine:
                         policy=policy.name,
                         reasoning=check.reasoning[:80],
                     )
+                    # Yield between retries so we don't hold the loop
+                    await asyncio.sleep(0)
 
                 return None  # All policies blocked
 

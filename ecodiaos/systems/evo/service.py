@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ecodiaos.core.hotreload import NeuroplasticityBus
 from ecodiaos.systems.evo.consolidation import ConsolidationOrchestrator
 from ecodiaos.systems.evo.detectors import PatternDetector, build_default_detectors
 from ecodiaos.systems.evo.hypothesis import HypothesisEngine
@@ -63,9 +64,9 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 # How often to attempt hypothesis generation from accumulated patterns
-_HYPOTHESIS_GENERATION_INTERVAL: int = 50   # Every 50 broadcasts
+_HYPOTHESIS_GENERATION_INTERVAL: int = 200  # Every 200 broadcasts (was 50)
 # How often to evaluate evidence against all active hypotheses
-_EVIDENCE_EVALUATION_INTERVAL: int = 10     # Every 10 broadcasts
+_EVIDENCE_EVALUATION_INTERVAL: int = 50     # Every 50 broadcasts (was 10)
 
 
 class EvoService:
@@ -88,11 +89,13 @@ class EvoService:
         llm: LLMProvider,
         memory: MemoryService | None = None,
         instance_name: str = "EOS",
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
         self._memory = memory
         self._instance_name = instance_name
+        self._bus = neuroplasticity_bus
         self._initialized: bool = False
         self._logger = logger.bind(system="evo")
 
@@ -165,8 +168,19 @@ class EvoService:
             parameters_restored=restored,
         )
 
+        # Register with the NeuroplasticityBus for hot-reload of PatternDetector subclasses.
+        if self._bus is not None:
+            self._bus.register(
+                base_class=PatternDetector,
+                registration_callback=self._on_detector_evolved,
+                system_id="evo",
+            )
+
     async def shutdown(self) -> None:
         """Graceful shutdown. Cancels any running consolidation task."""
+        if self._bus is not None:
+            self._bus.deregister(PatternDetector)
+
         if self._consolidation_task and not self._consolidation_task.done():
             self._consolidation_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -390,6 +404,34 @@ class EvoService:
         self._soma = soma
         self._logger.info("soma_wired_to_evo")
 
+    # ─── Hot-reload callbacks ────────────────────────────────────────────────────
+
+    def _on_detector_evolved(self, detector: PatternDetector) -> None:
+        """
+        Registration callback for NeuroplasticityBus.
+
+        Called once per PatternDetector subclass found in a hot-reloaded file.
+        Replaces any existing detector with the same name, or appends if new.
+        """
+        existing_names = [d.name for d in self._detectors]
+        if detector.name in existing_names:
+            self._detectors = [
+                detector if d.name == detector.name else d
+                for d in self._detectors
+            ]
+            self._logger.info(
+                "detector_replaced",
+                name=detector.name,
+                total_detectors=len(self._detectors),
+            )
+        else:
+            self._detectors.append(detector)
+            self._logger.info(
+                "detector_added",
+                name=detector.name,
+                total_detectors=len(self._detectors),
+            )
+
     # ─── Thread Integration ────────────────────────────────────────────────────
 
     def get_pending_candidates_snapshot(self) -> list[PatternCandidate]:
@@ -522,13 +564,18 @@ class EvoService:
         if self._hypothesis_engine is None:
             return
         try:
-            # Build a query from active hypothesis statements for targeted retrieval
+            # Build a query from TESTING hypotheses only (supported/refuted don't need more evidence)
             active = self._hypothesis_engine.get_all_active()
             if not active:
                 return
 
-            # Sample up to 3 hypotheses and use their statements as queries
-            sample = active[:3]
+            # Only evaluate hypotheses actively being tested
+            testing = [h for h in active if h.status == HypothesisStatus.TESTING]
+            if not testing:
+                return
+
+            # Sample up to 2 of the testing hypotheses (was 3 of all)
+            sample = testing[:2]
             seen_episodes: set[str] = set()
             for h in sample:
                 query = h.statement[:200] if h.statement else ""

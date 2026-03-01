@@ -39,7 +39,7 @@ from ecodiaos.systems.simula.synthesis.types import (
 
 if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
-    from ecodiaos.systems.simula.types import ChangeSpec
+    from ecodiaos.systems.simula.evolution_types import ChangeSpec
     from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge
 
 logger = structlog.get_logger().bind(system="simula.synthesis.sketch")

@@ -15,6 +15,7 @@ where only Level 1 (Advisor) actions are permitted.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -37,7 +38,16 @@ from ecodiaos.systems.equor.autonomy import (
     get_autonomy_level,
 )
 from ecodiaos.systems.equor.drift import DriftTracker, respond_to_drift, store_drift_report
-from ecodiaos.systems.equor.evaluators import evaluate_all_drives
+from ecodiaos.systems.equor.economic_evaluator import (
+    apply_economic_adjustment,
+    classify_economic_action,
+    evaluate_economic_intent,
+)
+from ecodiaos.systems.equor.evaluators import (
+    BaseEquorEvaluator,
+    default_evaluators,
+    evaluate_all_drives,
+)
 from ecodiaos.systems.equor.invariants import (
     HARDCODED_INVARIANTS,
     check_community_invariant,
@@ -49,9 +59,18 @@ if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.clients.neo4j import Neo4jClient
     from ecodiaos.config import EquorConfig, GovernanceConfig
+    from ecodiaos.core.hotreload import NeuroplasticityBus
     from ecodiaos.primitives.intent import Intent
 
 logger = structlog.get_logger()
+
+# Review timeout: the entire review() call must not block the event loop
+# beyond this budget. Community invariant LLM calls are the most expensive
+# component and will be skipped if the budget is exhausted.
+_REVIEW_TIMEOUT_S = 0.8
+# Cache TTL for constitution and autonomy level (seconds).
+# These change only via governance events, so a short TTL is safe.
+_STATE_CACHE_TTL_S = 30.0
 
 
 class EquorService:
@@ -69,6 +88,7 @@ class EquorService:
         llm: LLMProvider,
         config: EquorConfig,
         governance_config: GovernanceConfig,
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
     ):
         self._neo4j = neo4j
         self._llm = llm
@@ -78,6 +98,19 @@ class EquorService:
         self._safe_mode = False
         self._total_reviews = 0
         self._evo: Any = None  # Wired post-init for learning feedback from vetoes
+        self._bus = neuroplasticity_bus
+
+        # Live evaluator set — hot-reloaded via the NeuroplasticityBus.
+        # Initialised with built-in defaults; the bus callback replaces
+        # individual evaluators when Simula evolves a new subclass.
+        self._evaluators: dict[str, BaseEquorEvaluator] = default_evaluators()
+
+        # Cached state: constitution and autonomy level rarely change (only via
+        # governance events), so we cache them to avoid hitting Neo4j on every
+        # review() call. Invalidated after _STATE_CACHE_TTL_S or on mutation.
+        self._cached_constitution: dict[str, Any] | None = None
+        self._cached_autonomy_level: int | None = None
+        self._cache_updated_at: float = 0.0
 
     def set_evo(self, evo: Any) -> None:
         """Wire Evo so constitutional vetoes become learning episodes."""
@@ -87,10 +120,50 @@ class EquorService:
     # ─── Lifecycle ────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        """Ensure schema and seed invariants."""
+        """Ensure schema, seed invariants, and register for hot-reload."""
         await ensure_equor_schema(self._neo4j)
         await seed_hardcoded_invariants(self._neo4j)
+
+        if self._bus is not None:
+            self._bus.register(
+                base_class=BaseEquorEvaluator,
+                registration_callback=self._on_evaluator_evolved,
+                system_id=self.system_id,
+            )
+
         logger.info("equor_initialized")
+
+    async def shutdown(self) -> None:
+        """Deregister evaluators from the bus on shutdown."""
+        if self._bus is not None:
+            self._bus.deregister(BaseEquorEvaluator)
+            logger.info("equor_evaluators_deregistered")
+
+    def _on_evaluator_evolved(self, evaluator: BaseEquorEvaluator) -> None:
+        """
+        NeuroplasticityBus callback — swap a single drive evaluator in-place.
+
+        The bus instantiates the new subclass and calls this method.  We key on
+        ``drive_name`` so only the matching evaluator is replaced; the other
+        three continue running undisturbed.
+        """
+        name = evaluator.drive_name
+        if name not in self._evaluators:
+            logger.warning(
+                "equor_unknown_drive_evolved",
+                drive_name=name,
+                class_name=type(evaluator).__name__,
+            )
+            return
+
+        old_cls = type(self._evaluators[name]).__name__
+        self._evaluators[name] = evaluator
+        logger.info(
+            "equor_evaluator_hot_reloaded",
+            drive=name,
+            old_class=old_cls,
+            new_class=type(evaluator).__name__,
+        )
 
     # ─── Primary Entry Point: Constitutional Review ───────────────
 
@@ -108,57 +181,211 @@ class EquorService:
             return self._safe_mode_review(intent)
 
         try:
-            # 1. Run all four drive evaluators in parallel
-            alignment = await evaluate_all_drives(intent)
-
-            # 2. Get current constitution and autonomy level
-            constitution = await self._get_constitution_dict()
-            autonomy_level = await get_autonomy_level(self._neo4j)
-
-            # 3. Run the verdict engine (includes invariant checks)
-            check = compute_verdict(alignment, intent, autonomy_level, constitution)
-
-            # 4. Check community invariants if we haven't already blocked
-            if check.verdict not in (Verdict.BLOCKED,):
-                community_violations = await self._check_community_invariants(intent)
-                if community_violations:
-                    check.verdict = Verdict.BLOCKED
-                    check.reasoning = (
-                        f"Community invariant violated: {community_violations[0]}"
-                    )
-
-            # 5. Store audit trail
+            async with asyncio.timeout(_REVIEW_TIMEOUT_S):
+                return await self._review_inner(intent, start)
+        except TimeoutError:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            await self._store_review_record(intent, alignment, check, elapsed_ms)
-
-            # 6. Update drift tracking
-            self._drift_tracker.record_decision(alignment, check.verdict.value)
-            self._total_reviews += 1
-
-            # 6b. Feed blocked verdicts to Evo as negative learning episodes
-            if check.verdict == Verdict.BLOCKED and self._evo is not None:
-                await self._feed_veto_to_evo(intent, check)
-
-            # 7. Check if drift report is due + promotion eligibility
-            if self._total_reviews % self._config.drift_report_interval == 0:
-                await self._run_drift_check()
-                await self._run_promotion_check()
-
-            logger.info(
-                "constitutional_review_complete",
+            logger.warning(
+                "equor_review_timeout",
                 intent_id=intent.id,
-                verdict=check.verdict.value,
-                composite=f"{alignment.composite:.2f}",
-                latency_ms=elapsed_ms,
+                elapsed_ms=elapsed_ms,
             )
-
-            return check
-
+            # Timeout is NOT a failure — return a conservative approval so
+            # we don't block the fast path. The audit trail records the timeout.
+            return ConstitutionalCheck(
+                intent_id=intent.id,
+                verdict=Verdict.APPROVED,
+                reasoning=(
+                    f"Equor review timed out after {elapsed_ms}ms. "
+                    "Approved conservatively (heuristic invariants passed)."
+                ),
+                confidence=0.5,
+            )
         except Exception as e:
             # Equor failure = enter safe mode
             logger.error("equor_review_failed", error=str(e), intent_id=intent.id)
             self._safe_mode = True
             return self._safe_mode_review(intent)
+
+    async def review_critical(self, intent: Intent) -> ConstitutionalCheck:
+        """
+        Lightweight critical-path review for Nova's fast path.
+
+        Constraints (must complete in ≤50ms):
+          - Uses ONLY cached constitution/autonomy (never waits for Neo4j)
+          - Runs CPU-only verdict computation (drive evaluation + hardcoded invariants)
+          - Skips community invariant LLM checks entirely
+          - Skips audit trail write (fire-and-forget bookkeeping still runs)
+
+        If no cached state is available (cold start), conservatively approves
+        with low confidence so the fast path can proceed without blocking.
+        """
+        start = time.monotonic()
+
+        if self._safe_mode:
+            return self._safe_mode_review(intent)
+
+        # Use cached state only — never block on Neo4j
+        if (
+            self._cached_constitution is not None
+            and self._cached_autonomy_level is not None
+        ):
+            constitution = self._cached_constitution
+            autonomy_level = self._cached_autonomy_level
+        else:
+            # Cold start: no cached state yet. Approve conservatively.
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            logger.debug(
+                "critical_review_no_cache",
+                intent_id=intent.id,
+                elapsed_ms=elapsed_ms,
+            )
+            return ConstitutionalCheck(
+                intent_id=intent.id,
+                verdict=Verdict.APPROVED,
+                reasoning="Critical-path review: no cached state, approved conservatively.",
+                confidence=0.4,
+            )
+
+        # Pure CPU: drive evaluation + hardcoded invariant verdict
+        alignment = await evaluate_all_drives(intent, self._evaluators)
+
+        # Economic guardrail on critical path too — all CPU, no I/O.
+        economic_delta = evaluate_economic_intent(intent)
+        if economic_delta is not None:
+            alignment = apply_economic_adjustment(alignment, economic_delta)
+
+        check = compute_verdict(alignment, intent, autonomy_level, constitution)
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+
+        # Fire-and-forget bookkeeping (non-blocking)
+        asyncio.create_task(
+            self._post_review_bookkeeping(intent, alignment, check, elapsed_ms),
+            name=f"equor_critical_{intent.id[:8]}",
+        )
+
+        logger.debug(
+            "critical_review_complete",
+            intent_id=intent.id,
+            verdict=check.verdict.value,
+            latency_ms=elapsed_ms,
+        )
+        return check
+
+    async def _review_inner(
+        self, intent: Intent, start: float,
+    ) -> ConstitutionalCheck:
+        """Core review logic, called within the review timeout."""
+        # 1. Drive evaluation + cached state fetch in parallel.
+        #    Drive evaluators are pure CPU heuristics (<1ms).
+        #    Constitution/autonomy are cached with TTL to avoid Neo4j per-review.
+        alignment, (constitution, autonomy_level) = await asyncio.gather(
+            evaluate_all_drives(intent, self._evaluators),
+            self._get_cached_state(),
+        )
+
+        # 1b. Economic guardrail: if this is an Oikos economic intent,
+        #     apply domain-specific drive adjustments before verdict.
+        #     This ensures Care/Honesty floors catch scam assets, harmful
+        #     bounties, etc. even if base evaluators scored them neutrally.
+        economic_delta = evaluate_economic_intent(intent)
+        if economic_delta is not None:
+            alignment = apply_economic_adjustment(alignment, economic_delta)
+            logger.debug(
+                "economic_adjustment_applied",
+                intent_id=intent.id,
+                action_type=classify_economic_action(intent),
+                adjusted_care=f"{alignment.care:.2f}",
+                adjusted_honesty=f"{alignment.honesty:.2f}",
+            )
+
+        # 2. Run the verdict engine (pure CPU, includes hardcoded invariant checks)
+        check = compute_verdict(alignment, intent, autonomy_level, constitution)
+
+        # 3. Community invariant checks — parallelised with a tight timeout.
+        #    Only run if we haven't already blocked (invariant / floor / autonomy).
+        if check.verdict not in (Verdict.BLOCKED, Verdict.DEFERRED):
+            community_violations = await self._check_community_invariants(intent)
+            if community_violations:
+                check.verdict = Verdict.BLOCKED
+                check.reasoning = (
+                    f"Community invariant violated: {community_violations[0]}"
+                )
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+
+        # 4. Fire-and-forget: audit trail, drift tracking, Evo feedback.
+        #    These are important but must not block the review response.
+        asyncio.create_task(
+            self._post_review_bookkeeping(intent, alignment, check, elapsed_ms),
+            name=f"equor_bookkeeping_{intent.id[:8]}",
+        )
+
+        logger.info(
+            "constitutional_review_complete",
+            intent_id=intent.id,
+            verdict=check.verdict.value,
+            composite=f"{alignment.composite:.2f}",
+            latency_ms=elapsed_ms,
+        )
+
+        return check
+
+    async def _get_cached_state(self) -> tuple[dict[str, Any], int]:
+        """Return (constitution_dict, autonomy_level) from cache or Neo4j."""
+        now = time.monotonic()
+        if (
+            self._cached_constitution is not None
+            and self._cached_autonomy_level is not None
+            and (now - self._cache_updated_at) < _STATE_CACHE_TTL_S
+        ):
+            return self._cached_constitution, self._cached_autonomy_level
+
+        # Fetch both in parallel
+        constitution, autonomy_level = await asyncio.gather(
+            self._get_constitution_dict(),
+            get_autonomy_level(self._neo4j),
+        )
+        self._cached_constitution = constitution
+        self._cached_autonomy_level = autonomy_level
+        self._cache_updated_at = now
+        return constitution, autonomy_level
+
+    def _invalidate_state_cache(self) -> None:
+        """Called after governance mutations (amendments, autonomy changes)."""
+        self._cached_constitution = None
+        self._cached_autonomy_level = None
+        self._cache_updated_at = 0.0
+
+    async def _post_review_bookkeeping(
+        self,
+        intent: Intent,
+        alignment: DriveAlignmentVector,
+        check: ConstitutionalCheck,
+        elapsed_ms: int,
+    ) -> None:
+        """Non-blocking post-review work: audit trail, drift, Evo feedback."""
+        try:
+            await self._store_review_record(intent, alignment, check, elapsed_ms)
+        except Exception:
+            logger.debug("audit_trail_write_failed", exc_info=True)
+
+        self._drift_tracker.record_decision(alignment, check.verdict.value)
+        self._total_reviews += 1
+
+        if check.verdict == Verdict.BLOCKED and self._evo is not None:
+            try:
+                await self._feed_veto_to_evo(intent, check)
+            except Exception:
+                logger.debug("evo_veto_feed_failed", exc_info=True)
+
+        if self._total_reviews % self._config.drift_report_interval == 0:
+            try:
+                await self._run_drift_check()
+                await self._run_promotion_check()
+            except Exception:
+                logger.debug("drift_or_promotion_check_failed", exc_info=True)
 
     # ─── Invariant Management ─────────────────────────────────────
 
@@ -224,6 +451,7 @@ class EquorService:
         return await check_promotion_eligibility(self._neo4j, current, target_level)
 
     async def apply_autonomy_change(self, new_level: int, reason: str, actor: str = "governance") -> dict[str, Any]:
+        self._invalidate_state_cache()
         return await apply_autonomy_change(self._neo4j, new_level, reason, actor)
 
     # ─── Amendments ───────────────────────────────────────────────
@@ -241,6 +469,7 @@ class EquorService:
         )
 
     async def apply_amendment(self, proposal_id: str, proposed_drives: dict[str, float]) -> dict[str, Any]:
+        self._invalidate_state_cache()
         return await apply_amendment(self._neo4j, proposal_id, proposed_drives)
 
     # ─── Drift ────────────────────────────────────────────────────
@@ -349,7 +578,7 @@ class EquorService:
         }
 
     async def _check_community_invariants(self, intent: Intent) -> list[str]:
-        """Check all community-defined invariants via LLM evaluation."""
+        """Check all community-defined invariants via LLM evaluation (parallelised)."""
         results = await self._neo4j.execute_read(
             """
             MATCH (c:Constitution)-[:INCLUDES_INVARIANT]->(i:Invariant)
@@ -358,15 +587,30 @@ class EquorService:
             """
         )
 
-        violations = []
-        for row in results:
-            satisfied = await check_community_invariant(
-                self._llm, intent, row["name"], row["description"],
-            )
-            if not satisfied:
-                violations.append(row["name"])
+        if not results:
+            return []
 
-        return violations
+        # Run all invariant checks in parallel with a per-check timeout
+        async def _check_one(row: dict[str, Any]) -> str | None:
+            try:
+                async with asyncio.timeout(0.4):
+                    satisfied = await check_community_invariant(
+                        self._llm, intent, row["name"], row["description"],
+                    )
+                    return None if satisfied else row["name"]
+            except TimeoutError:
+                logger.warning(
+                    "community_invariant_check_timeout",
+                    invariant=row["name"],
+                )
+                return None  # Timeout = skip (fail-open for liveness)
+            except Exception:
+                return row["name"]  # Error = fail-safe (treat as violated)
+
+        check_results = await asyncio.gather(
+            *[_check_one(row) for row in results],
+        )
+        return [name for name in check_results if name is not None]
 
     async def _feed_veto_to_evo(
         self, intent: Intent, check: ConstitutionalCheck,

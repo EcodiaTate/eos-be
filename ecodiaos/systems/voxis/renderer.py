@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -314,10 +315,44 @@ def _build_correction_instruction(violation: str) -> str:
     )
 
 
+# ─── Base Class (hot-reload contract) ────────────────────────────
+
+
+class BaseContentRenderer(ABC):
+    """
+    Abstract base for all Voxis content renderers.
+
+    Simula-evolved renderers subclass this.  The hot-reload engine discovers
+    subclasses of this ABC in changed files and replaces the live
+    ``ContentRenderer`` instance on ``VoxisService`` atomically.
+
+    Evolved subclasses **must** implement ``render``.
+    They can accept any constructor args they need — the ``VoxisService``
+    ``instance_factory`` callback handles instantiation.
+    """
+
+    @abstractmethod
+    async def render(
+        self,
+        intent: ExpressionIntent,
+        context: ExpressionContext,
+        drive_weights: dict[str, float] | None = None,
+        diversity_instruction: str | None = None,
+        dynamics: object | None = None,
+    ) -> Expression:
+        """
+        Execute the full expression pipeline for the given intent and context.
+
+        Must always return a complete ``Expression``.
+        Must never raise — return a fallback ``Expression`` on failure.
+        """
+        ...
+
+
 # ─── Main Renderer ────────────────────────────────────────────────
 
 
-class ContentRenderer:
+class ContentRenderer(BaseContentRenderer):
     """
     Full 9-step expression pipeline with Active Inference policy selection.
 

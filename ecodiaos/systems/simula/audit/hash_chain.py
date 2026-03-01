@@ -36,7 +36,7 @@ from ecodiaos.systems.simula.verification.types import (
 
 if TYPE_CHECKING:
     from ecodiaos.clients.neo4j import Neo4jClient
-    from ecodiaos.systems.simula.types import EvolutionRecord
+    from ecodiaos.systems.simula.evolution_types import EvolutionRecord
 
 logger = structlog.get_logger().bind(system="simula.audit.hash_chain")
 

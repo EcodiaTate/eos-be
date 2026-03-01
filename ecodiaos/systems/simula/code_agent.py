@@ -58,7 +58,7 @@ from ecodiaos.clients.llm import (
     ToolResult,
 )
 from ecodiaos.clients.optimized_llm import OptimizedLLMProvider
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.evolution_types import (
     GOVERNANCE_REQUIRED,
     ChangeCategory,
     CodeChangeResult,
@@ -146,7 +146,7 @@ SIMULA_AGENT_TOOLS: list[ToolDefinition] = [
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "String pattern to search for (case-sensitive)"},
-                "directory": {"type": "string", "description": "Directory to search in (default: src/)"},
+                "directory": {"type": "string", "description": "Directory to search in (default: ecodiaos/)"},
             },
             "required": ["pattern"],
         },
@@ -273,37 +273,37 @@ _SPEC_FILE_MAP: dict[str, str] = {
 # Keyword → file path mapping for find_similar
 _SIMILAR_CODE_MAP: dict[str, list[str]] = {
     "executor": [
-        "src/ecodiaos/systems/axon/executors/",
-        "src/ecodiaos/systems/axon/executor.py",
+        "ecodiaos/systems/axon/executors/",
+        "ecodiaos/systems/axon/executor.py",
     ],
     "pattern detector": [
-        "src/ecodiaos/systems/evo/detectors.py",
+        "ecodiaos/systems/evo/detectors.py",
     ],
     "detector": [
-        "src/ecodiaos/systems/evo/detectors.py",
+        "ecodiaos/systems/evo/detectors.py",
     ],
     "input channel": [
-        "src/ecodiaos/systems/atune/",
+        "ecodiaos/systems/atune/",
     ],
     "channel": [
-        "src/ecodiaos/systems/atune/",
+        "ecodiaos/systems/atune/",
     ],
     "service": [
-        "src/ecodiaos/systems/axon/service.py",
-        "src/ecodiaos/systems/evo/service.py",
+        "ecodiaos/systems/axon/service.py",
+        "ecodiaos/systems/evo/service.py",
     ],
     "hypothesis": [
-        "src/ecodiaos/systems/evo/hypothesis.py",
+        "ecodiaos/systems/evo/hypothesis.py",
     ],
     "consolidation": [
-        "src/ecodiaos/systems/evo/consolidation.py",
+        "ecodiaos/systems/evo/consolidation.py",
     ],
     "parameter": [
-        "src/ecodiaos/systems/evo/parameter_tuner.py",
+        "ecodiaos/systems/evo/parameter_tuner.py",
     ],
     "primitives": [
-        "src/ecodiaos/primitives/common.py",
-        "src/ecodiaos/primitives/memory_trace.py",
+        "ecodiaos/primitives/common.py",
+        "ecodiaos/primitives/memory_trace.py",
     ],
 }
 
@@ -379,7 +379,7 @@ Prefer diff_file over write_file when modifying existing files."""
 
 
 def _build_architecture_context(
-    category: ChangeCategory, codebase_root: Path,
+    category: ChangeCategory, codebase_root: Path, spec_root: Path | None = None,
 ) -> str:
     """
     Build rich architecture context for the system prompt.
@@ -404,7 +404,7 @@ def _build_architecture_context(
     spec_name = spec_map.get(category, "architecture")
     spec_file = _SPEC_FILE_MAP.get(spec_name)
     if spec_file:
-        spec_path = codebase_root / spec_file
+        spec_path = (spec_root or codebase_root) / spec_file
         if spec_path.exists():
             try:
                 spec_text = spec_path.read_text(encoding="utf-8")[:2000]
@@ -415,9 +415,9 @@ def _build_architecture_context(
 
     # 2. Load exemplar code for the category
     exemplar_map: dict[ChangeCategory, str] = {
-        ChangeCategory.ADD_EXECUTOR: "src/ecodiaos/systems/axon/executor.py",
-        ChangeCategory.ADD_INPUT_CHANNEL: "src/ecodiaos/systems/atune/service.py",
-        ChangeCategory.ADD_PATTERN_DETECTOR: "src/ecodiaos/systems/evo/detectors.py",
+        ChangeCategory.ADD_EXECUTOR: "ecodiaos/systems/axon/executor.py",
+        ChangeCategory.ADD_INPUT_CHANNEL: "ecodiaos/systems/atune/service.py",
+        ChangeCategory.ADD_PATTERN_DETECTOR: "ecodiaos/systems/evo/detectors.py",
     }
     exemplar_path_str = exemplar_map.get(category)
     if exemplar_path_str and budget_remaining > 500:
@@ -437,9 +437,9 @@ def _build_architecture_context(
 
     # 3. Load the target system's __init__.py for API awareness
     system_map: dict[ChangeCategory, str] = {
-        ChangeCategory.ADD_EXECUTOR: "src/ecodiaos/systems/axon/__init__.py",
-        ChangeCategory.ADD_INPUT_CHANNEL: "src/ecodiaos/systems/atune/__init__.py",
-        ChangeCategory.ADD_PATTERN_DETECTOR: "src/ecodiaos/systems/evo/__init__.py",
+        ChangeCategory.ADD_EXECUTOR: "ecodiaos/systems/axon/__init__.py",
+        ChangeCategory.ADD_INPUT_CHANNEL: "ecodiaos/systems/atune/__init__.py",
+        ChangeCategory.ADD_PATTERN_DETECTOR: "ecodiaos/systems/evo/__init__.py",
     }
     init_path_str = system_map.get(category)
     if init_path_str and budget_remaining > 200:
@@ -488,7 +488,7 @@ class SimulaCodeAgent:
         # Stage 2C: Static analysis post-generation gate
         static_analysis_bridge: object | None = None,
         static_analysis_max_fix_iterations: int = 3,
-        # Hunter: allow overriding the workspace root for external target analysis
+        # Inspector: allow overriding the workspace root for external target analysis
         workspace_root: Path | None = None,
     ) -> None:
         self._llm = llm
@@ -496,6 +496,19 @@ class SimulaCodeAgent:
         self._thinking_budget = thinking_budget_tokens
         self._embedding = embedding_client
         self._root = (workspace_root or codebase_root).resolve()
+        # Spec files live in .claude/ at the repo root (one level above backend/).
+        # Walk up from _root until we find a directory containing .claude/, or
+        # fall back to _root itself so read_spec degrades gracefully.
+        _candidate = self._root
+        while True:
+            if (_candidate / ".claude").is_dir():
+                break
+            parent = _candidate.parent
+            if parent == _candidate:
+                _candidate = self._root  # reached filesystem root, give up
+                break
+            _candidate = parent
+        self._spec_root = _candidate
         self._max_turns = max_turns
         self._logger = logger.bind(system="simula.code_agent")
         self._files_written: list[str] = []
@@ -892,6 +905,13 @@ class SimulaCodeAgent:
     async def _tool_list_directory(self, tc: ToolCall) -> ToolResult:
         rel_path = tc.input.get("path", "")
         target = (self._root / rel_path).resolve() if rel_path else self._root
+        log.debug(
+            "list_directory_debug",
+            rel_path=rel_path,
+            target=str(target),
+            root=str(self._root),
+            exists=target.exists(),
+        )
         if not str(target).startswith(str(self._root)):
             return ToolResult(tc.id, "Access denied", True)
         try:
@@ -908,7 +928,7 @@ class SimulaCodeAgent:
 
     async def _tool_search_code(self, tc: ToolCall) -> ToolResult:
         pattern = tc.input.get("pattern", "")
-        directory = tc.input.get("directory", "src/")
+        directory = tc.input.get("directory", "ecodiaos/")
         search_root = (self._root / directory).resolve()
         if not str(search_root).startswith(str(self._root)):
             return ToolResult(tc.id, "Access denied", True)
@@ -957,13 +977,24 @@ class SimulaCodeAgent:
             return ToolResult(tc.id, f"Test run error: {exc}", True)
 
     async def _tool_run_linter(self, tc: ToolCall) -> ToolResult:
+        import sys as _sys
         path = tc.input.get("path", "")
         target = (self._root / path).resolve()
         if not str(target).startswith(str(self._root)):
             return ToolResult(tc.id, "Access denied", True)
+        # Prefer the venv-local ruff so we don't pick up a mismatched binary
+        # from PATH (e.g. a Windows ruff.exe when running under WSL).
+        _venv_ruff = Path(_sys.executable).parent / "ruff"
+        _venv_ruff_exe = Path(_sys.executable).parent / "ruff.exe"
+        if _venv_ruff.exists():
+            _ruff = str(_venv_ruff)
+        elif _venv_ruff_exe.exists():
+            _ruff = str(_venv_ruff_exe)
+        else:
+            _ruff = "ruff"  # fall back to PATH
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ruff", "check", str(target),
+                _ruff, "check", str(target),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 cwd=str(self._root),
@@ -1036,13 +1067,19 @@ class SimulaCodeAgent:
 
     async def _tool_type_check(self, tc: ToolCall) -> ToolResult:
         """Run mypy type checker on a path."""
+        import sys as _sys
         path = tc.input.get("path", "")
         target = (self._root / path).resolve()
         if not str(target).startswith(str(self._root)):
             return ToolResult(tc.id, "Access denied", True)
+        _bin_dir = Path(_sys.executable).parent
+        _mypy = str(next(
+            (p for p in [_bin_dir / "mypy", _bin_dir / "mypy.exe"] if p.exists()),
+            "mypy",
+        ))
         try:
             proc = await asyncio.create_subprocess_exec(
-                "mypy", str(target), "--strict", "--no-error-summary",
+                _mypy, str(target), "--strict", "--no-error-summary",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 cwd=str(self._root),
@@ -1146,7 +1183,7 @@ class SimulaCodeAgent:
                 True,
             )
 
-        target = self._root / spec_file
+        target = self._spec_root / spec_file
         if not target.exists():
             return ToolResult(tc.id, f"Spec file not found: {spec_file}", True)
 
@@ -1338,7 +1375,7 @@ class SimulaCodeAgent:
 
     def _check_forbidden_path(self, rel_path: str) -> str | None:
         """Check if a path is forbidden. Returns error message or None."""
-        from ecodiaos.systems.simula.types import FORBIDDEN_WRITE_PATHS
+        from ecodiaos.systems.simula.evolution_types import FORBIDDEN_WRITE_PATHS
         for forbidden in FORBIDDEN_WRITE_PATHS:
             if rel_path.startswith(forbidden) or forbidden in rel_path:
                 return (
@@ -1362,11 +1399,12 @@ class SimulaCodeAgent:
         return ".".join(parts) if parts else None
 
     def _build_system_prompt(self, proposal: EvolutionProposal) -> str:
-        from ecodiaos.systems.simula.types import FORBIDDEN_WRITE_PATHS, SIMULA_IRON_RULES
+        from ecodiaos.systems.simula.evolution_types import FORBIDDEN_WRITE_PATHS, SIMULA_IRON_RULES
 
         architecture_context = _build_architecture_context(
             category=proposal.category,
             codebase_root=self._root,
+            spec_root=self._spec_root,
         )
 
         prompt = _SYSTEM_PROMPT_TEMPLATE.format(

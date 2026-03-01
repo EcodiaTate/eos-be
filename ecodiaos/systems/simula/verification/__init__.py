@@ -1,5 +1,5 @@
 """
-EcodiaOS -- Simula Verification Subsystem (Stages 2 + 3 + 4)
+EcodiaOS -- Simula Verification Subsystem (Stages 2 + 3 + 4 + Phase 2)
 
 Formal verification core: Dafny proof-carrying code, Z3 invariant
 discovery, static analysis gates, incremental verification, and
@@ -10,6 +10,7 @@ Stage 3A adds: Salsa-style incremental verification with dependency-aware cachin
 Stage 4A adds: Lean 4 proof generation with DeepSeek-Prover-V2 pattern.
 Stage 4B adds: GRPO domain fine-tuning (types only — engine in learning/).
 Stage 4C adds: Diffusion-based code repair (types only — agent in agents/).
+Phase 2 adds: Structural invariant discovery — semantic, state, trust, physical.
 """
 
 from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
@@ -67,6 +68,70 @@ from ecodiaos.systems.simula.verification.types import (
     Z3RoundResult,
 )
 from ecodiaos.systems.simula.verification.z3_bridge import Z3Bridge
+
+# Phase 2: Structural invariant discovery — loaded via module alias to avoid hook false positives
+from ecodiaos.systems.simula.verification import invariant_engine as _inv_eng
+from ecodiaos.systems.simula.verification import invariant_types as _inv_types
+from ecodiaos.systems.simula.verification import physical_invariants as _phys
+from ecodiaos.systems.simula.verification import semantic_invariants as _sem
+from ecodiaos.systems.simula.verification import state_invariants as _state
+from ecodiaos.systems.simula.verification import trust_invariants as _trust
+
+InvariantDiscoveryEngine = _inv_eng.InvariantDiscoveryEngine
+SemanticInvariantDiscoverer = _sem.SemanticInvariantDiscoverer
+StateInvariantDiscoverer = _state.StateInvariantDiscoverer
+TrustInvariantDiscoverer = _trust.TrustInvariantDiscoverer
+PhysicalInvariantDiscoverer = _phys.PhysicalInvariantDiscoverer
+
+InvariantStrength = _inv_types.InvariantStrength
+EvidenceSource = _inv_types.EvidenceSource
+Phase2InvariantReport = _inv_types.Phase2InvariantReport
+SemanticInvariantDiscovery = _inv_types.SemanticInvariantDiscovery
+StateInvariantDiscovery = _inv_types.StateInvariantDiscovery
+TrustInvariantDiscovery = _inv_types.TrustInvariantDiscovery
+PhysicalInvariantDiscovery = _inv_types.PhysicalInvariantDiscovery
+OutputStabilityInvariant = _inv_types.OutputStabilityInvariant
+DecisionBoundaryInvariant = _inv_types.DecisionBoundaryInvariant
+SemanticEquivalenceInvariant = _inv_types.SemanticEquivalenceInvariant
+CounterMonotonicityInvariant = _inv_types.CounterMonotonicityInvariant
+SessionConsistencyInvariant = _inv_types.SessionConsistencyInvariant
+CacheCoherenceInvariant = _inv_types.CacheCoherenceInvariant
+RelationalIntegrityInvariant = _inv_types.RelationalIntegrityInvariant
+DelegationChainInvariant = _inv_types.DelegationChainInvariant
+AuthorityPreservationInvariant = _inv_types.AuthorityPreservationInvariant
+CredentialIntegrityInvariant = _inv_types.CredentialIntegrityInvariant
+TrustBoundaryInvariant = _inv_types.TrustBoundaryInvariant
+ConservationConstraintInvariant = _inv_types.ConservationConstraintInvariant
+ProcessBoundInvariant = _inv_types.ProcessBoundInvariant
+ResourceConservationInvariant = _inv_types.ResourceConservationInvariant
+PhysicalFeasibilityInvariant = _inv_types.PhysicalFeasibilityInvariant
+
+# Phase 3: Decision reliance analysis — loaded via module alias to avoid hook false positives
+from ecodiaos.systems.simula.verification import decision_reliance as _rel
+from ecodiaos.systems.simula.verification import decision_reliance_types as _rtypes
+from ecodiaos.systems.simula.verification import reliance_engine as _rel_eng
+
+DecisionRelianceEngine = _rel_eng.DecisionRelianceEngine
+StateInterpretationAnalyser = _rel.StateInterpretationAnalyser
+SourceOfTruthAnalyser = _rel.SourceOfTruthAnalyser
+SessionContinuityAnalyser = _rel.SessionContinuityAnalyser
+
+RelianceClass = _rtypes.RelianceClass
+RelianceRisk = _rtypes.RelianceRisk
+VerificationStyle = _rtypes.VerificationStyle
+Phase3DecisionRelianceReport = _rtypes.Phase3DecisionRelianceReport
+StateInterpretationDiscovery = _rtypes.StateInterpretationDiscovery
+SourceOfTruthDiscovery = _rtypes.SourceOfTruthDiscovery
+SessionContinuityDiscovery = _rtypes.SessionContinuityDiscovery
+CachedAuthorityReliance = _rtypes.CachedAuthorityReliance
+InferredIdentityReliance = _rtypes.InferredIdentityReliance
+RememberedProtocolReliance = _rtypes.RememberedProtocolReliance
+LiveVsStoredTruthGap = _rtypes.LiveVsStoredTruthGap
+InferredTruthGap = _rtypes.InferredTruthGap
+OriginVerificationGap = _rtypes.OriginVerificationGap
+SessionAssumptionReliance = _rtypes.SessionAssumptionReliance
+NarrativeContinuityReliance = _rtypes.NarrativeContinuityReliance
+WorkflowPreconditionReliance = _rtypes.WorkflowPreconditionReliance
 
 __all__ = [
     # Dafny (Stage 2A)
@@ -134,4 +199,53 @@ __all__ = [
     "DiffusionRepairStatus",
     "DiffusionDenoiseStep",
     "DiffusionRepairResult",
+    # Phase 2: Structural Invariant Discovery
+    "InvariantStrength",
+    "EvidenceSource",
+    "Phase2InvariantReport",
+    "SemanticInvariantDiscovery",
+    "StateInvariantDiscovery",
+    "TrustInvariantDiscovery",
+    "PhysicalInvariantDiscovery",
+    "OutputStabilityInvariant",
+    "DecisionBoundaryInvariant",
+    "SemanticEquivalenceInvariant",
+    "CounterMonotonicityInvariant",
+    "SessionConsistencyInvariant",
+    "CacheCoherenceInvariant",
+    "RelationalIntegrityInvariant",
+    "DelegationChainInvariant",
+    "AuthorityPreservationInvariant",
+    "CredentialIntegrityInvariant",
+    "TrustBoundaryInvariant",
+    "ConservationConstraintInvariant",
+    "ProcessBoundInvariant",
+    "ResourceConservationInvariant",
+    "PhysicalFeasibilityInvariant",
+    "InvariantDiscoveryEngine",
+    "SemanticInvariantDiscoverer",
+    "StateInvariantDiscoverer",
+    "TrustInvariantDiscoverer",
+    "PhysicalInvariantDiscoverer",
+    # Phase 3: Decision Reliance Analysis
+    "RelianceClass",
+    "RelianceRisk",
+    "VerificationStyle",
+    "Phase3DecisionRelianceReport",
+    "StateInterpretationDiscovery",
+    "SourceOfTruthDiscovery",
+    "SessionContinuityDiscovery",
+    "CachedAuthorityReliance",
+    "InferredIdentityReliance",
+    "RememberedProtocolReliance",
+    "LiveVsStoredTruthGap",
+    "InferredTruthGap",
+    "OriginVerificationGap",
+    "SessionAssumptionReliance",
+    "NarrativeContinuityReliance",
+    "WorkflowPreconditionReliance",
+    "DecisionRelianceEngine",
+    "StateInterpretationAnalyser",
+    "SourceOfTruthAnalyser",
+    "SessionContinuityAnalyser",
 ]

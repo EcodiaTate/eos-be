@@ -15,14 +15,10 @@ from pathlib import Path
 
 import structlog
 
-from ecodiaos.systems.simula.types import ConfigSnapshot, FileSnapshot
+from ecodiaos.systems.simula.errors import RollbackError
+from ecodiaos.systems.simula.evolution_types import ConfigSnapshot, FileSnapshot
 
 logger = structlog.get_logger().bind(system="simula.rollback")
-
-
-class RollbackError(RuntimeError):
-    """Raised when restoring files to their pre-change state fails."""
-    pass
 
 
 class RollbackManager:

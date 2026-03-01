@@ -11,20 +11,26 @@ from ecodiaos.systems.synapse.coherence import CoherenceMonitor
 from ecodiaos.systems.synapse.degradation import DegradationManager
 from ecodiaos.systems.synapse.event_bus import EventBus
 from ecodiaos.systems.synapse.health import HealthMonitor
+from ecodiaos.systems.synapse.metabolism import MetabolicTracker
 from ecodiaos.systems.synapse.resources import ResourceAllocator
-from ecodiaos.systems.synapse.rhythm import EmergentRhythmDetector
+from ecodiaos.systems.synapse.rhythm import DefaultRhythmStrategy, EmergentRhythmDetector
 from ecodiaos.systems.synapse.service import SynapseService
 from ecodiaos.systems.synapse.types import (
+    BaseResourceAllocator,
+    BaseRhythmStrategy,
     ClockState,
     CoherenceSnapshot,
     CycleResult,
     DegradationLevel,
     DegradationStrategy,
     ManagedSystemProtocol,
+    MetabolicSnapshot,
     ResourceAllocation,
     ResourceSnapshot,
     RhythmSnapshot,
     RhythmState,
+    SomaticCycleState,
+    SomaTickEvent,
     SynapseEvent,
     SynapseEventType,
     SystemBudget,
@@ -44,6 +50,11 @@ __all__ = [
     "HealthMonitor",
     "ResourceAllocator",
     "EmergentRhythmDetector",
+    "DefaultRhythmStrategy",
+    "MetabolicTracker",
+    # Strategy ABCs (NeuroplasticityBus targets)
+    "BaseResourceAllocator",
+    "BaseRhythmStrategy",
     # Types
     "ClockState",
     "CoherenceSnapshot",
@@ -51,10 +62,13 @@ __all__ = [
     "DegradationLevel",
     "DegradationStrategy",
     "ManagedSystemProtocol",
+    "MetabolicSnapshot",
     "ResourceAllocation",
     "ResourceSnapshot",
     "RhythmSnapshot",
     "RhythmState",
+    "SomaticCycleState",
+    "SomaTickEvent",
     "SynapseEvent",
     "SynapseEventType",
     "SystemBudget",

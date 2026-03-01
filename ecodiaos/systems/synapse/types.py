@@ -8,6 +8,7 @@ and cross-system coherence measurement.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from datetime import datetime
 import enum
 from typing import Any, Protocol
@@ -147,6 +148,58 @@ class ResourceSnapshot(EOSBaseModel):
 # ─── Clock ────────────────────────────────────────────────────────────
 
 
+class SomaticCycleState(EOSBaseModel):
+    """
+    Somatic snapshot carried on every theta tick.
+
+    Extracted from Soma's AllostaticSignal after step 0 runs. Downstream
+    consumers (Nova, Evo, coherence monitor) read this from CycleResult
+    rather than holding a direct Soma reference, keeping coupling minimal.
+
+    All fields default to neutral/quiescent values so the struct is safe
+    to construct when Soma is absent or degraded.
+    """
+
+    urgency: float = 0.0
+    """Scalar [0,1] allostatic urgency — how far from all setpoints."""
+
+    dominant_error: str = "energy"
+    """Name of the InteroceptiveDimension with the largest allostatic error."""
+
+    arousal_sensed: float = 0.4
+    """Raw sensed AROUSAL dimension [0,1] — used by clock for adaptive timing."""
+
+    energy_sensed: float = 0.6
+    """Raw sensed ENERGY dimension [0,1]."""
+
+    precision_weights: dict[str, float] = Field(default_factory=dict)
+    """Per-dimension precision weights from Soma. Empty dict = uniform."""
+
+    nearest_attractor: str | None = None
+    """Label of the nearest phase-space attractor, or None if transient."""
+
+    trajectory_heading: str = "transient"
+    """Phase-space heading: 'approaching', 'within', 'departing', 'transient'."""
+
+    soma_cycle_ms: float = 0.0
+    """How long Soma's own run_cycle() took (for overrun diagnostics)."""
+
+
+class SomaTickEvent(EOSBaseModel):
+    """
+    Event emitted by Synapse on the Redis event bus after every theta tick
+    where Soma ran. Carries the full somatic state for stateless consumers.
+
+    Channel: ``synapse.soma.tick``
+    Payload: this model serialised to JSON.
+    """
+
+    id: str = Field(default_factory=new_id)
+    cycle_number: int
+    somatic_state: SomaticCycleState
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
 class CycleResult(EOSBaseModel):
     """Result of a single theta rhythm tick."""
 
@@ -158,6 +211,8 @@ class CycleResult(EOSBaseModel):
     had_broadcast: bool = False
     arousal: float = 0.0
     salience_composite: float = 0.0
+    # Somatic state snapshot from Soma step 0 (None when Soma absent/degraded)
+    somatic: SomaticCycleState | None = None
     timestamp: datetime = Field(default_factory=utc_now)
 
 
@@ -226,6 +281,8 @@ class SynapseEventType(enum.StrEnum):
 
     # Cognitive cycle
     CYCLE_COMPLETED = "cycle_completed"
+    # Somatic tick — emitted every cycle where Soma ran successfully
+    SOMA_TICK = "soma_tick"
 
     # Rhythm (emergent)
     RHYTHM_STATE_CHANGED = "rhythm_state_changed"
@@ -236,6 +293,45 @@ class SynapseEventType(enum.StrEnum):
     # Resources
     RESOURCE_REBALANCED = "resource_rebalanced"
     RESOURCE_PRESSURE = "resource_pressure"
+
+    # Metabolic (financial burn rate)
+    METABOLIC_PRESSURE = "metabolic_pressure"
+
+    # Funding request — organism is broke and asking for capital
+    FUNDING_REQUEST_ISSUED = "funding_request_issued"
+
+    # Financial events (on-chain wallet activity + revenue injection)
+    # These bypass normal SalienceHead calculation and encode at salience=1.0.
+    # Biologically equivalent to trauma or a massive meal — must not decay easily.
+    WALLET_TRANSFER_CONFIRMED = "wallet_transfer_confirmed"
+    REVENUE_INJECTED = "revenue_injected"
+
+    # Mitosis lifecycle (Phase 16e: Speciation)
+    CHILD_SPAWNED = "child_spawned"
+    CHILD_HEALTH_REPORT = "child_health_report"
+    CHILD_STRUGGLING = "child_struggling"
+    CHILD_RESCUED = "child_rescued"
+    CHILD_INDEPENDENT = "child_independent"
+    CHILD_DIED = "child_died"
+    DIVIDEND_RECEIVED = "dividend_received"
+
+    # Economic immune system (Phase 16f)
+    TRANSACTION_SHIELDED = "transaction_shielded"
+    THREAT_DETECTED = "threat_detected"
+    PROTOCOL_ALERT = "protocol_alert"
+    EMERGENCY_WITHDRAWAL = "emergency_withdrawal"
+    THREAT_ADVISORY_RECEIVED = "threat_advisory_received"
+    THREAT_ADVISORY_SENT = "threat_advisory_sent"
+    ADDRESS_BLACKLISTED = "address_blacklisted"
+
+    # Certificate lifecycle (Phase 16g: Civilization Layer)
+    CERTIFICATE_EXPIRING = "certificate_expiring"
+    CERTIFICATE_EXPIRED = "certificate_expired"
+
+    # Economic morphogenesis (Phase 16l)
+    ORGAN_CREATED = "organ_created"
+    ORGAN_TRANSITION = "organ_transition"
+    ORGAN_RESOURCE_REBALANCED = "organ_resource_rebalanced"
 
 
 class SynapseEvent(EOSBaseModel):
@@ -312,6 +408,114 @@ class CoherenceSnapshot(EOSBaseModel):
     # Window size used for computation
     window_cycles: int = 0
     timestamp: datetime = Field(default_factory=utc_now)
+
+
+# ─── Metabolic (Financial Burn Rate) ─────────────────────────────────
+
+
+class MetabolicSnapshot(EOSBaseModel):
+    """
+    Point-in-time view of the organism's financial metabolism.
+
+    Tracks the real-world fiat cost of LLM API calls (the organism's
+    primary energy expenditure). The rolling_deficit accumulates between
+    revenue injections. Soma and Nova can read this to "feel" financial
+    starvation and modulate behaviour accordingly.
+    """
+
+    # Cumulative fiat cost (USD) since last revenue injection
+    rolling_deficit_usd: float = 0.0
+    # Cost incurred during the most recent reporting window
+    window_cost_usd: float = 0.0
+    # Per-system cost breakdown in the current window
+    per_system_cost_usd: dict[str, float] = Field(default_factory=dict)
+    # Burn rate in USD per second (EMA-smoothed)
+    burn_rate_usd_per_sec: float = 0.0
+    # Burn rate in USD per hour (derived)
+    burn_rate_usd_per_hour: float = 0.0
+    # Total tokens consumed (input + output) since last reset
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    # Number of LLM calls since last reset
+    total_calls: int = 0
+    # Estimated hours until a given fiat balance reaches zero
+    hours_until_depleted: float = Field(default=float("inf"))
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
+# ─── Strategy ABCs (NeuroplasticityBus targets) ──────────────────────
+
+
+class BaseResourceAllocator(ABC):
+    """
+    Strategy base class for Synapse resource allocation.
+
+    The NeuroplasticityBus uses this ABC as its registration target so that
+    evolved allocator subclasses can be hot-swapped into a live
+    SynapseService without restarting the process.
+
+    Subclasses MUST be zero-arg constructable (all state is rebuilt from
+    scratch on hot-swap — this is intentional, as evolved logic starts with
+    fresh observations).
+    """
+
+    @property
+    @abstractmethod
+    def allocator_name(self) -> str:
+        """Stable identifier for this allocator strategy."""
+        ...
+
+    @abstractmethod
+    def capture_snapshot(self) -> ResourceSnapshot:
+        """Capture current resource utilisation snapshot."""
+        ...
+
+    @abstractmethod
+    def record_system_load(self, system_id: str, cpu_util: float) -> None:
+        """Record observed CPU utilisation for a system."""
+        ...
+
+    @abstractmethod
+    def rebalance(self, cycle_period_ms: float) -> dict[str, ResourceAllocation]:
+        """Compute per-system resource allocations based on budgets and load."""
+        ...
+
+
+class BaseRhythmStrategy(ABC):
+    """
+    Strategy base class for emergent rhythm classification.
+
+    The NeuroplasticityBus uses this ABC as its registration target so that
+    evolved classification subclasses can be hot-swapped into a live
+    SynapseService without restarting the process.
+
+    Only the classification logic is abstracted — the rolling window
+    data collection, hysteresis, and event emission remain in the
+    EmergentRhythmDetector host.  This keeps the swap surgical: new
+    thresholds or detection algorithms without disrupting the data
+    pipeline.
+
+    Subclasses MUST be zero-arg constructable.
+    """
+
+    @property
+    @abstractmethod
+    def strategy_name(self) -> str:
+        """Stable identifier for this rhythm classification strategy."""
+        ...
+
+    @abstractmethod
+    def classify(self, metrics: dict[str, float]) -> RhythmState:
+        """
+        Classify the current cognitive rhythm from computed metrics.
+
+        Receives a dict with keys: broadcast_density, salience_mean,
+        salience_trend, period_mean, jitter_coefficient, rhythm_stability,
+        arousal_mean, coherence_stress_mean, burst_fraction, cycle_rate_hz.
+
+        Must return a RhythmState enum value.
+        """
+        ...
 
 
 # ─── Protocol ─────────────────────────────────────────────────────────

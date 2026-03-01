@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from ecodiaos.clients.llm import LLMProvider
-    from ecodiaos.systems.simula.types import ChangeCategory, EvolutionProposal
+    from ecodiaos.systems.simula.evolution_types import ChangeCategory, EvolutionProposal
     from ecodiaos.systems.simula.verification.dafny_bridge import DafnyBridge
 
 logger = structlog.get_logger().bind(system="simula.formal_specs.generator")

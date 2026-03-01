@@ -1,0 +1,47 @@
+# Simula Observer — Standalone Docker Compose
+#
+# Runs the eBPF network observer in host-view mode with full kernel visibility.
+#
+# Usage:
+#   docker compose -f docker-compose.observer.yml up --build
+#
+# Quick validation (bpftrace):
+#   OBSERVER_MODE=bpftrace docker compose -f docker-compose.observer.yml up --build
+#
+# Health check:
+#   curl http://127.0.0.1:9472/health
+
+services:
+  simula-observer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: simula-observer
+    privileged: true
+    pid: host
+    network_mode: host
+    cap_add:
+      - SYS_ADMIN
+      - BPF
+      - PERFMON
+      - NET_ADMIN
+    volumes:
+      # kprobe/tracepoint registration
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      # BPF virtual filesystem (pinned maps, programs)
+      - /sys/fs/bpf:/sys/fs/bpf:ro
+      # Modern tracefs mount point (kernels >= 5.x)
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      # PID-to-container resolution (optional, for future use)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      OBSERVER_MODE: ${OBSERVER_MODE:-bcc}
+      OBSERVER_PORT: ${OBSERVER_PORT:-9472}
+      OBSERVER_PROBES: ${OBSERVER_PROBES:-tcp_sendmsg,tcp_recvmsg,security_socket_connect,sys_exit_read}
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9472/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s

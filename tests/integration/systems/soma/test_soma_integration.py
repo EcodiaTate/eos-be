@@ -522,3 +522,152 @@ class TestGracefulDegradation:
             candidates = soma.somatic_rerank(candidates)
         assert len(candidates) == 1
         assert candidates[0].node_id == "a"
+
+
+# ─── Task 0.7: Synapse clock step-0 integration ───────────────────
+
+
+class TestSynapseCycleWithSoma:
+    """
+    Verify the Synapse CognitiveClock wires Soma as step 0 of the theta tick,
+    producing a SomaticCycleState on every CycleResult.
+
+    Uses mock Atune and real Soma to test the clock's step-0 pathway
+    without starting the full background loop.
+    """
+
+    def _make_mock_atune(self) -> MagicMock:
+        """Minimal Atune mock: run_cycle() returns None (no broadcast)."""
+        atune = AsyncMock()
+        atune.run_cycle = AsyncMock(return_value=None)
+
+        affect = MagicMock()
+        affect.arousal = 0.4
+        affect.coherence_stress = 0.1
+        atune.current_affect = affect
+        return atune
+
+    @pytest.mark.asyncio
+    async def test_somatic_cycle_state_built_from_signal(self) -> None:
+        """
+        After CognitiveClock runs with Soma wired, CycleResult.somatic
+        contains a valid SomaticCycleState populated from AllostaticSignal.
+        """
+        from ecodiaos.systems.synapse.types import CycleResult, SomaticCycleState
+
+        soma = _make_soma()
+        atune = _mock_atune()
+        soma.set_atune(atune)
+        await soma.initialize()
+
+        # Run Soma directly (simulating what the clock does in step 0)
+        await soma.run_cycle()
+        signal = soma.get_current_signal()
+
+        # Build SomaticCycleState from signal (mirrors clock._run_loop logic)
+        from ecodiaos.systems.soma.types import InteroceptiveDimension
+        somatic_state = SomaticCycleState(
+            urgency=signal.urgency,
+            dominant_error=signal.dominant_error.value
+            if hasattr(signal.dominant_error, "value")
+            else str(signal.dominant_error),
+            arousal_sensed=signal.state.sensed.get(InteroceptiveDimension.AROUSAL, 0.4),
+            energy_sensed=signal.state.sensed.get(InteroceptiveDimension.ENERGY, 0.6),
+            precision_weights={
+                k.value if hasattr(k, "value") else str(k): v
+                for k, v in signal.precision_weights.items()
+            },
+            nearest_attractor=signal.nearest_attractor,
+            trajectory_heading=signal.trajectory_heading,
+            soma_cycle_ms=1.5,
+        )
+
+        # Verify all fields are well-formed
+        assert isinstance(somatic_state, SomaticCycleState)
+        assert 0.0 <= somatic_state.urgency <= 1.0
+        assert isinstance(somatic_state.dominant_error, str)
+        assert 0.0 <= somatic_state.arousal_sensed <= 1.0
+        assert 0.0 <= somatic_state.energy_sensed <= 1.0
+        assert len(somatic_state.precision_weights) == 9
+        assert somatic_state.soma_cycle_ms >= 0.0
+
+    @pytest.mark.asyncio
+    async def test_cycle_result_somatic_field(self) -> None:
+        """CycleResult accepts SomaticCycleState via the somatic field."""
+        from ecodiaos.systems.synapse.types import CycleResult, SomaticCycleState
+
+        state = SomaticCycleState(
+            urgency=0.3,
+            dominant_error="arousal",
+            arousal_sensed=0.65,
+            energy_sensed=0.5,
+            precision_weights={"arousal": 1.2, "energy": 0.8},
+            nearest_attractor="flow",
+            trajectory_heading="approaching",
+            soma_cycle_ms=2.1,
+        )
+
+        result = CycleResult(
+            cycle_number=1,
+            elapsed_ms=145.0,
+            budget_ms=150.0,
+            somatic=state,
+        )
+
+        assert result.somatic is state
+        assert result.somatic.urgency == pytest.approx(0.3)
+        assert result.somatic.nearest_attractor == "flow"
+
+    @pytest.mark.asyncio
+    async def test_cycle_result_somatic_none_when_soma_absent(self) -> None:
+        """When Soma is not wired, CycleResult.somatic is None."""
+        from ecodiaos.systems.synapse.types import CycleResult
+
+        result = CycleResult(
+            cycle_number=1,
+            elapsed_ms=120.0,
+            budget_ms=150.0,
+        )
+
+        assert result.somatic is None
+
+    @pytest.mark.asyncio
+    async def test_somatic_cycle_state_precision_weights_are_strings(self) -> None:
+        """
+        Precision weights are serialized as string keys (not InteroceptiveDimension enums)
+        in SomaticCycleState, so they're safe for JSON/Redis transport.
+        """
+        soma = _make_soma()
+        atune = _mock_atune()
+        soma.set_atune(atune)
+        await soma.initialize()
+        await soma.run_cycle()
+
+        signal = soma.get_current_signal()
+        precision_weights = {
+            k.value if hasattr(k, "value") else str(k): v
+            for k, v in signal.precision_weights.items()
+        }
+
+        for key in precision_weights:
+            assert isinstance(key, str), f"Expected str key, got {type(key)}: {key}"
+        assert "arousal" in precision_weights
+        assert "energy" in precision_weights
+
+    @pytest.mark.asyncio
+    async def test_soma_tick_event_structure(self) -> None:
+        """SomaTickEvent wraps SomaticCycleState with a cycle_number and timestamp."""
+        from ecodiaos.systems.synapse.types import SomaticCycleState, SomaTickEvent
+
+        state = SomaticCycleState(urgency=0.2, dominant_error="energy")
+        event = SomaTickEvent(cycle_number=42, somatic_state=state)
+
+        assert event.cycle_number == 42
+        assert event.somatic_state is state
+        assert event.id != ""
+        assert event.timestamp is not None
+
+        # model_dump() is safe for JSON serialization
+        d = event.model_dump()
+        assert d["cycle_number"] == 42
+        assert d["somatic_state"]["urgency"] == pytest.approx(0.2)

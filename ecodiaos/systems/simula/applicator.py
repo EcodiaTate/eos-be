@@ -24,7 +24,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 import yaml
 
-from ecodiaos.systems.simula.types import (
+from ecodiaos.systems.simula.errors import ApplicationError
+from ecodiaos.systems.simula.evolution_types import (
     ChangeCategory,
     CodeChangeResult,
     ConfigSnapshot,
@@ -42,10 +43,6 @@ if TYPE_CHECKING:
     from ecodiaos.systems.simula.verification.static_analysis import StaticAnalysisBridge
 
 logger = structlog.get_logger()
-
-
-class ApplicationError(RuntimeError):
-    """Raised when a change application fails unrecoverably."""
 
 
 class ChangeApplicator:

@@ -533,6 +533,153 @@ class TestSystemIdentity:
         assert callable(nova.receive_broadcast)
 
 
+# ─── Somatic Threshold Modulation (Stage 0, Task 0.4/0.7) ────────
+
+
+class TestNovaSomaticThresholds:
+    """
+    Verify that Soma's allostatic state modulates EFE deliberation thresholds.
+
+    Tests the update_somatic_thresholds() pathway from Nova service.receive_broadcast()
+    through to DeliberationEngine. This is the Stage 0 Task 0.4 integration.
+    """
+
+    @pytest.mark.asyncio
+    async def test_update_somatic_thresholds_low_urgency_low_arousal(self) -> None:
+        """Below-threshold urgency and arousal → no deltas applied."""
+        nova = make_nova_service()
+        await nova.initialize()
+
+        engine = nova._deliberation_engine
+        engine.update_somatic_thresholds(urgency=0.1, arousal=0.3)
+
+        # Below urgency threshold (0.3) and below arousal threshold (0.6) → no change
+        assert engine._novelty_threshold_delta == pytest.approx(0.0)
+        assert engine._precision_threshold_delta == pytest.approx(0.0)
+        assert engine._do_nothing_efe_override is None
+
+    @pytest.mark.asyncio
+    async def test_update_somatic_thresholds_high_arousal(self) -> None:
+        """High arousal lowers precision threshold (more sensitive to broadcasts)."""
+        nova = make_nova_service()
+        await nova.initialize()
+
+        engine = nova._deliberation_engine
+        engine.update_somatic_thresholds(urgency=0.0, arousal=0.8)
+
+        # arousal=0.8 → delta = -min(0.15, (0.8 - 0.6) * 0.375) = -min(0.15, 0.075) = -0.075
+        assert engine._precision_threshold_delta == pytest.approx(-0.075, abs=1e-6)
+        assert engine._novelty_threshold_delta == pytest.approx(0.0)
+        assert engine._do_nothing_efe_override is None
+
+    @pytest.mark.asyncio
+    async def test_update_somatic_thresholds_max_arousal(self) -> None:
+        """Maximum arousal caps precision delta at -0.15."""
+        nova = make_nova_service()
+        await nova.initialize()
+
+        engine = nova._deliberation_engine
+        engine.update_somatic_thresholds(urgency=0.0, arousal=1.0)
+
+        assert engine._precision_threshold_delta == pytest.approx(-0.15, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_update_somatic_thresholds_high_urgency(self) -> None:
+        """High urgency lowers novelty threshold and raises do-nothing EFE baseline."""
+        nova = make_nova_service()
+        await nova.initialize()
+
+        engine = nova._deliberation_engine
+        engine.update_somatic_thresholds(urgency=1.0, arousal=0.0)
+
+        # urgency=1.0 → urgency_excess = (1.0 - 0.3) / 0.7 = 1.0
+        # novelty_delta = -min(0.20, 1.0 * 0.20) = -0.20
+        assert engine._novelty_threshold_delta == pytest.approx(-0.20, abs=1e-6)
+        # do_nothing_override = -0.10 + min(0.15, 1.0 * 0.15) = -0.10 + 0.15 = +0.05
+        assert engine._do_nothing_efe_override == pytest.approx(0.05, abs=1e-4)
+
+    @pytest.mark.asyncio
+    async def test_update_somatic_thresholds_moderate_urgency(self) -> None:
+        """Moderate urgency (0.65) produces intermediate deltas."""
+        nova = make_nova_service()
+        await nova.initialize()
+
+        engine = nova._deliberation_engine
+        engine.update_somatic_thresholds(urgency=0.65, arousal=0.0)
+
+        # urgency_excess = (0.65 - 0.3) / 0.7 = 0.5
+        # novelty_delta = -min(0.20, 0.5 * 0.20) = -0.10
+        assert engine._novelty_threshold_delta == pytest.approx(-0.10, abs=1e-6)
+        assert engine._do_nothing_efe_override is not None
+        assert engine._do_nothing_efe_override < 0.0  # Still negative (inaction harder but not positive)
+
+    @pytest.mark.asyncio
+    async def test_update_somatic_thresholds_resets_on_recovery(self) -> None:
+        """After stress, returning to low urgency/arousal resets deltas to zero."""
+        nova = make_nova_service()
+        await nova.initialize()
+
+        engine = nova._deliberation_engine
+
+        # Stress state
+        engine.update_somatic_thresholds(urgency=1.0, arousal=1.0)
+        assert engine._novelty_threshold_delta < 0.0
+        assert engine._precision_threshold_delta < 0.0
+        assert engine._do_nothing_efe_override is not None
+
+        # Recovery
+        engine.update_somatic_thresholds(urgency=0.0, arousal=0.2)
+        assert engine._novelty_threshold_delta == pytest.approx(0.0)
+        assert engine._precision_threshold_delta == pytest.approx(0.0)
+        assert engine._do_nothing_efe_override is None
+
+    @pytest.mark.asyncio
+    async def test_receive_broadcast_with_mocked_soma_calls_thresholds(self) -> None:
+        """
+        NovaService.receive_broadcast() reads Soma signal and calls
+        update_somatic_thresholds() on the deliberation engine.
+        """
+        nova = make_nova_service()
+        await nova.initialize()
+
+        # Build a Soma mock whose get_current_signal() returns an AllostaticSignal-like object
+        from ecodiaos.systems.soma.types import (
+            ALL_DIMENSIONS,
+            InteroceptiveDimension,
+            InteroceptiveState,
+        )
+
+        sensed = {d: 0.5 for d in ALL_DIMENSIONS}
+        sensed[InteroceptiveDimension.AROUSAL] = 0.85  # High arousal
+
+        mock_state = MagicMock()
+        mock_state.sensed = sensed
+
+        mock_signal = MagicMock()
+        mock_signal.urgency = 0.6
+        mock_signal.state = mock_state
+        mock_signal.dominant_error = InteroceptiveDimension.AROUSAL
+        mock_signal.precision_weights = {d: 1.0 for d in ALL_DIMENSIONS}
+        mock_signal.nearest_attractor = None
+        mock_signal.trajectory_heading = "transient"
+
+        soma_mock = MagicMock()
+        soma_mock.get_current_signal.return_value = mock_signal
+        soma_mock.urgency_threshold = 0.5
+
+        nova.set_soma(soma_mock)
+
+        engine = nova._deliberation_engine
+        initial_precision_delta = engine._precision_threshold_delta
+
+        broadcast = make_broadcast("Test with somatic state", precision=0.7)
+        await nova.receive_broadcast(broadcast)
+
+        # High arousal (0.85) should have lowered precision threshold
+        assert engine._precision_threshold_delta < initial_precision_delta
+        assert engine._precision_threshold_delta < 0.0
+
+
 # ─── Multi-Broadcast Scenarios ────────────────────────────────────
 
 

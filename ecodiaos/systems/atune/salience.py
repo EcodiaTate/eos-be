@@ -411,6 +411,35 @@ class KeywordHead(SalienceHead):
         return clamp(composite, 0.0, 1.0)
 
 
+class EconomicSalienceHead(SalienceHead):
+    """
+    Detects financial and economic concepts in the environment.
+    Neuroscience analog: economic decision-making circuits.
+    """
+
+    name = "economic"
+    base_weight = 0.10
+    precision_sensitivity: dict[str, float] = {"dominance": 0.2}  # Slightly modulated by goal-directedness
+
+    FINANCIAL_KEYWORDS = {
+        "money", "finance", "investment", "stock", "market", "currency", "trade",
+        "profit", "loss", "revenue", "expense", "budget", "capital", "asset",
+        "debt", "credit", "bank", "transaction", "economic", "financial",
+        "price", "cost", "wealth", "income", "salary", "earnings", "fund",
+        "portfolio", "bond", "equity", "cash", "margin", "return", "dividend"
+    }
+
+    async def score(self, percept: Percept, context: AttentionContext) -> float:
+        text = self._text(percept)
+        text_lower = text.lower()
+
+        # Check for financial keywords
+        keyword_matches = any(keyword in text_lower for keyword in self.FINANCIAL_KEYWORDS)
+
+        # Return high score if financial keywords are present
+        return 0.8 if keyword_matches else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Head registry
 # ---------------------------------------------------------------------------
@@ -423,6 +452,7 @@ ALL_HEADS: list[SalienceHead] = [
     EmotionalHead(),
     CausalHead(),
     KeywordHead(),
+    EconomicSalienceHead(),
 ]
 
 

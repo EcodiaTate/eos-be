@@ -52,7 +52,7 @@ from ecodiaos.systems.simula.verification.types import (
 if TYPE_CHECKING:
     from ecodiaos.clients.llm import LLMProvider
     from ecodiaos.clients.neo4j import Neo4jClient
-    from ecodiaos.systems.simula.types import EvolutionProposal
+    from ecodiaos.systems.simula.evolution_types import EvolutionProposal
 
 logger = structlog.get_logger().bind(system="simula.agents.repair")
 

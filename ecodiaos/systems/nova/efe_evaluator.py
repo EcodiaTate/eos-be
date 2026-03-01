@@ -26,6 +26,7 @@ Feasibility and risk are computed heuristically (fast, no LLM needed).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import TYPE_CHECKING
@@ -229,8 +230,6 @@ class EFEEvaluator:
         Evaluate EFE for all candidate policies.
         Results are sorted by EFE (lowest = most preferred).
         """
-        import asyncio
-
         # Evaluate all policies in parallel (within the 5000ms budget)
         tasks = [
             self.evaluate(policy, goal, beliefs, affect, drive_weights)
@@ -276,14 +275,17 @@ class EFEEvaluator:
             beliefs_summary=summarise_beliefs(beliefs, max_entities=3),
         )
         try:
-            # Use cache-tagged evaluate if optimized provider is available
-            if self._optimized:
-                response = await self._llm.evaluate(  # type: ignore[call-arg]
-                    prompt, max_tokens=200, temperature=0.2,
-                    cache_system="nova.efe.pragmatic", cache_method="evaluate",
-                )
-            else:
-                response = await self._llm.evaluate(prompt, max_tokens=200, temperature=0.2)
+            # Per-call timeout prevents a single hung LLM request from
+            # blocking the entire EFE evaluation via asyncio.gather.
+            async with asyncio.timeout(_EVAL_TIMEOUT_MS / 1000.0):
+                # Use cache-tagged evaluate if optimized provider is available
+                if self._optimized:
+                    response = await self._llm.evaluate(  # type: ignore[call-arg]
+                        prompt, max_tokens=200, temperature=0.2,
+                        cache_system="nova.efe.pragmatic", cache_method="evaluate",
+                    )
+                else:
+                    response = await self._llm.evaluate(prompt, max_tokens=200, temperature=0.2)
 
             # Use output validator for robust JSON extraction
             data = self._validator.extract_json(response.text)
@@ -299,6 +301,8 @@ class EFEEvaluator:
                     confidence=float(data.get("confidence", 0.5)),
                     reasoning=str(data.get("reasoning", ""))[:200],
                 )
+        except TimeoutError:
+            self._logger.debug("pragmatic_llm_timeout", policy=policy.name)
         except Exception:
             pass
         return _estimate_pragmatic_heuristic(policy, goal)
@@ -318,14 +322,15 @@ class EFEEvaluator:
             known_uncertainties=known_uncertainties,
         )
         try:
-            # Use cache-tagged evaluate if optimized provider is available
-            if self._optimized:
-                response = await self._llm.evaluate(  # type: ignore[call-arg]
-                    prompt, max_tokens=150, temperature=0.2,
-                    cache_system="nova.efe.epistemic", cache_method="evaluate",
-                )
-            else:
-                response = await self._llm.evaluate(prompt, max_tokens=150, temperature=0.2)
+            async with asyncio.timeout(_EVAL_TIMEOUT_MS / 1000.0):
+                # Use cache-tagged evaluate if optimized provider is available
+                if self._optimized:
+                    response = await self._llm.evaluate(  # type: ignore[call-arg]
+                        prompt, max_tokens=150, temperature=0.2,
+                        cache_system="nova.efe.epistemic", cache_method="evaluate",
+                    )
+                else:
+                    response = await self._llm.evaluate(prompt, max_tokens=150, temperature=0.2)
 
             # Use output validator for robust JSON extraction
             data = self._validator.extract_json(response.text)
@@ -341,6 +346,8 @@ class EFEEvaluator:
                     expected_info_gain=float(data.get("info_gain", 0.3)),
                     novelty=float(data.get("novelty", 0.2)),
                 )
+        except TimeoutError:
+            self._logger.debug("epistemic_llm_timeout", policy=policy.name)
         except Exception:
             pass
         return _estimate_epistemic_heuristic(policy, beliefs)

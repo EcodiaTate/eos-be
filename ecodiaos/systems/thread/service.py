@@ -33,6 +33,12 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ecodiaos.primitives.common import utc_now
+from ecodiaos.systems.thread.chapter_detector import ChapterDetector
+from ecodiaos.systems.thread.narrative_synthesizer import NarrativeSynthesizer
+from ecodiaos.systems.thread.processors import (
+    BaseChapterDetector,
+    BaseNarrativeSynthesizer,
+)
 from ecodiaos.systems.thread.types import (
     FINGERPRINT_DIMS,
     ChapterStatus,
@@ -43,11 +49,14 @@ from ecodiaos.systems.thread.types import (
     IdentitySchema,
     LifeStorySnapshot,
     NarrativeChapter,
+    NarrativeSurpriseAccumulator,
     SchemaConflict,
     SchemaStatus,
+    ThreadConfig,
 )
 
 if TYPE_CHECKING:
+    from ecodiaos.core.hotreload import NeuroplasticityBus
     from ecodiaos.systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
@@ -124,9 +133,11 @@ class ThreadService:
         self,
         memory: MemoryService | None = None,
         instance_name: str = "EOS",
+        neuroplasticity_bus: NeuroplasticityBus | None = None,
     ) -> None:
         self._memory = memory
         self._instance_name = instance_name
+        self._bus = neuroplasticity_bus
         self._initialized: bool = False
         self._logger = logger.bind(system="thread")
 
@@ -136,6 +147,14 @@ class ThreadService:
         self._atune: Any = None
         self._evo: Any = None
         self._nova: Any = None
+
+        # Hot-reloadable processors — defaults created here, bus can swap them
+        self._narrative_synthesizer: BaseNarrativeSynthesizer | None = None
+        self._chapter_detector: BaseChapterDetector = ChapterDetector()
+
+        # Owned state that survives processor hot-swaps
+        self._thread_config = ThreadConfig()
+        self._surprise_accumulator = NarrativeSurpriseAccumulator()
 
         # Identity state
         self._commitments: list[Commitment] = []
@@ -181,6 +200,20 @@ class ThreadService:
             ))
             self._logger.info("first_chapter_opened", title="Awakening")
 
+        # Register hot-reloadable processors with NeuroplasticityBus
+        if self._bus is not None:
+            self._bus.register(
+                base_class=BaseNarrativeSynthesizer,
+                registration_callback=self._on_narrative_synthesizer_evolved,
+                system_id="thread",
+                instance_factory=self._build_narrative_synthesizer,
+            )
+            self._bus.register(
+                base_class=BaseChapterDetector,
+                registration_callback=self._on_chapter_detector_evolved,
+                system_id="thread",
+            )
+
         self._initialized = True
         self._logger.info(
             "thread_initialized",
@@ -213,7 +246,10 @@ class ThreadService:
             )
 
     async def shutdown(self) -> None:
-        """Persist current state to the Memory graph."""
+        """Persist current state and deregister from NeuroplasticityBus."""
+        if self._bus is not None:
+            self._bus.deregister(BaseNarrativeSynthesizer)
+            self._bus.deregister(BaseChapterDetector)
         await self._persist_state_to_graph()
         self._logger.info(
             "thread_shutdown",
@@ -839,6 +875,65 @@ class ThreadService:
             "schemas_formed": self._schemas_formed,
             "conflicts_detected": self._conflicts_detected,
         }
+
+    # ─── Hot-reload callbacks ─────────────────────────────────────────────────
+
+    def _build_narrative_synthesizer(
+        self, cls: type[BaseNarrativeSynthesizer],
+    ) -> BaseNarrativeSynthesizer:
+        """
+        Instance factory for NeuroplasticityBus.
+
+        Evolved NarrativeSynthesizer subclasses may need an LLM and config.
+        Try the full constructor first, fall back to zero-arg.
+        """
+        try:
+            # The default NarrativeSynthesizer requires (llm, config, organism_name)
+            if self._narrative_synthesizer is not None and isinstance(
+                self._narrative_synthesizer, NarrativeSynthesizer
+            ):
+                return cls(
+                    llm=self._narrative_synthesizer._llm,  # type: ignore[attr-defined]
+                    config=self._thread_config,
+                    organism_name=self._instance_name,
+                )
+        except TypeError:
+            pass
+        # Evolved subclass may use a zero-arg constructor
+        return cls()  # type: ignore[call-arg]
+
+    def _on_narrative_synthesizer_evolved(
+        self, synthesizer: BaseNarrativeSynthesizer,
+    ) -> None:
+        """
+        Registration callback for NeuroplasticityBus.
+
+        Atomically swaps the active NarrativeSynthesizer. No state to
+        transfer — the synthesizer is stateless (all narrative context
+        is passed per-call).
+        """
+        self._narrative_synthesizer = synthesizer
+        self._logger.info(
+            "narrative_synthesizer_hot_reloaded",
+            synthesizer=type(synthesizer).__name__,
+        )
+
+    def _on_chapter_detector_evolved(
+        self, detector: BaseChapterDetector,
+    ) -> None:
+        """
+        Registration callback for NeuroplasticityBus.
+
+        Atomically swaps the active ChapterDetector. The
+        NarrativeSurpriseAccumulator is owned by ThreadService and passed
+        into the detector on each call, so the swap never loses the
+        organism's running chapter statistics.
+        """
+        self._chapter_detector = detector
+        self._logger.info(
+            "chapter_detector_hot_reloaded",
+            detector=type(detector).__name__,
+        )
 
     # ─── Internal Helpers ────────────────────────────────────────────────────
 

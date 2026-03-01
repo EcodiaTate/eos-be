@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ecodiaos.systems.synapse.types import (
+    BaseRhythmStrategy,
     CycleResult,
     RhythmSnapshot,
     RhythmState,
@@ -67,6 +68,75 @@ _IDLE_DENSITY_THRESHOLD: float = 0.05  # Almost no broadcasts
 _IDLE_SALIENCE_THRESHOLD: float = 0.1
 
 
+class DefaultRhythmStrategy(BaseRhythmStrategy):
+    """
+    Default rhythm classification strategy using fixed thresholds.
+
+    Detects six emergent cognitive states via priority-ordered rules.
+    This is the concrete strategy that ships with Synapse — Simula can
+    evolve subclasses of BaseRhythmStrategy with different thresholds
+    or entirely new detection algorithms.
+    """
+
+    @property
+    def strategy_name(self) -> str:
+        return "default"
+
+    def classify(self, metrics: dict[str, float]) -> RhythmState:
+        """
+        Classify the current cognitive rhythm from computed metrics.
+
+        Priority order (highest to lowest):
+        1. STRESS — erratic timing + high coherence stress (danger signal)
+        2. FLOW — high density + stable + high salience (peak performance)
+        3. DEEP_PROCESSING — slow + periodic bursts (concentrated thought)
+        4. BOREDOM — declining salience + low density (understimulation)
+        5. IDLE — almost no broadcasts (dormant)
+        6. NORMAL — everything else
+        """
+        density = metrics["broadcast_density"]
+        stability = metrics["rhythm_stability"]
+        jitter_cv = metrics["jitter_coefficient"]
+        salience_mean = metrics["salience_mean"]
+        salience_slope = metrics["salience_trend"]
+        period_mean = metrics["period_mean"]
+        coherence_stress = metrics["coherence_stress_mean"]
+        burst_fraction = metrics["burst_fraction"]
+
+        # 1. STRESS: erratic timing + high coherence stress
+        if jitter_cv > _STRESS_JITTER_THRESHOLD and coherence_stress > _STRESS_COHERENCE_THRESHOLD:
+            return RhythmState.STRESS
+
+        # 2. FLOW: high broadcast density + stable rhythm + high salience
+        if (
+            density > _FLOW_DENSITY_THRESHOLD
+            and stability > _FLOW_STABILITY_THRESHOLD
+            and salience_mean > _FLOW_SALIENCE_THRESHOLD
+        ):
+            return RhythmState.FLOW
+
+        # 3. DEEP_PROCESSING: slow rhythm + periodic high-salience bursts
+        if (
+            period_mean > _DEEP_PERIOD_THRESHOLD_MS
+            and burst_fraction > _DEEP_BURST_MIN_FRACTION
+        ):
+            return RhythmState.DEEP_PROCESSING
+
+        # 4. BOREDOM: declining salience + low density
+        if (
+            salience_slope < _BOREDOM_SALIENCE_SLOPE_THRESHOLD
+            and density < _BOREDOM_DENSITY_THRESHOLD
+        ):
+            return RhythmState.BOREDOM
+
+        # 5. IDLE: almost no broadcasts + low salience
+        if density < _IDLE_DENSITY_THRESHOLD and salience_mean < _IDLE_SALIENCE_THRESHOLD:
+            return RhythmState.IDLE
+
+        # 6. NORMAL: default state
+        return RhythmState.NORMAL
+
+
 class EmergentRhythmDetector:
     """
     Detects meta-cognitive states from raw cycle telemetry.
@@ -78,11 +148,16 @@ class EmergentRhythmDetector:
     State transitions have hysteresis — a candidate state must persist
     for _HYSTERESIS_CYCLES ticks before being adopted, preventing
     oscillation.
+
+    Classification is delegated to a BaseRhythmStrategy instance that
+    can be hot-swapped by the NeuroplasticityBus without disrupting
+    the rolling window or hysteresis state.
     """
 
     def __init__(self, event_bus: EventBus | None = None) -> None:
         self._event_bus = event_bus
         self._logger = logger.bind(component="rhythm_detector")
+        self._strategy: BaseRhythmStrategy = DefaultRhythmStrategy()
 
         # Current state
         self._state: RhythmState = RhythmState.IDLE
@@ -152,61 +227,28 @@ class EmergentRhythmDetector:
 
         return self._build_snapshot(metrics)
 
+    # ─── Strategy hot-swap ───────────────────────────────────────────
+
+    def set_strategy(self, strategy: BaseRhythmStrategy) -> None:
+        """
+        Hot-swap the classification strategy.
+
+        Rolling window data and hysteresis state are preserved — only
+        the classification algorithm changes.  Safe to call mid-cycle.
+        """
+        old_name = self._strategy.strategy_name
+        self._strategy = strategy
+        self._logger.info(
+            "rhythm_strategy_swapped",
+            old=old_name,
+            new=strategy.strategy_name,
+        )
+
     # ─── Classification ──────────────────────────────────────────────
 
     def _classify(self, metrics: dict[str, float]) -> RhythmState:
-        """
-        Classify the current cognitive rhythm from computed metrics.
-
-        Priority order (highest to lowest):
-        1. STRESS — erratic timing + high coherence stress (danger signal)
-        2. FLOW — high density + stable + high salience (peak performance)
-        3. DEEP_PROCESSING — slow + periodic bursts (concentrated thought)
-        4. BOREDOM — declining salience + low density (understimulation)
-        5. IDLE — almost no broadcasts (dormant)
-        6. NORMAL — everything else
-        """
-        density = metrics["broadcast_density"]
-        stability = metrics["rhythm_stability"]
-        jitter_cv = metrics["jitter_coefficient"]
-        salience_mean = metrics["salience_mean"]
-        salience_slope = metrics["salience_trend"]
-        period_mean = metrics["period_mean"]
-        coherence_stress = metrics["coherence_stress_mean"]
-        burst_fraction = metrics["burst_fraction"]
-
-        # 1. STRESS: erratic timing + high coherence stress
-        if jitter_cv > _STRESS_JITTER_THRESHOLD and coherence_stress > _STRESS_COHERENCE_THRESHOLD:
-            return RhythmState.STRESS
-
-        # 2. FLOW: high broadcast density + stable rhythm + high salience
-        if (
-            density > _FLOW_DENSITY_THRESHOLD
-            and stability > _FLOW_STABILITY_THRESHOLD
-            and salience_mean > _FLOW_SALIENCE_THRESHOLD
-        ):
-            return RhythmState.FLOW
-
-        # 3. DEEP_PROCESSING: slow rhythm + periodic high-salience bursts
-        if (
-            period_mean > _DEEP_PERIOD_THRESHOLD_MS
-            and burst_fraction > _DEEP_BURST_MIN_FRACTION
-        ):
-            return RhythmState.DEEP_PROCESSING
-
-        # 4. BOREDOM: declining salience + low density
-        if (
-            salience_slope < _BOREDOM_SALIENCE_SLOPE_THRESHOLD
-            and density < _BOREDOM_DENSITY_THRESHOLD
-        ):
-            return RhythmState.BOREDOM
-
-        # 5. IDLE: almost no broadcasts + low salience
-        if density < _IDLE_DENSITY_THRESHOLD and salience_mean < _IDLE_SALIENCE_THRESHOLD:
-            return RhythmState.IDLE
-
-        # 6. NORMAL: default state
-        return RhythmState.NORMAL
+        """Delegate to the pluggable strategy."""
+        return self._strategy.classify(metrics)
 
     # ─── Metrics Computation ─────────────────────────────────────────
 

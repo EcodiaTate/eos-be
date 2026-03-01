@@ -20,8 +20,17 @@ import structlog
 from ecodiaos.primitives.common import new_id, utc_now
 from ecodiaos.systems.oneiros.circadian import CircadianClock, SleepStageController
 from ecodiaos.systems.oneiros.journal import DreamInsightTracker, DreamJournal
-from ecodiaos.systems.oneiros.lucid import DirectedExploration, MetaCognition
+from ecodiaos.systems.oneiros.lucid import (
+    BaseDirectedExploration,
+    BaseMetaCognition,
+    DirectedExploration,
+    MetaCognition,
+)
 from ecodiaos.systems.oneiros.nrem import (
+    BaseBeliefCompressor,
+    BaseEpisodicReplay,
+    BaseHypothesisPruner,
+    BaseSynapticDownscaler,
     BeliefCompressor,
     EpisodicReplay,
     HypothesisPruner,
@@ -29,10 +38,15 @@ from ecodiaos.systems.oneiros.nrem import (
 )
 from ecodiaos.systems.oneiros.rem import (
     AffectProcessor,
+    BaseAffectProcessor,
+    BaseDreamGenerator,
+    BaseEthicalDigestion,
+    BaseThreatSimulator,
     DreamGenerator,
     EthicalDigestion,
     ThreatSimulator,
 )
+from ecodiaos.systems.oneiros.workers_base import BaseOneirosWorker
 from ecodiaos.systems.oneiros.types import (
     LucidResult,
     NREMConsolidationResult,
@@ -83,6 +97,7 @@ class OneirosService:
         llm: Any = None,
         embed_fn: Any = None,
         metrics: Any = None,
+        neuroplasticity_bus: Any = None,
     ) -> None:
         self._config = config
         self._synapse = synapse
@@ -90,6 +105,7 @@ class OneirosService:
         self._llm = llm
         self._embed_fn = embed_fn
         self._metrics = metrics
+        self._bus = neuroplasticity_bus
 
         # Cross-system references (set via setters after construction)
         self._equor: Any = None
@@ -99,6 +115,8 @@ class OneirosService:
         self._thymos: Any = None
         self._memory: Any = None
         self._soma: Any = None
+        self._oikos: Any = None
+        self._economic_dream_worker: Any = None
 
         # Core subsystems
         self._clock = CircadianClock(config)
@@ -182,6 +200,16 @@ class OneirosService:
         """Wire Soma for sleep pressure from energy errors and counterfactual REM replay."""
         self._soma = soma
 
+    def set_oikos(self, oikos: Any) -> None:
+        """Wire Oikos for economic dreaming during consolidation (Phase 16i)."""
+        from ecodiaos.systems.oikos.dream_worker import EconomicDreamWorker
+
+        self._oikos = oikos
+        self._economic_dream_worker: Any = EconomicDreamWorker(
+            config=oikos._config,
+        )
+        self._logger.info("oikos_wired_for_economic_dreaming")
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     async def initialize(self) -> None:
@@ -203,11 +231,24 @@ class OneirosService:
             except Exception as exc:
                 self._logger.warning("synapse_subscribe_failed", error=str(exc))
 
+        # Register with NeuroplasticityBus for hot-reload of all worker ABCs
+        if self._bus is not None:
+            self._bus.register(
+                base_class=BaseOneirosWorker,
+                registration_callback=self._on_worker_evolved,
+                system_id="oneiros",
+                instance_qualifier=lambda cls: bool(getattr(cls, "worker_type", "")),
+                instance_factory=self._build_worker,
+            )
+
         self._initialized = True
         self._logger.info("oneiros_initialized")
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
+        if self._bus is not None:
+            self._bus.deregister(BaseOneirosWorker)
+
         if self._sleep_task is not None and not self._sleep_task.done():
             self._sleep_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -224,6 +265,92 @@ class OneirosService:
         """Health snapshot for Synapse."""
         snapshot = self._build_health_snapshot()
         return snapshot.model_dump()
+
+    # ── Hot-Reload (NeuroplasticityBus) ─────────────────────────
+
+    def _build_worker(self, cls: type[BaseOneirosWorker]) -> BaseOneirosWorker:
+        """
+        Factory for NeuroplasticityBus: instantiate an evolved worker subclass
+        with the dependencies it needs.  Falls back to zero-arg construction if
+        the evolved class has a different constructor signature.
+        """
+        wt = getattr(cls, "worker_type", "")
+
+        # Map worker_type → constructor kwargs
+        factory_kwargs: dict[str, dict[str, Any]] = {
+            "nrem.episodic_replay": dict(neo4j=self._neo4j, llm=self._llm, config=self._config),
+            "nrem.synaptic_downscaler": dict(neo4j=self._neo4j, config=self._config),
+            "nrem.belief_compressor": dict(nova=self._nova, config=self._config),
+            "nrem.hypothesis_pruner": dict(evo=self._evo, config=self._config),
+            "rem.dream_generator": dict(
+                neo4j=self._neo4j, llm=self._llm, embed_fn=self._embed_fn, config=self._config,
+            ),
+            "rem.affect_processor": dict(neo4j=self._neo4j, config=self._config),
+            "rem.threat_simulator": dict(
+                neo4j=self._neo4j, llm=self._llm, thymos=self._thymos, config=self._config,
+            ),
+            "rem.ethical_digestion": dict(llm=self._llm, equor=self._equor, config=self._config),
+            "lucid.directed_exploration": dict(
+                llm=self._llm, journal=self._journal, config=self._config,
+            ),
+            "lucid.metacognition": dict(
+                journal=self._journal, neo4j=self._neo4j, llm=self._llm,
+            ),
+        }
+
+        kwargs = factory_kwargs.get(wt, {})
+        try:
+            return cls(**kwargs)  # type: ignore[call-arg]
+        except TypeError:
+            return cls()  # type: ignore[call-arg]
+
+    def _on_worker_evolved(self, worker: BaseOneirosWorker) -> None:
+        """
+        NeuroplasticityBus callback: surgically swap a single worker instance.
+
+        Any in-flight ``run()`` call that already captured a reference to the
+        old worker completes normally — only the *next* sleep cycle picks up
+        the evolved implementation.
+        """
+        wt = worker.worker_type
+
+        # ── NREM ──
+        if isinstance(worker, BaseEpisodicReplay):
+            self._episodic_replay = worker  # type: ignore[assignment]
+        elif isinstance(worker, BaseSynapticDownscaler):
+            self._synaptic_downscaler = worker  # type: ignore[assignment]
+        elif isinstance(worker, BaseBeliefCompressor):
+            self._belief_compressor = worker  # type: ignore[assignment]
+        elif isinstance(worker, BaseHypothesisPruner):
+            self._hypothesis_pruner = worker  # type: ignore[assignment]
+        # ── REM ──
+        elif isinstance(worker, BaseDreamGenerator):
+            self._dream_generator = worker  # type: ignore[assignment]
+        elif isinstance(worker, BaseAffectProcessor):
+            self._affect_processor = worker  # type: ignore[assignment]
+        elif isinstance(worker, BaseThreatSimulator):
+            self._threat_simulator = worker  # type: ignore[assignment]
+        elif isinstance(worker, BaseEthicalDigestion):
+            self._ethical_digestion = worker  # type: ignore[assignment]
+        # ── Lucid ──
+        elif isinstance(worker, BaseDirectedExploration):
+            self._directed_exploration = worker  # type: ignore[assignment]
+        elif isinstance(worker, BaseMetaCognition):
+            self._metacognition = worker  # type: ignore[assignment]
+        else:
+            self._logger.warning(
+                "oneiros_unknown_worker_type",
+                worker_type=wt,
+                cls=type(worker).__name__,
+            )
+            return
+
+        self._logger.info(
+            "oneiros_worker_hot_reloaded",
+            worker_type=wt,
+            cls=type(worker).__name__,
+            is_sleeping=self._stage_controller.is_sleeping,
+        )
 
     # ── Cognitive Cycle Hook ──────────────────────────────────────
 
@@ -359,6 +486,9 @@ class OneirosService:
                 if self._current_cycle is not None and lucid_result is not None:
                     self._current_cycle.lucid_explorations = lucid_result.explorations_completed
                     self._current_cycle.meta_observations = lucid_result.meta_observations
+
+            # ── ECONOMIC DREAMING (Phase 16i) ─────────────────────
+            await self._run_economic_dreaming(cycle_id)
 
             # ── HYPNOPOMPIA ───────────────────────────────────────
             await self._run_hypnopompia(cycle_id)
@@ -705,6 +835,55 @@ class OneirosService:
         self._stage_controller.advance(lucid_budget_s)
 
         return result
+
+    async def _run_economic_dreaming(self, cycle_id: str) -> None:
+        """
+        Run Monte Carlo economic simulation during consolidation (Phase 16i).
+
+        The organism dreams about its economic future: projecting
+        thousands of stochastic paths forward, stress-testing against
+        catastrophe scenarios, and deriving parameter adjustments.
+
+        Runs after REM/Lucid and before HYPNOPOMPIA so that economic
+        insights are available when the organism wakes.
+        """
+        if self._oikos is None or self._economic_dream_worker is None:
+            return
+
+        try:
+            # Read current economic state (cheap snapshot, no I/O)
+            state = self._oikos.snapshot()
+
+            self._logger.info(
+                "economic_dreaming_begin",
+                cycle_id=cycle_id,
+                runway_days=str(state.runway_days),
+            )
+
+            # Run the Monte Carlo simulation (CPU-heavy, uses executor)
+            dream_result = await self._economic_dream_worker.run(
+                state=state,
+                cycle_id=cycle_id,
+            )
+
+            # Feed results back into Oikos
+            self._oikos.integrate_dream_result(dream_result)
+
+            self._logger.info(
+                "economic_dreaming_integrated",
+                ruin_probability=str(dream_result.ruin_probability),
+                survival_30d=str(dream_result.survival_probability_30d),
+                resilience=str(dream_result.resilience_score),
+                recommendations=len(dream_result.recommendations),
+            )
+
+        except Exception as exc:
+            # Economic dreaming failure must not crash the sleep cycle
+            self._logger.error(
+                "economic_dreaming_failed",
+                cycle_id=cycle_id,
+                error=str(exc),
+            )
 
     async def _run_hypnopompia(self, cycle_id: str) -> None:
         """Transition out — restore wake processing."""
