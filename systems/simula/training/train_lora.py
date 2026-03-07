@@ -336,10 +336,10 @@ def run_training(dataset_path: Path) -> Path:
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
-        dataset_text_field="text",
         max_seq_length=max_seq_len,
         args=training_args,
         callbacks=[ProgressCallback()],
+        dataset_kwargs={"skip_prepare_dataset": True},
     )
 
     # W&B run — guarded; non-fatal if W&B not available or not authenticated
