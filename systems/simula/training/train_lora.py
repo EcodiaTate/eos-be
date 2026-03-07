@@ -324,7 +324,8 @@ def run_training(dataset_path: Path) -> Path:
     )
 
     # Custom callback for progress tracking
-    class ProgressCallback:
+    from transformers import TrainerCallback
+    class ProgressCallback(TrainerCallback):
         def on_log(self, args: object, state: object, control: object, logs: dict[str, float] | None = None, **kwargs: object) -> None:
             if logs:
                 TRAINING_STATE["current_loss"] = logs.get("loss", 0.0)
