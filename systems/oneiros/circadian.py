@@ -297,24 +297,6 @@ class SleepStageController:
         self._transition_to(SleepStage.HYPNAGOGIA)
         self._logger.info("sleep_begun", cycle_id=cycle_id)
 
-    def advance(self, elapsed_s: float) -> SleepStage | None:
-        """
-        Advance the sleep clock by *elapsed_s* seconds.
-
-        Returns the new stage if a transition occurred, ``None`` if staying.
-        """
-        if self._stage == SleepStage.WAKE:
-            return None
-
-        self._stage_elapsed_s += elapsed_s
-        self._sleep_elapsed_s += elapsed_s
-
-        new_stage = self._check_transition()
-        if new_stage is not None:
-            self._transition_to(new_stage)
-            return new_stage
-        return None
-
     def emergency_wake(self, reason: str) -> None:
         """Immediately jump to HYPNOPOMPIA (then WAKE on next advance)."""
         if self._stage == SleepStage.WAKE:
@@ -331,34 +313,6 @@ class SleepStageController:
         self._current_cycle_id = None
 
     # ── Internals ─────────────────────────────────────────────────
-
-    def _check_transition(self) -> SleepStage | None:
-        """Determine if the current stage should transition."""
-        if self._stage == SleepStage.HYPNAGOGIA:
-            if self._stage_elapsed_s >= self._hypnagogia_s:
-                return SleepStage.NREM
-
-        elif self._stage == SleepStage.NREM:
-            if self._sleep_elapsed_s >= self._nrem_end_s:
-                return SleepStage.REM
-
-        elif self._stage == SleepStage.REM:
-            if self._sleep_elapsed_s >= self._rem_end_s:
-                if self._has_creative_goal:
-                    return SleepStage.LUCID
-                return SleepStage.HYPNOPOMPIA
-
-        elif self._stage == SleepStage.LUCID:
-            if self._sleep_elapsed_s >= self._lucid_end_s:
-                return SleepStage.HYPNOPOMPIA
-
-        elif (
-            self._stage == SleepStage.HYPNOPOMPIA
-            and self._stage_elapsed_s >= self._hypnopompia_s
-        ):
-            return SleepStage.WAKE
-
-        return None
 
     def _transition_to(self, new_stage: SleepStage) -> None:
         old = self._stage

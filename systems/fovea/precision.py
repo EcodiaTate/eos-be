@@ -36,14 +36,17 @@ _STABILITY_SCALE: float = 1000.0
 
 class PrecisionWeightComputer:
     """
-    Derives per-component precision weights from the world model's
-    historical accuracy and context stability.
+    Derives per-dimension precision weights from the world model's
+    per-dimension historical accuracy and context stability.
 
-    precision_i = historical_accuracy(context_type_i) ** 2 + stability_bonus
-    stability_bonus = min(context_age / 1000, 0.3)
+    Spec 20 §3.4 — P1: each error dimension gets an independent precision weight:
+        precision_i = dim_accuracy(context_type, dim_i) ** 2 + stability_bonus
+        stability_bonus = min(context_age / 1000, 0.3)
 
-    Each of the six error dimensions gets its own precision weight,
-    stored on the FoveaPredictionError.component_precisions dict.
+    Different prediction types have different historical accuracy within the same
+    context: content errors may be 70% accurate while causal errors are 30%.
+    Uniform precision would over-discount reliable dimensions — per-dimension
+    tracking correctly amplifies precise dimensions and dampens noisy ones.
     """
 
     def __init__(self, world_model: LogosWorldModel) -> None:
@@ -56,45 +59,41 @@ class PrecisionWeightComputer:
         context: PerceptContext,
     ) -> None:
         """
-        Compute and set per-component precision weights on *error*.
+        Compute and set per-dimension precision weights on *error*.
 
-        Queries the world model for historical accuracy and context stability,
-        then applies the formula:
-            precision = accuracy ** 2 + min(stability_age / 1000, 0.3)
-        capped at 1.0.
+        Spec 20 §3.4 (P1 fix 2026-03-07): queries the world model for
+        per-dimension accuracy, applies:
+            precision_i = accuracy_i ** 2 + stability_bonus
+        independently for each of the six error dimensions, capped at 1.0.
+
+        The stability bonus is shared (context-level); per-dimension accuracy
+        is what differentiates the six components.
         """
         context_type = context.context_type or context.source_system
 
-        # Get base signals from world model
-        historical_accuracy = await self._safe_call(
-            self._world_model.get_historical_accuracy(context_type), 0.5
-        )
+        # Stability bonus is context-level (same for all dimensions)
         stability_age = await self._safe_call(
             self._world_model.get_context_stability_age(context_type), 0
         )
-
-        # Base precision from accuracy (quadratic: high accuracy = very high precision)
-        base_precision = historical_accuracy ** 2
-
-        # Stability bonus from context age
         stability_bonus = min(stability_age / _STABILITY_SCALE, _MAX_STABILITY_BONUS)
 
-        # Combined precision, capped at 1.0
-        combined_precision = min(base_precision + stability_bonus, 1.0)
-
-        # Set the same precision for all components by default.
-        # Future enhancement: per-dimension accuracy tracking from Logos.
+        # Per-dimension accuracy → independent precision weights
+        dim_precisions: dict[str, float] = {}
         for error_type in ErrorType:
-            error.component_precisions[error_type.value] = combined_precision
+            dim_accuracy = await self._safe_call(
+                self._world_model.get_dimension_accuracy(context_type, error_type.value),
+                0.5,
+            )
+            precision = min(dim_accuracy ** 2 + stability_bonus, 1.0)
+            dim_precisions[error_type.value] = precision
+            error.component_precisions[error_type.value] = precision
 
         self._logger.debug(
-            "precision_computed",
+            "precision_computed_per_dimension",
             context_type=context_type,
-            accuracy=round(historical_accuracy, 4),
             stability_age=stability_age,
-            base_precision=round(base_precision, 4),
             stability_bonus=round(stability_bonus, 4),
-            combined=round(combined_precision, 4),
+            dim_precisions={k: round(v, 4) for k, v in dim_precisions.items()},
         )
 
     @staticmethod

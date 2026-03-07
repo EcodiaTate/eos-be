@@ -123,7 +123,7 @@ class EquorConfig(BaseModel):
     care_floor_multiplier: float = -0.3
     honesty_floor_multiplier: float = -0.3
     drift_window_size: int = 1000
-    drift_report_interval: int = 1000  # every N reviews
+    drift_report_interval: int = 100  # every N reviews
 
 
 class AxonConfig(BaseModel):

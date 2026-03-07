@@ -26,13 +26,6 @@ import httpx
 import structlog
 
 from infrastructure.providers.akash import AkashProvider
-from systems.axon.executor import Executor
-from systems.axon.types import (
-    ExecutionContext,
-    ExecutionResult,
-    RateLimit,
-    ValidationResult,
-)
 from systems.simula.training.dataset_builder import DatasetBuilder
 from systems.simula.training.types import (
     DatasetFormat,
@@ -43,7 +36,47 @@ from systems.simula.training.types import (
 
 if TYPE_CHECKING:
     from clients.neo4j import Neo4jClient
+    from systems.axon.executor import Executor as _AxonExecutorBase
+    from systems.axon.types import ExecutionContext, ExecutionResult, RateLimit, ValidationResult
     from systems.skia.pinata_client import PinataClient
+else:
+    class _AxonExecutorBase:
+        """Local base replacing Axon Executor to avoid cross-system import."""
+        action_type: str = ""
+        description: str = ""
+        required_autonomy: int = 0
+        reversible: bool = True
+        max_duration_ms: int = 0
+
+    class RateLimit:
+        """Minimal runtime stub for RateLimit."""
+        @staticmethod
+        def per_hour(n: int) -> "RateLimit":
+            rl = RateLimit()
+            rl._n = n
+            return rl
+
+    class ValidationResult:
+        """Minimal runtime stub for ValidationResult."""
+        @staticmethod
+        def ok() -> "ValidationResult":
+            return ValidationResult()
+        @staticmethod
+        def fail(msg: str, **kwargs: Any) -> "ValidationResult":
+            vr = ValidationResult()
+            vr.error = msg
+            return vr
+
+    class ExecutionContext:
+        """Minimal runtime stub for ExecutionContext."""
+        pass
+
+    class ExecutionResult:
+        """Minimal runtime stub for ExecutionResult."""
+        def __init__(self, *, success: bool = True, data: dict | None = None, error: str = ""):
+            self.success = success
+            self.data = data or {}
+            self.error = error
 
 logger = structlog.get_logger("systems.simula.training.executor")
 
@@ -59,7 +92,7 @@ _MAX_POLL_ATTEMPTS = 240   # 240 × 30s = 2 hours max training time
 _DEPLOY_TIMEOUT_S = 600.0  # 10 minutes to get a GPU lease
 
 
-class ExecuteModelFineTune(Executor):
+class ExecuteModelFineTune(_AxonExecutorBase):
     """
     Axon executor for autonomous model fine-tuning.
 

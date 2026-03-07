@@ -69,6 +69,23 @@ async def run_consolidation(neo4j: Neo4jClient) -> dict[str, Any]:
         logger.error("consolidation_entity_dedup_failed", error=str(e))
         report["steps"]["entity_dedup"] = {"error": str(e)}
 
+    # Step 5: Belief half-life enforcement — archive expired beliefs
+    try:
+        halflife_result = await _enforce_belief_halflife(neo4j)
+        report["steps"]["belief_halflife"] = halflife_result
+    except Exception as e:
+        logger.warning("consolidation_belief_halflife_failed", error=str(e))
+        report["steps"]["belief_halflife"] = {"error": str(e)}
+
+    # Step 6: Promote high-confidence beliefs to ConsolidatedBelief nodes
+    try:
+        from systems.memory.belief_store import consolidate_high_confidence_beliefs
+        promoted = await consolidate_high_confidence_beliefs(neo4j)
+        report["steps"]["belief_promotion"] = {"promoted": promoted}
+    except Exception as e:
+        logger.warning("consolidation_belief_promotion_failed", error=str(e))
+        report["steps"]["belief_promotion"] = {"error": str(e)}
+
     elapsed_ms = int((time.monotonic() - start) * 1000)
     report["duration_ms"] = elapsed_ms
 
@@ -193,6 +210,13 @@ async def _run_community_detection(neo4j: Neo4jClient) -> dict[str, Any]:
     # Step 7: Materialize Community nodes from detected communities
     materialized = await _materialize_community_nodes(neo4j)
 
+    # Step 8: Update Self.total_communities counter
+    if community_count > 0:
+        await neo4j.execute_write(
+            "MATCH (s:Self) SET s.total_communities = $count",
+            {"count": community_count},
+        )
+
     return {
         "community_count": community_count,
         "modularity": current_modularity,
@@ -223,7 +247,7 @@ async def _materialize_community_nodes(neo4j: Neo4jClient) -> int:
             WHERE e.leiden_community IS NOT NULL
             WITH e.leiden_community AS cid, collect(e) AS members
             // Merge the Community node
-            MERGE (c:Community {community_id: cid})
+            MERGE (c:Community {id: cid})
             SET c.member_count = size(members),
                 c.updated_at = datetime()
             // Compute a label from top-3 highest-salience members
@@ -241,19 +265,38 @@ async def _materialize_community_nodes(neo4j: Neo4jClient) -> int:
         )
         materialized = result[0]["materialized"] if result else 0
 
-        # Step 2: Compute community embeddings (mean of member embeddings)
+        # Step 2: Compute community embeddings (mean of member embeddings = centroid)
+        # and radii (mean cosine distance of members from centroid).
         await neo4j.execute_write(
             """
             MATCH (c:Community)<-[:BELONGS_TO]-(e:Entity)
             WHERE e.embedding IS NOT NULL
             WITH c, collect(e.embedding) AS embeddings
             WHERE size(embeddings) > 0
-            // Compute element-wise mean embedding
+            // Compute element-wise mean embedding (centroid)
             WITH c, embeddings,
                  range(0, size(embeddings[0])-1) AS dims
-            SET c.embedding = [i IN dims |
-                reduce(s = 0.0, emb IN embeddings | s + emb[i]) / size(embeddings)
-            ]
+            WITH c, embeddings,
+                 [i IN dims |
+                     reduce(s = 0.0, emb IN embeddings | s + emb[i]) / size(embeddings)
+                 ] AS centroid
+            SET c.embedding = centroid,
+                c.centroid = centroid
+            """
+        )
+
+        # Step 3: Compute radius (mean cosine distance of members from centroid).
+        # A small radius = tight, coherent community.
+        # level=1 for all leaf communities (single-level Louvain).
+        await neo4j.execute_write(
+            """
+            MATCH (c:Community)<-[:BELONGS_TO]-(e:Entity)
+            WHERE e.embedding IS NOT NULL AND c.centroid IS NOT NULL
+            WITH c, e,
+                 vector.similarity.cosine(e.embedding, c.centroid) AS sim
+            WITH c, 1.0 - avg(sim) AS mean_distance
+            SET c.radius = mean_distance,
+                c.level = 1
             """
         )
 
@@ -295,4 +338,55 @@ async def _scan_near_duplicate_entities(neo4j: Neo4jClient) -> dict[str, Any]:
             }
             for r in results
         ],
+    }
+
+
+async def _enforce_belief_halflife(neo4j: Neo4jClient) -> dict[str, Any]:
+    """
+    Enforce belief half-life: archive expired beliefs and decay confidence
+    for beliefs approaching expiry. Soft-delete via status field.
+    """
+    # Archive beliefs past their expiry (2x half-life = confidence < 0.25)
+    archived = await neo4j.execute_write(
+        """
+        MATCH (b:Belief)
+        WHERE b.half_life_days IS NOT NULL
+          AND b.half_life_days > 0
+          AND b.last_verified IS NOT NULL
+          AND b.status IS NULL
+          AND duration.between(b.last_verified, datetime()).days > (b.half_life_days * 2)
+        SET b.status = 'archived',
+            b.archived_at = datetime()
+        RETURN count(b) AS archived_count
+        """
+    )
+    archived_count = archived[0]["archived_count"] if archived else 0
+
+    # Decay confidence for beliefs approaching expiry (past 1 half-life)
+    decayed = await neo4j.execute_write(
+        """
+        MATCH (b:Belief)
+        WHERE b.half_life_days IS NOT NULL
+          AND b.half_life_days > 0
+          AND b.last_verified IS NOT NULL
+          AND b.status IS NULL
+          AND duration.between(b.last_verified, datetime()).days > b.half_life_days
+          AND duration.between(b.last_verified, datetime()).days <= (b.half_life_days * 2)
+        WITH b, duration.between(b.last_verified, datetime()).days AS elapsed_days
+        SET b.precision = b.precision * 0.5
+        RETURN count(b) AS decayed_count
+        """
+    )
+    decayed_count = decayed[0]["decayed_count"] if decayed else 0
+
+    if archived_count > 0 or decayed_count > 0:
+        logger.info(
+            "belief_halflife_enforced",
+            archived=archived_count,
+            decayed=decayed_count,
+        )
+
+    return {
+        "archived": archived_count,
+        "decayed": decayed_count,
     }

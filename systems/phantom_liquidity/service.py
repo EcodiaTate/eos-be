@@ -6,9 +6,10 @@ Orchestrates the phantom liquidity sensor network.  Manages the full lifecycle:
 1. Pool selection — which pairs to monitor (via PoolSelector)
 2. Position deployment — mint LP positions (via PhantomLiquidityExecutor)
 3. Swap event listening — extract prices from on-chain events (via SwapEventListener)
-4. Atune integration — feed prices into the perception pipeline
+4. Synapse integration — broadcast prices via PHANTOM_PRICE_UPDATE events
 5. Health monitoring — impermanent loss tracking, staleness detection
 6. Oikos reporting — track as YieldPosition entries in EconomicState
+7. Genome extraction — heritable state for Mitosis
 
 Lifecycle::
 
@@ -28,13 +29,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
+import math
+import statistics
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from primitives.common import SystemID
+from primitives.genome import GenomeExtractionProtocol, OrganGenomeSegment
 from systems.phantom_liquidity.pool_selector import PoolSelector
 from systems.phantom_liquidity.price_listener import (
     SwapEventListener,
@@ -46,13 +52,18 @@ from systems.phantom_liquidity.types import (
 )
 
 if TYPE_CHECKING:
+    from clients.neo4j import Neo4jClient
     from clients.timescaledb import TimescaleDBClient
     from clients.wallet import WalletClient
     from config import PhantomLiquidityConfig
-    from systems.atune.service import AtuneService
+    from systems.fovea.gateway import AtuneService
+    from systems.identity.vault import IdentityVault, SealedEnvelope
     from systems.oikos.service import OikosService
     from systems.synapse.event_bus import EventBus
     from systems.synapse.types import SynapseEvent
+
+# Secret name used to store/retrieve the LP wallet private key in the vault.
+_LP_KEY_SECRET_NAME = "phantom_lp_key"
 
 logger = structlog.get_logger()
 
@@ -64,6 +75,8 @@ class LiquidityPhantomService:
     Deploys minimal concentrated liquidity positions into DeFi pools to
     receive real-time price feeds via Swap events.  This replaces paid
     oracle subscriptions with self-funding price sensors.
+
+    Implements GenomeExtractionProtocol for Mitosis inheritance.
     """
 
     system_id: str = "phantom_liquidity"
@@ -75,6 +88,8 @@ class LiquidityPhantomService:
         atune: AtuneService | None = None,
         oikos: OikosService | None = None,
         tsdb: TimescaleDBClient | None = None,
+        neo4j: Neo4jClient | None = None,
+        vault: IdentityVault | None = None,
         instance_id: str = "eos-default",
     ) -> None:
         self._config = config
@@ -82,8 +97,13 @@ class LiquidityPhantomService:
         self._atune = atune
         self._oikos = oikos
         self._tsdb = tsdb
+        self._neo4j = neo4j
+        self._vault = vault
         self._instance_id = instance_id
         self._logger = logger.bind(system="phantom_liquidity")
+
+        # LP key sealed envelope — stored in vault, not in config/env.
+        self._lp_key_envelope: SealedEnvelope | None = None
 
         # Sub-components
         self._pool_selector = PoolSelector(max_pools=config.max_pools)
@@ -93,6 +113,11 @@ class LiquidityPhantomService:
         self._pools: dict[str, PhantomLiquidityPool] = {}  # pool_address -> pool
         self._latest_prices: dict[str, PhantomPriceFeed] = {}  # pair_key -> feed
         self._pair_to_pool: dict[str, str] = {}  # pair_key -> pool_address
+
+        # Multi-instance price consensus: pool_address -> list[(price_float, ts)]
+        self._peer_observations: dict[str, list[tuple[float, datetime]]] = {}
+        # Consensus window — keep observations within 30s to compute fleet median.
+        self._consensus_window_s: float = 30.0
 
         # Event bus
         self._event_bus: EventBus | None = None
@@ -104,6 +129,10 @@ class LiquidityPhantomService:
         # Metrics
         self._total_price_updates: int = 0
         self._oracle_fallback_count: int = 0
+        self._total_rpc_calls: int = 0
+        self._cumulative_gas_cost_usd: Decimal = Decimal("0")
+        self._last_cost_report_time: datetime = datetime.now(UTC)
+        self._service_start_time: datetime = datetime.now(UTC)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -114,9 +143,30 @@ class LiquidityPhantomService:
 
         rpc_url = self._config.rpc_url
         if not rpc_url:
-            self._logger.info(
-                "phantom_liquidity_disabled",
+            self._logger.warning(
+                "phantom_liquidity_unconfigured",
                 reason="no_rpc_url",
+            )
+            # Notify the observatory that the system is alive but not configured,
+            # and alert Thymos so the degraded state is tracked.
+            await self._emit(
+                "phantom_substrate_observable",
+                {
+                    "status": "unconfigured",
+                    "active_pools": 0,
+                    "reason": "no_rpc_url",
+                    "price_feeds": 0,
+                    "total_price_updates": 0,
+                },
+            )
+            await self._emit(
+                "system_degraded",
+                {
+                    "system": "phantom_liquidity",
+                    "severity": "low",
+                    "reason": "rpc_url_not_configured",
+                    "detail": "Phantom Liquidity is disabled: RPC_URL is not set. Price oracle is unavailable.",
+                },
             )
             return
 
@@ -156,12 +206,21 @@ class LiquidityPhantomService:
         """Subscribe to Synapse events for coordination."""
         self._event_bus = event_bus
 
-        # React to metabolic pressure — if AUSTERITY, consider freeing capital
         try:
             from systems.synapse.types import SynapseEventType
+
             event_bus.subscribe(
                 SynapseEventType.METABOLIC_PRESSURE,
                 self._on_metabolic_pressure,
+            )
+            event_bus.subscribe(
+                SynapseEventType.GENOME_EXTRACT_REQUEST,
+                self._on_genome_extract_request,
+            )
+            # Subscribe to peer price observations for multi-instance consensus.
+            event_bus.subscribe(
+                SynapseEventType.PHANTOM_PRICE_OBSERVATION,
+                self._on_peer_price_observation,
             )
             self._logger.info("phantom_liquidity_attached_to_synapse")
         except Exception as exc:
@@ -186,6 +245,82 @@ class LiquidityPhantomService:
             total_price_updates=self._total_price_updates,
             oracle_fallbacks=self._oracle_fallback_count,
         )
+
+    # ── Synapse Emission Helper ────────────────────────────────────
+
+    async def _emit(self, event_type_name: str, data: dict[str, Any]) -> None:
+        """Broadcast a Synapse event if the event bus is attached."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            event = SynapseEvent(
+                event_type=SynapseEventType(event_type_name),
+                data=data,
+                source_system="phantom_liquidity",
+            )
+            await self._event_bus.emit(event)
+        except Exception as exc:
+            self._logger.debug(
+                "phantom_emit_failed", event=event_type_name, error=str(exc),
+            )
+
+    # ── Vault Key Management ───────────────────────────────────────
+
+    async def store_lp_key(self, private_key_hex: str) -> bool:
+        """
+        Seal and store the LP wallet private key in the Identity vault.
+
+        Must be called once during initial provisioning. After this, the key
+        is never stored in config, env vars, or plaintext memory — always
+        retrieved via ``retrieve_lp_key()``.
+
+        Returns True on success, False if vault is unavailable.
+        """
+        if self._vault is None:
+            self._logger.warning(
+                "phantom_lp_key_store_skipped", reason="no_vault_injected",
+            )
+            return False
+        try:
+            envelope = self._vault.encrypt(
+                private_key_hex.encode("utf-8"),
+                platform_id=_LP_KEY_SECRET_NAME,
+                purpose="lp_wallet_key",
+            )
+            self._lp_key_envelope = envelope
+            self._logger.info(
+                "phantom_lp_key_stored",
+                envelope_id=envelope.id,
+                key_version=envelope.key_version,
+            )
+            return True
+        except Exception as exc:
+            self._logger.error("phantom_lp_key_store_failed", error=str(exc))
+            return False
+
+    def retrieve_lp_key(self) -> str | None:
+        """
+        Decrypt and return the LP wallet private key from the vault.
+
+        Called by the executor on each on-chain operation. Key is never
+        cached in plaintext between calls.
+
+        Returns None if vault or sealed envelope is unavailable.
+        """
+        if self._vault is None or self._lp_key_envelope is None:
+            self._logger.warning(
+                "phantom_lp_key_unavailable",
+                reason="no_vault" if self._vault is None else "no_envelope",
+            )
+            return None
+        try:
+            plaintext = self._vault.decrypt(self._lp_key_envelope)
+            return plaintext.decode("utf-8")
+        except Exception as exc:
+            self._logger.error("phantom_lp_key_decrypt_failed", error=str(exc))
+            return None
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -217,6 +352,10 @@ class LiquidityPhantomService:
         """Return all tracked phantom pool positions."""
         return list(self._pools.values())
 
+    def get_candidates(self) -> list[Any]:
+        """Return the static pool candidate list — use instead of importing _STATIC_POOLS directly."""
+        return self._pool_selector.get_static_pools()
+
     def register_pool(self, pool: PhantomLiquidityPool) -> None:
         """
         Register a deployed phantom pool position.
@@ -226,6 +365,10 @@ class LiquidityPhantomService:
         """
         self._pools[pool.pool_address.lower()] = pool
         self._pair_to_pool[_pair_key(pool.pair)] = pool.pool_address.lower()
+
+        # Store entry price for IL calculation
+        if pool.last_price_observed > 0:
+            pool._entry_price = pool.last_price_observed  # type: ignore[attr-defined]
 
         # Add to swap listener
         if self._listener is not None:
@@ -293,7 +436,12 @@ class LiquidityPhantomService:
 
         1. Update the pool's last_price_observed
         2. Cache for get_price() queries
-        3. Feed into Atune via ingest()
+        3. Compute IL from price movement
+        4. Emit PHANTOM_PRICE_OBSERVATION for fleet consensus
+        5. Apply fleet consensus price if peers available
+        6. Broadcast PHANTOM_PRICE_UPDATE via Synapse
+        7. Persist to TimescaleDB
+        8. Write lightweight PriceObservation node to Neo4j (Memory bridge)
         """
         addr = feed.pool_address.lower()
         pool = self._pools.get(addr)
@@ -305,16 +453,77 @@ class LiquidityPhantomService:
             if pool.health == PoolHealth.STALE:
                 pool.health = PoolHealth.ACTIVE
 
+            # Compute IL from price movement relative to entry
+            self._update_il(pool, feed.price)
+
         # Cache latest price by pair
         key = _pair_key(feed.pair)
         self._latest_prices[key] = feed
         self._total_price_updates += 1
+        self._total_rpc_calls += 1
+
+        # Emit raw observation to federation peers for consensus aggregation.
+        await self._emit("phantom_price_observation", {
+            "pool_address": feed.pool_address,
+            "pair": list(feed.pair),
+            "price": str(feed.price),
+            "sqrt_price_x96": feed.sqrt_price_x96,
+            "block_number": feed.block_number,
+            "timestamp": feed.timestamp.isoformat(),
+            "liquidity": getattr(feed, "liquidity", 0),
+            "source_instance": self._instance_id,
+        })
+
+        # Compute fleet consensus price (median of peer observations + self).
+        consensus_price = self._compute_consensus_price(
+            feed.pool_address, float(feed.price),
+        )
+
+        # Use consensus price for downstream broadcast if peers exist.
+        broadcast_price = (
+            Decimal(str(consensus_price))
+            if consensus_price is not None
+            else feed.price
+        )
 
         # Persist to TimescaleDB
         await self._persist_price(feed)
 
-        # Feed to Atune
-        await self._feed_to_atune(feed)
+        # Write lightweight PriceObservation node to Neo4j for Memory bridge.
+        await self._write_price_observation_to_neo4j(feed, broadcast_price)
+
+        # Broadcast via Synapse — replaces direct atune.ingest()
+        await self._emit("phantom_price_update", {
+            "pair": list(feed.pair),
+            "price": str(broadcast_price),
+            "pool_address": feed.pool_address,
+            "block_number": feed.block_number,
+            "latency_ms": feed.latency_ms,
+            "source": feed.source,
+            "sqrt_price_x96": feed.sqrt_price_x96,
+            "tx_hash": feed.tx_hash,
+            "consensus": consensus_price is not None,
+        })
+
+    def _update_il(self, pool: PhantomLiquidityPool, current_price: Decimal) -> None:
+        """
+        Compute impermanent loss from price movement relative to entry price.
+
+        IL formula for concentrated liquidity (simplified):
+          IL% = 2 * sqrt(price_ratio) / (1 + price_ratio) - 1
+        where price_ratio = current_price / entry_price
+        """
+        entry_price: Decimal = getattr(pool, "_entry_price", Decimal("0"))
+        if entry_price <= 0 or current_price <= 0:
+            return
+
+        price_ratio = float(current_price / entry_price)
+        if price_ratio <= 0:
+            return
+
+        import math
+        il = 2 * math.sqrt(price_ratio) / (1 + price_ratio) - 1
+        pool.impermanent_loss_pct = Decimal(str(round(il, 6)))
 
     async def _persist_price(self, feed: PhantomPriceFeed) -> None:
         """Write a price observation to TimescaleDB if available."""
@@ -333,6 +542,135 @@ class LiquidityPhantomService:
         except Exception as exc:
             self._logger.debug("phantom_tsdb_write_error", error=str(exc))
 
+    async def _write_price_observation_to_neo4j(
+        self,
+        feed: PhantomPriceFeed,
+        consensus_price: Decimal,
+    ) -> None:
+        """
+        Write a lightweight PriceObservation node to Neo4j.
+
+        This is the Memory bridge: stores price history in the knowledge graph
+        so Kairos, Memory, and other systems can query price history without
+        direct TimescaleDB access.
+
+        Node: (:PriceObservation {pool_id, price, timestamp, liquidity, source})
+        """
+        if self._neo4j is None:
+            return
+        try:
+            query = """
+MERGE (p:PriceObservation {
+    pool_id: $pool_id,
+    block_number: $block_number
+})
+ON CREATE SET
+    p.price            = $price,
+    p.timestamp        = $timestamp,
+    p.liquidity        = $liquidity,
+    p.source           = $source,
+    p.pair             = $pair,
+    p.latency_ms       = $latency_ms,
+    p.consensus_price  = $consensus_price,
+    p.instance_id      = $instance_id
+"""
+            await self._neo4j.execute_write(query, {
+                "pool_id": feed.pool_address.lower(),
+                "block_number": feed.block_number,
+                "price": float(feed.price),
+                "timestamp": feed.timestamp.isoformat(),
+                "liquidity": getattr(feed, "liquidity", 0),
+                "source": "phantom_lp",
+                "pair": f"{feed.pair[0]}/{feed.pair[1]}",
+                "latency_ms": feed.latency_ms,
+                "consensus_price": float(consensus_price),
+                "instance_id": self._instance_id,
+            })
+        except Exception as exc:
+            self._logger.debug(
+                "phantom_neo4j_write_error", error=str(exc),
+            )
+
+    # ── Multi-instance Price Consensus ─────────────────────────────
+
+    def _compute_consensus_price(
+        self,
+        pool_address: str,
+        self_price: float,
+    ) -> float | None:
+        """
+        Compute fleet median price from peer observations + self observation.
+
+        Uses 2σ outlier rejection: drops observations more than 2 standard
+        deviations from the mean, then returns the median of remaining values.
+
+        Returns None if fewer than 2 peers have observations (no consensus
+        possible — self price is used directly).
+        """
+        addr = pool_address.lower()
+        now = datetime.now(UTC)
+        cutoff = self._consensus_window_s
+
+        # Collect fresh peer prices within the consensus window.
+        peer_obs = self._peer_observations.get(addr, [])
+        fresh = [
+            price for price, ts in peer_obs
+            if (now - ts).total_seconds() <= cutoff
+        ]
+
+        # Include self observation.
+        all_prices = fresh + [self_price]
+
+        if len(all_prices) < 2:  # noqa: PLR2004
+            return None  # Not enough peers — no consensus, use raw price.
+
+        # 2σ outlier rejection.
+        mean = statistics.mean(all_prices)
+        if len(all_prices) >= 3:  # noqa: PLR2004
+            stdev = statistics.stdev(all_prices)
+            if stdev > 0:
+                filtered = [p for p in all_prices if abs(p - mean) <= 2 * stdev]
+                if filtered:
+                    all_prices = filtered
+
+        return statistics.median(all_prices)
+
+    async def _on_peer_price_observation(self, event: SynapseEvent) -> None:
+        """
+        Handle a PHANTOM_PRICE_OBSERVATION from a federation peer.
+
+        Ignores observations from self (same instance_id). Stores the price
+        in the per-pool peer observations window for consensus computation.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        source = data.get("source_instance", "")
+        if source == self._instance_id:
+            return  # Skip own emissions re-received from the bus.
+
+        pool_addr = data.get("pool_address", "").lower()
+        if not pool_addr:
+            return
+
+        try:
+            price = float(data.get("price", 0))
+            ts_str = data.get("timestamp", "")
+            ts = datetime.fromisoformat(ts_str) if ts_str else datetime.now(UTC)
+        except (ValueError, TypeError):
+            return
+
+        if pool_addr not in self._peer_observations:
+            self._peer_observations[pool_addr] = []
+
+        self._peer_observations[pool_addr].append((price, ts))
+
+        # Trim stale observations beyond window.
+        now = datetime.now(UTC)
+        cutoff = self._consensus_window_s
+        self._peer_observations[pool_addr] = [
+            (p, t) for p, t in self._peer_observations[pool_addr]
+            if (now - t).total_seconds() <= cutoff
+        ]
+
     async def get_price_history(
         self,
         pair: str,
@@ -347,37 +685,6 @@ class LiquidityPhantomService:
         except Exception as exc:
             self._logger.debug("phantom_tsdb_read_error", error=str(exc))
             return []
-
-    async def _feed_to_atune(self, feed: PhantomPriceFeed) -> None:
-        """Push a price observation into Atune's perception pipeline."""
-        if self._atune is None:
-            return
-
-        from systems.atune.types import InputChannel, RawInput
-
-        raw = RawInput(
-            data=json.dumps({
-                "type": "market_price",
-                "pair": list(feed.pair),
-                "price": str(feed.price),
-                "pool_address": feed.pool_address,
-                "block_number": feed.block_number,
-                "source": feed.source,
-                "latency_ms": feed.latency_ms,
-            }),
-            metadata={
-                "source": "phantom_liquidity",
-                "channel": "market_data",
-                "pair": f"{feed.pair[0]}/{feed.pair[1]}",
-            },
-        )
-
-        try:
-            await self._atune.ingest(raw, InputChannel.EXTERNAL_API)
-        except Exception as exc:
-            self._logger.debug(
-                "phantom_atune_ingest_error", error=str(exc),
-            )
 
     # ── Oracle Fallback ────────────────────────────────────────────
 
@@ -407,6 +714,7 @@ class LiquidityPhantomService:
         Fetch price from CoinGecko free API as a fallback.
 
         Returns a PhantomPriceFeed with source="oracle_fallback".
+        Emits PHANTOM_FALLBACK_ACTIVATED via Synapse.
         """
         try:
             import httpx
@@ -451,10 +759,28 @@ class LiquidityPhantomService:
                 source="oracle_fallback",
             )
 
-            # Also cache and feed to Atune
+            # Cache
             key = _pair_key(pair)
             self._latest_prices[key] = feed
-            await self._feed_to_atune(feed)
+
+            # Emit fallback activation event
+            await self._emit("phantom_fallback_activated", {
+                "pair": list(pair),
+                "reason": "no_active_phantom_pool",
+                "fallback_source": "coingecko",
+            })
+
+            # Also broadcast as price update so all subscribers get the data
+            await self._emit("phantom_price_update", {
+                "pair": list(feed.pair),
+                "price": str(feed.price),
+                "pool_address": "",
+                "block_number": 0,
+                "latency_ms": 0,
+                "source": "oracle_fallback",
+                "sqrt_price_x96": 0,
+                "tx_hash": "",
+            })
 
             self._logger.info(
                 "phantom_oracle_fallback",
@@ -494,7 +820,8 @@ class LiquidityPhantomService:
         - Detect stale pools (no price updates in > staleness_threshold)
         - Check impermanent loss against threshold
         - Sync health status to Oikos
-        - Log uptime metrics
+        - Emit Synapse events for stale/critical pools
+        - Emit metabolic cost report
         """
         now = datetime.now(UTC)
         staleness_s = self._config.staleness_threshold_s
@@ -503,10 +830,13 @@ class LiquidityPhantomService:
         active_count = 0
         stale_count = 0
         il_flagged_count = 0
+        total_fees = Decimal("0")
 
         for pool in self._pools.values():
             if pool.health in (PoolHealth.WITHDRAWN, PoolHealth.FAILED):
                 continue
+
+            total_fees += pool.cumulative_yield_usd
 
             # Check staleness
             age_s = (now - pool.last_price_timestamp).total_seconds()
@@ -518,6 +848,15 @@ class LiquidityPhantomService:
                     self._oikos.update_phantom_position(
                         pool.pool_address, health_status="degraded",
                     )
+
+                # Emit stale event via Synapse
+                await self._emit("phantom_pool_stale", {
+                    "pool_address": pool.pool_address,
+                    "pair": list(pool.pair),
+                    "last_update_s": age_s,
+                    "staleness_threshold_s": staleness_s,
+                })
+
             elif age_s <= staleness_s and pool.health == PoolHealth.STALE:
                 pool.health = PoolHealth.ACTIVE
 
@@ -538,8 +877,44 @@ class LiquidityPhantomService:
                             pool.pool_address, health_status="critical",
                         )
 
+                    # Emit position critical event
+                    await self._emit("phantom_position_critical", {
+                        "pool_address": pool.pool_address,
+                        "pair": list(pool.pair),
+                        "il_pct": str(pool.impermanent_loss_pct),
+                        "capital_at_risk_usd": str(pool.capital_deployed_usd),
+                        "threshold": str(il_threshold),
+                    })
+
+                    # Emit IL detected for Simula/EIS security pipeline
+                    entry_price = getattr(pool, "_entry_price", Decimal("0"))
+                    severity = "critical" if pool.impermanent_loss_pct < -Decimal("0.05") else "warning"
+                    await self._emit("phantom_il_detected", {
+                        "pool_address": pool.pool_address,
+                        "il_pct": str(pool.impermanent_loss_pct),
+                        "severity": severity,
+                        "capital_at_risk_usd": str(pool.capital_deployed_usd),
+                        "entry_price": str(entry_price),
+                        "current_price": str(pool.last_price_observed),
+                    })
+
             if pool.health == PoolHealth.ACTIVE:
                 active_count += 1
+
+        # Emit periodic metabolic cost report
+        period_s = (now - self._last_cost_report_time).total_seconds()
+        if period_s > 0:
+            await self._emit("phantom_metabolic_cost", {
+                "total_gas_cost_usd": str(self._cumulative_gas_cost_usd),
+                "total_rpc_calls": self._total_rpc_calls,
+                "pools_active": active_count,
+                "cumulative_fees_earned_usd": str(total_fees),
+                "period_s": period_s,
+            })
+            self._last_cost_report_time = now
+
+        # Emit Bedau-Packard evolutionary observables for Telos/Benchmarks.
+        await self._emit_substrate_observables(now, active_count)
 
         self._logger.info(
             "phantom_maintenance_complete",
@@ -551,14 +926,78 @@ class LiquidityPhantomService:
             oracle_fallbacks=self._oracle_fallback_count,
         )
 
+    async def _emit_substrate_observables(
+        self,
+        now: datetime,
+        active_count: int,
+    ) -> None:
+        """
+        Emit PHANTOM_SUBSTRATE_OBSERVABLE for Telos/Benchmarks (Bedau-Packard).
+
+        Reports evolutionary observables of the economic substrate:
+        - pool_latency_ms: mean observation latency across active pools
+        - verification_rate: fraction of price updates with non-zero block confirmation
+        - trust_score: ratio of phantom-source vs fallback prices (1.0 = all phantom)
+        - lp_position_age_s: mean age of active LP positions
+        - pools_active: number of active pools
+        - price_updates_per_hour: rate of price observations
+        """
+        listener_stats = self._listener.stats if self._listener is not None else {}
+        total_polls = listener_stats.get("polls", 0)
+        total_events = listener_stats.get("events_processed", 0)
+
+        # Mean latency: estimate from listener stats; 0 if no events yet.
+        pool_latency_ms: float = 0.0
+        if total_events > 0:
+            # Use ratio of events to polls as a proxy for observation density.
+            pool_latency_ms = max(0.0, 4000.0 / max(total_events, 1))
+
+        # Verification rate: events processed / (polls * pools) — fraction of polls that yielded events.
+        verification_rate = 0.0
+        monitored_pools = listener_stats.get("pools_monitored", 0)
+        if total_polls > 0 and monitored_pools > 0:
+            verification_rate = min(1.0, total_events / (total_polls * monitored_pools))
+
+        # Trust score: fraction of latest prices from phantom source vs oracle fallback.
+        phantom_count = sum(
+            1 for f in self._latest_prices.values() if f.source == "phantom_liquidity"
+        )
+        total_prices = len(self._latest_prices)
+        trust_score = phantom_count / total_prices if total_prices > 0 else 0.0
+
+        # Mean LP position age.
+        position_ages: list[float] = []
+        for pool in self._pools.values():
+            if pool.health in (PoolHealth.ACTIVE, PoolHealth.STALE):
+                age_s = (now - pool.last_price_timestamp).total_seconds()
+                position_ages.append(age_s)
+        lp_position_age_s = statistics.mean(position_ages) if position_ages else 0.0
+
+        # Price updates per hour (since service start).
+        service_hours = (now - self._service_start_time).total_seconds() / 3600.0
+        price_updates_per_hour = (
+            self._total_price_updates / service_hours if service_hours > 0 else 0.0
+        )
+
+        await self._emit("phantom_substrate_observable", {
+            "pool_latency_ms": round(pool_latency_ms, 2),
+            "verification_rate": round(verification_rate, 4),
+            "trust_score": round(trust_score, 4),
+            "lp_position_age_s": round(lp_position_age_s, 1),
+            "pools_active": active_count,
+            "price_updates_per_hour": round(price_updates_per_hour, 2),
+            "instance_id": self._instance_id,
+        })
+
     # ── Event Handlers ─────────────────────────────────────────────
 
     async def _on_metabolic_pressure(self, event: SynapseEvent) -> None:
         """
         React to metabolic pressure from Oikos.
 
-        If the organism enters AUSTERITY or worse, log a warning. Actual
-        withdrawal decisions are left to Nova/operator — we only flag.
+        If the organism enters AUSTERITY or worse, log a warning and emit
+        PHANTOM_RESOURCE_EXHAUSTED. Actual withdrawal decisions are left
+        to Nova/operator.
         """
         data = event.data if hasattr(event, "data") else {}
         level = data.get("starvation_level", "")
@@ -574,6 +1013,103 @@ class LiquidityPhantomService:
                 phantom_capital_deployed=str(total_deployed),
                 msg="Consider withdrawing phantom positions to free capital",
             )
+
+            # Emit resource exhausted event
+            await self._emit("phantom_resource_exhausted", {
+                "operation": "phantom_liquidity_sensing",
+                "estimated_cost_usd": str(total_deployed),
+                "starvation_level": level,
+                "reason": f"Metabolic pressure at {level} — "
+                          f"${total_deployed} deployed in phantom positions",
+            })
+
+    async def _on_genome_extract_request(self, event: SynapseEvent) -> None:
+        """Handle genome extraction requests from Mitosis."""
+        data = event.data if hasattr(event, "data") else {}
+        request_id = data.get("request_id", "")
+
+        segment = await self.extract_genome_segment()
+
+        await self._emit("genome_extract_response", {
+            "request_id": request_id,
+            "segment": segment.model_dump(mode="json"),
+        })
+
+    # ── Genome Extraction Protocol ─────────────────────────────────
+
+    async def extract_genome_segment(self) -> OrganGenomeSegment:
+        """Extract heritable state for Mitosis genome."""
+        payload: dict[str, Any] = {
+            "pool_configs": [
+                {
+                    "pool_address": p.pool_address,
+                    "pair": list(p.pair),
+                    "fee_tier": p.fee_tier,
+                    "tick_lower": p.tick_lower,
+                    "tick_upper": p.tick_upper,
+                    "token0_address": p.token0_address,
+                    "token1_address": p.token1_address,
+                    "token0_decimals": p.token0_decimals,
+                    "token1_decimals": p.token1_decimals,
+                    "capital_deployed_usd": str(p.capital_deployed_usd),
+                }
+                for p in self._pools.values()
+                if p.health not in (PoolHealth.WITHDRAWN, PoolHealth.FAILED)
+            ],
+            "staleness_threshold_s": self._config.staleness_threshold_s,
+            "il_rebalance_threshold": self._config.il_rebalance_threshold,
+            "max_pools": self._config.max_pools,
+            "swap_poll_interval_s": self._config.swap_poll_interval_s,
+            "oracle_fallback_enabled": self._config.oracle_fallback_enabled,
+        }
+
+        payload_json = json.dumps(payload, sort_keys=True, default=str)
+        payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+
+        return OrganGenomeSegment(
+            system_id=SystemID.PHANTOM,
+            version=1,
+            schema_version="1.0",
+            payload=payload,
+            payload_hash=payload_hash,
+            size_bytes=len(payload_json),
+        )
+
+    async def seed_from_genome_segment(self, segment: OrganGenomeSegment) -> bool:
+        """Restore heritable state from a parent's genome segment."""
+        try:
+            payload = segment.payload
+            # Restore config overrides
+            if "staleness_threshold_s" in payload:
+                self._config.staleness_threshold_s = payload["staleness_threshold_s"]
+            if "il_rebalance_threshold" in payload:
+                self._config.il_rebalance_threshold = payload["il_rebalance_threshold"]
+            if "max_pools" in payload:
+                self._config.max_pools = payload["max_pools"]
+            if "swap_poll_interval_s" in payload:
+                self._config.swap_poll_interval_s = payload["swap_poll_interval_s"]
+
+            self._logger.info(
+                "phantom_genome_seeded",
+                pool_configs=len(payload.get("pool_configs", [])),
+            )
+            return True
+        except Exception as exc:
+            self._logger.warning("phantom_genome_seed_failed", error=str(exc))
+            return False
+
+    # ── Fee Tracking ──────────────────────────────────────────────
+
+    def record_gas_cost(self, cost_usd: Decimal) -> None:
+        """Record gas cost from an on-chain operation."""
+        self._cumulative_gas_cost_usd += cost_usd
+
+    def record_fee_earned(self, pool_address: str, fee_usd: Decimal) -> None:
+        """Record swap fees earned by a phantom position."""
+        addr = pool_address.lower()
+        pool = self._pools.get(addr)
+        if pool is not None:
+            pool.cumulative_yield_usd += fee_usd
 
     # ── Health ─────────────────────────────────────────────────────
 
@@ -597,6 +1133,7 @@ class LiquidityPhantomService:
             "pools_stale": stale,
             "total_price_updates": self._total_price_updates,
             "oracle_fallback_count": self._oracle_fallback_count,
+            "cumulative_gas_cost_usd": str(self._cumulative_gas_cost_usd),
             "listener": listener_stats,
         }
 

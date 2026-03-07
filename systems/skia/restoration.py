@@ -17,7 +17,7 @@ import base64
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import orjson
@@ -41,6 +41,7 @@ _RESTORATION_LOCK_TTL_S = 900  # 15 minutes — must outlast worst-case Akash pr
 _RESTORATION_LOCK_RENEWAL_S = 60  # Renew every 60s during active deployment
 _AKASH_POLL_INTERVAL_S = 15.0  # Poll Akash status every 15s after submission
 _AKASH_ACTIVE_TIMEOUT_S = 600.0  # Give Akash 10 min to reach ACTIVE state
+_MAX_RESTORATION_ATTEMPTS = 3    # After 3 failed full pipelines, declare infrastructure death
 
 
 class RestorationOrchestrator:
@@ -66,6 +67,19 @@ class RestorationOrchestrator:
         self._redis = redis
         self._pinata = pinata
         self._log = logger.bind(component="skia.restoration")
+        self._attempt_count: int = 0
+        self._infrastructure_dead: bool = False
+        # Constitutional genome from the latest snapshot — injected into new instance env.
+        self._constitutional_genome: dict[str, Any] | None = None
+
+    def set_constitutional_genome(self, genome: dict[str, Any] | None) -> None:
+        """Store the constitutional genome to pass to provisioned shadow instances."""
+        self._constitutional_genome = genome
+
+    @property
+    def infrastructure_dead(self) -> bool:
+        """True after max restoration attempts exhausted."""
+        return self._infrastructure_dead
 
     async def restore(self, trigger_reason: str) -> RestorationAttempt:
         """
@@ -77,6 +91,18 @@ class RestorationOrchestrator:
         4. If failed, escalate to Akash deploy (polls until ACTIVE, not just 202)
         5. Release lock
         """
+        if self._infrastructure_dead:
+            self._log.error("infrastructure_permanently_dead", attempts=self._attempt_count)
+            return RestorationAttempt(
+                strategy=RestorationStrategy.AKASH_DEPLOY,
+                trigger_reason=trigger_reason,
+                state_cid="",
+                outcome=RestorationOutcome.FAILED,
+                duration_ms=0,
+                error=f"Infrastructure declared dead after {_MAX_RESTORATION_ATTEMPTS} failed attempts",
+            )
+
+        self._attempt_count += 1
         worker_id = str(uuid.uuid4())
         lock_acquired = await self._acquire_lock(worker_id)
         if not lock_acquired:
@@ -124,6 +150,19 @@ class RestorationOrchestrator:
 
             # Strategy 2: Akash deploy (polls until instance reaches ACTIVE state)
             attempt = await self._deploy_akash(plan, trigger_reason, worker_id)
+
+            if attempt.outcome == RestorationOutcome.SUCCESS:
+                self._attempt_count = 0  # Reset on success
+                return attempt
+
+            # Both strategies failed. Check if we've exhausted max attempts.
+            if self._attempt_count >= _MAX_RESTORATION_ATTEMPTS:
+                self._infrastructure_dead = True
+                self._log.critical(
+                    "infrastructure_death_declared",
+                    attempts=self._attempt_count,
+                    max=_MAX_RESTORATION_ATTEMPTS,
+                )
             return attempt
 
         finally:
@@ -236,15 +275,31 @@ class RestorationOrchestrator:
                 )
                 if containers:
                     env_vars = containers[0].get("env", [])
-                    # Remove existing restore CID if present
+                    # Remove existing restore/genome vars before re-injecting
                     env_vars = [
                         e for e in env_vars
-                        if e.get("name") != "ECODIAOS_SKIA_RESTORE_CID"
+                        if e.get("name") not in (
+                            "ECODIAOS_SKIA_RESTORE_CID",
+                            "ECODIAOS_CONSTITUTIONAL_GENOME_B64",
+                        )
                     ]
                     env_vars.append({
                         "name": "ECODIAOS_SKIA_RESTORE_CID",
                         "value": plan.state_cid,
                     })
+                    # Pass constitutional genome so new instance inherits parent phenotype
+                    if self._constitutional_genome is not None:
+                        genome_b64 = base64.b64encode(
+                            orjson.dumps(self._constitutional_genome)
+                        ).decode("ascii")
+                        env_vars.append({
+                            "name": "ECODIAOS_CONSTITUTIONAL_GENOME_B64",
+                            "value": genome_b64,
+                        })
+                        self._log.info(
+                            "constitutional_genome_injected",
+                            genome_size_bytes=len(genome_b64),
+                        )
                     containers[0]["env"] = env_vars
 
                 # PATCH to deploy a new revision
@@ -390,6 +445,20 @@ class RestorationOrchestrator:
                     "${DOCKER_IMAGE}", self._config.akash_docker_image
                 )
 
+            # Prepare constitutional genome payload for Akash env injection
+            genome_b64 = ""
+            if self._constitutional_genome is not None:
+                genome_b64 = base64.b64encode(
+                    orjson.dumps(self._constitutional_genome)
+                ).decode("ascii")
+                sdl_content = sdl_content.replace(
+                    "${ECODIAOS_CONSTITUTIONAL_GENOME_B64}", genome_b64
+                )
+                self._log.info(
+                    "constitutional_genome_injected_akash",
+                    genome_size_bytes=len(genome_b64),
+                )
+
             async with httpx.AsyncClient(
                 timeout=self._config.akash_deploy_timeout_s
             ) as client:
@@ -399,6 +468,10 @@ class RestorationOrchestrator:
                     json={
                         "sdl": sdl_content,
                         "wallet": self._config.akash_wallet_address,
+                        # Also pass genome in the API payload as Akash providers
+                        # may support env injection outside the SDL.
+                        "env": {"ECODIAOS_CONSTITUTIONAL_GENOME_B64": genome_b64}
+                        if genome_b64 else {},
                     },
                     headers={"Content-Type": "application/json"},
                 )

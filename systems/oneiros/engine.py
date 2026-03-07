@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
@@ -46,7 +46,105 @@ from systems.synapse.types import SynapseEvent, SynapseEventType
 
 if TYPE_CHECKING:
     from systems.logos.service import LogosService
+    from systems.oneiros.types import (
+        EmergenceReport,
+        LucidDreamingReport,
+        REMStageReport,
+        SlowWaveReport,
+    )
     from systems.synapse.event_bus import EventBus
+
+
+# ─── Stage Protocols ─────────────────────────────────────────────
+# Each stage exposes a typed execute() signature. The engine holds concrete
+# instances but these Protocols allow tests and future alternative implementations
+# to satisfy the interface contract without inheritance.
+
+
+@runtime_checkable
+class DescentStageProtocol(Protocol):
+    """Contract for the Descent stage."""
+
+    async def execute(
+        self,
+        trigger: SleepTrigger,
+        logos: Any,
+        target_duration_s: float,
+        *,
+        active_hypothesis_count: int,
+        unprocessed_error_count: int,
+    ) -> SleepCheckpoint:
+        ...
+
+    @property
+    def input_suspended(self) -> bool:
+        ...
+
+    def resume_input_channels(self) -> None:
+        ...
+
+
+@runtime_checkable
+class SlowWaveStageProtocol(Protocol):
+    """Contract for the Slow Wave stage."""
+
+    async def execute(
+        self,
+        checkpoint: SleepCheckpoint,
+        uncompressed_episodes: list[dict[str, Any]] | None,
+        active_hypotheses: list[dict[str, Any]] | None,
+        causal_observations: list[dict[str, Any]] | None,
+    ) -> SlowWaveReport:
+        ...
+
+
+@runtime_checkable
+class REMStageProtocol(Protocol):
+    """Contract for the REM stage."""
+
+    async def execute(
+        self,
+        checkpoint: SleepCheckpoint,
+        kairos_priority_seeds: list[dict[str, Any]] | None,
+    ) -> REMStageReport:
+        ...
+
+    @property
+    def pre_attention_entries(self) -> list[Any]:
+        ...
+
+
+@runtime_checkable
+class LucidDreamingStageProtocol(Protocol):
+    """Contract for the Lucid Dreaming stage."""
+
+    async def execute(
+        self,
+        checkpoint: SleepCheckpoint,
+    ) -> LucidDreamingReport:
+        ...
+
+
+@runtime_checkable
+class EmergenceStageProtocol(Protocol):
+    """Contract for the Emergence stage."""
+
+    async def execute(
+        self,
+        checkpoint: SleepCheckpoint,
+        logos: Any,
+        sleep_start_time: float | None,
+        slow_wave_report: SlowWaveReport | None,
+        rem_report: REMStageReport | None,
+        lucid_report: LucidDreamingReport | None,
+        pre_attention_entries: list[Any],
+        sleep_cycle_id: str,
+    ) -> EmergenceReport:
+        ...
+
+    @property
+    def average_intelligence_improvement(self) -> float:
+        ...
 
 logger = structlog.get_logger("oneiros.engine")
 
@@ -78,13 +176,13 @@ class SleepCycleEngine:
         self._config = config or SleepSchedulerConfig()
         self._event_bus = event_bus
 
-        # Sub-stages
+        # Sub-stages (typed via stage Protocols)
         self._scheduler = SleepScheduler(config=self._config)
-        self._descent = DescentStage(event_bus=event_bus)
-        self._slow_wave: SlowWaveStage | None = None  # needs logos
-        self._rem: REMStage | None = None  # needs logos
-        self._lucid: LucidDreamingStage | None = None  # needs logos + simula
-        self._emergence = EmergenceStage(event_bus=event_bus)
+        self._descent: DescentStageProtocol = DescentStage(event_bus=event_bus)
+        self._slow_wave: SlowWaveStageProtocol | None = None  # needs logos
+        self._rem: REMStageProtocol | None = None  # needs logos
+        self._lucid: LucidDreamingStageProtocol | None = None  # needs logos + simula
+        self._emergence: EmergenceStageProtocol = EmergenceStage(event_bus=event_bus)
 
         # Cross-system refs (set via setters)
         self._logos: LogosService | None = None
@@ -98,6 +196,10 @@ class SleepCycleEngine:
         self._current_stage: SleepStageV2 | None = None
         self._current_checkpoint: SleepCheckpoint | None = None
         self._sleep_start_mono: float | None = None
+        self._creative_goal: str | None = None
+
+        # Interrupted checkpoint pending restoration on next sleep cycle
+        self._pending_restore_checkpoint: SleepCheckpoint | None = None
 
         self._logger = logger.bind(component="engine")
 
@@ -128,6 +230,12 @@ class SleepCycleEngine:
         self._equor = equor
         self._rebuild_stages()
 
+    def set_creative_goal(self, goal: str | None) -> None:
+        """Pass the current creative goal into LucidDreamingStage."""
+        self._creative_goal = goal
+        if self._lucid is not None and isinstance(self._lucid, LucidDreamingStage):
+            self._lucid._creative_goal = goal
+
     def _rebuild_stages(self) -> None:
         """Rebuild stages that depend on cross-system refs."""
         self._slow_wave = SlowWaveStage(
@@ -145,6 +253,7 @@ class SleepCycleEngine:
             simula=self._simula,
             equor=self._equor,
             event_bus=self._event_bus,
+            creative_goal=self._creative_goal,
         )
 
     @property
@@ -164,7 +273,7 @@ class SleepCycleEngine:
         return self._current_checkpoint
 
     @property
-    def emergence(self) -> EmergenceStage:
+    def emergence(self) -> EmergenceStageProtocol:
         """Access emergence for intelligence improvement tracking."""
         return self._emergence
 
@@ -204,38 +313,61 @@ class SleepCycleEngine:
         self._sleep_start_mono = time.monotonic()
         target_duration_s = self._config.target_sleep_duration_s
 
+        # Check whether we have an interrupted checkpoint to restore from.
+        restore_checkpoint = self._pending_restore_checkpoint
+        self._pending_restore_checkpoint = None
+
         report = SleepCycleV2Report(trigger=trigger)
 
-        self._logger.info(
-            "sleep_cycle_starting",
-            trigger=trigger.value,
-            target_duration_s=target_duration_s,
-        )
+        if restore_checkpoint is not None:
+            self._logger.info(
+                "sleep_cycle_resuming_from_checkpoint",
+                trigger=trigger.value,
+                checkpoint_id=restore_checkpoint.id,
+                note="skipping DESCENT, resuming at SLOW_WAVE",
+            )
+        else:
+            self._logger.info(
+                "sleep_cycle_starting",
+                trigger=trigger.value,
+                target_duration_s=target_duration_s,
+            )
 
         try:
-            # -- Stage 1: DESCENT (10%) --
-            # Capture pre-sleep counts from Evo and Fovea for the checkpoint.
-            # Both are fetched via duck-typed optional methods to avoid hard deps.
-            active_hypothesis_count = 0
-            if self._evo is not None and hasattr(self._evo, "get_active_hypothesis_count"):
-                with contextlib.suppress(Exception):
-                    active_hypothesis_count = await self._evo.get_active_hypothesis_count()
+            if restore_checkpoint is not None:
+                # -- Restored from interrupted cycle: skip DESCENT --
+                checkpoint = restore_checkpoint
+                self._current_checkpoint = checkpoint
+                report.checkpoint = checkpoint
+            else:
+                # -- Stage 1: DESCENT (10%) --
+                # Capture pre-sleep counts from Evo and Fovea for the checkpoint.
+                active_hypothesis_count = 0
+                if self._evo is not None:
+                    with contextlib.suppress(Exception):
+                        active_hypothesis_count = (
+                            await self._evo.get_active_hypothesis_count()
+                        )
 
-            unprocessed_error_count = 0
-            if self._fovea is not None and hasattr(self._fovea, "get_unprocessed_error_count"):
-                with contextlib.suppress(Exception):
-                    unprocessed_error_count = await self._fovea.get_unprocessed_error_count()
+                unprocessed_error_count = 0
+                if self._fovea is not None and hasattr(
+                    self._fovea, "get_unprocessed_error_count"
+                ):
+                    with contextlib.suppress(Exception):
+                        unprocessed_error_count = (
+                            await self._fovea.get_unprocessed_error_count()
+                        )
 
-            await self._transition_to(SleepStageV2.DESCENT)
-            checkpoint = await self._descent.execute(
-                trigger=trigger,
-                logos=self._logos,
-                target_duration_s=target_duration_s,
-                active_hypothesis_count=active_hypothesis_count,
-                unprocessed_error_count=unprocessed_error_count,
-            )
-            self._current_checkpoint = checkpoint
-            report.checkpoint = checkpoint
+                await self._transition_to(SleepStageV2.DESCENT)
+                checkpoint = await self._descent.execute(
+                    trigger=trigger,
+                    logos=self._logos,
+                    target_duration_s=target_duration_s,
+                    active_hypothesis_count=active_hypothesis_count,
+                    unprocessed_error_count=unprocessed_error_count,
+                )
+                self._current_checkpoint = checkpoint
+                report.checkpoint = checkpoint
 
             # -- Stage 2: SLOW_WAVE (50%) --
             await self._transition_to(SleepStageV2.SLOW_WAVE)
@@ -267,6 +399,10 @@ class SleepCycleEngine:
                     report.lucid = lucid_report
 
             # -- Stage 4: EMERGENCE (10%) --
+            # Resume input channels now that compilation is complete.
+            if hasattr(self._descent, "resume_input_channels"):
+                self._descent.resume_input_channels()  # type: ignore[union-attr]
+
             await self._transition_to(SleepStageV2.EMERGENCE)
             emergence_report = await self._emergence.execute(
                 checkpoint=checkpoint,
@@ -367,8 +503,9 @@ class SleepCycleEngine:
         """
         Interrupt the current sleep cycle.
 
-        Returns the checkpoint from Descent so the caller can decide
-        whether to restore or discard.
+        Captures the Descent checkpoint and stores it so the *next* call to
+        run_sleep_cycle() resumes from SLOW_WAVE rather than restarting from
+        scratch.  Returns the checkpoint for the caller's awareness.
         """
         if not self._is_sleeping:
             return None
@@ -380,6 +517,15 @@ class SleepCycleEngine:
         )
 
         checkpoint = self._current_checkpoint
+        # Persist checkpoint so the next sleep cycle can restore from SLOW_WAVE
+        if checkpoint is not None:
+            self._pending_restore_checkpoint = checkpoint
+            self._logger.info(
+                "interrupt_checkpoint_stored",
+                checkpoint_id=checkpoint.id,
+                note="next sleep cycle will resume from SLOW_WAVE",
+            )
+
         self._is_sleeping = False
         self._current_stage = None
         self._current_checkpoint = None

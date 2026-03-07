@@ -260,51 +260,53 @@ async def deploy_idle_capital(
         expected_daily_yield_usd=str(daily_yield),
     )
 
-    # ── Step 3: Drive DeFiYieldExecutor ──────────────────────────────────────
-    # Import here to avoid circular imports at module load time.
-    from primitives.constitutional import ConstitutionalCheck
-    from primitives.intent import GoalDescriptor, Intent
-    from systems.axon.executors.defi_yield import DeFiYieldExecutor
-    from systems.axon.types import ExecutionContext, ScopedCredentials
+    # ── Step 3: Request Axon execution via Synapse bus ──────────────────────
+    # No direct cross-system import — all motor actions go through Synapse.
+    if event_bus is None:
+        log.error("no_event_bus_for_yield_deployment")
+        return DeploymentOutcome(success=False, error="No event bus", degraded=True)
 
-    executor = DeFiYieldExecutor(wallet=wallet)
+    import uuid
 
-    # Build a minimal ExecutionContext — yield deployment is autonomous,
-    # not driven by a Nova intent, so we construct a synthetic one.
-    ctx = ExecutionContext(
-        intent=Intent(
-            goal=GoalDescriptor(
-                description=f"Deploy ${deployable:.2f} USDC into {protocol} for yield",
-                target_domain="oikos.yield",
-            ),
-            autonomy_level_granted=3,
-        ),
-        equor_check=ConstitutionalCheck(
-            intent_id="",
-            reasoning="Autonomous yield deployment within survival reserve",
-        ),
-        credentials=ScopedCredentials(),
-        instance_id="eos-oikos-yield",
-    )
+    from systems.synapse.types import SynapseEvent, SynapseEventType
 
-    result = await executor.execute(
-        params={
+    request_id = str(uuid.uuid4())
+    result_future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+
+    async def _on_yield_result(evt: SynapseEvent) -> None:
+        if evt.data.get("request_id") == request_id and not result_future.done():
+            result_future.set_result(evt.data)
+
+    # Subscribe once; the done-check in _on_yield_result makes it inert after use.
+    event_bus.subscribe(SynapseEventType.YIELD_DEPLOYMENT_RESULT, _on_yield_result)
+
+    await event_bus.emit(SynapseEvent(
+        event_type=SynapseEventType.YIELD_DEPLOYMENT_REQUEST,
+        source_system="oikos",
+        data={
             "action": "deposit",
-            "amount": str(deployable.quantize(Decimal("0.000001"))),
+            "amount_usd": str(deployable.quantize(Decimal("0.000001"))),
             "protocol": protocol,
+            "apy": str(apy),
+            "request_id": request_id,
         },
-        context=ctx,
-    )
+    ))
 
-    if not result.success:
-        log.error("executor_failed", error=result.error)
+    # Wait up to 30s for Axon to respond
+    try:
+        result_data = await asyncio.wait_for(result_future, timeout=30.0)
+    except asyncio.TimeoutError:
+        log.error("yield_deployment_timeout", request_id=request_id)
         return DeploymentOutcome(
-            success=False,
-            error=result.error,
-            degraded=True,
+            success=False, error="Axon deployment timeout", degraded=True
         )
 
-    tx_hash: str = result.data.get("tx_hash", "")
+    if not result_data.get("success", False):
+        error_msg = result_data.get("error", "Unknown executor error")
+        log.error("executor_failed", error=error_msg)
+        return DeploymentOutcome(success=False, error=error_msg, degraded=True)
+
+    tx_hash: str = result_data.get("tx_hash", "")
     log.info(
         "capital_deployed",
         tx_hash=tx_hash,

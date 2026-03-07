@@ -1,74 +1,68 @@
 """
 EcodiaOS — Simula CodeGen Stall Pattern Detector
 
-Detects cognitive stalls in simula_codegen by monitoring broadcast acknowledgement rates.
+Monitors and detects cognitive stall patterns in simula_codegen broadcasts.
 """
 
 from __future__ import annotations
 
 import structlog
-from typing import Dict, Any, List
+from typing import List, Optional
 
 from systems.evo.detectors import PatternDetector
-from primitives.common import EOSBaseModel
+from systems.synapse.types import SynapseEvent, SynapseEventType
 
-logger = structlog.get_logger("evo.simula_codegen_stall_detector")
-
-class SimulaCodegenStallPattern(EOSBaseModel):
-    """
-    Represents a detected stall pattern in simula_codegen.
-    
-    Tracks key metrics indicating a potential cognitive stall.
-    """
-    broadcast_ack_rate: float
-    cycles_observed: int
-    stall_severity: float
+logger = structlog.get_logger("simula_codegen_stall_detector")
 
 class SimulaCodegenStallDetector(PatternDetector):
     """
-    Pattern detector for identifying cognitive stalls in simula_codegen.
+    Pattern detector for identifying simula_codegen cognitive stalls.
     
-    Monitors broadcast acknowledgement rates and processing cycles to 
-    detect potential system degradation.
+    Detection criteria:
+    1. Low broadcast acknowledgement rate
+    2. High communication channel jitter
+    3. Repeated failed transmission attempts
     """
     
-    name = "simula_codegen_stall_detector"
-    description = "Detects cognitive stalls in simula_codegen subsystem"
-    
-    def scan(self, system_state: Dict[str, Any]) -> List[SimulaCodegenStallPattern]:
+    def __init__(self, window_size: int = 100):
         """
-        Scan for stall patterns in simula_codegen.
+        Initialize the stall detector.
         
         Args:
-            system_state: Current system state metrics
+            window_size: Number of recent events to analyze
+        """
+        self.window_size = window_size
+        self.recent_events: List[SynapseEvent] = []
+    
+    def scan(self, events: List[SynapseEvent]) -> Optional[dict]:
+        """
+        Scan events for cognitive stall patterns.
+        
+        Args:
+            events: List of recent Synapse events
         
         Returns:
-            List of detected stall patterns
+            Detected pattern details or None
         """
-        try:
-            broadcast_ack_rate = system_state.get('broadcast_ack_rate', 1.0)
-            processing_cycles = system_state.get('processing_cycles', 0)
-            
-            # Stall detection logic
-            if broadcast_ack_rate < 0.5 and processing_cycles > 10:
-                stall_pattern = SimulaCodegenStallPattern(
-                    broadcast_ack_rate=broadcast_ack_rate,
-                    cycles_observed=processing_cycles,
-                    stall_severity=1.0 - broadcast_ack_rate
-                )
-                
-                logger.warning(
-                    "Potential cognitive stall detected in simula_codegen",
-                    stall_pattern=stall_pattern.model_dump()
-                )
-                
-                return [stall_pattern]
-            
-            return []
+        self.recent_events.extend(events)
+        self.recent_events = self.recent_events[-self.window_size:]
         
-        except Exception as e:
-            logger.error(
-                "Error scanning for simula_codegen stall",
-                error=str(e)
+        stall_events = [
+            event for event in self.recent_events
+            if event.type == SynapseEventType.COGNITIVE_STALL
+        ]
+        
+        if len(stall_events) > self.window_size * 0.1:  # More than 10% stall events
+            logger.warning(
+                "High cognitive stall rate detected",
+                stall_count=len(stall_events),
+                total_events=len(self.recent_events)
             )
-            return []
+            
+            return {
+                "pattern": "simula_codegen_stall",
+                "stall_rate": len(stall_events) / len(self.recent_events),
+                "recommended_action": "THYMOS_T4_SIMULA_CODEGEN_STALL_REPAIR"
+            }
+        
+        return None

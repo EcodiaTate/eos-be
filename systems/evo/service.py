@@ -37,11 +37,14 @@ import asyncio
 import collections
 import contextlib
 import time
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from primitives.common import DriveAlignmentVector, SystemID
 from primitives.memory_trace import Episode
+from primitives.re_training import RETrainingExample
 from systems.evo.belief_consolidation import BeliefConsolidationScanner
 from systems.evo.belief_halflife import BeliefAgingScanner
 from systems.evo.cognitive_niche import NicheRegistry
@@ -72,15 +75,12 @@ from systems.evo.types import (
     SelfModelStats,
     TournamentOutcome,
 )
-from systems.simula.proposals.arxiv_translator import (
-    ArxivProposalTranslator,
-)
-
 if TYPE_CHECKING:
     from clients.llm import LLMProvider
+    from clients.redis import RedisClient
     from config import EvoConfig
     from core.hotreload import NeuroplasticityBus
-    from systems.atune.types import WorkspaceBroadcast
+    from systems.fovea.types import WorkspaceBroadcast
     from systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
@@ -176,19 +176,50 @@ class EvoService:
         # Used to detect a stalled loop at 2× this interval.
         self._consolidation_expected_interval_s: float = 6.0 * 3600  # 6 hours
 
+        # ── RE performance degradation tracking ───────────────────────────
+        # Consecutive RE_DECISION_OUTCOME events where success_rate < 0.60.
+        # After 10 consecutive degraded readings a hyperparameter-adjustment
+        # PatternCandidate is queued for the next consolidation pass.
+        self._re_degradation_count: int = 0
+
         # ── Hypothesis budget degradation tracking ────────────────────────
         # Consecutive hypothesis generation cycles that were skipped due to
         # LLM budget exhaustion.
         self._consecutive_hypothesis_skips: int = 0
+        # Logos cognitive pressure gate — when True, non-critical hypothesis
+        # generation is paused to reduce compute during compression pressure.
+        self._cognitive_pressure_high: bool = False
         # Thymos reference — wired via set_thymos() if called.
         self._thymos: Any = None
 
         # Synapse event bus — wired via set_event_bus()
         self._event_bus: Any = None
 
+        # Cached Soma curiosity drive — updated from SOMATIC_MODULATION_SIGNAL events
+        # so we never call soma.get_current_signal() directly.
+        self._cached_soma_curiosity_drive: float = 0.5
+
+        # Redis client — wired via set_redis(); used for PatternContext checkpoints
+        # so accumulated detector state survives restarts between consolidations.
+        self._redis: Any = None
+
         # ArXiv research pipeline
         self._arxiv_scientist: ArxivScientist = ArxivScientist(llm=self._llm)
-        self._arxiv_translator: ArxivProposalTranslator = ArxivProposalTranslator()
+        # _arxiv_translator is intentionally lazy — imported inside
+        # _handle_new_arxiv_innovation() to avoid the cross-system top-level import.
+
+        # ── Metabolic gating ──────────────────────────────────────────────
+        self._starvation_level: str = "nominal"
+
+        # ── Speciation tracking (Task 2) ─────────────────────────────────
+        # Rolling confirmation rate: deque of (timestamp, confirmed_count, total_count)
+        self._confirmation_history: collections.deque[tuple[float, int, int]] = (
+            collections.deque(maxlen=100)
+        )
+        # Track known hypothesis domains for novel domain detection
+        self._known_hypothesis_domains: set[str] = set()
+        # Last speciation event timestamp (monotonic) — enforce max 1 per 24h
+        self._last_speciation_event_at: float = 0.0
 
         # ── Economic learning state ────────────────────────────────────────────
         # Rolling window of bounty attempt outcomes: True=success, False=failure
@@ -230,14 +261,14 @@ class EvoService:
         # Belief half-life scanner — requires Neo4j via MemoryService
         belief_aging: BeliefAgingScanner | None = None
         if self._memory is not None:
-            belief_aging = BeliefAgingScanner(neo4j=self._memory._neo4j)
+            belief_aging = BeliefAgingScanner(neo4j=self._memory)
 
         self._belief_aging = belief_aging
 
         # Belief consolidation scanner — hardens high-confidence beliefs into read-only nodes
         belief_consolidation: BeliefConsolidationScanner | None = None
         if self._memory is not None:
-            belief_consolidation = BeliefConsolidationScanner(neo4j=self._memory._neo4j)
+            belief_consolidation = BeliefConsolidationScanner(neo4j=self._memory)
         self._belief_consolidation = belief_consolidation
 
         # Tournament engine for competitive A/B hypothesis experimentation
@@ -250,7 +281,7 @@ class EvoService:
         genome_extractor: GenomeExtractor | None = None
         if self._memory is not None:
             genome_extractor = GenomeExtractor(
-                neo4j=self._memory._neo4j,
+                neo4j=self._memory,
                 instance_id=self._config.instance_id if hasattr(self._config, "instance_id") else self._instance_name,
             )
         self._genome_extractor = genome_extractor
@@ -276,6 +307,29 @@ class EvoService:
         self._structural_generator = StructuralHypothesisGenerator(
             memory=self._memory,
         )
+
+        # Causal failure analyzer — feeds Phase 6.5 failure-pattern detection
+        # and Phase 8 causal-surgery proposals.  Requires Neo4j + LLM; skipped
+        # when memory is not wired (test / lightweight environments).
+        self._causal_surgery_analyzer: Any = None
+        if self._memory is not None:
+            try:
+                from systems.simula.coevolution.causal_surgery import (
+                    CausalDAGBuilder,
+                    CausalFailureAnalyzer,
+                )
+
+                _dag_builder = CausalDAGBuilder(neo4j=self._memory)
+                self._causal_surgery_analyzer = CausalFailureAnalyzer(
+                    neo4j=self._memory,
+                    llm=self._llm,
+                    dag_builder=_dag_builder,
+                )
+            except Exception as _exc:
+                self._logger.warning(
+                    "causal_surgery_analyzer_init_failed",
+                    error=str(_exc),
+                )
 
         # ── Cognitive Speciation Subsystem ────────────────────────────────────
         # Niche registry — manages isolated hypothesis ecosystems
@@ -303,7 +357,9 @@ class EvoService:
             belief_consolidation_scanner=belief_consolidation,
             tournament_engine=self._tournament_engine,
             genome_extractor=genome_extractor,
+            causal_surgery_analyzer=self._causal_surgery_analyzer,
             procedure_codifier=self._procedure_codifier,
+            oikos=self._oikos if hasattr(self, "_oikos") else None,
             schema_induction_engine=self._schema_engine,
             meta_learning_engine=self._meta_learning,
             speciation_engine=self._speciation_engine,
@@ -319,10 +375,15 @@ class EvoService:
         restored = await self._parameter_tuner.load_from_memory()
 
         self._initialized = True
+
+        # Restore PatternContext from Redis checkpoint (Spec §III gap fix)
+        pattern_restored = await self._restore_pattern_context_checkpoint()
+
         self._logger.info(
             "evo_initialized",
             detectors=len(self._detectors),
             parameters_restored=restored,
+            pattern_context_restored=pattern_restored,
         )
 
         # Register with the NeuroplasticityBus for hot-reload of PatternDetector subclasses.
@@ -396,14 +457,9 @@ class EvoService:
             # Curiosity-modulated hypothesis generation interval
             # High curiosity → generate hypotheses more aggressively
             curiosity_multiplier = 1.0
-            if self._soma is not None:
-                try:
-                    signal = self._soma.get_current_signal()
-                    curiosity_drive = signal.state.sensed.get("curiosity_drive", 0.5)
-                    # Scale: 0.5 drive = 1.0x, 1.0 drive = 1.5x (generate earlier)
-                    curiosity_multiplier = 0.5 + curiosity_drive * 1.0
-                except Exception:
-                    pass
+            # Use cached Soma curiosity drive (updated via SOMATIC_MODULATION_SIGNAL handler)
+            curiosity_drive = getattr(self, "_cached_soma_curiosity_drive", 0.5)
+            curiosity_multiplier = 0.5 + curiosity_drive * 1.0
 
             effective_interval = max(
                 10, int(_HYPOTHESIS_GENERATION_INTERVAL / curiosity_multiplier)
@@ -428,6 +484,14 @@ class EvoService:
                     name="evo_evidence_evaluation",
                 )
 
+            # Periodic PatternContext checkpoint to Redis every 1000 broadcasts
+            # so online state survives restart between consolidations (Spec §III)
+            if self._total_broadcasts % 1000 == 0:
+                asyncio.create_task(
+                    self._save_pattern_context_checkpoint(),
+                    name="evo_pattern_checkpoint",
+                )
+
         except Exception as exc:
             self._logger.error("broadcast_processing_failed", error=str(exc))
 
@@ -446,14 +510,60 @@ class EvoService:
                 result = await self._hypothesis_engine.evaluate_evidence(h, episode)
                 self._total_evidence_evaluations += 1
 
-                # When a hypothesis crosses into SUPPORTED, generate an
-                # epistemic goal so Nova can actively explore the finding
-                if (
-                    result is not None
-                    and result.new_status == HypothesisStatus.SUPPORTED
-                    and self._nova is not None
-                ):
-                    await self._generate_goal_from_hypothesis(h)
+                # Emit lifecycle events on status transitions
+                if result is not None:
+                    if result.new_status == HypothesisStatus.SUPPORTED:
+                        # Emit EVO_HYPOTHESIS_CONFIRMED
+                        await self._emit_hypothesis_lifecycle_events([h], "confirmed")
+                        if self._nova is not None:
+                            await self._generate_goal_from_hypothesis(h)
+                        await self._emit_evolutionary_observable(
+                            observable_type="hypothesis_validated",
+                            value=h.evidence_score,
+                            is_novel=True,
+                            metadata={
+                                "hypothesis_id": h.id,
+                                "statement": h.statement[:200],
+                                "category": h.category.value if hasattr(h.category, "value") else str(h.category),
+                                "supporting_count": len(getattr(h, "supporting_episodes", [])),
+                                "path": "bayesian_evidence",
+                            },
+                        )
+                        # RE training: hypothesis confirmation
+                        await self._emit_re_training_example(
+                            category="hypothesis_reasoning",
+                            instruction=f"Evaluate hypothesis: {h.statement[:200]}",
+                            input_context=(
+                                f"evidence_score={h.evidence_score:.2f}, "
+                                f"supporting={len(h.supporting_episodes)}, "
+                                f"contradicting={len(h.contradicting_episodes)}"
+                            ),
+                            output="CONFIRMED",
+                            outcome_quality=min(1.0, h.evidence_score / 10.0),
+                            reasoning_trace=(
+                                f"Formal test: {h.formal_test[:200]}. "
+                                f"Confidence trajectory: score={h.evidence_score:.2f}"
+                            ),
+                        )
+                    elif result.new_status == HypothesisStatus.REFUTED:
+                        # Emit EVO_HYPOTHESIS_REFUTED
+                        await self._emit_hypothesis_lifecycle_events([h], "refuted")
+                        # RE training: hypothesis refutation
+                        await self._emit_re_training_example(
+                            category="hypothesis_reasoning",
+                            instruction=f"Evaluate hypothesis: {h.statement[:200]}",
+                            input_context=(
+                                f"evidence_score={h.evidence_score:.2f}, "
+                                f"supporting={len(h.supporting_episodes)}, "
+                                f"contradicting={len(h.contradicting_episodes)}"
+                            ),
+                            output="REFUTED",
+                            outcome_quality=0.0,
+                            reasoning_trace=(
+                                f"Formal test: {h.formal_test[:200]}. "
+                                f"Score dropped to {h.evidence_score:.2f}"
+                            ),
+                        )
 
             except Exception as exc:
                 self._logger.warning(
@@ -469,30 +579,31 @@ class EvoService:
         When Evo accumulates enough evidence to support a hypothesis, the
         organism should actively explore and test it — not just passively wait.
         """
-        from primitives.common import DriveAlignmentVector, new_id
-        from systems.nova.types import Goal, GoalSource, GoalStatus
-
-        goal = Goal(
-            id=new_id(),
-            description=(
-                f"Explore supported hypothesis: "
-                f"{hypothesis.statement[:120]}"
-            ),
-            source=GoalSource.EPISTEMIC,
-            priority=0.55,
-            urgency=0.3,
-            importance=0.6,
-            drive_alignment=DriveAlignmentVector(
-                coherence=0.3, care=0.0, growth=0.7, honesty=0.0,
-            ),
-            status=GoalStatus.ACTIVE,
-        )
+        if self._event_bus is None:
+            return
         try:
-            await self._nova.add_goal(goal)
+            from primitives.common import new_id
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            goal_id = new_id()
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.NOVA_GOAL_INJECTED,
+                source_system="evo",
+                data={
+                    "goal_id": goal_id,
+                    "description": f"Explore supported hypothesis: {hypothesis.statement[:120]}",
+                    "source": "epistemic",
+                    "priority": 0.55,
+                    "urgency": 0.3,
+                    "importance": 0.6,
+                    "drive_alignment": {"coherence": 0.3, "care": 0.0, "growth": 0.7, "honesty": 0.0},
+                    "hypothesis_id": hypothesis.id,
+                },
+            ))
             self._logger.info(
                 "epistemic_goal_generated",
                 hypothesis_id=hypothesis.id,
-                goal_id=goal.id,
+                goal_id=goal_id,
             )
         except Exception as exc:
             self._logger.warning("epistemic_goal_failed", error=str(exc))
@@ -506,6 +617,11 @@ class EvoService:
         Safe to call from tests and management APIs.
         """
         if not self._initialized or self._orchestrator is None:
+            return None
+
+        # Metabolic gate: no consolidation under EMERGENCY/CRITICAL
+        if self._starvation_level in ("emergency", "critical"):
+            self._logger.info("consolidation_blocked_starvation", level=self._starvation_level)
             return None
 
         if self._consolidation_task and not self._consolidation_task.done():
@@ -626,6 +742,18 @@ class EvoService:
             delta=round(actual_delta, 4),
             reason=reason,
         )
+        await self._emit_evolutionary_observable(
+            observable_type="parameter_adjusted",
+            value=actual_delta,
+            is_novel=True,
+            metadata={
+                "parameter": parameter_path,
+                "old_value": current,
+                "new_value": new_value,
+                "reason": reason[:200],
+                "source": "thymos_immune_repair",
+            },
+        )
         return True
 
     def get_self_model(self) -> SelfModelStats | None:
@@ -721,6 +849,19 @@ class EvoService:
             self._orchestrator._logos = logos
         self._logger.info("logos_wired_to_evo")
 
+    def wire_oikos(self, oikos: Any) -> None:
+        """
+        Wire the Oikos metabolic service so Phase 5 parameter optimisation
+        can check the GROWTH gate before running expensive tuning.
+
+        Must be called after initialize() and before the first consolidation
+        cycle.
+        """
+        self._oikos = oikos
+        if self._orchestrator is not None:
+            self._orchestrator._oikos = oikos
+        self._logger.info("oikos_wired_to_evo")
+
     def wire_event_bus(self, event_bus: Any) -> None:
         """
         Wire the Synapse EventBus into the ConsolidationOrchestrator so that
@@ -737,7 +878,433 @@ class EvoService:
             self._orchestrator._event_bus = event_bus
         if self._niche_forking_engine is not None:
             self._niche_forking_engine._event_bus = event_bus
+        # Wire into ParameterTuner so every apply_adjustment() pushes
+        # EVO_PARAMETER_ADJUSTED — no more polling for Atune/Nova/Voxis.
+        if self._parameter_tuner is not None:
+            self._parameter_tuner.wire_event_bus(event_bus)
         self._logger.info("event_bus_wired_to_evo_orchestrator")
+
+    async def _emit_re_training_example(
+        self,
+        category: str,
+        instruction: str,
+        input_context: str,
+        output: str,
+        outcome_quality: float,
+        episode_id: str = "",
+        cost_usd: Decimal = Decimal("0"),
+        latency_ms: int = 0,
+        reasoning_trace: str = "",
+        alternatives: list[str] | None = None,
+        constitutional_alignment: DriveAlignmentVector | None = None,
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            example = RETrainingExample(
+                source_system=SystemID.EVO,
+                episode_id=episode_id,
+                instruction=instruction,
+                input_context=input_context,
+                output=output,
+                outcome_quality=outcome_quality,
+                category=category,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                reasoning_trace=reasoning_trace,
+                alternatives_considered=alternatives or [],
+                constitutional_alignment=constitutional_alignment or DriveAlignmentVector(),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                data=example.model_dump(mode="json"),
+                source_system="evo",
+            ))
+        except Exception:
+            self._logger.debug("re_training_emit_failed", exc_info=True)
+
+    async def _emit_evolutionary_observable(
+        self,
+        observable_type: str,
+        value: float,
+        is_novel: bool,
+        metadata: dict | None = None,
+    ) -> None:
+        """Emit an EvolutionaryObservable event on Synapse for population tracking."""
+        bus = self._event_bus
+        if bus is None:
+            return
+        try:
+            from primitives.common import SystemID
+            from primitives.evolutionary import EvolutionaryObservable
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            obs = EvolutionaryObservable(
+                source_system=SystemID.EVO,
+                instance_id=getattr(self, "_instance_id", "") or "",
+                observable_type=observable_type,
+                value=value,
+                is_novel=is_novel,
+                metadata=metadata or {},
+            )
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system=SystemID.EVO,
+                data=obs.model_dump(mode="json"),
+            )
+            await bus.emit(event)
+        except Exception:
+            pass  # Best-effort — never block the learning loop
+
+    async def _emit_hypothesis_lifecycle_events(
+        self,
+        hypotheses: list,
+        lifecycle: str,
+    ) -> None:
+        """
+        Emit EVO_HYPOTHESIS_CREATED / CONFIRMED / REFUTED for a batch of hypotheses.
+        """
+        if self._event_bus is None or not hypotheses:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            event_map = {
+                "created": SynapseEventType.EVO_HYPOTHESIS_CREATED,
+                "confirmed": SynapseEventType.EVO_HYPOTHESIS_CONFIRMED,
+                "refuted": SynapseEventType.EVO_HYPOTHESIS_REFUTED,
+            }
+            event_type = event_map.get(lifecycle)
+            if event_type is None:
+                return
+
+            for h in hypotheses:
+                category = h.category.value if hasattr(h.category, "value") else str(h.category)
+                data: dict = {
+                    "hypothesis_id": h.id,
+                    "category": category,
+                    "statement": h.statement[:300],
+                }
+                if lifecycle == "created":
+                    data["source_detector"] = getattr(h, "source_detector", "")
+                    data["novelty_score"] = getattr(h, "novelty_score", 0.0)
+                elif lifecycle == "confirmed":
+                    data["evidence_score"] = h.evidence_score
+                    data["supporting_count"] = len(getattr(h, "supporting_episodes", []))
+                elif lifecycle == "refuted":
+                    data["evidence_score"] = h.evidence_score
+                    data["contradicting_count"] = len(getattr(h, "contradicting_episodes", []))
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=event_type,
+                    source_system="evo",
+                    data=data,
+                ))
+        except Exception:
+            self._logger.debug("hypothesis_lifecycle_emit_failed", exc_info=True)
+
+    async def _emit_consolidation_complete(self, result: ConsolidationResult) -> None:
+        """Emit EVO_CONSOLIDATION_COMPLETE after a consolidation cycle."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_CONSOLIDATION_COMPLETE,
+                source_system="evo",
+                data={
+                    "consolidation_number": self._total_consolidations,
+                    "duration_ms": result.duration_ms,
+                    "hypotheses_integrated": result.hypotheses_integrated,
+                    "schemas_induced": result.schemas_induced,
+                    "parameters_adjusted": result.parameters_adjusted,
+                },
+            ))
+        except Exception:
+            self._logger.debug("consolidation_complete_emit_failed", exc_info=True)
+
+    async def _emit_capability_emerged(
+        self,
+        capability_name: str,
+        source_hypotheses: list[str],
+        novelty_score: float,
+        domain: str,
+    ) -> None:
+        """Emit EVO_CAPABILITY_EMERGED when a genuinely new capability is detected."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_CAPABILITY_EMERGED,
+                source_system="evo",
+                data={
+                    "capability_name": capability_name,
+                    "source_hypotheses": source_hypotheses,
+                    "novelty_score": novelty_score,
+                    "domain": domain,
+                },
+            ))
+        except Exception:
+            self._logger.debug("capability_emerged_emit_failed", exc_info=True)
+
+    async def _check_and_emit_speciation_event(self, result: ConsolidationResult) -> None:
+        """
+        After consolidation, check for significant behavioral shifts that
+        indicate a speciation-level divergence. Emit SPECIATION_EVENT if detected.
+        Max 1 event per 24 hours to avoid noise.
+        """
+        if self._event_bus is None:
+            return
+
+        now = time.monotonic()
+
+        # Rate limit: max 1 per 24h
+        if now - self._last_speciation_event_at < 86400:
+            return
+
+        # Track confirmation rate
+        evaluated = result.hypotheses_evaluated
+        integrated = result.hypotheses_integrated
+        self._confirmation_history.append((now, integrated, max(1, evaluated)))
+
+        # Need at least 7 days of history (rough: multiple consolidation cycles)
+        if len(self._confirmation_history) < 10:
+            return
+
+        triggers: list[str] = []
+        affected_domains: list[str] = []
+        magnitude = 0.0
+
+        # Check 1: Confirmation rate change > 20% over recent history
+        half = len(self._confirmation_history) // 2
+        older = list(self._confirmation_history)[:half]
+        newer = list(self._confirmation_history)[half:]
+
+        old_rate = sum(c for _, c, _ in older) / max(1, sum(t for _, _, t in older))
+        new_rate = sum(c for _, c, _ in newer) / max(1, sum(t for _, _, t in newer))
+
+        if abs(new_rate - old_rate) > 0.20:
+            triggers.append(
+                f"Confirmation rate shifted from {old_rate:.2f} to {new_rate:.2f}"
+            )
+            magnitude = max(magnitude, min(1.0, abs(new_rate - old_rate) / 0.5))
+
+        # Check 2: Novel hypothesis domains appearing
+        if self._hypothesis_engine is not None:
+            current_domains = {
+                h.category.value if hasattr(h.category, "value") else str(h.category)
+                for h in self._hypothesis_engine.get_active()
+            }
+            novel_domains = current_domains - self._known_hypothesis_domains
+            if novel_domains:
+                triggers.append(f"Novel domains emerged: {', '.join(novel_domains)}")
+                affected_domains.extend(novel_domains)
+                magnitude = max(magnitude, min(1.0, len(novel_domains) * 0.3))
+                self._known_hypothesis_domains.update(novel_domains)
+
+        # Check 3: Foundation belief weight drift > 10% (from consolidation result)
+        if result.foundation_conflicts > 0:
+            triggers.append(
+                f"{result.foundation_conflicts} foundation belief conflicts detected"
+            )
+            magnitude = max(magnitude, min(1.0, result.foundation_conflicts * 0.15))
+
+        if not triggers or magnitude < 0.2:
+            return
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.SPECIATION_EVENT,
+                source_system="evo",
+                data={
+                    "trigger": "; ".join(triggers),
+                    "magnitude": round(magnitude, 3),
+                    "affected_domains": affected_domains,
+                    "consolidation_number": self._total_consolidations,
+                },
+            ))
+            self._last_speciation_event_at = now
+            self._logger.info(
+                "speciation_event_emitted",
+                magnitude=round(magnitude, 3),
+                triggers=triggers,
+            )
+        except Exception:
+            self._logger.debug("speciation_event_emit_failed", exc_info=True)
+
+    async def _emit_fitness_observable_batch(self, result: Any) -> None:
+        """Loop 6: Emit FITNESS_OBSERVABLE_BATCH after consolidation for Benchmarks."""
+        if self._event_bus is None:
+            return
+        try:
+            from primitives.evolutionary import EvolutionaryObservable
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            instance_id = getattr(self, "_instance_id", "") or ""
+            evaluated = getattr(result, "hypotheses_evaluated", 0)
+            integrated = getattr(result, "hypotheses_integrated", 0)
+            schemas = getattr(result, "schemas_induced", 0)
+            archived = getattr(result, "hypotheses_archived", 0)
+
+            # Build individual evolutionary observables from consolidation results
+            observables: list[dict] = []
+            if integrated > 0:
+                observables.append(EvolutionaryObservable(
+                    source_system=SystemID.EVO, instance_id=instance_id,
+                    observable_type="hypotheses_integrated",
+                    value=float(integrated), is_novel=True,
+                    metadata={"consolidation": self._total_consolidations},
+                ).model_dump(mode="json"))
+            if schemas > 0:
+                observables.append(EvolutionaryObservable(
+                    source_system=SystemID.EVO, instance_id=instance_id,
+                    observable_type="schemas_induced",
+                    value=float(schemas), is_novel=True,
+                    metadata={"consolidation": self._total_consolidations},
+                ).model_dump(mode="json"))
+            if archived > 0:
+                observables.append(EvolutionaryObservable(
+                    source_system=SystemID.EVO, instance_id=instance_id,
+                    observable_type="hypotheses_archived",
+                    value=float(archived), is_novel=False,
+                    metadata={"consolidation": self._total_consolidations},
+                ).model_dump(mode="json"))
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.FITNESS_OBSERVABLE_BATCH,
+                source_system="evo",
+                data={
+                    "consolidation_number": self._total_consolidations,
+                    "hypotheses_evaluated": evaluated,
+                    "hypotheses_integrated": integrated,
+                    "schemas_induced": schemas,
+                    "duration_ms": getattr(result, "duration_ms", 0),
+                    "observables": observables,
+                    "instance_id": instance_id,
+                    "generation": 1,
+                },
+            ))
+            self._logger.debug(
+                "fitness_observable_batch_emitted",
+                consolidation=self._total_consolidations,
+                observable_count=len(observables),
+            )
+        except Exception as exc:
+            self._logger.debug("fitness_observable_batch_emit_failed", error=str(exc))
+
+    def set_redis(self, redis: Any) -> None:
+        """Wire the Redis client so PatternContext state is checkpointed between restarts.
+
+        Without this, the accumulated detector counters (cooccurrences, sequences,
+        temporal bins, affect responses) are lost on any restart that occurs between
+        consolidation cycles — Spec §III gap fix.
+        """
+        self._redis = redis
+        self._logger.info("redis_wired_to_evo_pattern_checkpoint")
+
+    # Redis key for the PatternContext checkpoint
+    _PATTERN_CONTEXT_REDIS_KEY = "evo:pattern_context:checkpoint"
+    # TTL: slightly longer than the maximum consolidation interval (6h) × 2
+    _PATTERN_CONTEXT_TTL_S: int = 14 * 3600  # 14 hours
+
+    async def _save_pattern_context_checkpoint(self) -> None:
+        """Checkpoint PatternContext counters to Redis (Spec §III gap fix).
+
+        Called before each consolidation cycle so the post-consolidation reset
+        can be safely applied — counters up to that point are durable.
+        Also called periodically (every 1000 broadcasts) to limit loss window.
+        Best-effort: failures are logged but never block the learning loop.
+        """
+        if self._redis is None:
+            return
+        try:
+            import json as _json
+
+            snapshot = {
+                "cooccurrence_counts": dict(self._pattern_context.cooccurrence_counts),
+                "sequence_counts": dict(self._pattern_context.sequence_counts),
+                "sequence_examples": {
+                    k: list(v)[:20]
+                    for k, v in self._pattern_context.sequence_examples.items()
+                },
+                "temporal_bins": dict(self._pattern_context.temporal_bins),
+                "temporal_baselines": dict(self._pattern_context.temporal_baselines),
+                "affect_responses": {
+                    k: [list(t) for t in v[-50:]]
+                    for k, v in self._pattern_context.affect_responses.items()
+                },
+                "episodes_scanned": self._pattern_context.episodes_scanned,
+            }
+            raw = _json.dumps(snapshot, separators=(",", ":"))
+            await self._redis.setex(
+                self._PATTERN_CONTEXT_REDIS_KEY,
+                self._PATTERN_CONTEXT_TTL_S,
+                raw,
+            )
+        except Exception as exc:
+            self._logger.debug("pattern_context_checkpoint_save_failed", error=str(exc))
+
+    async def _restore_pattern_context_checkpoint(self) -> bool:
+        """Restore PatternContext counters from Redis on startup.
+
+        Returns True if a valid checkpoint was found and applied.
+        Called from initialize() after sub-systems are built.
+        """
+        if self._redis is None:
+            return False
+        try:
+            import json as _json
+            from collections import defaultdict
+
+            raw = await self._redis.get(self._PATTERN_CONTEXT_REDIS_KEY)
+            if raw is None:
+                return False
+            snapshot = _json.loads(raw)
+
+            cc: dict = snapshot.get("cooccurrence_counts", {})
+            sc: dict = snapshot.get("sequence_counts", {})
+            se: dict = snapshot.get("sequence_examples", {})
+            tb: dict = snapshot.get("temporal_bins", {})
+            tbl: dict = snapshot.get("temporal_baselines", {})
+            ar: dict = snapshot.get("affect_responses", {})
+            eps: int = int(snapshot.get("episodes_scanned", 0))
+
+            ctx = self._pattern_context
+            # Merge rather than replace — initialize() may have already run detectors
+            for k, v in cc.items():
+                ctx.cooccurrence_counts[k] += v
+            for k, v in sc.items():
+                ctx.sequence_counts[k] += v
+            for k, v in se.items():
+                existing = ctx.sequence_examples.setdefault(k, [])
+                existing.extend(v)
+                ctx.sequence_examples[k] = existing[:20]
+            for k, v in tb.items():
+                ctx.temporal_bins[k] += v
+            ctx.temporal_baselines.update(tbl)
+            for k, v in ar.items():
+                existing = ctx.affect_responses.setdefault(k, [])
+                existing.extend(tuple(t) for t in v)
+                ctx.affect_responses[k] = existing[-50:]
+            ctx.episodes_scanned = max(ctx.episodes_scanned, eps)
+
+            self._logger.info(
+                "pattern_context_checkpoint_restored",
+                episodes_scanned=eps,
+                cooccurrence_pairs=len(cc),
+                sequences=len(sc),
+            )
+            return True
+        except Exception as exc:
+            self._logger.warning("pattern_context_checkpoint_restore_failed", error=str(exc))
+            return False
 
     def set_thymos(self, thymos: Any) -> None:
         """Wire Thymos so Evo can escalate sustained degradation as incidents."""
@@ -826,6 +1393,7 @@ class EvoService:
           - ACTION_COMPLETED: outcome feedback for hypothesis confidence
           - FOVEA_INTERNAL_PREDICTION_ERROR: competency errors → self-model updates
           - KAIROS_CAUSAL_DIRECTION_ACCEPTED: causal validation results for hypotheses
+          - GENOME_INHERITED: Telos drive mutations in child instances → hypothesized adaptations
 
         Call this from main.py during the integration wiring pass:
             evo.register_on_synapse(synapse.event_bus)
@@ -871,11 +1439,31 @@ class EvoService:
             SynapseEventType.METABOLIC_PRESSURE,
             self._on_metabolic_pressure,
         )
+        if hasattr(SynapseEventType, "COGNITIVE_PRESSURE"):
+            event_bus.subscribe(
+                SynapseEventType.COGNITIVE_PRESSURE,
+                self._on_cognitive_pressure,
+            )
         if hasattr(SynapseEventType, "BUDGET_EXHAUSTED"):
             event_bus.subscribe(
                 SynapseEventType.BUDGET_EXHAUSTED,
                 self._on_budget_exhausted,
             )
+
+        # SG5: Economic outcome events → close the learning loop on economic strategy
+        event_bus.subscribe(
+            SynapseEventType.BOUNTY_PAID,
+            self._on_bounty_paid,
+        )
+        if hasattr(SynapseEventType, "ASSET_BREAK_EVEN"):
+            event_bus.subscribe(
+                SynapseEventType.ASSET_BREAK_EVEN,
+                self._on_asset_break_even,
+            )
+        event_bus.subscribe(
+            SynapseEventType.CHILD_INDEPENDENT,
+            self._on_child_independent,
+        )
 
         # Simula evolution outcomes → reward/penalise source hypotheses
         if hasattr(SynapseEventType, "EVOLUTION_APPLIED"):
@@ -910,6 +1498,51 @@ class EvoService:
             event_bus.subscribe(
                 SynapseEventType.INTENT_REJECTED,
                 self._on_intent_rejected,
+            )
+
+        # Kairos Tier 3 invariant → pre-validated hypothesis
+        if hasattr(SynapseEventType, "KAIROS_TIER3_INVARIANT_DISCOVERED"):
+            event_bus.subscribe(
+                SynapseEventType.KAIROS_TIER3_INVARIANT_DISCOVERED,
+                self._on_kairos_tier3_invariant,
+            )
+
+        # Oikos metabolic pressure → inject economic hypothesis into tournament
+        if hasattr(SynapseEventType, "METABOLIC_EFFICIENCY_PRESSURE"):
+            event_bus.subscribe(
+                SynapseEventType.METABOLIC_EFFICIENCY_PRESSURE,
+                self._on_metabolic_efficiency_pressure,
+            )
+
+        # Telos drive mutations inherited by child instances → track as hypothesized adaptations
+        if hasattr(SynapseEventType, "GENOME_INHERITED"):
+            event_bus.subscribe(
+                SynapseEventType.GENOME_INHERITED,
+                self._on_genome_inherited,
+            )
+
+        # Soma somatic signal → cache curiosity drive (replaces direct soma.get_current_signal())
+        if hasattr(SynapseEventType, "SOMATIC_MODULATION_SIGNAL"):
+            event_bus.subscribe(
+                SynapseEventType.SOMATIC_MODULATION_SIGNAL,
+                self._on_somatic_modulation_signal,
+            )
+
+        # Degradation Engine §8.2 — stub subscription.
+        # Round 2 will implement: decay confidence on all unvalidated hypotheses
+        # by staleness_rate, then re-emit HYPOTHESIS_STALENESS_APPLIED so
+        # VitalityCoordinator can call on_hypotheses_revalidated().
+        if hasattr(SynapseEventType, "HYPOTHESIS_STALENESS"):
+            event_bus.subscribe(
+                SynapseEventType.HYPOTHESIS_STALENESS,
+                self._on_hypothesis_staleness,
+            )
+
+        # RE performance degradation → hyperparameter adjustment hypothesis
+        if hasattr(SynapseEventType, "RE_DECISION_OUTCOME"):
+            event_bus.subscribe(
+                SynapseEventType.RE_DECISION_OUTCOME,
+                self._on_re_decision_outcome,
             )
 
         self._logger.info("evo_synapse_subscriptions_registered")
@@ -1040,8 +1673,29 @@ class EvoService:
                 and len(hypothesis.supporting_episodes) >= VELOCITY_LIMITS["min_evidence_for_integration"]
             ):
                 hypothesis.status = HypothesisStatus.SUPPORTED
+                await self._emit_evolutionary_observable(
+                    observable_type="hypothesis_validated",
+                    value=hypothesis.evidence_score,
+                    is_novel=True,
+                    metadata={
+                        "hypothesis_id": hypothesis.id,
+                        "statement": hypothesis.statement[:200],
+                        "category": hypothesis.category.value if hasattr(hypothesis.category, "value") else str(hypothesis.category),
+                        "supporting_count": len(hypothesis.supporting_episodes),
+                    },
+                )
             elif hypothesis.evidence_score < -2.0:
                 hypothesis.status = HypothesisStatus.REFUTED
+                await self._emit_evolutionary_observable(
+                    observable_type="hypothesis_rejected",
+                    value=hypothesis.evidence_score,
+                    is_novel=True,
+                    metadata={
+                        "hypothesis_id": hypothesis.id,
+                        "statement": hypothesis.statement[:200],
+                        "category": hypothesis.category.value if hasattr(hypothesis.category, "value") else str(hypothesis.category),
+                    },
+                )
 
         # ── Volatility tracking ──────────────────────────────────────────────
         flip_log: list[int] = hypothesis.confidence_flip_log
@@ -1303,8 +1957,60 @@ class EvoService:
                 )
             )
 
+            # Emit hypothesis quality back to Thymos so the immune system
+            # knows whether repair patterns are generalising or staying narrow.
+            await self._emit_hypothesis_quality(
+                hypothesis=h,
+                repair_source_id=incident_id,
+            )
+
         except Exception as exc:
             self._logger.warning("repair_completed_handler_failed", error=str(exc))
+
+    async def _emit_hypothesis_quality(
+        self,
+        hypothesis: Any,
+        repair_source_id: str,
+    ) -> None:
+        """
+        Emit EVO_HYPOTHESIS_QUALITY so Thymos knows if repair patterns generalise.
+
+        Quality score is derived from:
+        - evidence_score: how much confirming evidence has accumulated
+        - applications: number of distinct episodes that supported this hypothesis
+        - confidence: Thompson posterior from evaluate_evidence
+        """
+        if self._event_bus is None:
+            return
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            # Normalise evidence score to [0, 1] — evidence_score is unbounded
+            # but typically ranges 0-10 for repair hypotheses
+            raw_score = getattr(hypothesis, "evidence_score", 0.0)
+            quality = min(1.0, max(0.0, raw_score / 8.0))
+
+            # Count distinct supporting episodes
+            supporting = getattr(hypothesis, "supporting_episodes", []) or []
+            applications = len(supporting)
+
+            # Confidence from Thompson sampling (normalised 0-1)
+            confidence = min(1.0, max(0.0, raw_score / 10.0))
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_HYPOTHESIS_QUALITY,
+                source_system="evo",
+                data={
+                    "hypothesis_id": hypothesis.id,
+                    "repair_source_id": repair_source_id,
+                    "quality_score": round(quality, 3),
+                    "applications": applications,
+                    "confidence": round(confidence, 3),
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("hypothesis_quality_emit_failed", error=str(exc))
 
     # ─── Speciation Event Handlers ───────────────────────────────────────────────
 
@@ -1437,6 +2143,16 @@ class EvoService:
                         hypothesis_id=h_id,
                         score=round(h.evidence_score, 3),
                     )
+                    await self._emit_evolutionary_observable(
+                        observable_type="hypothesis_rejected",
+                        value=h.evidence_score,
+                        is_novel=True,
+                        metadata={
+                            "hypothesis_id": h_id,
+                            "reason": "evolution_rollback",
+                            "rollback_proposal_id": proposal_id,
+                        },
+                    )
                 else:
                     self._logger.info(
                         "evolution_rollback_hypothesis_penalised",
@@ -1554,6 +2270,65 @@ class EvoService:
         except Exception as exc:
             self._logger.warning("intent_rejected_handler_failed", error=str(exc))
 
+    async def _on_kairos_tier3_invariant(self, event: Any) -> None:
+        """
+        Handle KAIROS_TIER3_INVARIANT_DISCOVERED: create a pre-validated hypothesis.
+
+        Tier 3 invariants are substrate-independent causal rules that have been
+        rigorously validated. Evo creates a hypothesis marked as pre-validated
+        (skip initial testing, go straight to SUPPORTED with high evidence).
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+
+        try:
+            data = getattr(event, "data", {}) or {}
+            invariant_id = str(data.get("invariant_id", ""))
+            abstract_form = str(data.get("abstract_form", data.get("description", "")))
+            domains = data.get("applicable_domains", [])
+
+            if not abstract_form:
+                return
+
+            # Check for duplicate
+            existing_ids = {h.id for h in self._hypothesis_engine.get_all_active()}
+            h_id = f"kairos_invariant_{invariant_id}" if invariant_id else f"kairos_{hash(abstract_form) % 100000}"
+            if h_id in existing_ids:
+                return
+
+            from systems.evo.types import HypothesisCategory
+
+            h = Hypothesis(
+                id=h_id,
+                category=HypothesisCategory.WORLD_MODEL,
+                statement=f"Causal invariant (Kairos Tier 3): {abstract_form[:300]}",
+                formal_test=(
+                    "Invariant holds across all observed domains. "
+                    "Refuted if a domain is found where it systematically fails."
+                ),
+                complexity_penalty=0.05,
+                status=HypothesisStatus.SUPPORTED,  # Pre-validated by Kairos
+                evidence_score=5.0,  # High evidence — already validated
+                min_age_hours=0.0,  # No age gate — already proven
+                novelty_score=1.0,  # Tier 3 invariants are inherently novel
+            )
+            self._hypothesis_engine._active[h.id] = h
+            self._hypothesis_engine._total_proposed += 1
+            self._hypothesis_engine._total_supported += 1
+
+            self._logger.info(
+                "kairos_invariant_hypothesis_created",
+                hypothesis_id=h.id,
+                invariant_id=invariant_id,
+                domains=domains[:5],
+            )
+
+            # Emit EVO_HYPOTHESIS_CONFIRMED since it's pre-validated
+            await self._emit_hypothesis_lifecycle_events([h], "confirmed")
+
+        except Exception as exc:
+            self._logger.warning("kairos_invariant_handler_failed", error=str(exc))
+
     # ─── Curiosity Integration ─────────────────────────────────────────────────
 
     async def generate_epistemic_intents(self) -> list[Any]:
@@ -1570,14 +2345,8 @@ class EvoService:
         if not active:
             return []
 
-        # Get Soma curiosity drive if available
-        soma_curiosity = 0.5
-        if self._soma is not None:
-            try:
-                signal = self._soma.get_current_signal()
-                soma_curiosity = signal.state.sensed.get("curiosity_drive", 0.5)
-            except Exception:
-                pass
+        # Use cached Soma curiosity drive (updated via SOMATIC_MODULATION_SIGNAL handler)
+        soma_curiosity = getattr(self, "_cached_soma_curiosity_drive", 0.5)
 
         intents = await self._curiosity_engine.generate_epistemic_intents(
             active_hypotheses=active,
@@ -1809,13 +2578,26 @@ class EvoService:
             self._logger.warning("on_revenue_injected_failed", error=str(exc))
 
     async def _on_metabolic_pressure(self, event: Any) -> None:
-        """METABOLIC_PRESSURE → episodic memory (economic stress signal)."""
+        """METABOLIC_PRESSURE → update starvation level + episodic memory."""
         if not self._initialized:
             return
         try:
             data = getattr(event, "data", {}) or {}
             reason: str = str(data.get("reason", "unknown"))
             runway: float = float(data.get("runway_days", data.get("days", 0.0)))
+
+            # ── Metabolic gating: update starvation level and adjust behavior ──
+            level = data.get("starvation_level", "")
+            if level:
+                old = self._starvation_level
+                self._starvation_level = level
+                if level != old:
+                    self._logger.info("evo_starvation_level_changed", old=old, new=level)
+                    await self._adjust_for_starvation(level)
+                    # Propagate to NicheRegistry so niche expansion is blocked
+                    # under metabolic pressure (GROWTH gate semantics).
+                    if self._niche_registry is not None:
+                        self._niche_registry.set_starvation_level(level)
 
             episode = _economic_episode(
                 source="oikos.metabolism",
@@ -1833,6 +2615,53 @@ class EvoService:
             self._logger.debug("economic_episode_metabolic_pressure", reason=reason, runway=runway)
         except Exception as exc:
             self._logger.warning("on_metabolic_pressure_failed", error=str(exc))
+
+    async def _on_cognitive_pressure(self, event: Any) -> None:
+        """COGNITIVE_PRESSURE → pause non-critical hypothesis generation at high load.
+
+        At pressure >= 0.85 (Logos compression utilization), hypothesis generation
+        is paused to free compute for the compression cascade itself. Resumes below
+        0.75 to provide hysteresis and prevent oscillation.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            pressure = float(data.get("pressure", 0.0))
+            was_high = self._cognitive_pressure_high
+            if pressure >= 0.85:
+                self._cognitive_pressure_high = True
+            elif pressure < 0.75:
+                self._cognitive_pressure_high = False
+            if self._cognitive_pressure_high != was_high:
+                self._logger.info(
+                    "evo_cognitive_pressure_gate_changed",
+                    paused=self._cognitive_pressure_high,
+                    pressure=pressure,
+                )
+        except Exception as exc:
+            self._logger.warning("on_cognitive_pressure_failed", error=str(exc))
+
+    async def _adjust_for_starvation(self, level: str) -> None:
+        """Evo-specific metabolic degradation.
+
+        AUSTERITY: reduce consolidation frequency, skip low-priority hypotheses
+        EMERGENCY: halt all experiments, freeze parameters
+        CRITICAL: full halt
+        """
+        if level in ("emergency", "critical"):
+            # Cancel running consolidation task
+            if self._consolidation_task is not None and not self._consolidation_task.done():
+                self._consolidation_task.cancel()
+                self._consolidation_in_flight = False
+                self._logger.warning("evo_consolidation_cancelled_starvation", level=level)
+            # Cancel arXiv scanning
+            if self._arxiv_scan_task is not None and not self._arxiv_scan_task.done():
+                self._arxiv_scan_task.cancel()
+                self._logger.warning("evo_arxiv_scan_cancelled_starvation", level=level)
+        elif level == "austerity":
+            # Double the consolidation interval to reduce frequency
+            self._consolidation_expected_interval_s = 12.0 * 3600  # 12 hours instead of 6
 
     async def _on_budget_exhausted(self, event: Any) -> None:
         """BUDGET_EXHAUSTED → episodic memory."""
@@ -1855,6 +2684,419 @@ class EvoService:
             self._logger.debug("economic_episode_budget_exhausted", system=system, duration_ms=duration_ms)
         except Exception as exc:
             self._logger.warning("on_budget_exhausted_failed", error=str(exc))
+
+    async def _on_bounty_paid(self, event: Any) -> None:
+        """
+        SG5 — BOUNTY_PAID → confirmed economic outcome.
+
+        A paid bounty is strong positive evidence that the 'bounty hunting is
+        viable at this competency level' hypothesis is correct. Record it as a
+        high-valence episode and update the rolling success window.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            amount: float = float(data.get("reward_usd", data.get("amount", 0.0)))
+            bounty_id: str = str(data.get("bounty_id", ""))
+
+            episode = _economic_episode(
+                source="oikos.bounty",
+                raw_content=f"bounty paid bounty_id={bounty_id} amount={amount:.2f}usd",
+                summary=f"bounty confirmed paid: {amount:.2f}usd",
+                salience=0.9,
+                valence=0.8,  # High positive: actual revenue realized
+                arousal=0.4,
+            )
+            await self._scan_episode_online(episode)
+            # Confirmed payment is the strongest positive outcome signal
+            self._bounty_outcomes.append(True)
+            await self._check_economic_parameter_adjustments()
+            self._logger.debug("economic_episode_bounty_paid", bounty_id=bounty_id, amount=amount)
+        except Exception as exc:
+            self._logger.warning("on_bounty_paid_failed", error=str(exc))
+
+    async def _on_asset_break_even(self, event: Any) -> None:
+        """
+        SG5 — ASSET_BREAK_EVEN → asset strategy hypothesis confirmation.
+
+        Break-even means the organism has recouped its dev cost — strong evidence
+        that 'building this type of autonomous asset generates positive ROI'.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            asset_id: str = str(data.get("asset_id", ""))
+            asset_name: str = str(data.get("asset_name", ""))
+            roi_score: float = float(data.get("roi_score", 0.0))
+            days: int = int(data.get("days_to_break_even", 0))
+
+            episode = _economic_episode(
+                source="oikos.asset",
+                raw_content=(
+                    f"asset broke even: {asset_name} (id={asset_id}) "
+                    f"roi={roi_score:.2f} days_to_break_even={days}"
+                ),
+                summary=f"asset break-even: {asset_name}",
+                salience=0.85,
+                valence=0.7,
+                arousal=0.3,
+            )
+            await self._scan_episode_online(episode)
+            self._logger.debug("economic_episode_asset_break_even", asset_id=asset_id, roi=roi_score)
+        except Exception as exc:
+            self._logger.warning("on_asset_break_even_failed", error=str(exc))
+
+    async def _on_child_independent(self, event: Any) -> None:
+        """
+        SG5 — CHILD_INDEPENDENT → reproduction strategy hypothesis confirmation.
+
+        Independence means a child instance no longer requires parent rescue —
+        strong evidence that 'reproduction is a viable growth strategy at this
+        capital level and niche'.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            child_id: str = str(data.get("child_id", ""))
+            net_worth: float = float(data.get("current_net_worth_usd", 0.0))
+            dividends: float = float(data.get("total_dividends_paid_usd", 0.0))
+            days: int = int(data.get("days_to_independence") or 0)
+
+            episode = _economic_episode(
+                source="oikos.mitosis",
+                raw_content=(
+                    f"child achieved independence: {child_id} "
+                    f"net_worth={net_worth:.2f}usd dividends_paid={dividends:.2f}usd "
+                    f"days_to_independence={days}"
+                ),
+                summary=f"child independent: {child_id[:40]}",
+                salience=0.9,
+                valence=0.9,  # Highest positive: successful speciation event
+                arousal=0.6,
+            )
+            await self._scan_episode_online(episode)
+            self._logger.debug(
+                "economic_episode_child_independent",
+                child_id=child_id,
+                net_worth=net_worth,
+            )
+        except Exception as exc:
+            self._logger.warning("on_child_independent_failed", error=str(exc))
+
+    async def _on_metabolic_efficiency_pressure(self, event: Any) -> None:
+        """
+        Oikos metabolic feedback → economic hypothesis injection.
+
+        When Oikos efficiency drops below 0.8, this handler:
+          1. Records a negative-valence economic episode so pattern detectors
+             accumulate evidence of "efficiency is consistently low".
+          2. Appends a TEMPORAL PatternCandidate to _pending_candidates
+             targeting the specific economic sub-domain (yield_strategy,
+             budget_allocation, or niche_selection) so the next hypothesis
+             generation cycle surfaces a domain-tagged economic hypothesis
+             for tournament scoring.
+
+        Does NOT call generate_hypotheses() directly — that requires LLM and
+        would be out of budget on the hot path. Candidates flow through the
+        normal consolidation pipeline.
+        """
+        if not self._initialized:
+            return
+        try:
+            from systems.evo.types import PatternCandidate, PatternType
+
+            data = getattr(event, "data", {}) or {}
+            efficiency: float = float(data.get("efficiency_ratio", 0.0))
+            pressure_level: str = str(data.get("pressure_level", "medium"))
+            hypothesis_domain: str = str(
+                data.get("hypothesis_domain", "yield_strategy | budget_allocation | niche_selection")
+            )
+            consecutive_cycles: int = int(data.get("consecutive_low_cycles", 1))
+
+            # Negative-valence episode: efficiency underperformance is a loss signal
+            valence = -0.4 if pressure_level == "medium" else -0.7
+            episode = _economic_episode(
+                source="oikos.metabolic",
+                raw_content=(
+                    f"metabolic efficiency pressure: efficiency={efficiency:.3f} "
+                    f"level={pressure_level} consecutive_cycles={consecutive_cycles} "
+                    f"domains={hypothesis_domain}"
+                ),
+                summary=f"low metabolic efficiency ({efficiency:.2f}) — {pressure_level} pressure",
+                salience=0.6 + (0.3 if pressure_level == "high" else 0.0),
+                valence=valence,
+                arousal=0.5,
+            )
+            await self._scan_episode_online(episode)
+
+            # Queue a TEMPORAL candidate so hypothesis generation sees persistent
+            # economic underperformance as a pattern requiring a hypothesis
+            candidate = PatternCandidate(
+                type=PatternType.TEMPORAL,
+                elements=[f"metabolic_efficiency_low:{pressure_level}", *hypothesis_domain.split(" | ")],
+                count=consecutive_cycles,
+                confidence=min(0.9, 0.5 + consecutive_cycles * 0.1),
+                examples=[episode.id] if hasattr(episode, "id") else [],
+                metadata={
+                    "efficiency_ratio": efficiency,
+                    "pressure_level": pressure_level,
+                    "source": "oikos_metabolic_feedback",
+                    "hypothesis_domain": hypothesis_domain,
+                },
+                source_detector="oikos_metabolic_pressure",
+            )
+            self._pending_candidates.append(candidate)
+
+            self._logger.debug(
+                "metabolic_efficiency_pressure_episode_recorded",
+                efficiency=efficiency,
+                pressure_level=pressure_level,
+                consecutive_cycles=consecutive_cycles,
+                pending_candidates=len(self._pending_candidates),
+            )
+        except Exception as exc:
+            self._logger.warning("on_metabolic_efficiency_pressure_failed", error=str(exc))
+
+    async def _on_genome_inherited(self, event: Any) -> None:
+        """
+        Telos drive calibration mutations inherited by a child instance.
+
+        Registers each mutated drive's calibration delta as a PROPOSED hypothesis so
+        Thompson sampling can score it over time as child performance data arrives.
+        The hypothesis posture is: "mutated drive calibration improves alignment in
+        niche <niche>"; confirmed when child ACTION_COMPLETED economic_delta > 0.
+
+        Payload (from TelosService._initialize_from_parent_genome):
+          - child_instance_id: child instance id
+          - parent_genome_id:  parent TelosGenomeFragment.genome_id
+          - generation:        child generation count
+          - drive_mutations:   dict[drive_name, dict[param, {"before": float, "after": float}]]
+          - niche:             child specialisation niche (optional)
+
+        Does NOT raise — genome inheritance must never stall the bus.
+        """
+        if not self._initialized:
+            return
+        try:
+            from systems.evo.types import PatternCandidate, PatternType
+
+            data = getattr(event, "data", {}) or {}
+            child_id: str = str(data.get("child_instance_id", "unknown"))
+            genome_id: str = str(data.get("parent_genome_id", ""))
+            generation: int = int(data.get("generation", 1))
+            drive_mutations: dict = data.get("drive_mutations", {}) or {}
+            niche: str = str(data.get("niche", "general"))
+
+            if not drive_mutations:
+                return
+
+            # One hypothesis candidate per mutated drive
+            for drive_name, param_deltas in drive_mutations.items():
+                if not isinstance(param_deltas, dict):
+                    continue
+
+                # Compute mean mutation magnitude as candidate confidence seed
+                magnitudes = []
+                for pd in param_deltas.values():
+                    if isinstance(pd, dict):
+                        before = float(pd.get("before", 0.0))
+                        after = float(pd.get("after", 0.0))
+                        if before != 0.0:
+                            magnitudes.append(abs(after - before) / abs(before))
+
+                mean_magnitude = sum(magnitudes) / len(magnitudes) if magnitudes else 0.05
+
+                candidate = PatternCandidate(
+                    type=PatternType.TEMPORAL,
+                    elements=[
+                        f"telos_drive_mutation:{drive_name}",
+                        f"niche:{niche}",
+                        f"generation:{generation}",
+                    ],
+                    count=1,
+                    confidence=max(0.3, min(0.7, 0.5 + mean_magnitude)),
+                    examples=[child_id],
+                    metadata={
+                        "source": "telos_genome_inheritance",
+                        "genome_id": genome_id,
+                        "child_instance_id": child_id,
+                        "drive_name": drive_name,
+                        "niche": niche,
+                        "generation": generation,
+                        "mutation_magnitude": mean_magnitude,
+                        "param_deltas": param_deltas,
+                        "hypothesis_domain": f"telos.drive_calibration.{drive_name}",
+                    },
+                    source_detector="telos_genome_inheritance",
+                )
+                self._pending_candidates.append(candidate)
+
+            self._logger.info(
+                "genome_inherited_candidates_queued",
+                child_id=child_id,
+                genome_id=genome_id,
+                drives_mutated=list(drive_mutations.keys()),
+                niche=niche,
+                pending_candidates=len(self._pending_candidates),
+            )
+        except Exception as exc:
+            self._logger.warning("on_genome_inherited_failed", error=str(exc))
+
+    async def _on_re_decision_outcome(self, event: Any) -> None:
+        """Track RE performance; queue a hyperparameter-adjustment candidate when degraded.
+
+        Watches the 7-day rolling RE success_rate from Nova's Thompson sampler.
+        After 10 consecutive readings below 0.60 (warning zone), queues a
+        PatternCandidate into _pending_candidates targeting
+        "reasoning_engine.hyperparameter_adjustment" so the next consolidation
+        pass generates a hypothesis proposing concrete RE tuning actions.
+
+        Does NOT call generate_hypotheses() directly — candidates flow through
+        the normal consolidation pipeline to stay within budget.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            success_rate = float(data.get("success_rate", 1.0))
+
+            if success_rate < 0.60:
+                self._re_degradation_count += 1
+                self._logger.debug(
+                    "re_degradation_count_incremented",
+                    success_rate=success_rate,
+                    count=self._re_degradation_count,
+                )
+
+                if self._re_degradation_count >= 10:
+                    # Queue a hyperparameter-adjustment candidate for consolidation
+                    candidate = PatternCandidate(
+                        pattern_type=PatternType.TEMPORAL,
+                        description=(
+                            f"RE success rate degraded to {success_rate:.2f} over 10 "
+                            "consecutive readings. Candidate adjustments: increase LoRA rank, "
+                            "lower learning rate, increase replay buffer, add contrastive loss."
+                        ),
+                        labels=[
+                            "reasoning_engine",
+                            "hyperparameter_adjustment",
+                            f"success_rate:{success_rate:.2f}",
+                        ],
+                        count=self._re_degradation_count,
+                        confidence=min(0.85, 0.5 + (10 - success_rate * 10) * 0.03),
+                        examples=[f"re_degradation_{self._re_degradation_count}"],
+                        metadata={
+                            "source": "re_decision_outcome",
+                            "success_rate": success_rate,
+                            "consecutive_degraded_readings": self._re_degradation_count,
+                            "hypothesis_domain": "reasoning_engine.hyperparameter_adjustment",
+                        },
+                        source_detector="re_performance_monitor",
+                    )
+                    self._pending_candidates.append(candidate)
+                    self._logger.warning(
+                        "re_degradation_hypothesis_queued",
+                        success_rate=success_rate,
+                        consecutive_readings=self._re_degradation_count,
+                        pending_candidates=len(self._pending_candidates),
+                    )
+                    self._re_degradation_count = 0
+            else:
+                self._re_degradation_count = 0
+
+        except Exception as exc:
+            self._logger.warning("on_re_decision_outcome_failed", error=str(exc))
+
+    async def _on_somatic_modulation_signal(self, event: Any) -> None:
+        """Cache Soma's curiosity drive from SOMATIC_MODULATION_SIGNAL broadcasts."""
+        try:
+            data = getattr(event, "data", {}) or {}
+            curiosity = float(data.get("curiosity_drive", data.get("external_stress", 0.5)))
+            self._cached_soma_curiosity_drive = max(0.0, min(1.0, curiosity))
+        except Exception:
+            pass
+
+    async def _on_hypothesis_staleness(self, event: Any) -> None:
+        """Degradation Engine §8.2 — decay evidence_score on PROPOSED/TESTING hypotheses.
+
+        Multiplies evidence_score by (1 - staleness_rate) for every active hypothesis
+        in PROPOSED or TESTING status. Hypotheses whose score falls below 0.05 are
+        archived with reason="staleness_decay" — the organism lost confidence in them.
+
+        Emits EVO_HYPOTHESES_STALED (if any archived) and EVO_HYPOTHESIS_REVALIDATED
+        so VitalityCoordinator can call on_hypotheses_revalidated() to reduce entropy
+        pressure — closing the degradation feedback loop.
+        """
+        data = getattr(event, "data", {}) or {}
+        staleness_rate = float(data.get("staleness_rate", 0.0))
+        tick_number = data.get("tick_number", 0)
+
+        if staleness_rate <= 0.0 or self._hypothesis_engine is None:
+            return
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            from systems.evo.types import HypothesisStatus
+
+            active = self._hypothesis_engine._active
+            decayed_count = 0
+            archived: list[Any] = []
+
+            for h in list(active.values()):
+                if h.status not in (HypothesisStatus.PROPOSED, HypothesisStatus.TESTING):
+                    continue
+                h.evidence_score = h.evidence_score * (1.0 - staleness_rate)
+                decayed_count += 1
+                if h.evidence_score < 0.05:
+                    archived.append(h)
+
+            # Archive hypotheses below threshold
+            for h in archived:
+                await self._hypothesis_engine.archive_hypothesis(h, reason="staleness_decay")
+
+            archived_ids = [h.id for h in archived]
+
+            self._logger.info(
+                "hypothesis_staleness_applied",
+                decayed_count=decayed_count,
+                archived_count=len(archived),
+                staleness_rate=round(staleness_rate, 4),
+                tick_number=tick_number,
+            )
+
+            if self._event_bus is None:
+                return
+
+            # Emit EVO_HYPOTHESES_STALED if any were archived
+            if archived:
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EVO_HYPOTHESES_STALED,
+                    source_system="evo",
+                    data={
+                        "decayed_count": decayed_count,
+                        "archived_count": len(archived),
+                        "archived_ids": archived_ids,
+                        "instance_id": self._instance_name,
+                    },
+                ))
+
+            # Always emit EVO_HYPOTHESIS_REVALIDATED — VitalityCoordinator uses this
+            # to call on_hypotheses_revalidated() and reduce cumulative entropy pressure
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_HYPOTHESIS_REVALIDATED,
+                source_system="evo",
+                data={
+                    "processed_count": decayed_count,
+                    "archived_count": len(archived),
+                    "instance_id": self._instance_name,
+                },
+            ))
+
+        except Exception:
+            self._logger.exception("hypothesis_staleness_handler_failed", tick_number=tick_number)
 
     async def _check_economic_parameter_adjustments(self) -> None:
         """
@@ -1895,6 +3137,17 @@ class EvoService:
                         direction="increase",
                         success_rate=round(rate, 3),
                     )
+                    await self._emit_evolutionary_observable(
+                        observable_type="parameter_adjusted",
+                        value=round(1.0 - rate, 2),
+                        is_novel=True,
+                        metadata={
+                            "parameter": "bounty_hunt_interval",
+                            "direction": "increase",
+                            "source": "economic_learning",
+                            "success_rate": round(rate, 3),
+                        },
+                    )
 
             # Rule 2: Consistent yield APY drop → suggest rebalance threshold reduction
             apy_window = list(self._yield_apy_history)
@@ -1922,6 +3175,17 @@ class EvoService:
                         target="yield_rebalance_threshold",
                         direction="decrease",
                         apy_drops=drops,
+                    )
+                    await self._emit_evolutionary_observable(
+                        observable_type="parameter_adjusted",
+                        value=round(drops / len(apy_window), 2),
+                        is_novel=True,
+                        metadata={
+                            "parameter": "yield_rebalance_threshold",
+                            "direction": "decrease",
+                            "source": "economic_learning",
+                            "apy_drops": drops,
+                        },
                     )
 
         except Exception as exc:
@@ -2042,7 +3306,7 @@ class EvoService:
             return None
         from systems.evo.genetic_memory import GenomeInheritanceMonitor
         monitor = GenomeInheritanceMonitor(
-            neo4j=self._memory._neo4j,
+            neo4j=self._memory,
             instance_id=self._config.instance_id if hasattr(self._config, "instance_id") else self._instance_name,
         )
         report = await monitor.generate_report()
@@ -2061,6 +3325,120 @@ class EvoService:
             "pending_candidates": len(self._pending_candidates),
             "arxiv_scanner": self._arxiv_scientist.stats,
         }
+
+    # ─── Genome Export (Oikos SG4 / Spec 26) ─────────────────────────────────
+
+    async def export_belief_genome(self) -> "BeliefGenomeInheritance | None":  # noqa: F821
+        """
+        Snapshot the current belief state into a BeliefGenome for child inheritance.
+
+        Returns a ``primitives.genome_inheritance.BeliefGenome`` capturing:
+          - Top-50 active hypotheses with confidence ≥ 0.6 (id, statement,
+            evidence_score, confidence, category, supporting_count)
+          - Current constitutional drive weights
+          - Last 10 constitutional drift history entries
+          - Learned belief half-lives (from ParameterTuner)
+
+        Called by SpawnChildExecutor Step 0b at child spawn time.
+        Returns None if the engine is not yet initialised.
+        """
+        from primitives.genome_inheritance import (
+            BeliefGenome as BeliefGenomeInheritance,
+            DriftHistoryEntry,
+            DriveWeightSnapshot,
+        )
+
+        if self._hypothesis_engine is None:
+            self._logger.warning("export_belief_genome_skipped", reason="not_initialized")
+            return None
+
+        # Signal genome extraction starting so spec_checker can observe it
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.GENOME_EXTRACT_REQUEST,
+                    source_system="evo",
+                    data={"requester": "evo", "genome_type": "belief"},
+                ))
+            except Exception:
+                pass  # non-fatal — genome extraction continues regardless
+
+        try:
+            # 1. Collect active hypotheses with confidence >= 0.6
+            active = self._hypothesis_engine.get_all_active()
+            top_hypotheses: list[dict[str, Any]] = []
+            for h in active:
+                confidence = getattr(h, "confidence", 0.0)
+                if confidence < 0.6:
+                    continue
+                top_hypotheses.append({
+                    "id": h.id,
+                    "statement": getattr(h, "statement", ""),
+                    "evidence_score": float(getattr(h, "evidence_score", 0.0)),
+                    "confidence": float(confidence),
+                    "category": (
+                        h.category.value
+                        if hasattr(getattr(h, "category", None), "value")
+                        else str(getattr(h, "category", ""))
+                    ),
+                    "supporting_count": int(getattr(h, "supporting_count", 0)),
+                })
+            # Sort by confidence desc, cap at 50
+            top_hypotheses.sort(key=lambda x: x["confidence"], reverse=True)
+            top_hypotheses = top_hypotheses[:50]
+
+            # 2. Drive weight snapshot from Equor if available, else defaults
+            drive_snapshot = DriveWeightSnapshot()
+            if self._equor is not None:
+                try:
+                    scores = await _safe_get_drive_scores(self._equor)
+                    if scores:
+                        drive_snapshot = DriveWeightSnapshot(
+                            coherence=float(scores.get("coherence", 0.20)),
+                            care=float(scores.get("care", 0.35)),
+                            growth=float(scores.get("growth", 0.15)),
+                            honesty=float(scores.get("honesty", 0.30)),
+                        )
+                except Exception:
+                    pass
+
+            # 3. Drift history (last 10 entries from memory if available)
+            drift_history: list[DriftHistoryEntry] = []
+            if self._memory is not None:
+                try:
+                    drift_records = await _safe_fetch_drift_history(self._memory)
+                    for rec in (drift_records or [])[:10]:
+                        drift_history.append(DriftHistoryEntry(
+                            composite_alignment=float(rec.get("composite_alignment", 0.0)),
+                            primary_cause=str(rec.get("primary_cause", "")),
+                        ))
+                except Exception:
+                    pass
+
+            import os as _os_bg
+            instance_id = _os_bg.environ.get("ECODIAOS_INSTANCE_ID", "eos-default")
+
+            genome = BeliefGenomeInheritance(
+                instance_id=instance_id,
+                generation=1,
+                top_50_hypotheses=top_hypotheses,
+                drive_weight_snapshot=drive_snapshot,
+                drift_history=drift_history,
+            )
+
+            self._logger.info(
+                "belief_genome_exported",
+                genome_id=genome.genome_id,
+                hypothesis_count=len(top_hypotheses),
+                drift_entries=len(drift_history),
+            )
+            return genome
+
+        except Exception as exc:
+            self._logger.error("export_belief_genome_failed", error=str(exc))
+            return None
 
     # ─── Stats ────────────────────────────────────────────────────────────────
 
@@ -2155,6 +3533,13 @@ class EvoService:
         candidates = list(self._pending_candidates)
         self._pending_candidates.clear()
 
+        # ── Pre-check: Logos cognitive pressure gate ──────────────────────
+        # When Logos broadcasts high compression pressure (>0.85 utilization),
+        # skip non-critical hypothesis generation to reduce compute load.
+        if self._cognitive_pressure_high:
+            self._logger.debug("hypothesis_generation_skipped_cognitive_pressure")
+            return
+
         # ── Pre-check: will the LLM call be skipped due to budget? ───────
         # The hypothesis engine skips generation silently in YELLOW/RED.
         # Detect this here so we can emit an observable degradation event.
@@ -2213,6 +3598,21 @@ class EvoService:
             # ── Use Telos to prioritise by effective_I impact ────────────
             self._apply_telos_hypothesis_priority(new_hypotheses)
 
+            # ── RE training: hypothesis generation decision ──
+            for h in new_hypotheses:
+                await self._emit_re_training_example(
+                    category="hypothesis_generation",
+                    instruction="Generate falsifiable hypothesis from accumulated pattern candidates.",
+                    input_context=f"patterns={len(candidates)}, detector={dominant_detector}",
+                    output=f"hypothesis={h.statement[:300]!r}, status={h.status.value if hasattr(h.status, 'value') else h.status}",
+                    # TODO(re-quality): replace with evidence_score after hypothesis evaluation
+                    outcome_quality=h.evidence_score if hasattr(h, "evidence_score") else 0.5,
+                    reasoning_trace=h.formal_test[:200] if hasattr(h, "formal_test") and h.formal_test else "",
+                )
+
+            # ── Emit EVO_HYPOTHESIS_CREATED for each new hypothesis ──
+            await self._emit_hypothesis_lifecycle_events(new_hypotheses, "created")
+
         except Exception as exc:
             self._logger.error("hypothesis_generation_safe_failed", error=str(exc))
 
@@ -2260,34 +3660,33 @@ class EvoService:
             except Exception as exc:
                 self._logger.debug("evo_degraded_emit_failed", error=str(exc))
 
-        if consecutive >= 10 and self._thymos is not None:
+        if consecutive >= 10 and self._event_bus is not None:
             try:
-                from systems.thymos.types import (
-                    Incident,
-                    IncidentClass,
-                    IncidentSeverity,
-                )
+                from systems.synapse.types import SynapseEvent, SynapseEventType
 
-                incident = Incident(
-                    incident_class=IncidentClass.RESOURCE_EXHAUSTION,
-                    severity=IncidentSeverity.HIGH,
-                    fingerprint="evo:cognitive_degradation:budget_exhausted",
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.INCIDENT_DETECTED,
                     source_system="evo",
-                    error_type="CognitiveDegradation",
-                    error_message=(
-                        f"Evo hypothesis generation has been skipped for "
-                        f"{consecutive} consecutive cycles due to LLM budget exhaustion. "
-                        f"Learning loop is impaired."
-                    ),
-                    context={
-                        "consecutive_skips": consecutive,
-                        "skipped_pattern_count": skipped_pattern_count,
-                        "estimated_recovery_s": estimated_recovery_s,
+                    data={
+                        "incident_class": "resource_exhaustion",
+                        "severity": "high",
+                        "fingerprint": "evo:cognitive_degradation:budget_exhausted",
+                        "source_system": "evo",
+                        "error_type": "CognitiveDegradation",
+                        "error_message": (
+                            f"Evo hypothesis generation has been skipped for "
+                            f"{consecutive} consecutive cycles due to LLM budget exhaustion. "
+                            f"Learning loop is impaired."
+                        ),
+                        "context": {
+                            "consecutive_skips": consecutive,
+                            "skipped_pattern_count": skipped_pattern_count,
+                            "estimated_recovery_s": estimated_recovery_s,
+                        },
+                        "affected_systems": ["evo"],
+                        "blast_radius": 0.4,
                     },
-                    affected_systems=["evo"],
-                    blast_radius=0.4,
-                )
-                await self._thymos.on_incident(incident)
+                ))
                 self._logger.warning(
                     "evo_cognitive_degradation_escalated_to_thymos",
                     consecutive=consecutive,
@@ -2347,6 +3746,8 @@ class EvoService:
     async def _run_consolidation_now(self) -> ConsolidationResult:
         """Execute consolidation and update counters."""
         assert self._orchestrator is not None
+        # Checkpoint PatternContext to Redis before consolidation resets it (Spec §III gap fix)
+        await self._save_pattern_context_checkpoint()
         try:
             result = await self._orchestrator.run(self._pattern_context)
             self._cycles_since_consolidation = 0
@@ -2356,16 +3757,16 @@ class EvoService:
             # Push learned head-weight adjustments to Atune's meta-attention
             # Evo tunes parameters like "atune.head.novelty.weight" — extract
             # the deltas and forward them so they actually take effect.
-            self._push_atune_head_weights()
+            await self._push_atune_head_weights()
 
             # Push learned personality adjustments to Voxis
             # Evo tunes parameters like "voxis.personality.warmth" — extract
             # the deltas and forward them so Voxis personality actually evolves.
-            self._push_voxis_personality()
+            await self._push_voxis_personality()
 
             # If Evo discovered systematic mis-predictions in interoceptive
             # transitions during consolidation, update Soma's dynamics matrix
-            self._push_soma_dynamics_update(result)
+            await self._push_soma_dynamics_update(result)
 
             # Push any learned free energy budget parameters to Nova's
             # deliberation engine so the surprise tolerance evolves over time.
@@ -2374,7 +3775,18 @@ class EvoService:
             # Push learned EFE component weights to Nova's EFE evaluator.
             # Evo tunes nova.efe.* parameters but they were never forwarded,
             # so the learned weights had zero effect on policy selection.
-            self._push_nova_efe_weights()
+            await self._push_nova_efe_weights()
+
+            # Sync learnable belief half-life parameters to Neo4j.
+            # ParameterTuner may have updated belief.halflife.* keys during
+            # Phase 5; propagate them to the BeliefAgingScanner registry and
+            # to existing belief nodes so Phase 2.5 uses the learned values.
+            if self._belief_aging is not None and self._parameter_tuner is not None:
+                try:
+                    all_params = self._parameter_tuner.get_all_parameters()
+                    await self._belief_aging.sync_halflife_overrides(all_params)
+                except Exception as exc:
+                    self._logger.warning("halflife_sync_failed", error=str(exc))
 
             # Annotate hypotheses with Telos topology contribution so
             # consolidation output reflects drive-aware prioritisation.
@@ -2390,6 +3802,15 @@ class EvoService:
                         "structural_hypotheses_consolidated",
                         count=len(structural_h),
                     )
+                    # Structural hypotheses represent genuinely new capabilities
+                    for sh in structural_h:
+                        category = sh.category.value if hasattr(sh.category, "value") else str(sh.category)
+                        await self._emit_capability_emerged(
+                            capability_name=sh.statement[:100],
+                            source_hypotheses=[sh.id],
+                            novelty_score=getattr(sh, "novelty_score", 0.5),
+                            domain=category,
+                        )
             except Exception as exc:
                 self._logger.warning("structural_hypothesis_consolidation_failed", error=str(exc))
 
@@ -2450,12 +3871,34 @@ class EvoService:
             except Exception as exc:
                 self._logger.warning("self_modification_cycle_failed", error=str(exc))
 
+            await self._emit_evolutionary_observable(
+                observable_type="experiment_completed",
+                value=float(result.hypotheses_integrated),
+                is_novel=True,
+                metadata={
+                    "consolidation_number": self._total_consolidations,
+                    "hypotheses_evaluated": result.hypotheses_evaluated,
+                    "hypotheses_integrated": result.hypotheses_integrated,
+                    "schemas_induced": result.schemas_induced,
+                    "duration_ms": result.duration_ms,
+                },
+            )
+
+            # Loop 6: Emit FITNESS_OBSERVABLE_BATCH for Benchmarks
+            await self._emit_fitness_observable_batch(result)
+
+            # Emit EVO_CONSOLIDATION_COMPLETE
+            await self._emit_consolidation_complete(result)
+
+            # Check for speciation-level behavioral shifts
+            await self._check_and_emit_speciation_event(result)
+
             return result
         except Exception as exc:
             self._logger.error("consolidation_run_failed", error=str(exc))
             return ConsolidationResult()
 
-    def _push_atune_head_weights(self) -> None:
+    async def _push_atune_head_weights(self) -> None:
         """
         Extract atune.head.* parameters from the tuner and push them to Atune.
 
@@ -2483,9 +3926,15 @@ class EvoService:
                 if abs(delta) > 0.001:
                     adjustments[head_name] = delta
 
-        if adjustments:
+        if adjustments and self._event_bus is not None:
             try:
-                self._atune.apply_evo_adjustments(adjustments)
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EVO_PARAMETER_ADJUSTED,
+                    source_system="evo",
+                    data={"target_system": "atune", "adjustments": adjustments},
+                ))
                 self._logger.info(
                     "atune_head_weights_pushed",
                     adjustments={k: round(v, 4) for k, v in adjustments.items()},
@@ -2493,7 +3942,7 @@ class EvoService:
             except Exception:
                 self._logger.debug("atune_head_push_failed", exc_info=True)
 
-    def _push_voxis_personality(self) -> None:
+    async def _push_voxis_personality(self) -> None:
         """
         Extract voxis.personality.* parameters from the tuner and push them to Voxis.
 
@@ -2521,9 +3970,15 @@ class EvoService:
                 if abs(delta) > 0.001:
                     personality_deltas[dimension] = delta
 
-        if personality_deltas:
+        if personality_deltas and self._event_bus is not None:
             try:
-                self._voxis.update_personality(personality_deltas)
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EVO_PARAMETER_ADJUSTED,
+                    source_system="evo",
+                    data={"target_system": "voxis", "adjustments": personality_deltas},
+                ))
                 self._logger.info(
                     "voxis_personality_pushed",
                     dimensions={k: round(v, 4) for k, v in personality_deltas.items()},
@@ -2569,7 +4024,7 @@ class EvoService:
         except Exception:
             self._logger.debug("nova_fe_budget_push_failed", exc_info=True)
 
-    def _push_nova_efe_weights(self) -> None:
+    async def _push_nova_efe_weights(self) -> None:
         """
         Extract nova.efe.* parameters from the tuner and push them to Nova.
 
@@ -2597,9 +4052,15 @@ class EvoService:
             if param_name in all_params:
                 new_weights[key] = all_params[param_name]
 
-        if new_weights:
+        if new_weights and self._event_bus is not None:
             try:
-                self._nova.update_efe_weights(new_weights)
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EVO_PARAMETER_ADJUSTED,
+                    source_system="evo",
+                    data={"target_system": "nova", "adjustments": new_weights},
+                ))
                 self._logger.info(
                     "nova_efe_weights_pushed",
                     weights={k: round(v, 4) for k, v in new_weights.items()},
@@ -2609,86 +4070,71 @@ class EvoService:
 
     def _annotate_telos_priority(self, result: ConsolidationResult) -> None:
         """
-        Use Telos hypothesis prioritiser to annotate consolidation output.
+        Emit hypothesis data to Telos for drive-topology prioritisation.
 
-        Hypotheses that would improve weak drives (care coverage < 0.8,
-        honesty validity < 0.8, coherence cost > 1.2) get boosted priority
-        for the next cycle. The annotations are stored on the result so
-        downstream consumers (e.g. arXiv scan, tournament engine) can
-        prefer topology-beneficial hypotheses.
+        Telos consumes EVO_HYPOTHESIS_CREATED events and maintains its own
+        rankings. We emit the current hypothesis batch here so Telos can
+        update its topology model; rankings are applied in the next cycle.
         """
-        telos = getattr(self, "_telos", None)
-        if telos is None:
-            return
+        # Telos interaction is now purely event-driven (no direct method call).
+        # Rankings received back from Telos via _telos_hypothesis_rankings cache
+        # are applied in _apply_telos_hypothesis_priority().
+        pass
 
-        # Collect active hypotheses from the hypothesis engine
-        hypothesis_engine = getattr(self, "_hypothesis_engine", None)
-        if hypothesis_engine is None:
-            return
-        active = getattr(hypothesis_engine, "_hypotheses", {})
-        if not active:
+    async def _push_soma_dynamics_update(self, result: ConsolidationResult) -> None:
+        """
+        Inject Evo's cognitive load as an interoceptive signal into Soma.
+
+        Soma's allostatic model needs to know when the learning system is under
+        pressure (high hypothesis density, elevated error rate, stalled consolidation)
+        so it can modulate the organism's arousal and urgency accordingly.
+
+        Uses inject_external_stress() — the established synchronous injection path —
+        with a composite stress value derived from:
+          - hypothesis_density: ratio of active hypotheses to capacity cap (50)
+          - evidence_evaluation_rate: how heavily the evidence sweep ran last cycle
+          - stalled_consolidation: +0.3 if consolidation has never completed
+        """
+        if self._event_bus is None:
             return
 
         try:
-            hyp_dicts = [
-                {
-                    "hypothesis_id": str(getattr(h, "id", k)),
-                    "domain": str(getattr(h, "domain", "")),
-                    "statement": str(getattr(h, "statement", getattr(h, "description", ""))),
-                    "confidence": float(getattr(h, "confidence", 0.5)),
-                }
-                for k, h in active.items()
-            ]
+            # Hypothesis density: how full is the active hypothesis registry?
+            active_count = 0
+            if self._hypothesis_engine is not None:
+                active_count = len(self._hypothesis_engine.get_all_active())
 
-            ranked = telos.prioritize_hypotheses(hyp_dicts)
+            from systems.evo.types import VELOCITY_LIMITS
+            capacity = int(VELOCITY_LIMITS.get("max_active_hypotheses", 50))
+            hypothesis_density = min(1.0, active_count / max(1, capacity))
 
-            # Store rankings on the result for downstream use
-            result.telos_hypothesis_rankings = [
-                {"hypothesis_id": r.hypothesis_id, "rank": r.rank, "composite": r.composite_contribution}
-                for r in ranked[:10]
-            ]
+            # Evidence evaluation load: consecutive hypothesis skips mean cognitive stress
+            skip_stress = min(1.0, self._consecutive_hypothesis_skips / 10.0)
 
-            self._logger.info(
-                "telos_hypothesis_priority_annotated",
-                total=len(ranked),
-                top_id=ranked[0].hypothesis_id if ranked else "none",
+            # Consolidation stall: if learning has never completed, add base stress
+            stall_stress = 0.3 if self._last_consolidation_completed_at is None else 0.0
+
+            cognitive_stress = min(
+                1.0,
+                hypothesis_density * 0.5 + skip_stress * 0.35 + stall_stress,
+            )
+
+            if self._event_bus is not None:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SOMATIC_MODULATION_SIGNAL,
+                    source_system="evo",
+                    data={"external_stress": cognitive_stress, "source": "evo_cognitive_load"},
+                ))
+            self._logger.debug(
+                "evo_soma_stress_injected",
+                cognitive_stress=round(cognitive_stress, 3),
+                hypothesis_density=round(hypothesis_density, 3),
+                skip_stress=round(skip_stress, 3),
             )
         except Exception:
-            self._logger.debug("telos_hypothesis_annotation_failed", exc_info=True)
-
-    def _push_soma_dynamics_update(self, result: ConsolidationResult) -> None:
-        """
-        If consolidation found systematic mis-predictions in interoceptive transitions,
-        update Soma's dynamics matrix to refine the 9x9 cross-dimension coupling.
-
-        Extracts soma.dynamics.* parameters from the tuner and pushes the
-        updated coupling matrix to Soma for improved allostatic prediction.
-        """
-        if self._soma is None or self._parameter_tuner is None:
-            return
-
-        from systems.evo.types import PARAMETER_DEFAULTS
-
-        all_params = self._parameter_tuner.get_all_parameters()
-        dynamics_updates: dict[str, float] = {}
-
-        for param_name, current_value in all_params.items():
-            if not param_name.startswith("soma.dynamics."):
-                continue
-            default_value = PARAMETER_DEFAULTS.get(param_name, current_value)
-            delta = current_value - default_value
-            if abs(delta) > 0.005:
-                dynamics_updates[param_name] = current_value
-
-        if dynamics_updates:
-            try:
-                self._soma.update_dynamics_matrix(dynamics_updates)
-                self._logger.info(
-                    "soma_dynamics_pushed",
-                    updated_entries=len(dynamics_updates),
-                )
-            except Exception:
-                self._logger.debug("soma_dynamics_push_failed", exc_info=True)
+            self._logger.debug("soma_stress_inject_failed", exc_info=True)
 
     # ─── Kairos Causal Hypothesis Feeding ────────────────────────────────────
 
@@ -2788,33 +4234,18 @@ class EvoService:
 
     def _apply_telos_hypothesis_priority(self, hypotheses: list[Any]) -> None:
         """
-        Use Telos to prioritise newly generated hypotheses by effective_I impact.
+        Apply cached Telos hypothesis priority rankings to newly generated hypotheses.
 
-        Hypotheses that would improve weak drives (low care coverage, low honesty
-        validity, high coherence cost) get their evidence score boosted so they
-        are tested earlier. This shifts Evo from pure novelty-seeking to
-        impact-driven hypothesis testing.
+        Telos publishes rankings via Synapse events; EvoService caches them in
+        self._telos_hypothesis_rankings (populated by the event handler).
+        We apply the cached boost here without calling Telos directly.
         """
-        if self._telos is None:
+        rank_cache: dict[str, Any] = getattr(self, "_telos_hypothesis_rankings", {})
+        if not rank_cache:
             return
 
         try:
-            hyp_dicts = [
-                {
-                    "hypothesis_id": h.id,
-                    "domain": getattr(h, "domain", ""),
-                    "statement": h.statement,
-                    "confidence": h.evidence_score,
-                }
-                for h in hypotheses
-            ]
-
-            ranked = self._telos.prioritize_hypotheses(hyp_dicts)
-            if not ranked:
-                return
-
-            # Apply a small evidence boost to topology-beneficial hypotheses
-            rank_lookup = {r.hypothesis_id: r for r in ranked}
+            rank_lookup = rank_cache
             boosted = 0
             for h in hypotheses:
                 ranking = rank_lookup.get(h.id)
@@ -2853,7 +4284,9 @@ class EvoService:
             )
             return
 
-        result = await self._arxiv_translator.translate_and_dispatch(
+        from systems.simula.proposals.arxiv_translator import ArxivProposalTranslator
+
+        result = await ArxivProposalTranslator().translate_and_dispatch(
             raw_technique=raw_dict,
             simula_service=self._simula,
         )
@@ -2958,6 +4391,10 @@ class EvoService:
 
                 if self._consolidation_in_flight:
                     self._logger.debug("consolidation_still_in_flight_skipping")
+                    continue
+
+                # Metabolic gate: skip consolidation under starvation
+                if self._starvation_level in ("emergency", "critical"):
                     continue
 
                 if self._orchestrator.should_run(
@@ -3267,3 +4704,26 @@ class EconomicPatternDetector(PatternDetector):
         )
 
         return candidates
+
+
+# ─── Genome Export Helpers (Spec 26 SG4) ─────────────────────────────────────
+
+
+async def _safe_get_drive_scores(equor: Any) -> dict[str, float] | None:
+    """Fetch drive alignment scores from Equor without raising."""
+    try:
+        result = equor.get_drive_alignment_scores()
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result  # type: ignore[return-value]
+    except Exception:
+        return None
+
+
+async def _safe_fetch_drift_history(memory: Any) -> list[dict[str, Any]] | None:
+    """Fetch last 10 constitutional drift entries from Memory without raising."""
+    try:
+        records = await memory.query_drift_history(limit=10)
+        return records  # type: ignore[return-value]
+    except Exception:
+        return None

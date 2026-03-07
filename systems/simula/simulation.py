@@ -44,11 +44,13 @@ from systems.simula.evolution_types import (
     ImpactType,
     ResourceCostEstimate,
     RiskLevel,
+    RiskWeightVector,
     SimulationResult,
 )
 
 if TYPE_CHECKING:
     from clients.llm import LLMProvider
+    from clients.neo4j import Neo4jClient
     from config import SimulaConfig
     from systems.memory.service import MemoryService
     from systems.simula.analytics import EvolutionAnalyticsEngine
@@ -62,6 +64,36 @@ logger = structlog.get_logger().bind(system="simula.simulation")
 _VALID_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 _PASCAL_CASE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
+
+_NAMING_PATTERNS: dict[str, re.Pattern[str]] = {
+    "snake_case": _SNAKE_CASE,
+    "pascal_case": _PASCAL_CASE,
+    "valid_identifier": _VALID_NAME,
+}
+
+# Default category validation rules (matches the original hard-coded behaviour).
+# Schema: {category_value: {name_field, required_fields, naming_convention, example}}
+# Override via SimulaConfig.category_validation_rules.
+_DEFAULT_CATEGORY_RULES: dict[str, dict[str, object]] = {
+    "add_executor": {
+        "name_field": "executor_name",
+        "required_fields": ["executor_action_type"],
+        "naming_convention": "snake_case",
+        "example": "email_sender",
+    },
+    "add_input_channel": {
+        "name_field": "channel_name",
+        "required_fields": ["channel_type"],
+        "naming_convention": "snake_case",
+        "example": "websocket_channel",
+    },
+    "add_pattern_detector": {
+        "name_field": "detector_name",
+        "required_fields": ["detector_pattern_type"],
+        "naming_convention": "pascal_case",
+        "example": "FrequencyDetector",
+    },
+}
 
 # Resource cost heuristics per category (zero LLM tokens)
 _RESOURCE_COST_HEURISTICS: dict[ChangeCategory, dict[str, int | float]] = {
@@ -117,12 +149,14 @@ class ChangeSimulator:
         memory: MemoryService | None = None,
         analytics: EvolutionAnalyticsEngine | None = None,
         codebase_root: Path | None = None,
+        neo4j: Neo4jClient | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
         self._memory = memory
         self._analytics = analytics
         self._root = codebase_root or Path(config.codebase_root).resolve()
+        self._neo4j = neo4j
         self._log = logger
         # Optimization: detect optimized provider for budget checks + cache tagging
         self._optimized = isinstance(llm, OptimizedLLMProvider)
@@ -131,6 +165,16 @@ class ChangeSimulator:
             prune_ratio=config.kv_compression_ratio,
             enabled=config.kv_compression_enabled,
         )
+        # Learnable risk synthesis weights; loaded from Neo4j on first simulate()
+        # Initialize from config defaults, then override with Neo4j persisted values
+        self._risk_weights: RiskWeightVector = RiskWeightVector(
+            w_base=config.risk_weight_base,
+            w_counterfactual=config.risk_weight_counterfactual,
+            w_dependency=config.risk_weight_dependency,
+            w_resource=config.risk_weight_resource,
+            w_alignment=config.risk_weight_alignment,
+        )
+        self._risk_weights_loaded: bool = False
 
     async def simulate(self, proposal: EvolutionProposal) -> EnrichedSimulationResult:
         """
@@ -146,6 +190,11 @@ class ChangeSimulator:
             category=proposal.category.value,
         )
 
+        # Lazy-load learnable risk weights from Neo4j on first call
+        if not self._risk_weights_loaded:
+            await self.load_weights()
+            self._risk_weights_loaded = True
+
         # Forbidden categories are rejected before reaching simulation,
         # but defend in depth
         from systems.simula.evolution_types import FORBIDDEN
@@ -155,11 +204,22 @@ class ChangeSimulator:
                 risk_summary=f"Category {proposal.category.value} is forbidden.",
             )
 
-        # Run all strategies concurrently
-        base_task = self._simulate_by_category(proposal)
-        counterfactual_task = self._counterfactual_replay(proposal)
-        dependency_task = self._analyze_dependencies(proposal)
-        alignment_task = self._predict_constitutional_alignment(proposal)
+        # Run all strategies concurrently, each capped at 1/5 of the simulation
+        # stage budget (from config) so one slow strategy cannot starve others.
+        # 4 strategies + 20% headroom for gather overhead → divide by 5.
+        _strategy_budget = self._config.simulate_stage_timeout_s / 5
+        base_task = asyncio.wait_for(
+            self._simulate_by_category(proposal), timeout=_strategy_budget
+        )
+        counterfactual_task = asyncio.wait_for(
+            self._counterfactual_replay(proposal), timeout=_strategy_budget
+        )
+        dependency_task = asyncio.wait_for(
+            self._analyze_dependencies(proposal), timeout=_strategy_budget
+        )
+        alignment_task = asyncio.wait_for(
+            self._predict_constitutional_alignment(proposal), timeout=_strategy_budget
+        )
 
         base_result, counterfactuals, dependency_impacts, alignment = await asyncio.gather(
             base_task,
@@ -233,23 +293,47 @@ class ChangeSimulator:
         Enhanced static analysis for additive changes.
         Beyond name validation: checks naming conventions, system existence,
         existing overlap detection, and spec completeness.
+
+        Validation rules are loaded from SimulaConfig.category_validation_rules
+        (merged over _DEFAULT_CATEGORY_RULES) so Evo can tune them without
+        modifying this file.
         """
         spec = proposal.change_spec
         issues: list[str] = []
 
-        # Determine the relevant name and validate by category
-        name: str | None = None
+        # Merge config overrides over the built-in default rules
+        rules: dict[str, dict[str, object]] = {
+            **_DEFAULT_CATEGORY_RULES,
+            **self._config.category_validation_rules,
+        }
+        cat_key = proposal.category.value
+        rule = rules.get(cat_key)
 
-        if proposal.category == ChangeCategory.ADD_EXECUTOR:
-            name = spec.executor_name
-            if not spec.executor_action_type:
-                issues.append("executor_action_type is required")
-            if name and not _SNAKE_CASE.match(name):
+        # Determine name and validate required fields from rule schema
+        name: str | None = None
+        if rule is not None:
+            name_field = str(rule.get("name_field", ""))
+            name = getattr(spec, name_field, None) if name_field else None
+
+            for req_field in rule.get("required_fields", []):  # type: ignore[union-attr]
+                if not getattr(spec, str(req_field), None):
+                    issues.append(f"{req_field} is required")
+
+            naming_conv = str(rule.get("naming_convention", "valid_identifier"))
+            pattern = _NAMING_PATTERNS.get(naming_conv, _VALID_NAME)
+            example = str(rule.get("example", ""))
+            if name and not pattern.match(name):
+                hint = f" (e.g., {example!r})" if example else ""
                 issues.append(
-                    f"Executor module name {name!r} should be snake_case "
-                    f"(e.g., 'email_sender', not 'EmailSender')"
+                    f"Name {name!r} should be {naming_conv}{hint}"
                 )
-            # Check if executor with this action_type already exists
+        else:
+            # Unknown additive category — skip naming validation, still check name exists
+            name = getattr(spec, f"{cat_key.split('_', 1)[-1]}_name", None)
+
+        # ADD_EXECUTOR-specific checks (conflict detection + directory guard)
+        # These remain here because they are operational, not schema-expressible.
+        if proposal.category == ChangeCategory.ADD_EXECUTOR:
             if spec.executor_action_type:
                 existing = await self._check_existing_executor(spec.executor_action_type)
                 if existing:
@@ -257,27 +341,9 @@ class ChangeSimulator:
                         f"Executor for action_type {spec.executor_action_type!r} "
                         f"already exists: {existing}"
                     )
-            # Verify the axon executors directory exists
             executors_dir = self._root / "src" / "ecodiaos" / "systems" / "axon" / "executors"
             if not executors_dir.exists():
                 issues.append("Axon executors directory not found -- system may not be built yet")
-
-        elif proposal.category == ChangeCategory.ADD_INPUT_CHANNEL:
-            name = spec.channel_name
-            if not spec.channel_type:
-                issues.append("channel_type is required")
-            if name and not _SNAKE_CASE.match(name):
-                issues.append(f"Channel module name {name!r} should be snake_case")
-
-        elif proposal.category == ChangeCategory.ADD_PATTERN_DETECTOR:
-            name = spec.detector_name
-            if not spec.detector_pattern_type:
-                issues.append("detector_pattern_type is required")
-            if name and not _PASCAL_CASE.match(name):
-                issues.append(
-                    f"Detector class name {name!r} should be PascalCase "
-                    f"(e.g., 'FrequencyDetector')"
-                )
 
         if name is None:
             issues.append("No name provided for additive change")
@@ -498,6 +564,19 @@ class ChangeSimulator:
             "Only include episodes where the answer is 'yes'."
         )
 
+        # ── Corpus 14 §11: Per-proposal token budget check ───────────────────
+        # Counterfactual replay costs ~800 tokens (500 prompt + ~300 response).
+        # Skip if the proposal's remaining budget is below this threshold.
+        _COUNTERFACTUAL_TOKEN_COST = 800
+        if proposal.remaining_token_budget < _COUNTERFACTUAL_TOKEN_COST:
+            self._log.info(
+                "counterfactual_replay_skipped_token_budget",
+                remaining=proposal.remaining_token_budget,
+                cost=_COUNTERFACTUAL_TOKEN_COST,
+                proposal_id=proposal.id,
+            )
+            return []
+
         # Budget gate: skip counterfactual replay in RED tier
         if self._optimized:
             assert isinstance(self._llm, OptimizedLLMProvider)
@@ -519,6 +598,11 @@ class ChangeSimulator:
                     self._llm.evaluate(prompt=prompt, max_tokens=500, temperature=0.2),
                     timeout=15.0,
                 )
+            # Corpus 14 §11: Meter actual tokens consumed and deduct from budget
+            _actual_tokens = getattr(response, "total_tokens", None)
+            if _actual_tokens is None:
+                _actual_tokens = _COUNTERFACTUAL_TOKEN_COST  # use estimate as fallback
+            proposal.tokens_consumed += _actual_tokens
             return self._parse_counterfactual_response(response.text, episodes)
         except Exception as exc:
             self._log.warning("counterfactual_llm_failed", error=str(exc))
@@ -609,9 +693,14 @@ class ChangeSimulator:
         if not affected_systems:
             affected_systems = self._infer_affected_systems(proposal)
 
+        # Cap output: at most 50 records to prevent unbounded growth when a
+        # large codebase has thousands of cross-system imports.
+        _MAX_IMPACTS = 50
         impacts: list[DependencyImpact] = []
 
         for sys_name in affected_systems:
+            if len(impacts) >= _MAX_IMPACTS:
+                break
             sys_dir = self._root / _SYSTEM_DIRS.get(sys_name, f"systems/{sys_name}")
             if not sys_dir.exists():
                 continue
@@ -621,6 +710,13 @@ class ChangeSimulator:
 
             # For each file, find what imports it from other systems
             for py_file in py_files:
+                if len(impacts) >= _MAX_IMPACTS:
+                    self._log.debug(
+                        "dependency_analysis_cap_reached",
+                        cap=_MAX_IMPACTS,
+                        system=sys_name,
+                    )
+                    break
                 rel_path = str(py_file.relative_to(self._root))
                 module_name = self._path_to_module(rel_path)
                 if not module_name:
@@ -635,15 +731,16 @@ class ChangeSimulator:
                         risk_contribution=min(1.0, len(importers) * 0.1),
                     ))
 
-            # Check for test coverage
-            test_dir = self._root / "tests" / "unit" / "systems" / sys_name
-            if test_dir.exists():
-                test_files = list(test_dir.rglob("*.py"))
-                impacts.append(DependencyImpact(
-                    file_path=str(test_dir.relative_to(self._root)),
-                    impact_type="test_coverage",
-                    risk_contribution=0.0 if test_files else 0.3,
-                ))
+            # Check for test coverage (only if under cap)
+            if len(impacts) < _MAX_IMPACTS:
+                test_dir = self._root / "tests" / "unit" / "systems" / sys_name
+                if test_dir.exists():
+                    test_files = list(test_dir.rglob("*.py"))
+                    impacts.append(DependencyImpact(
+                        file_path=str(test_dir.relative_to(self._root)),
+                        impact_type="test_coverage",
+                        risk_contribution=0.0 if test_files else 0.3,
+                    ))
 
         return impacts
 
@@ -771,9 +868,13 @@ class ChangeSimulator:
     ) -> float:
         """
         Predict how well this change aligns with the four constitutional drives.
-        Single LLM call, 100 tokens max output. Returns -1.0 to 1.0.
 
-        Budget: ~200 tokens total (prompt + response).
+        Two-round scoring (#42):
+          Round 1 — coarse score (-1.0 to 1.0), single number, ~200 tokens.
+          Round 2 — second opinion only when round-1 score is borderline
+                     (abs(score) < 0.3), averages both to reduce noise.
+
+        Budget: ~200 tokens (clear cases) or ~400 tokens (borderline).
         """
         prompt = (
             "EcodiaOS has four constitutional drives: "
@@ -786,7 +887,34 @@ class ChangeSimulator:
             "Reply with a single number only (e.g., 0.7)."
         )
 
-        # Budget gate: skip alignment prediction in RED tier
+        def _extract_score(text: str) -> float | None:
+            for token in text.strip().split():
+                try:
+                    return max(-1.0, min(1.0, float(token.strip(".,;:"))))
+                except ValueError:
+                    continue
+            return None
+
+        async def _call(estimated_tokens: int, cache_method: str) -> str:
+            if self._optimized:
+                assert isinstance(self._llm, OptimizedLLMProvider)
+                if not self._llm.should_use_llm("simula.simulation", estimated_tokens=estimated_tokens):
+                    return ""
+                resp = await asyncio.wait_for(
+                    self._llm.evaluate(  # type: ignore[call-arg]
+                        prompt=prompt, max_tokens=20, temperature=0.1,
+                        cache_system="simula.simulation", cache_method=cache_method,
+                    ),
+                    timeout=5.0,
+                )
+            else:
+                resp = await asyncio.wait_for(
+                    self._llm.evaluate(prompt=prompt, max_tokens=20, temperature=0.1),
+                    timeout=5.0,
+                )
+            return resp.text
+
+        # Budget gate: skip in RED tier
         if self._optimized:
             assert isinstance(self._llm, OptimizedLLMProvider)
             if not self._llm.should_use_llm("simula.simulation", estimated_tokens=100):
@@ -794,29 +922,31 @@ class ChangeSimulator:
                 return 0.0
 
         try:
-            if self._optimized:
-                response = await asyncio.wait_for(
-                    self._llm.evaluate(  # type: ignore[call-arg]
-                        prompt=prompt, max_tokens=20, temperature=0.1,
-                        cache_system="simula.simulation", cache_method="constitutional_alignment",
-                    ),
-                    timeout=5.0,
-                )
-            else:
-                response = await asyncio.wait_for(
-                    self._llm.evaluate(prompt=prompt, max_tokens=20, temperature=0.1),
-                    timeout=5.0,
-                )
-            # Extract the float from the response
-            text = response.text.strip()
-            # Handle potential formatting like "0.7" or "Score: 0.7"
-            for token in text.split():
+            text1 = await _call(estimated_tokens=100, cache_method="constitutional_alignment")
+            if not text1:
+                return 0.0
+            score1 = _extract_score(text1)
+            if score1 is None:
+                return 0.0
+
+            # Round 2: second opinion for borderline scores only
+            if abs(score1) < 0.3:
                 try:
-                    score = float(token.strip(".,;:"))
-                    return max(-1.0, min(1.0, score))
-                except ValueError:
-                    continue
-            return 0.0
+                    text2 = await _call(estimated_tokens=100, cache_method="constitutional_alignment_r2")
+                    score2 = _extract_score(text2) if text2 else None
+                    if score2 is not None:
+                        avg = (score1 + score2) / 2.0
+                        self._log.debug(
+                            "alignment_prediction_two_round",
+                            score1=round(score1, 3),
+                            score2=round(score2, 3),
+                            avg=round(avg, 3),
+                        )
+                        return avg
+                except Exception:
+                    pass  # round-2 failure is non-fatal; fall back to round-1
+
+            return score1
         except Exception as exc:
             self._log.warning("alignment_prediction_failed", error=str(exc))
             return 0.0
@@ -868,14 +998,28 @@ class ChangeSimulator:
             RiskLevel.UNACCEPTABLE: 1.0,
         }.get(base_result.risk_level, 0.4)
 
+        # Spec §11: per-category risk boost/penalty applied after weighted sum.
+        # High-structural-change categories carry inherent additional risk;
+        # budget tweaks are lower risk by nature. Values tunable via config.
+        category_boost = {
+            ChangeCategory.MODIFY_CONTRACT: self._config.category_risk_boost_modify_contract,
+            ChangeCategory.ADD_SYSTEM_CAPABILITY: self._config.category_risk_boost_add_system,
+            ChangeCategory.ADJUST_BUDGET: self._config.category_risk_boost_adjust_budget,
+        }.get(proposal.category, 0.0)
+
         # Weighted composite risk score (0.0 - 1.0)
+        # Weights come from the learnable RiskWeightVector (normalised to sum=1.0).
+        # Default vector matches spec §11: base=0.40, cf=0.20, dep=0.15, res=0.10, align=0.15.
+        w = self._risk_weights.normalised()
         composite_risk = (
-            0.40 * base_risk_numeric
-            + 0.20 * cf_regression_rate
-            + 0.15 * min(1.0, total_risk_contribution)
-            + 0.10 * resource_risk
-            + 0.15 * alignment_risk
+            w.w_base * base_risk_numeric
+            + w.w_counterfactual * cf_regression_rate
+            + w.w_dependency * min(1.0, total_risk_contribution)
+            + w.w_resource * resource_risk
+            + w.w_alignment * alignment_risk
+            + category_boost
         )
+        composite_risk = min(1.0, max(0.0, composite_risk))
 
         # Dynamic caution adjustment from analytics history
         caution_adj: CautionAdjustment | None = None
@@ -892,26 +1036,55 @@ class ChangeSimulator:
                     reasoning=caution_adj.reasoning,
                 )
 
-        # Map composite score to RiskLevel
-        if composite_risk >= 0.75:
+        # Map composite score to RiskLevel (thresholds tunable via config)
+        if composite_risk >= self._config.risk_threshold_unacceptable:
             final_risk = RiskLevel.UNACCEPTABLE
-        elif composite_risk >= 0.50:
+        elif composite_risk >= self._config.risk_threshold_high:
             final_risk = RiskLevel.HIGH
-        elif composite_risk >= 0.25:
+        elif composite_risk >= self._config.risk_threshold_moderate:
             final_risk = RiskLevel.MODERATE
         else:
             final_risk = RiskLevel.LOW
 
-        # Emit decision audit log with all signal values and weights
+        # Log decisive signals at threshold crossings so operators can see
+        # exactly which component pushed the score over LOW→MODERATE or MODERATE→HIGH.
+        if final_risk in (RiskLevel.MODERATE, RiskLevel.HIGH, RiskLevel.UNACCEPTABLE):
+            signal_contributions = {
+                "base_risk": round(w.w_base * base_risk_numeric, 3),
+                "counterfactual_risk": round(w.w_counterfactual * cf_regression_rate, 3),
+                "dependency_risk": round(w.w_dependency * min(1.0, total_risk_contribution), 3),
+                "resource_risk": round(w.w_resource * resource_risk, 3),
+                "alignment_risk": round(w.w_alignment * alignment_risk, 3),
+                "category_boost": round(category_boost, 3),
+            }
+            decisive = sorted(signal_contributions.items(), key=lambda kv: kv[1], reverse=True)
+            crossed = (
+                "MODERATE→HIGH" if final_risk in (RiskLevel.HIGH, RiskLevel.UNACCEPTABLE)
+                else "LOW→MODERATE"
+            )
+            self._log.warning(
+                "risk_threshold_crossed",
+                proposal_id=proposal.id,
+                category=proposal.category.value,
+                composite_risk=round(composite_risk, 3),
+                final_risk=final_risk.value,
+                crossed=crossed,
+                decisive_signal=decisive[0][0] if decisive else "unknown",
+                decisive_contribution=decisive[0][1] if decisive else 0.0,
+                top3_signals=decisive[:3],
+            )
+
+        # Emit decision audit log with all signal values and actual weights used
         self._log.info(
             "simulation_decision_audit",
             proposal_id=proposal.id,
             category=proposal.category.value,
-            base_risk=f"{0.40 * base_risk_numeric:.3f} (0.40×{base_risk_numeric:.2f})",
-            counterfactual_risk=f"{0.20 * cf_regression_rate:.3f} (0.20×{cf_regression_rate:.2f})",
-            dependency_risk=f"{0.15 * min(1.0, total_risk_contribution):.3f} (0.15×{total_risk_contribution:.2f})",
-            resource_risk=f"{0.10 * resource_risk:.3f} (0.10×{resource_risk:.2f})",
-            alignment_risk=f"{0.15 * alignment_risk:.3f} (0.15×{alignment_risk:.2f})",
+            base_risk=f"{w.w_base * base_risk_numeric:.3f} ({w.w_base:.2f}×{base_risk_numeric:.2f})",
+            counterfactual_risk=f"{w.w_counterfactual * cf_regression_rate:.3f} ({w.w_counterfactual:.2f}×{cf_regression_rate:.2f})",
+            dependency_risk=f"{w.w_dependency * min(1.0, total_risk_contribution):.3f} ({w.w_dependency:.2f}×{total_risk_contribution:.2f})",
+            resource_risk=f"{w.w_resource * resource_risk:.3f} ({w.w_resource:.2f}×{resource_risk:.2f})",
+            alignment_risk=f"{w.w_alignment * alignment_risk:.3f} ({w.w_alignment:.2f}×{alignment_risk:.2f})",
+            category_boost=round(category_boost, 2),
             weighted_sum=round(composite_risk, 3),
             caution_adjustment=caution_adj.magnitude if caution_adj and caution_adj.should_adjust else 0.0,
             final_risk=final_risk.value,
@@ -977,6 +1150,81 @@ class ChangeSimulator:
     async def _check_name_conflict(self, name: str, category: ChangeCategory) -> bool:
         """Returns True if the name would cause a conflict."""
         return bool(not _VALID_NAME.match(name))
+
+    # ─── Learnable Risk Weights ───────────────────────────────────────────────
+
+    async def load_weights(self) -> None:
+        """
+        Load the current risk weight vector from Neo4j (:RiskWeights node).
+        Falls back to defaults if no node exists yet.
+        Called once before the first simulate() and whenever Evo pushes an
+        ADJUST_BUDGET proposal targeting a risk_weight_* parameter.
+        """
+        if self._neo4j is None:
+            return
+        try:
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (w:RiskWeights)
+                RETURN w.w_base AS w_base, w.w_counterfactual AS w_counterfactual,
+                       w.w_dependency AS w_dependency, w.w_resource AS w_resource,
+                       w.w_alignment AS w_alignment
+                ORDER BY w.updated_at DESC
+                LIMIT 1
+                """,
+            )
+            if rows:
+                r = rows[0]
+                self._risk_weights = RiskWeightVector(
+                    w_base=float(r["w_base"]),
+                    w_counterfactual=float(r["w_counterfactual"]),
+                    w_dependency=float(r["w_dependency"]),
+                    w_resource=float(r["w_resource"]),
+                    w_alignment=float(r["w_alignment"]),
+                )
+                self._log.info(
+                    "risk_weights_loaded",
+                    w_base=self._risk_weights.w_base,
+                    w_counterfactual=self._risk_weights.w_counterfactual,
+                    w_dependency=self._risk_weights.w_dependency,
+                    w_resource=self._risk_weights.w_resource,
+                    w_alignment=self._risk_weights.w_alignment,
+                )
+        except Exception as exc:
+            self._log.warning("risk_weights_load_failed", error=str(exc))
+
+    async def persist_weights(self, weights: RiskWeightVector) -> None:
+        """
+        Persist a new risk weight vector to Neo4j.
+        Called by Evo after gradient updates to the weight vector.
+        Creates/merges a single :RiskWeights node (only one active at a time).
+        """
+        if self._neo4j is None:
+            return
+        try:
+            normalised = weights.normalised()
+            await self._neo4j.execute_write(
+                """
+                MERGE (w:RiskWeights {id: "singleton"})
+                SET w.w_base = $w_base,
+                    w.w_counterfactual = $w_counterfactual,
+                    w.w_dependency = $w_dependency,
+                    w.w_resource = $w_resource,
+                    w.w_alignment = $w_alignment,
+                    w.updated_at = datetime()
+                """,
+                {
+                    "w_base": normalised.w_base,
+                    "w_counterfactual": normalised.w_counterfactual,
+                    "w_dependency": normalised.w_dependency,
+                    "w_resource": normalised.w_resource,
+                    "w_alignment": normalised.w_alignment,
+                },
+            )
+            self._risk_weights = normalised
+            self._log.info("risk_weights_persisted", weights=normalised.model_dump())
+        except Exception as exc:
+            self._log.warning("risk_weights_persist_failed", error=str(exc))
 
     def _build_episode_context(self, episodes: list[Any]) -> str:
         """Build concise context string from episode objects."""

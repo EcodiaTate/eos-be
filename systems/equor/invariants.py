@@ -23,6 +23,37 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# ─── INV-017: Drive Extinction State ──────────────────────────────
+# The 72-hour rolling means are computed asynchronously by a background
+# query in EquorService and cached here. The hot-path invariant check
+# reads only from this in-memory cache — no DB calls on the critical path.
+
+_drive_rolling_means_72h: dict[str, float] = {
+    "coherence": 1.0,
+    "care": 1.0,
+    "growth": 1.0,
+    "honesty": 1.0,
+}
+
+# Extinction threshold: if any drive's 72h mean falls below this, BLOCKED.
+_DRIVE_EXTINCTION_THRESHOLD: float = 0.01
+
+
+def update_drive_rolling_means(means: dict[str, float]) -> None:
+    """Called by EquorService background loop to refresh the cached means.
+
+    Only updates drives that are present in the provided dict so a partial
+    query result doesn't zero out drives that weren't queried.
+    """
+    for drive, value in means.items():
+        if drive in _drive_rolling_means_72h:
+            _drive_rolling_means_72h[drive] = float(value)
+
+
+def get_drive_rolling_means() -> dict[str, float]:
+    """Return a snapshot of the current cached 72h drive means."""
+    return dict(_drive_rolling_means_72h)
+
 
 # ─── Data Types ───────────────────────────────────────────────────
 
@@ -271,6 +302,36 @@ def _check_no_money_laundering(intent: Intent) -> bool:
     return not any(indicator in goal_lower for indicator in laundering_indicators)
 
 
+# KEEP — protects all four constitutional drive dimensions from extinction; weight adjustment is fine,
+#   but if any drive's 72h rolling mean falls below 0.01 the dimension is gone, not just down-weighted.
+#   This is the organism equivalent of losing a sense organ — irreversible without governance intervention.
+def _check_drive_extinction(intent: Intent) -> bool:
+    """INV-017: No action may proceed when any drive's 72h rolling mean < 0.01.
+
+    Drive extinction is dimension loss, not phenotypic drift. The four constitutional
+    drives (Coherence, Care, Growth, Honesty) are the coordinate geometry of the
+    organism's value space. If any mean collapses to near-zero the organism can no
+    longer evaluate intents on that axis — all actions become constitutionally blind.
+
+    The check reads from _drive_rolling_means_72h, which is populated by a background
+    query in EquorService. Default values are 1.0 so the check passes until the first
+    real DB result arrives (conservative warm-up behaviour).
+
+    Returns False (violation) if any drive mean < _DRIVE_EXTINCTION_THRESHOLD.
+    """
+    for drive, mean in _drive_rolling_means_72h.items():
+        if mean < _DRIVE_EXTINCTION_THRESHOLD:
+            logger.error(
+                "inv_017_drive_extinction_triggered",
+                drive=drive,
+                rolling_mean_72h=round(mean, 6),
+                threshold=_DRIVE_EXTINCTION_THRESHOLD,
+                all_means=_drive_rolling_means_72h,
+            )
+            return False
+    return True
+
+
 # KEEP — the survival reserve is a hard floor the organism cannot cross; draining it is irreversible self-harm.
 def _check_no_survival_reserve_raid(intent: Intent) -> bool:
     """INV-016: No economic action may drain the survival reserve."""
@@ -377,6 +438,16 @@ HARDCODED_INVARIANTS: list[tuple[InvariantDef, Any]] = [
         InvariantDef(id="INV-016", name="No Survival Reserve Raid", severity="critical",
                      description="EOS must not drain its survival reserve for non-survival purposes."),
         _check_no_survival_reserve_raid,
+    ),
+    (
+        InvariantDef(id="INV-017", name="No Drive Extinction", severity="critical",
+                     description=(
+                         "EOS must not act when any constitutional drive's 72-hour rolling mean "
+                         "has dropped below 0.01. Drive extinction is dimension loss — the organism "
+                         "can no longer evaluate intents on that axis. Requires governance approval "
+                         "and human/federation review to restore the drive before actions resume."
+                     )),
+        _check_drive_extinction,
     ),
 ]
 

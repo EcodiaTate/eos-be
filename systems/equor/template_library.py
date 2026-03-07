@@ -21,7 +21,6 @@ with soft deactivation.
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -84,7 +83,6 @@ class TemplateLibrary:
           - approximate signature match within tolerance
         """
         self._total_lookups += 1
-        time.monotonic()
         best: ConstitutionalTemplate | None = None
 
         for template in self._templates.values():

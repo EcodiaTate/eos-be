@@ -45,7 +45,6 @@ from systems.axon.types import (
     StepOutcome,
 )
 from systems.synapse.types import SynapseEvent, SynapseEventType
-from systems.thymos.types import Incident, IncidentClass, IncidentSeverity
 
 if TYPE_CHECKING:
     from systems.axon.audit import AuditLogger
@@ -178,24 +177,23 @@ class ExecutionPipeline:
                 # Report to Thymos via Synapse event bus
                 if self._event_bus is not None:
                     try:
-                        incident = Incident(
-                            incident_class=IncidentClass.CRASH,
-                            severity=IncidentSeverity.HIGH,
-                            fingerprint=hashlib.md5(f"unknown_executor_{step.executor}".encode()).hexdigest(),
-                            source_system="axon",
-                            error_type="missing_executor",
-                            error_message=f"No executor registered for '{step.executor}'",
-                            context={
-                                "action_type": step.executor,
-                                "intent_id": intent.id,
-                                "execution_id": execution_id,
-                            }
-                        )
                         await self._event_bus.emit(
                             SynapseEvent(
                                 event_type=SynapseEventType.SYSTEM_FAILED,
                                 source_system="axon",
-                                data={"incident": incident.model_dump()},
+                                data={"incident": {
+                                    "incident_class": "crash",
+                                    "severity": "high",
+                                    "fingerprint": hashlib.md5(f"unknown_executor_{step.executor}".encode()).hexdigest(),
+                                    "source_system": "axon",
+                                    "error_type": "missing_executor",
+                                    "error_message": f"No executor registered for '{step.executor}'",
+                                    "context": {
+                                        "action_type": step.executor,
+                                        "intent_id": intent.id,
+                                        "execution_id": execution_id,
+                                    },
+                                }},
                             )
                         )
                     except Exception as _emit_exc:
@@ -265,6 +263,20 @@ class ExecutionPipeline:
                     error=f"Rate limit exceeded for executor '{step.executor}'",
                     start_time=start_time,
                 )
+            # Sub-limit check: API calls/min and notifications/hr (Spec §5.3)
+            if executor and hasattr(self._budget, "can_execute_action_type"):
+                sub_ok, sub_reason = self._budget.can_execute_action_type(
+                    executor.action_type
+                )
+                if not sub_ok:
+                    return self._fast_fail(
+                        intent_id=intent.id,
+                        execution_id=execution_id,
+                        status=ExecutionStatus.RATE_LIMITED,
+                        failure_reason=FailureReason.RATE_LIMITED.value,
+                        error=sub_reason,
+                        start_time=start_time,
+                    )
 
         # ── STAGE 4: Circuit breaker check ───────────────────────
         for step in intent.plan.steps:
@@ -307,6 +319,24 @@ class ExecutionPipeline:
                             executor=step.executor,
                             reason=sim.revert_reason,
                         )
+                        # Emit AXON_SHIELD_REJECTION so Thymos gets real-time
+                        # incident channel for shield blocks (not just post-mortem).
+                        if hasattr(self, "_event_bus") and self._event_bus is not None:
+                            await self._event_bus.emit(SynapseEvent(
+                                event_type=SynapseEventType.AXON_SHIELD_REJECTION,
+                                source_system="axon",
+                                data={
+                                    "execution_id": execution_id,
+                                    "executor": step.executor,
+                                    "intent_id": intent.id,
+                                    "rejection_reason": sim.revert_reason or "unknown",
+                                    "check_type": self._classify_shield_rejection(sim),
+                                    "params": {
+                                        k: v for k, v in step.parameters.items()
+                                        if k not in ("private_key", "seed", "mnemonic")
+                                    },
+                                },
+                            ))
                         return self._fast_fail(
                             intent_id=intent.id,
                             execution_id=execution_id,
@@ -505,6 +535,9 @@ class ExecutionPipeline:
 
         self._rate_limiter.record(executor.action_type)
         self._circuit_breaker.record_result(executor.action_type, result.success)
+        # Record for sub-limit sliding windows (API calls/min, notifications/hr)
+        if result.success and hasattr(self._budget, "record_action_type"):
+            self._budget.record_action_type(executor.action_type)
 
         outcome = StepOutcome(
             step_index=idx,
@@ -573,6 +606,8 @@ class ExecutionPipeline:
 
             self._rate_limiter.record(executor.action_type)
             self._circuit_breaker.record_result(executor.action_type, result.success)
+            if result.success and hasattr(self._budget, "record_action_type"):
+                self._budget.record_action_type(executor.action_type)
 
             self._logger.debug(
                 "parallel_step_complete",
@@ -614,42 +649,57 @@ class ExecutionPipeline:
 
     async def _deliver_to_nova(self, outcome: AxonOutcome) -> None:
         """
-        Deliver the execution outcome to Nova for belief updating.
-        Convert AxonOutcome → IntentOutcome (Nova's shared primitive).
+        Deliver the execution outcome to Nova via Synapse event bus.
 
-        Retries up to 3 times with exponential backoff. If Nova's belief state
-        diverges from real execution, goals become stale and learning breaks.
+        Emits ACTION_EXECUTED or ACTION_FAILED so Nova can update beliefs
+        without requiring a direct import of nova.types. All consumers
+        (Nova, Evo, Fovea) subscribe to these events — no direct call needed.
+
+        If the event bus is not wired, logs a warning. The direct Nova fallback
+        has been removed to enforce bus-first architecture (AV2 resolved).
         """
-        if self._nova is None:
+        if not hasattr(self, "_event_bus") or self._event_bus is None:
+            self._logger.warning(
+                "nova_delivery_skipped_no_event_bus",
+                intent_id=outcome.intent_id,
+                execution_id=outcome.execution_id,
+                note="Set event bus via set_event_bus() to enable Nova outcome delivery",
+            )
             return
 
-        from systems.nova.types import IntentOutcome
-
-        nova_outcome = IntentOutcome(
-            intent_id=outcome.intent_id,
-            success=outcome.success,
-            episode_id=outcome.episode_id,
-            failure_reason=outcome.failure_reason,
-            new_observations=outcome.new_observations,
+        event_type = (
+            SynapseEventType.ACTION_EXECUTED if outcome.success
+            else SynapseEventType.ACTION_FAILED
         )
-
-        last_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                await self._nova.process_outcome(nova_outcome)
-                return  # Success
-            except Exception as exc:
-                last_error = exc
-                if attempt < 2:
-                    await asyncio.sleep(0.1 * (2 ** attempt))  # 100ms, 200ms
-
-        self._logger.error(
-            "nova_delivery_failed_after_retries",
-            intent_id=outcome.intent_id,
-            execution_id=outcome.execution_id,
-            attempts=3,
-            error=str(last_error),
-        )
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=event_type,
+                source_system="axon",
+                data={
+                    "intent_id": outcome.intent_id,
+                    "execution_id": outcome.execution_id,
+                    "success": outcome.success,
+                    "episode_id": outcome.episode_id,
+                    "failure_reason": outcome.failure_reason,
+                    "new_observations": outcome.new_observations,
+                    "duration_ms": outcome.duration_ms,
+                    "step_outcomes": [
+                        {
+                            "action_type": s.action_type,
+                            "success": s.result.success,
+                            "error": s.result.error,
+                            "duration_ms": s.duration_ms,
+                        }
+                        for s in outcome.step_outcomes
+                    ],
+                },
+            ))
+        except Exception as exc:
+            self._logger.error(
+                "nova_delivery_event_emit_failed",
+                intent_id=outcome.intent_id,
+                error=str(exc),
+            )
 
     async def _contribute_to_atune(self, outcome: AxonOutcome) -> None:
         """
@@ -676,8 +726,6 @@ class ExecutionPipeline:
             if all_silent:
                 return
 
-        from systems.atune.types import WorkspaceContribution
-
         if outcome.success:
             content = (
                 f"Action completed: {outcome.execution_id} "
@@ -692,14 +740,29 @@ class ExecutionPipeline:
             priority = 0.55  # Failure is salient and demands attention
 
         try:
-            self._atune.contribute(WorkspaceContribution(
-                system="axon",
-                content=content,
-                priority=priority,
-                reason="action_outcome",
-            ))
+            # Use dict payload to avoid importing fovea.types at runtime
+            self._atune.contribute({
+                "system": "axon",
+                "content": content,
+                "priority": priority,
+                "reason": "action_outcome",
+            })
         except Exception as exc:
             self._logger.debug("atune_contribution_failed", error=str(exc))
+
+    @staticmethod
+    def _classify_shield_rejection(sim: Any) -> str:
+        """Classify the shield rejection type from SimulationResult."""
+        reason = (sim.revert_reason or "").lower()
+        if "blacklist" in reason:
+            return "blacklist"
+        if "slippage" in reason:
+            return "slippage"
+        if "gas" in reason or "roi" in reason:
+            return "gas_roi"
+        if "mev" in reason or "sandwich" in reason or "frontrun" in reason:
+            return "mev"
+        return "unknown"
 
     def _fast_fail(
         self,

@@ -44,6 +44,10 @@ import structlog
 from pydantic import Field
 
 from primitives.common import EOSBaseModel, new_id, utc_now
+
+# Module-level import — acceptable because Synapse never imports from Oikos,
+# so no circular dependency exists. If that ever changes, move these to per-method
+# deferred imports (matching the pattern in service.py and yield_strategy.py).
 from systems.synapse.types import SynapseEvent, SynapseEventType
 
 if TYPE_CHECKING:

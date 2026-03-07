@@ -746,6 +746,11 @@ class BountyHunter:
         except Exception:
             self._log.exception("foraging_percept_emit_failed")
 
+    @property
+    def stats(self) -> dict[str, int]:
+        """Observability snapshot for OikosService.stats aggregation."""
+        return {"known_urls": 0}
+
     async def _on_bounty_paid(self, event: object) -> None:
         """
         Handle BOUNTY_PAID event — log for audit trail.

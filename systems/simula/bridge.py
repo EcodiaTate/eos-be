@@ -201,6 +201,13 @@ class EvoSimulaBridge:
         # Combine all text for keyword matching
         combined = f"{mutation_target} {mutation_type} {description}".lower()
 
+        # Explicit new_subsystem mutation_type → route to SubsystemGenerator
+        # This is detected upstream in SimulaService._on_evolution_candidate;
+        # if we reach here via the callback path, map to ADD_SYSTEM_CAPABILITY
+        # so the proposal is at least categorised and can pass constraint checks.
+        if mutation_type == "new_subsystem":
+            return ChangeCategory.ADD_SYSTEM_CAPABILITY
+
         # Rule-based matching
         for keywords, category in _CATEGORY_KEYWORDS:
             for keyword in keywords:

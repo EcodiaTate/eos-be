@@ -196,3 +196,11 @@ __all__ += [
     "extract_changed_functions",
     "TaintEngine",
 ]
+
+# Genome extraction (Speciation: Mitosis inheritance)
+try:
+    from systems.eis.genome import EISGenomeExtractor  # noqa: F401
+
+    __all__ += ["EISGenomeExtractor"]
+except ImportError:
+    pass

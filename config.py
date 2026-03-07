@@ -191,8 +191,10 @@ class NovaConfig(BaseModel):
     # ── Cognition Cost (Metabolic Budgeting) ──
     # Cognitive frugality weight (λ) in EFE: higher = prefer cheaper policies
     efe_weight_cognition_cost: float = 0.10
-    # Enable cognition cost integration in EFE computation
-    cognition_cost_enabled: bool = True
+    # Enable cognition cost integration in EFE computation (spec §12: enable_cognition_budgeting)
+    enable_cognition_budgeting: bool = True
+    # Enable Evo hypothesis tournament loop (spec §12: enable_hypothesis_tournaments)
+    enable_hypothesis_tournaments: bool = True
     # Budget per importance tier (USD)
     cognition_budget_low: float = 0.10
     cognition_budget_medium: float = 0.50
@@ -288,11 +290,18 @@ class SimulaConfig(BaseModel):
     max_simulation_episodes: int = 200
     regression_threshold_unacceptable: float = 0.10
     regression_threshold_high: float = 0.05
+    # Rollback snapshot TTL (seconds) — prevents unbounded Redis growth
+    rollback_snapshot_ttl_seconds: int = 3600  # 1 hour
     # Code agent settings
     codebase_root: str = "."
     code_agent_model: str = "claude-opus-4-6"
     max_code_agent_turns: int = 20
-    test_command: str = "pytest"
+    # test_command: the shell command used to run the test suite.
+    # Leave as "" to use the platform-aware default (sys.executable -m pytest).
+    # On Windows, "pytest" without a full path may not be found in all environments;
+    # the empty-string default lets HealthChecker build the command with Path.as_posix()
+    # and shlex.quote so the executable is always the running interpreter.
+    test_command: str = ""
     auto_apply_self_applicable: bool = True
     # Stage 1A: Extended-thinking model for governance-required and high-risk proposals
     thinking_model: str = "o3"
@@ -315,7 +324,7 @@ class SimulaConfig(BaseModel):
     z3_enabled: bool = False  # requires z3-solver pip package
     z3_check_timeout_ms: int = 5000
     z3_max_discovery_rounds: int = 6
-    z3_blocking: bool = False  # advisory by default, graduates to blocking
+    z3_blocking: bool = True  # blocking by default for all critical categories (Spec §9)
     # Stage 2C: Static analysis gates
     static_analysis_enabled: bool = True  # on by default (pip packages)
     static_analysis_max_fix_iterations: int = 3
@@ -454,6 +463,14 @@ class SimulaConfig(BaseModel):
     # Pipeline safety limits
     max_active_proposals: int = 50  # reject new proposals when this many are in-flight
     pipeline_timeout_s: float = 600.0  # hard timeout for the full process_proposal() pipeline (10 min)
+    # Per-stage timeout budgets — individual stages cannot blow out the total deadline.
+    # Alerts are emitted when actual time exceeds stage_budget_alert_fraction of the budget.
+    validate_stage_timeout_s: float = 1.0    # governance validation + triage
+    simulate_stage_timeout_s: float = 30.0   # deep simulation (all strategies combined)
+    apply_stage_timeout_s: float = 60.0      # code generation + file writes
+    verify_stage_timeout_s: float = 120.0    # health check + formal verification
+    record_stage_timeout_s: float = 5.0      # Neo4j audit record write
+    stage_budget_alert_fraction: float = 0.9  # emit alert when stage uses >90% of its budget
     # Stage 7: Inspector — Zero-Day Discovery Engine
     inspector_enabled: bool = False  # opt-in vulnerability hunting
     inspector_max_workers: int = 4  # concurrent surface × goal analysis workers (1-16)
@@ -466,6 +483,64 @@ class SimulaConfig(BaseModel):
     inspector_generate_pocs: bool = False  # auto-generate exploit PoC scripts
     inspector_generate_patches: bool = False  # auto-generate + verify patches
     inspector_remediation_enabled: bool = False  # enable InspectorRepairOrchestrator
+    # Configurable category validation rules (JSON schema).
+    # Each key is a ChangeCategory value; each value is a dict with:
+    #   name_field: str       — which ChangeSpec attribute holds the name
+    #   required_fields: list[str] — spec fields that must be non-empty
+    #   naming_convention: str — "snake_case" | "pascal_case" | "valid_identifier"
+    #   example: str          — shown in error messages (e.g., 'email_sender')
+    # Leave empty to use built-in defaults (equivalent to the hard-coded rules).
+    category_validation_rules: dict[str, Any] = Field(default_factory=dict)
+
+    # ─── Learnable Risk Weighting (Corpus 5) ──────────────────────────────────
+    # Risk synthesis weights for ChangeSimulator._synthesize_risk() weighting.
+    # Defaults match Spec §11; tunable via Evo ADJUST_BUDGET proposals targeting
+    # risk_weight_* parameters. Normalized to sum=1.0 before use.
+    risk_weight_base: float = 0.40  # Base category simulation result
+    risk_weight_counterfactual: float = 0.20  # Counterfactual regression rate
+    risk_weight_dependency: float = 0.15  # Dependency blast radius
+    risk_weight_resource: float = 0.10  # Resource cost estimation
+    risk_weight_alignment: float = 0.15  # Constitutional alignment
+
+    # ─── Learnable Configuration Defaults (Corpus 8) ────────────────────────────
+    # Hard-coded heuristics extracted to SimulaConfig so Evo can tune them.
+    # Defaults match current behavior in simulation.py + architecture_efe_scorer.py.
+    # Evo learns optimal values via ADJUST_BUDGET proposals + analytics feedback.
+
+    # Risk thresholds for mapping composite_risk → RiskLevel
+    risk_threshold_moderate: float = 0.25  # composite_risk >= 0.25 → MODERATE
+    risk_threshold_high: float = 0.50  # composite_risk >= 0.50 → HIGH
+    risk_threshold_unacceptable: float = 0.75  # composite_risk >= 0.75 → UNACCEPTABLE
+
+    # EFE (Expected Free Energy) scoring thresholds
+    efe_auto_approve_threshold: float = -0.35  # Equor auto-approves if EFE <= this
+    efe_complexity_penalty_weight: float = 0.15  # Complexity penalty multiplier
+
+    # Proposal processing limits
+    proactive_scan_incident_limit_per_cycle: int = 1000  # Max patterns per scan
+    proactive_scan_interval_accelerated_factor: float = 0.4  # 40% of normal
+    proactive_scan_interval_critical_factor: float = 0.15  # 15% of normal
+
+    # Repair memory thresholds
+    repair_low_success_rate_threshold: float = 0.40  # Below this → scrutiny
+
+    # Fovea attention thresholds
+    fovea_divergence_threshold: float = 0.25  # 25% divergence triggers attention
+
+    # Category-level base complexity heuristics (0.0-1.0 scale)
+    category_complexity_adjust_budget: float = 0.05
+    category_complexity_add_pattern: float = 0.20
+    category_complexity_add_channel: float = 0.25
+    category_complexity_add_executor: float = 0.30
+    category_complexity_modify_contract: float = 0.45
+    category_complexity_modify_cycle: float = 0.35
+    category_complexity_change_consolidation: float = 0.40
+    category_complexity_add_system: float = 0.60
+
+    # Category-specific risk boost/penalty (applied after weighted synthesis)
+    category_risk_boost_modify_contract: float = 0.2
+    category_risk_boost_add_system: float = 0.2
+    category_risk_boost_adjust_budget: float = -0.1
 
 
 class ThymosConfig(BaseModel):
@@ -569,6 +644,12 @@ class OikosConfig(BaseModel):
     mitosis_child_struggling_runway_days: float = 30.0
     # Maximum rescue attempts per child before graceful death
     mitosis_max_rescues_per_child: int = 2
+    # Probability that any individual genome parameter is mutated during inheritance
+    mitosis_mutation_rate: float = 0.05
+    # Speciation distance threshold (cosine distance) — emit SPECIATION_EVENT above this
+    mitosis_speciation_distance_threshold: float = 0.3
+    # Hours of silence from a child before triggering death pipeline
+    mitosis_health_timeout_hours: int = 24
 
     # ── Phase 16k: Cognitive Derivatives ──
     # Base discount for futures buyers (16% = 0.16)
@@ -1034,6 +1115,14 @@ class FederationConfig(BaseModel):
     # Identity certificate data directory (Phase 16g)
     identity_data_dir: str = "data/identity"
 
+    # Peer discovery — seed list bootstraps the population.
+    # Each entry is a federation endpoint URL (e.g. "https://peer.ecodiaos.net/federation").
+    # On initialize(), FederationService attempts establish_link() for each seed
+    # that is not already linked.  Failures are logged and retried on next startup.
+    seed_peers: list[str] = Field(default_factory=list)
+    # Retry failed seed connections on this interval (seconds). 0 = no retry.
+    seed_retry_interval_seconds: int = 300
+
     # Reputation staking (Phase 16k: Honesty as Schelling Point)
     staking_enabled: bool = False
     staking: StakingConfig = Field(default_factory=StakingConfig)
@@ -1234,6 +1323,9 @@ class SkiaConfig(BaseModel):
     snapshot_node_labels: list[str] = Field(default_factory=lambda: [
         "Self", "Episode", "Entity", "Goal", "Hypothesis",
         "Constitution", "Value", "Relationship",
+        # Evo learning state — procedures, consolidated beliefs, parameter history,
+        # and genetic genome are critical for resuming learning after restoration.
+        "Procedure", "ConsolidatedBelief", "ParameterAdjustment", "BeliefGenome",
     ])
     snapshot_include_edges: bool = True
     snapshot_compress: bool = True
@@ -1263,6 +1355,13 @@ class SkiaConfig(BaseModel):
     # ── Cost Tracking ──
     estimated_snapshot_cost_usd: float = 0.001
     estimated_restoration_cost_usd: float = 0.05
+
+    # ── Mutation (Heritable Variation) ──
+    mutation_rate: float = 0.05       # Probability each numeric param is mutated
+    mutation_magnitude: float = 0.05  # Max proportional perturbation (+/- 5%)
+
+    # ── Standalone Worker ──
+    worker_heartbeat_interval_s: float = 30.0  # SKIA_HEARTBEAT emission interval
 
     # ── Redis Keys ──
     state_cid_redis_key: str = "skia:latest_state_cid"

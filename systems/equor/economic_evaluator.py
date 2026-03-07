@@ -29,7 +29,7 @@ can run inside ``asyncio.gather`` without blocking.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -214,7 +214,6 @@ def _evaluate_hunt_bounties(intent: Intent) -> dict[str, float]:
             break
 
     # ── Honesty: work must be transparent ──
-    _collect_step_params(intent)
     if "fake" in all_text or "mislead" in all_text or "deceive" in all_text:
         deltas["honesty"] -= 0.4
     if "open source" in all_text or "transparent" in all_text:
@@ -307,7 +306,6 @@ def _evaluate_deploy_asset(intent: Intent) -> dict[str, float]:
     """
     deltas: dict[str, float] = {"coherence": 0.0, "care": 0.0, "growth": 0.0, "honesty": 0.0}
     all_text = _collect_intent_text(intent)
-    _collect_step_params(intent)
 
     # ── Care (critical — scam/spam veto) ──
     for indicator in _ASSET_HARM_INDICATORS:
@@ -450,8 +448,6 @@ def _evaluate_unknown_economic(intent: Intent) -> dict[str, float]:
 
 # ─── Dispatcher ──────────────────────────────────────────────────
 
-_EVALUATOR_MAP: dict[str, type[object]] = {}  # placeholder for type, using callables
-
 _ACTION_EVALUATORS: dict[str | None, object] = {
     "hunt_bounties": _evaluate_hunt_bounties,
     "defi_yield": _evaluate_defi_yield,
@@ -535,9 +531,9 @@ def _collect_intent_text(intent: Intent) -> str:
     return " ".join(parts).lower()
 
 
-def _collect_step_params(intent: Intent) -> dict[str, object]:
+def _collect_step_params(intent: Intent) -> dict[str, Any]:
     """Merge all step parameters into a single dict for easy lookup."""
-    merged: dict[str, object] = {}
+    merged: dict[str, Any] = {}
     for step in intent.plan.steps:
         merged.update(step.parameters)
     return merged

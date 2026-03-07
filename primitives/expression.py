@@ -117,6 +117,9 @@ class Expression(Identified, Timestamped):
     # Generation audit
     generation_trace: GenerationTrace | None = None
 
+    # Voice / TTS parameters derived by VoiceEngine (None = text-only delivery)
+    voice_params: dict[str, float | str] | None = None
+
     # Silence path
     is_silence: bool = False
     silence_reason: str | None = None

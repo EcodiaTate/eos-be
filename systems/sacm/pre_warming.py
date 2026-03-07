@@ -240,6 +240,10 @@ class PreWarmingEngine:
         self._prev_snapshot: PricingSurfaceSnapshot | None = None
         # oikos is OikosService at runtime; typed as Any to avoid circular import
         self._oikos: Any | None = None
+        self._synapse: Any | None = None
+        # provider_managers: provider_id → ProviderManager (infrastructure layer)
+        # Wired via register_provider_manager() so pre-warming can call .deploy()
+        self._provider_managers: dict[str, Any] = {}
         self._log = logger.bind(component="sacm.pre_warming")
 
     # ── Oikos Integration ─────────────────────────────────────────────
@@ -253,6 +257,23 @@ class PreWarmingEngine:
         """
         self._oikos = oikos
         self._log.info("oikos_wired_to_pre_warm_engine")
+
+    def set_synapse(self, synapse: Any) -> None:
+        """Attach Synapse so pre-warm events can be emitted."""
+        self._synapse = synapse
+        self._log.info("synapse_wired_to_pre_warm_engine")
+
+    def register_provider_manager(self, provider_id: str, manager: Any) -> None:
+        """
+        Register an infrastructure ProviderManager so pre-warming can call
+        manager.deploy() to provision real instances.
+
+        Call once per provider after ProviderManager is initialised.
+        provider_id must match the SubstrateOffer.provider_id values used by
+        the oracle so the correct manager is selected at provisioning time.
+        """
+        self._provider_managers[provider_id] = manager
+        self._log.info("provider_manager_registered", provider_id=provider_id)
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -623,7 +644,66 @@ class PreWarmingEngine:
         hourly_cost: float,
         reason: str,
     ) -> WarmInstance:
-        """Create a new WarmInstance record in the pool."""
+        """
+        Create a new WarmInstance record in the pool.
+
+        Spec 27 §16 + Oikos integration: runs the Oikos metabolic gate before
+        committing the spend so the organism's economic health can veto
+        speculative pre-warming during austerity or starvation.
+
+        Gate parameters:
+          - action_type: "sacm_pre_warm"
+          - priority: GROWTH (speculative capacity, not operational survival)
+          - estimated_cost: hourly_cost_usd (upper-bound for the first hour)
+        """
+        if self._oikos is not None:
+            try:
+                from decimal import Decimal
+
+                from systems.oikos.models import MetabolicPriority
+
+                gate_ok = await self._oikos.check_metabolic_gate(
+                    action_type="sacm_pre_warm",
+                    action_id=offer.id,
+                    estimated_cost_usd=Decimal(str(round(hourly_cost, 6))),
+                    priority=MetabolicPriority.GROWTH,
+                    rationale=(
+                        f"Pre-warm {offload_class} instance on {offer.provider_id} "
+                        f"for {reason} at ${hourly_cost:.4f}/hr"
+                    ),
+                )
+                if not gate_ok:
+                    self._log.info(
+                        "pre_warm_metabolic_gate_denied",
+                        provider_id=offer.provider_id,
+                        offload_class=offload_class,
+                        hourly_cost_usd=round(hourly_cost, 4),
+                        reason=reason,
+                    )
+                    # Return a stub in RELEASED state so callers skip without error
+                    return WarmInstance(
+                        offer_id=offer.id,
+                        provider_id=offer.provider_id,
+                        offload_class=offload_class,
+                        resources=ResourceEnvelope(
+                            cpu_vcpu=offer.max_cpu_vcpu,
+                            memory_gib=offer.max_memory_gib,
+                            storage_gib=offer.max_storage_gib,
+                            gpu_units=offer.max_gpu_units,
+                            gpu_vram_gib=offer.gpu_vram_gib,
+                        ),
+                        hourly_cost_usd=hourly_cost,
+                        status=WarmInstanceStatus.RELEASED,
+                        reason=f"metabolic_gate_denied:{reason}",
+                    )
+            except Exception as exc:
+                # Non-fatal: if Oikos is unavailable, log and proceed
+                self._log.warning(
+                    "pre_warm_metabolic_gate_error",
+                    error=str(exc),
+                    provider_id=offer.provider_id,
+                )
+
         inst = WarmInstance(
             offer_id=offer.id,
             provider_id=offer.provider_id,
@@ -649,4 +729,106 @@ class PreWarmingEngine:
             hourly_cost_usd=round(hourly_cost, 4),
             reason=reason,
         )
+        self._emit_pre_warm_event(inst, reason)
+
+        # ── Provision via ProviderManager ──────────────────────────────
+        # Call deploy() to provision the actual infrastructure instance.
+        # Transition to READY on success, RELEASED on failure (pool cleans up).
+        manager = self._provider_managers.get(offer.provider_id)
+        if manager is not None:
+            asyncio.create_task(
+                self._provision_via_manager(inst, manager),
+                name=f"sacm_provision_{inst.id[:8]}",
+            )
+        else:
+            self._log.warning(
+                "no_provider_manager_for_pre_warm",
+                provider_id=offer.provider_id,
+                instance_id=inst.id,
+                hint="register_provider_manager() not called for this provider",
+            )
+
         return inst
+
+    async def _provision_via_manager(self, inst: WarmInstance, manager: Any) -> None:
+        """
+        Call ProviderManager.deploy() to provision a real instance and
+        update the WarmInstance status based on the result.
+
+        On success: instance transitions to READY via mark_ready().
+        On failure: instance is removed from the pool (RELEASED) so it
+        does not consume budget or block claims.
+        """
+        try:
+            result = await manager.deploy(
+                image="ghcr.io/ecodiaos/core:latest",
+                env_vars={
+                    "SACM_WARM_INSTANCE_ID": inst.id,
+                    "SACM_OFFER_ID": inst.offer_id,
+                    "SACM_OFFLOAD_CLASS": str(inst.offload_class),
+                    "SACM_CPU_VCPU": str(inst.resources.cpu_vcpu),
+                    "SACM_MEMORY_GIB": str(inst.resources.memory_gib),
+                    "SACM_GPU_UNITS": str(inst.resources.gpu_units),
+                },
+            )
+
+            if result.success:
+                # Persist the provider-assigned endpoint/deployment_id
+                async with self._lock:
+                    current = self._pool.get(inst.id)
+                    if current is not None:
+                        current.reason = (
+                            f"{inst.reason}:deployment_id={result.deployment_id}"
+                        )
+                await self.mark_ready(inst.id)
+                self._log.info(
+                    "warm_instance_provisioned",
+                    instance_id=inst.id,
+                    provider_id=inst.provider_id,
+                    deployment_id=result.deployment_id,
+                    endpoint=result.endpoint,
+                )
+            else:
+                self._log.warning(
+                    "warm_instance_provision_failed",
+                    instance_id=inst.id,
+                    provider_id=inst.provider_id,
+                    error=result.error,
+                )
+                await self.release(inst.id)
+
+        except Exception as exc:
+            self._log.error(
+                "warm_instance_provision_error",
+                instance_id=inst.id,
+                provider_id=inst.provider_id,
+                error=str(exc),
+                exc_info=True,
+            )
+            await self.release(inst.id)
+
+    def _emit_pre_warm_event(self, inst: WarmInstance, reason: str) -> None:
+        """Emit SACM_PRE_WARM_PROVISIONED via Synapse so downstream systems can react."""
+        if self._synapse is None:
+            return
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        asyncio.create_task(
+            self._synapse.event_bus.emit(
+                SynapseEvent(
+                    event_type=SynapseEventType.SACM_PRE_WARM_PROVISIONED,
+                    source_system="sacm",
+                    data={
+                        "instance_id": inst.id,
+                        "provider_id": inst.provider_id,
+                        "offload_class": str(inst.offload_class),
+                        "cpu_vcpu": inst.resources.cpu_vcpu,
+                        "memory_gib": inst.resources.memory_gib,
+                        "gpu_units": inst.resources.gpu_units,
+                        "hourly_cost_usd": round(inst.hourly_cost_usd, 6),
+                        "reason": reason,
+                    },
+                )
+            ),
+            name=f"sacm_pre_warm_{inst.id[:8]}",
+        )

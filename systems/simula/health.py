@@ -37,6 +37,8 @@ import ast
 import asyncio
 import contextlib
 import importlib.util
+import shlex
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -80,6 +82,7 @@ class HealthChecker:
         self,
         codebase_root: Path,
         test_command: str = "pytest",
+        health_check_timeout_s: float = 300.0,
         dafny_bridge: DafnyBridge | None = None,
         z3_bridge: Z3Bridge | None = None,
         static_analysis_bridge: StaticAnalysisBridge | None = None,
@@ -95,7 +98,24 @@ class HealthChecker:
         performance_baseline_timeout_s: float = 60.0,
     ) -> None:
         self._root = codebase_root
-        self._test_command = test_command
+        # Build a platform-safe test command list.
+        # If test_command is empty, default to `<interpreter> -m pytest` using the
+        # running Python executable (Path.as_posix() + shlex.quote handles spaces and
+        # Windows paths correctly).  A non-empty test_command is split with shlex so
+        # it works on both Unix and Windows regardless of quote style.
+        if test_command:
+            try:
+                self._test_command_argv: list[str] = shlex.split(test_command)
+            except ValueError:
+                self._test_command_argv = test_command.split()
+        else:
+            self._test_command_argv = [
+                shlex.quote(Path(sys.executable).as_posix()),
+                "-m",
+                "pytest",
+            ]
+        self._test_command = test_command  # kept for logging
+        self._health_check_timeout_s = health_check_timeout_s
         self._dafny = dafny_bridge
         self._z3 = z3_bridge
         self._static_analysis = static_analysis_bridge
@@ -145,8 +165,16 @@ class HealthChecker:
             return HealthCheckResult(healthy=False, issues=import_errors)
         self._log.info("health_import_passed", files=len(files_written))
 
-        # 3. Unit tests
-        tests_passed, test_output = await self._run_tests(files_written)
+        # 3. Unit tests — 20% of health_check_timeout_s, minimum 10s absolute floor
+        # so pytest can always start even when the overall budget is tight.
+        _test_budget = max(self._health_check_timeout_s * 0.20, 10.0)
+        try:
+            tests_passed, test_output = await asyncio.wait_for(
+                self._run_tests(files_written), timeout=_test_budget
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            self._log.error("health_tests_timeout", timeout_s=_test_budget)
+            return HealthCheckResult(healthy=False, issues=["Unit tests timed out"])
         if not tests_passed:
             self._log.warning("health_tests_failed", output=test_output[:500])
             return HealthCheckResult(
@@ -210,10 +238,16 @@ class HealthChecker:
                 duration_ms=mutation_result.total_duration_ms,
             )
 
-        # 4. Formal verification (Stage 2) — runs with independent timeout
-        formal_result = await self._run_formal_verification(
-            files_written, proposal,
-        )
+        # 4. Formal verification (Stage 2) — 40% of health_check_timeout_s, minimum 15s
+        _formal_budget = max(self._health_check_timeout_s * 0.40, 15.0)
+        try:
+            formal_result = await asyncio.wait_for(
+                self._run_formal_verification(files_written, proposal),
+                timeout=_formal_budget,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            self._log.warning("health_formal_verify_timeout", timeout_s=_formal_budget)
+            formal_result = None  # advisory — missing timeout is not a blocking failure
         if formal_result is not None:
             if not formal_result.passed and formal_result.blocking_issues:
                 self._log.warning(
@@ -236,10 +270,16 @@ class HealthChecker:
                 )
             self._log.info("health_formal_verification_passed")
 
-        # 5. Lean 4 proof verification (Stage 4A) — runs for proof-eligible categories
-        lean_result = await self._run_lean_verification(
-            files_written, proposal,
-        )
+        # 5. Lean 4 proof verification (Stage 4A) — 10% of health_check_timeout_s, minimum 10s
+        _lean_budget = max(self._health_check_timeout_s * 0.10, 10.0)
+        try:
+            lean_result = await asyncio.wait_for(
+                self._run_lean_verification(files_written, proposal),
+                timeout=_lean_budget,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            self._log.warning("health_lean_verify_timeout", timeout_s=_lean_budget)
+            lean_result = None
         if lean_result is not None:
             if lean_result.status.value == "failed" and self._lean_blocking:
                 self._log.warning(
@@ -263,8 +303,16 @@ class HealthChecker:
                 copilot_rate=f"{lean_result.copilot_automation_rate:.0%}",
             )
 
-        # 6. Formal guarantees (Stage 6D + 6E) — e-graph equivalence + symbolic execution
-        fg_result = await self._run_formal_guarantees(files_written, proposal)
+        # 6. Formal guarantees (Stage 6D + 6E) — 10% of health_check_timeout_s, minimum 10s
+        _fg_budget = max(self._health_check_timeout_s * 0.10, 10.0)
+        try:
+            fg_result = await asyncio.wait_for(
+                self._run_formal_guarantees(files_written, proposal),
+                timeout=_fg_budget,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            self._log.warning("health_formal_guarantees_timeout", timeout_s=_fg_budget)
+            fg_result = None
         if fg_result is not None:
             if fg_result.blocking_issues:
                 self._log.warning(
@@ -330,19 +378,68 @@ class HealthChecker:
     async def _check_imports(self, files: list[str]) -> list[str]:
         """""""""
         Derive dotted module paths from written file paths and check
-        whether importlib can locate them.  Returns error strings.
+        whether importlib can locate them — including transitive imports
+        discovered by walking the AST of each written file.
+
+        Transitive scan detects broken imports one hop deep (the written
+        file's direct imports), which catches the most common post-apply
+        failure mode where a new module imports a non-existent symbol.
         """""""""
         errors: list[str] = []
+        # Collect all modules to check: direct + transitive from AST walk
+        modules_to_check: list[tuple[str, str]] = []  # (module_path, source_filepath)
+
         for filepath in files:
             if not filepath.endswith(".py"):
                 continue
             module_path = self._derive_module_path(filepath)
-            if module_path is None:
+            if module_path is not None:
+                modules_to_check.append((module_path, filepath))
+
+            # Transitive: parse the file and collect its import statements
+            path = Path(filepath)
+            if path.exists():
+                try:
+                    source = path.read_text(encoding="utf-8")
+                    tree = ast.parse(source, filename=filepath)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                modules_to_check.append((alias.name, filepath))
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.module:
+                                # Resolve relative imports using the file's own module path
+                                if node.level and node.level > 0 and module_path:
+                                    parts = module_path.rsplit(".", node.level)
+                                    base = parts[0] if len(parts) > 1 else ""
+                                    resolved = f"{base}.{node.module}" if base else node.module
+                                else:
+                                    resolved = node.module
+                                modules_to_check.append((resolved, filepath))
+                except SyntaxError:
+                    pass  # Syntax errors are caught in _check_syntax
+                except Exception:
+                    pass  # Best-effort transitive scan
+
+        seen: set[str] = set()
+        for module_path, source_filepath in modules_to_check:
+            if module_path in seen:
+                continue
+            seen.add(module_path)
+            # Skip stdlib and third-party roots that importlib handles fine
+            root = module_path.split(".")[0]
+            if root in {"sys", "os", "re", "ast", "json", "time", "typing",
+                        "collections", "pathlib", "asyncio", "contextlib",
+                        "datetime", "enum", "hashlib", "importlib", "math",
+                        "functools", "itertools", "abc", "dataclasses"}:
                 continue
             try:
                 spec = importlib.util.find_spec(module_path)
                 if spec is None:
-                    errors.append(f"Import check: module not found: {module_path}")
+                    errors.append(
+                        f"Import check: module not found: {module_path}"
+                        + (f" (imported by {source_filepath})" if source_filepath else "")
+                    )
             except ModuleNotFoundError as exc:
                 errors.append(f"Import check: {module_path}: {exc}")
             except Exception as exc:

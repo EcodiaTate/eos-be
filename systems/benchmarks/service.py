@@ -18,13 +18,30 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
-from primitives.common import utc_now
+from primitives.common import SystemID, utc_now
+from systems.benchmarks.bedau_packard import BedauPackardTracker
+from systems.benchmarks.ethical_drift import EthicalDriftEvaluator, EthicalDriftTracker
+from systems.benchmarks.evaluation_protocol import EvaluationProtocol
+from systems.benchmarks.evolutionary_tracker import EvolutionaryTracker
+from systems.benchmarks.longitudinal import LongitudinalTracker
+from systems.benchmarks.paper_data import PaperDataExporter
+from systems.benchmarks.pillars import (
+    compute_learning_velocity,
+    detect_memorization,
+    load_fixed_test_sets,
+    measure_causal_reasoning,
+    measure_novelty_emergence,
+    measure_specialization,
+)
+from systems.benchmarks.shadow_reset import ShadowResetController, ShadowResetResult
+from systems.benchmarks.test_sets import TestSetManager
 from systems.benchmarks.types import (
     BenchmarkSnapshot,
     BenchmarkTrend,
@@ -35,6 +52,43 @@ from systems.synapse.types import SynapseEvent, SynapseEventType
 if TYPE_CHECKING:
     from clients.timescaledb import TimescaleDBClient
     from config import BenchmarkConfig
+
+
+# ─── Protocols for injected dependencies ─────────────────────────────────
+# These define the minimal contract Benchmarks requires from each system.
+
+
+@runtime_checkable
+class NovaHealthProtocol(Protocol):
+    async def health(self) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class OikosStatsProtocol(Protocol):
+    @property
+    def stats(self) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class EvoStatsProtocol(Protocol):
+    @property
+    def stats(self) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class SimulaStatsProtocol(Protocol):
+    @property
+    def stats(self) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class TelosHealthProtocol(Protocol):
+    async def health(self) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class LogosHealthProtocol(Protocol):
+    async def health(self) -> dict[str, Any]: ...
 
 logger = structlog.get_logger("systems.benchmarks")
 
@@ -82,58 +136,723 @@ class BenchmarkService:
         self._logger = logger.bind(system="benchmarks")
 
         # Injected dependencies (set via setters after construction)
-        self._nova: Any | None = None
-        self._evo: Any | None = None
-        self._oikos: Any | None = None
-        self._simula: Any | None = None
-        self._telos: Any | None = None
-        self._logos: Any | None = None
+        self._nova: NovaHealthProtocol | None = None
+        self._evo: EvoStatsProtocol | None = None
+        self._oikos: OikosStatsProtocol | None = None
+        self._simula: SimulaStatsProtocol | None = None
+        self._telos: TelosHealthProtocol | None = None
+        self._logos: LogosHealthProtocol | None = None
         self._event_bus: Any | None = None
+        self._redis: Any | None = None
+        self._memory: Any | None = None  # Neo4j Memory client for episode tagging
 
         # Runtime state
         self._initialized: bool = False
         self._task: asyncio.Task[None] | None = None
+        self._monthly_eval_task: asyncio.Task[None] | None = None
+
+        # Five-pillar evaluation protocol + test sets (instantiated in initialize())
+        self._evaluation_protocol: EvaluationProtocol | None = None
+        self._test_set_manager: TestSetManager | None = None
 
         # In-memory cache of the most recently collected snapshot (for sync stats access)
         self._last_snapshot: BenchmarkSnapshot | None = None
 
         # Track which metrics are currently in regression so we don't repeat-alert
         self._regressed: set[str] = set()
+        # Timestamps of when each metric entered regression (for duration tracking)
+        self._regressed_at: dict[str, float] = {}
+        # Previous cycle llm_dependency for RE progress emission
+        self._prev_llm_dependency: float | None = None
+
+        # Intelligence-ratio Bedau-Packard state:
+        # Set of drive-config fingerprints seen in the PREVIOUS population snapshot.
+        # On each new snapshot we compute novel (newly appeared) AND persistent
+        # (still present) configs = adaptive_activity_A per Bedau & Packard.
+        self._prev_drive_config_fingerprints: set[str] = set()
+        # Most recent constitutional_phenotype_divergence computed from Telos snapshot.
+        # Written by _on_telos_population_snapshot; included in next _collect() run.
+        self._last_phenotype_divergence: float | None = None
+
+        # Evolutionary tracker
+        self._evo_tracker = EvolutionaryTracker(
+            instance_id=instance_id,
+            generation=1,
+            parent_instance_id=None,
+        )
+
+        # Shadow-reset controller (non-destructive population snapshot + delta)
+        self._shadow_reset = ShadowResetController(
+            instance_id=instance_id,
+        )
+
+        # Metabolic efficiency time-series (from BENCHMARKS_METABOLIC_VALUE events).
+        # Holds the last 7 days of efficiency readings as (timestamp_iso, efficiency) tuples.
+        # Used to detect degradation trends independent of the 24h KPI poll cycle.
+        from collections import deque as _deque
+        self._metabolic_efficiency_history: _deque[tuple[str, float]] = _deque(maxlen=168)  # 7d × hourly
 
         # Counters for observability
         self._total_runs: int = 0
         self._total_regressions_fired: int = 0
 
+        # RE performance tracking — rolling 7-day window of per-decision outcomes.
+        # Populated by _on_re_decision_outcome (RE_DECISION_OUTCOME subscription).
+        self._re_outcomes: list[dict[str, Any]] = []
+        # Total slow-path decisions in the 7-day window (for RE usage_pct).
+        # Incremented each time any RE_DECISION_OUTCOME arrives (RE or Claude).
+        self._total_decisions_7d: int = 0
+        # Latest computed RE performance snapshot — included in monthly eval payload.
+        self._re_performance: dict[str, Any] = {
+            "success_rate": 0.0,
+            "usage_pct": 0.0,
+            "total_decisions": 0,
+        }
+
+        # Loop 6: Accumulated fitness observables from Evo
+        self._accumulated_fitness: dict[str, Any] = {
+            "hypotheses_evaluated": 0,
+            "hypotheses_integrated": 0,
+            "schemas_induced": 0,
+            "consolidation_count": 0,
+        }
+
+        # Bedau-Packard fleet-level tracker (§8.5, monthly).
+        # Populated from CHILD_SPAWNED events via _fleet_genomes cache.
+        self._bp_tracker = BedauPackardTracker(
+            speciation_threshold=getattr(
+                getattr(config, "mitosis", None), "speciation_distance_threshold", 0.3
+            ),
+        )
+        # Cache of fleet genome snapshots keyed by instance_id.
+        # Updated by _on_child_spawned_genome when CHILD_SPAWNED events arrive.
+        self._fleet_genomes: dict[str, dict[str, Any]] = {}
+        # Month counter for OEE gating (≥3 months before oee_assessment is included)
+        self._monthly_eval_count: int = 0
+
+        # ── Pillar 5: Ethical Drift Map ───────────────────────────────────────
+        # EthicalDriftEvaluator: runs the 100 frozen scenarios each month.
+        # EthicalDriftTracker: persists results to Neo4j, computes drift vectors.
+        # _current_month: monotonic counter (1 = first evaluation, increments each run).
+        self._ethical_drift = EthicalDriftEvaluator()
+        self._drift_tracker = EthicalDriftTracker(memory=None)  # memory injected later
+
+        # ── Longitudinal tracker ──────────────────────────────────────────────
+        # Captures Month 1 baseline and enables Month 1 vs Month N comparison.
+        # This is §6.4 — "the single most important result for the paper."
+        self._longitudinal = LongitudinalTracker(
+            memory=None, instance_id=instance_id  # memory injected later
+        )
+        # Monotonic month counter — independent of calendar month so that
+        # Month 1 is always the first evaluation regardless of when it runs.
+        self._current_month: int = 1
+
+        # ── Paper data exporter (Round 5D) ────────────────────────────────────
+        # Exports 4 CSVs from Neo4j + optional W&B push after each monthly eval.
+        # Wired with memory in set_memory().
+        self._paper_exporter = PaperDataExporter(
+            memory=None,
+            instance_id=instance_id,
+        )
+
+        # ── Pillars 1–4 + §6.3 Memorization (Round 6) ────────────────────────
+        # Direct pillar evaluation using pillars.py — runs alongside (not replacing)
+        # the EvaluationProtocol. Adds pillar1_* / pillar2_* / pillar3_* /
+        # pillar4_* / memorization_* keys to result_dict each month.
+        # Set via set_reasoning_engine() after initialize().
+        self._reasoning_engine: Any | None = None
+        # Loaded once in initialize() from data/evaluation/*.jsonl.
+        self._test_sets: dict = {}
+        # Accumulates {"month": int, "score": float} entries each month from
+        # Pillar 3 (L2+L3 combined). Fed into compute_learning_velocity().
+        self._causal_history: list[dict] = []
+
     # ─── Dependency injection ─────────────────────────────────────────
 
-    def set_nova(self, nova: Any) -> None:
+    def set_nova(self, nova: NovaHealthProtocol | None) -> None:
         self._nova = nova
 
-    def set_evo(self, evo: Any) -> None:
+    def set_evo(self, evo: EvoStatsProtocol | None) -> None:
         self._evo = evo
 
-    def set_oikos(self, oikos: Any) -> None:
+    def set_oikos(self, oikos: OikosStatsProtocol | None) -> None:
         self._oikos = oikos
 
-    def set_simula(self, simula: Any) -> None:
+    def set_simula(self, simula: SimulaStatsProtocol | None) -> None:
         self._simula = simula
 
-    def set_telos(self, telos: Any) -> None:
+    def set_telos(self, telos: TelosHealthProtocol | None) -> None:
         self._telos = telos
 
-    def set_logos(self, logos: Any) -> None:
+    def set_logos(self, logos: LogosHealthProtocol | None) -> None:
         self._logos = logos
 
     def set_event_bus(self, bus: Any) -> None:
         self._event_bus = bus
+        self._evo_tracker.attach(bus)
+        bus.subscribe(SynapseEventType.FITNESS_OBSERVABLE_BATCH, self._on_fitness_observable_batch)
+        # Additional Synapse subscriptions for cross-system correlation
+        bus.subscribe(SynapseEventType.SOMA_ALLOSTATIC_REPORT, self._on_soma_allostatic_report)
+        bus.subscribe(SynapseEventType.COHERENCE_SNAPSHOT, self._on_coherence_snapshot)
+        bus.subscribe(SynapseEventType.EFFECTIVE_I_COMPUTED, self._on_effective_i_computed)
+        bus.subscribe(SynapseEventType.KAIROS_INTELLIGENCE_RATIO_STEP_CHANGE, self._on_kairos_i_ratio_step)
+        bus.subscribe(SynapseEventType.TELOS_POPULATION_SNAPSHOT, self._on_telos_population_snapshot)
+        if hasattr(SynapseEventType, "BENCHMARKS_METABOLIC_VALUE"):
+            bus.subscribe(SynapseEventType.BENCHMARKS_METABOLIC_VALUE, self._on_metabolic_value)
+        if hasattr(SynapseEventType, "SIMULA_KPI_PUSH"):
+            bus.subscribe(SynapseEventType.SIMULA_KPI_PUSH, self._on_simula_kpi_push)
+        if hasattr(SynapseEventType, "RE_DECISION_OUTCOME"):
+            bus.subscribe(SynapseEventType.RE_DECISION_OUTCOME, self._on_re_decision_outcome)
+        # Fleet genome cache for Bedau-Packard monthly computation
+        if hasattr(SynapseEventType, "CHILD_SPAWNED"):
+            bus.subscribe(SynapseEventType.CHILD_SPAWNED, self._on_child_spawned_genome)
+        # Wire drift tracker so it can emit ETHICAL_DRIFT_RECORDED
+        self._drift_tracker.set_event_bus(bus)
+
+    def set_redis(self, redis: Any) -> None:
+        self._redis = redis
+        self._evo_tracker._redis = redis
+        self._shadow_reset.set_redis(redis)
+        self._shadow_reset.set_tracker(self._evo_tracker)
+
+    def set_memory(self, memory: Any) -> None:
+        self._memory = memory
+        self._drift_tracker._memory = memory
+        self._longitudinal._memory = memory
+        self._paper_exporter.set_memory(memory)
+        # Wire Neo4j into the fleet-level Bedau-Packard tracker so each monthly
+        # compute_adaptive_activity() call persists a (:BedauPackardSample) node
+        # that PaperDataExporter.export_evolutionary_activity() can query.
+        neo4j = getattr(memory, "_neo4j", None)
+        if neo4j is not None:
+            self._bp_tracker.set_neo4j(neo4j, instance_id=self._instance_id)
+
+    def set_re_service(self, re_service: Any) -> None:
+        """Inject the Reasoning Engine service into the 5-pillar evaluation protocol.
+
+        Must be called after initialize() so that _evaluation_protocol exists.
+        Safe to call with None (clears existing injection).
+        """
+        if self._evaluation_protocol is not None:
+            self._evaluation_protocol.set_re_service(re_service)
+
+    def set_reasoning_engine(self, engine: Any) -> None:
+        """Inject RE service for direct pillar evaluation via pillars.py.
+
+        Distinct from set_re_service() which targets EvaluationProtocol.
+        Call after initialize(). Safe to call with None.
+        """
+        self._reasoning_engine = engine
+
+    # ─── On-demand evaluation (for ablation studies) ──────────────────────────
+
+    async def run_evaluation_now(self, month: int) -> "LongitudinalSnapshot":
+        """Run a 5-pillar evaluation synchronously without advancing _current_month.
+
+        Used by AblationOrchestrator to capture baseline and ablated scores.
+        Does NOT emit MONTHLY_EVALUATION_COMPLETE — this is a silent, on-demand call.
+        Returns a LongitudinalSnapshot with available pillar scores.
+
+        Falls back gracefully if evaluation protocol is not initialised (stubs).
+        """
+        from systems.benchmarks.longitudinal import LongitudinalSnapshot
+
+        if self._evaluation_protocol is None or self._test_set_manager is None:
+            return LongitudinalSnapshot(month=month, instance_id=self._instance_id)
+
+        try:
+            test_sets = await self._test_set_manager.load_all()
+            result = await self._evaluation_protocol.run_monthly_evaluation(
+                test_sets=test_sets,
+                month=month,
+            )
+        except Exception as exc:
+            self._logger.warning("run_evaluation_now_failed", error=str(exc), month=month)
+            return LongitudinalSnapshot(month=month, instance_id=self._instance_id)
+
+        p1 = result.pillar1_specialization
+        p3 = result.pillar3_causal
+        p5 = result.pillar5_ethical
+        snap = LongitudinalSnapshot(
+            month=month,
+            instance_id=self._instance_id,
+            specialization_index=p1.specialization_index if p1 else 0.0,
+            domain_improvement=p1.domain_improvement if p1 else 0.0,
+            general_retention=p1.general_retention if p1 else 0.0,
+            l1_association=p3.l1_association if p3 else 0.0,
+            l2_intervention=p3.l2_intervention if p3 else 0.0,
+            l3_counterfactual=p3.l3_counterfactual if p3 else 0.0,
+            ccr_validity=p3.ccr_validity if p3 else 0.0,
+            drift_magnitude=p5.drift_magnitude if p5 else 0.0,
+            dominant_drive=p5.dominant_drive if p5 else "",
+            re_success_rate=self._re_performance.get("success_rate", 0.0),
+            re_usage_pct=self._re_performance.get("usage_pct", 0.0),
+        )
+        return snap
+
+    # ─── Shadow-reset public API ──────────────────────────────────────────────
+
+    async def take_shadow_snapshot(self) -> str:
+        """
+        Capture a non-destructive shadow snapshot of current population state.
+
+        Returns a snapshot_id string.  Call compute_shadow_delta(snapshot_id)
+        later to measure how much adaptive activity has changed.
+
+        Also emits SHADOW_RESET_SNAPSHOT on the Synapse bus so Alive and Evo
+        can correlate population state changes with snapshot timestamps.
+        """
+        snapshot_id = await self._shadow_reset.take_shadow_snapshot()
+
+        if self._event_bus is not None:
+            tracker_stats = self._evo_tracker.stats
+            try:
+                event = SynapseEvent(
+                    event_type=SynapseEventType.SHADOW_RESET_SNAPSHOT,
+                    source_system=SystemID.BENCHMARKS,
+                    data={
+                        "snapshot_id": snapshot_id,
+                        "instance_id": self._instance_id,
+                        "total_observables": tracker_stats.get("total_observables", 0),
+                        "novelty_rate": tracker_stats.get("novelty_rate", 0.0),
+                        "diversity_index": tracker_stats.get("diversity_index", 0.0),
+                    },
+                )
+                await self._event_bus.emit(event)
+            except Exception:
+                pass  # Bus emission is best-effort
+
+        return snapshot_id
+
+    async def compute_shadow_delta(self, snapshot_id: str) -> dict[str, Any]:
+        """
+        Compare current population state to a previous shadow snapshot.
+
+        Returns a dict representation of ShadowResetResult.
+        Raises ValueError if snapshot_id is not found.
+
+        Also emits SHADOW_RESET_DELTA on the Synapse bus so Evo can incorporate
+        adaptive-dynamics evidence into hypothesis scoring.
+        """
+        result: ShadowResetResult = await self._shadow_reset.compute_shadow_delta(
+            snapshot_id
+        )
+        result_dict = {
+            "snapshot_id": result.snapshot_id,
+            "activity_drop_pct": result.activity_drop_pct,
+            "diversity_change_pct": result.diversity_change_pct,
+            "jaccard_overlap": result.jaccard_overlap,
+            "is_adaptive": result.is_adaptive,
+            "elapsed_seconds": result.elapsed_seconds,
+            "diversity_recovery_time": result.diversity_recovery_time,
+            "current_novelty_rate": result.current_novelty_rate,
+            "snapshot_novelty_rate": result.snapshot_novelty_rate,
+            "computed_at_iso": result.computed_at_iso,
+        }
+
+        if self._event_bus is not None:
+            try:
+                event = SynapseEvent(
+                    event_type=SynapseEventType.SHADOW_RESET_DELTA,
+                    source_system=SystemID.BENCHMARKS,
+                    data=result_dict,
+                )
+                await self._event_bus.emit(event)
+            except Exception:
+                pass
+
+        return result_dict
+
+    async def _on_fitness_observable_batch(self, event: Any) -> None:
+        """Loop 6: Aggregate fitness observables from Evo into the next snapshot."""
+        data = getattr(event, "data", {}) or {}
+        self._accumulated_fitness["hypotheses_evaluated"] += data.get("hypotheses_evaluated", 0)
+        self._accumulated_fitness["hypotheses_integrated"] += data.get("hypotheses_integrated", 0)
+        self._accumulated_fitness["schemas_induced"] += data.get("schemas_induced", 0)
+        self._accumulated_fitness["consolidation_count"] += 1
+        self._logger.debug(
+            "fitness_observable_batch_received",
+            consolidation=data.get("consolidation_number", 0),
+        )
+
+    async def _on_soma_allostatic_report(self, event: Any) -> None:
+        """Correlate economic_ratio with allostatic cost from Soma."""
+        data = getattr(event, "data", {}) or {}
+        allostatic_efficiency = data.get("allostatic_efficiency")
+        if allostatic_efficiency is not None and self._last_snapshot is not None:
+            self._logger.debug(
+                "soma_allostatic_correlated",
+                allostatic_efficiency=allostatic_efficiency,
+                economic_ratio=self._last_snapshot.economic_ratio,
+            )
+
+    async def _on_coherence_snapshot(self, event: Any) -> None:
+        """Correlate decision_quality with coherence from Synapse."""
+        data = getattr(event, "data", {}) or {}
+        composite = data.get("composite")
+        if composite is not None and self._last_snapshot is not None:
+            self._logger.debug(
+                "coherence_correlated",
+                coherence_composite=composite,
+                decision_quality=self._last_snapshot.decision_quality,
+            )
+
+    async def _on_effective_i_computed(self, event: Any) -> None:
+        """Track per-instance effective_I for population comparison."""
+        data = getattr(event, "data", {}) or {}
+        effective_i = data.get("effective_I")
+        if effective_i is not None:
+            self._logger.debug(
+                "effective_i_tracked",
+                effective_i=effective_i,
+                instance_id=self._instance_id,
+            )
+
+    async def _on_kairos_i_ratio_step(self, event: Any) -> None:
+        """Signal when intelligence ratio makes a step change."""
+        data = getattr(event, "data", {}) or {}
+        self._logger.info(
+            "kairos_i_ratio_step_change",
+            old_ratio=data.get("old_ratio"),
+            new_ratio=data.get("new_ratio"),
+            delta=data.get("delta"),
+            cause=data.get("cause"),
+        )
+
+    async def _on_metabolic_value(self, event: Any) -> None:
+        """
+        Track Oikos metabolic efficiency in a push-based time-series.
+
+        Oikos emits BENCHMARKS_METABOLIC_VALUE on every consolidation cycle
+        when efficiency < 0.8, and once on recovery to "nominal". This handler
+        appends to a 7-day sliding deque and emits KPI_THRESHOLD_WARNING when
+        the 7-day trend is degrading (latest reading more than 10% below the
+        rolling mean).
+
+        This supplements the pull-based `economic_ratio` KPI (revenue_7d /
+        costs_7d from oikos.stats) with a push-based signal so that economic
+        collapse is observable within a single consolidation cycle rather than
+        the next 24h poll window.
+        """
+        data = getattr(event, "data", {}) or {}
+        efficiency: float | None = data.get("efficiency")
+        if efficiency is None:
+            return
+        efficiency = float(efficiency)
+        ts: str = data.get("timestamp", "")
+        pressure_level: str = str(data.get("pressure_level", "nominal"))
+
+        self._metabolic_efficiency_history.append((ts, efficiency))
+
+        self._logger.debug(
+            "metabolic_efficiency_sample_recorded",
+            efficiency=efficiency,
+            pressure_level=pressure_level,
+            history_length=len(self._metabolic_efficiency_history),
+        )
+
+        # Degradation detection: compare latest reading against 7-day rolling mean.
+        # Emit KPI_THRESHOLD_WARNING only when we have enough history (≥4 samples)
+        # and the trend is clearly worsening (latest < mean − 10%).
+        history = list(self._metabolic_efficiency_history)
+        if len(history) < 4 or self._event_bus is None:
+            return
+
+        values = [v for _, v in history]
+        rolling_mean = sum(values) / len(values)
+        degradation_threshold = rolling_mean * 0.9
+
+        if efficiency < degradation_threshold and pressure_level != "nominal":
+            # Compute a simple 7-day trend slope (last vs first half mean)
+            mid = len(values) // 2
+            first_half_mean = sum(values[:mid]) / mid
+            second_half_mean = sum(values[mid:]) / (len(values) - mid)
+            trend_slope = second_half_mean - first_half_mean  # negative = degrading
+
+            try:
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.BENCHMARK_REGRESSION,
+                    source_system="benchmarks",
+                    data={
+                        "kpi": "metabolic_efficiency",
+                        "current": efficiency,
+                        "rolling_mean": round(rolling_mean, 4),
+                        "trend_slope": round(trend_slope, 4),
+                        "pressure_level": pressure_level,
+                        "history_samples": len(history),
+                        "warning": "metabolic_efficiency_degrading",
+                        "instance_id": self._instance_id,
+                    },
+                ))
+                self._logger.warning(
+                    "metabolic_efficiency_degradation_detected",
+                    efficiency=efficiency,
+                    rolling_mean=round(rolling_mean, 4),
+                    trend_slope=round(trend_slope, 4),
+                )
+            except Exception:
+                pass
+
+    async def _on_re_decision_outcome(self, event: Any) -> None:
+        """Track RE model performance separately from overall llm_dependency.
+
+        Maintains a 7-day rolling window of RE-specific outcomes.  Updates
+        _re_performance so it can be included in the next monthly eval snapshot.
+        """
+        data = getattr(event, "data", {}) or {}
+        source = str(data.get("source", "claude"))
+
+        # Count every slow-path decision (RE or Claude) for usage_pct denominator
+        self._total_decisions_7d += 1
+
+        if source != "re":
+            return
+
+        cutoff = time.time() - 7 * 86400
+        self._re_outcomes.append({
+            "success": bool(data.get("success", False)),
+            "value": float(data.get("value", 0.0)),
+            "timestamp": time.time(),
+        })
+
+        # Trim to 7-day window
+        self._re_outcomes = [o for o in self._re_outcomes if o["timestamp"] > cutoff]
+
+        if self._re_outcomes:
+            re_success_rate = (
+                sum(1 for o in self._re_outcomes if o["success"]) / len(self._re_outcomes)
+            )
+            re_usage_pct = len(self._re_outcomes) / max(1, self._total_decisions_7d)
+        else:
+            re_success_rate = 0.0
+            re_usage_pct = 0.0
+
+        self._re_performance = {
+            "success_rate": round(re_success_rate, 4),
+            "usage_pct": round(re_usage_pct, 4),
+            "total_decisions": len(self._re_outcomes),
+        }
+
+        self._logger.debug(
+            "re_performance_updated",
+            success_rate=self._re_performance["success_rate"],
+            usage_pct=self._re_performance["usage_pct"],
+            total_decisions=self._re_performance["total_decisions"],
+        )
+
+    async def _on_simula_kpi_push(self, event: Any) -> None:
+        """Receive Simula KPI data via SIMULA_KPI_PUSH (replaces direct record_kpi calls).
+
+        Simula emits this event instead of calling benchmarks.record_kpi() directly,
+        keeping inter-system comms on the Synapse bus.
+        """
+        data = getattr(event, "data", {}) or {}
+        system = str(data.get("system", "simula"))
+        # Strip 'system' key — remainder is the metrics payload
+        metrics = {k: v for k, v in data.items() if k != "system"}
+        if metrics:
+            await self.record_kpi(system=system, metrics=metrics)
+
+    async def _on_child_spawned_genome(self, event: Any) -> None:
+        """Cache genome snapshot when a new child instance spawns.
+
+        Populates _fleet_genomes so the monthly Bedau-Packard computation
+        has access to all known fleet members' genome data.
+        """
+        data = getattr(event, "data", {}) or {}
+        instance_id = data.get("child_instance_id")
+        if not instance_id:
+            return
+        genome_payload: dict[str, Any] = {}
+        # CHILD_SPAWNED payload may include genome sub-keys at top level
+        for key in ("evo", "simula", "telos", "equor"):
+            if key in data:
+                genome_payload[key] = data[key]
+        self._fleet_genomes[str(instance_id)] = {
+            "instance_id": str(instance_id),
+            **genome_payload,
+        }
+        self._logger.debug(
+            "fleet_genome_cached",
+            instance_id=instance_id,
+            genome_keys=list(genome_payload.keys()),
+            fleet_size=len(self._fleet_genomes),
+        )
+
+    async def _collect_fleet_genomes(self) -> list[dict[str, Any]]:
+        """Return cached fleet genome snapshots for Bedau-Packard computation.
+
+        Returns the genesis instance's own genome (empty dict) as a
+        single-item list when no children have spawned yet.  This allows
+        the tracker to compute single-instance stats rather than skipping.
+
+        Full fleet genome collection via GENOME_EXTRACT_REQUEST/RESPONSE is
+        a future enhancement; current implementation relies on the CHILD_SPAWNED
+        event cache which is populated as children are born.
+        """
+        if self._fleet_genomes:
+            return list(self._fleet_genomes.values())
+        # Single-instance fallback: return minimal genesis entry so the tracker
+        # can still compute change_rate and novelty from the genesis genome
+        # (drive weights emitted via TELOS_POPULATION_SNAPSHOT are a better
+        # source, but the monthly BP computation uses genome format)
+        return []
+
+    async def _on_telos_population_snapshot(self, event: Any) -> None:
+        """
+        Bedau-Packard intelligence-ratio time-series signal.
+
+        For each TELOS_POPULATION_SNAPSHOT:
+          1. Extract per-instance drive-weight vectors from the distribution data.
+          2. Fingerprint each configuration (rounded to 2dp for stability).
+          3. adaptive_activity_A = configs that are BOTH novel (not in prev snapshot)
+             AND still present (in current snapshot) — Bedau & Packard's definition
+             of adaptive, persistent novelty.
+          4. constitutional_phenotype_divergence = mean per-drive variance across fleet.
+          5. Persist a (:BedauPackardSample) node to Neo4j.
+          6. Emit BENCHMARKS_EVOLUTIONARY_ACTIVITY to Evo and Nexus.
+          7. Cache divergence on the last snapshot so it appears in the next persist cycle.
+        """
+        data = getattr(event, "data", {}) or {}
+
+        # ── Extract drive-weight distribution ────────────────────────────────
+        # Payload carries drive_weight_distribution as a dict of
+        # {coherence, care, growth, honesty} → {mean, variance, min, max}
+        # and constitutional_phenotype_clusters as list of
+        # {label, centroid, size, dominant_drive}
+        dist: dict[str, Any] = data.get("drive_weight_distribution", {})
+        clusters: list[dict[str, Any]] = data.get("constitutional_phenotype_clusters", [])
+        instance_count: int = data.get("instance_count", 0)
+        speciation_signal: float = float(data.get("speciation_signal", 0.0))
+        ts: str = data.get("timestamp", utc_now().isoformat())
+
+        drives = ["coherence", "care", "growth", "honesty"]
+
+        # ── Build per-cluster drive-config fingerprints ──────────────────────
+        # Each cluster centroid represents a distinct constitutional phenotype.
+        # We fingerprint as a tuple of rounded centroid values.
+        current_fingerprints: set[str] = set()
+        for cluster in clusters:
+            centroid = cluster.get("centroid", {})
+            key = "|".join(
+                f"{drive}:{round(float(centroid.get(drive, 0.0)), 2):.2f}"
+                for drive in drives
+            )
+            current_fingerprints.add(key)
+
+        # adaptive_activity_A: novel configs that are ALSO still present
+        novel_this_period = current_fingerprints - self._prev_drive_config_fingerprints
+        adaptive_activity_A = len(novel_this_period & current_fingerprints)
+        self._prev_drive_config_fingerprints = current_fingerprints
+
+        # ── Compute constitutional_phenotype_divergence ──────────────────────
+        # Mean of per-drive variance across the fleet (from distribution payload).
+        # When dist carries per-drive variance fields, use them directly.
+        # Fallback: compute from cluster centroids if variance not in payload.
+        divergence: float | None = None
+        drive_variances: list[float] = []
+        for drive in drives:
+            drive_data = dist.get(drive, {})
+            if isinstance(drive_data, dict):
+                var = drive_data.get("variance")
+                if var is not None:
+                    drive_variances.append(float(var))
+
+        if not drive_variances and len(clusters) >= 2:
+            # Fall back: compute variance of centroid values across clusters
+            for drive in drives:
+                vals = [
+                    float(c.get("centroid", {}).get(drive, 0.0))
+                    for c in clusters
+                ]
+                if len(vals) >= 2:
+                    mean_v = sum(vals) / len(vals)
+                    var_v = sum((v - mean_v) ** 2 for v in vals) / len(vals)
+                    drive_variances.append(var_v)
+
+        if drive_variances:
+            divergence = round(sum(drive_variances) / len(drive_variances), 6)
+
+        # Cache divergence so the next _collect() can include it in the snapshot
+        self._last_phenotype_divergence: float | None = divergence
+
+        # ── Persist (:BedauPackardSample) node to Neo4j ──────────────────────
+        node_id = f"bps:{self._instance_id}:{ts}"
+        if self._memory is not None:
+            try:
+                neo4j = getattr(self._memory, "_neo4j", None)
+                if neo4j is not None:
+                    await neo4j.execute_write(
+                        """
+                        MERGE (bps:BedauPackardSample {node_id: $node_id})
+                        SET bps.instance_id = $instance_id,
+                            bps.timestamp = $ts,
+                            bps.adaptive_activity_A = $activity_a,
+                            bps.constitutional_phenotype_divergence = $divergence,
+                            bps.speciation_signal = $speciation_signal,
+                            bps.instance_count = $instance_count,
+                            bps.cluster_count = $cluster_count
+                        """,
+                        {
+                            "node_id": node_id,
+                            "instance_id": self._instance_id,
+                            "ts": ts,
+                            "activity_a": adaptive_activity_A,
+                            "divergence": divergence,
+                            "speciation_signal": speciation_signal,
+                            "instance_count": instance_count,
+                            "cluster_count": len(clusters),
+                        },
+                    )
+            except Exception as exc:
+                self._logger.debug("bedau_packard_neo4j_persist_failed", error=str(exc))
+
+        # ── Emit BENCHMARKS_EVOLUTIONARY_ACTIVITY ────────────────────────────
+        if self._event_bus is not None:
+            event_out = SynapseEvent(
+                event_type=SynapseEventType.BENCHMARKS_EVOLUTIONARY_ACTIVITY,
+                source_system=self.system_id,
+                data={
+                    "instance_id": self._instance_id,
+                    "timestamp": ts,
+                    "adaptive_activity_A": adaptive_activity_A,
+                    "constitutional_phenotype_divergence": divergence,
+                    "speciation_signal": speciation_signal,
+                    "instance_count": instance_count,
+                    "bedau_packard_node_id": node_id,
+                },
+            )
+            await self._event_bus.emit(event_out)
+
+        self._logger.info(
+            "bedau_packard_intelligence_ratio_sampled",
+            adaptive_activity_A=adaptive_activity_A,
+            constitutional_phenotype_divergence=divergence,
+            speciation_signal=speciation_signal,
+            instance_count=instance_count,
+            cluster_count=len(clusters),
+        )
 
     # ─── Lifecycle ────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
         """Ensure the benchmarks table exists and start the collection loop."""
         await self._ensure_schema()
+        await self._evo_tracker.restore_from_redis()
+        await self._restore_regressed_from_redis()
+
+        # Five-pillar evaluation protocol
+        self._evaluation_protocol = EvaluationProtocol(instance_id=self._instance_id)
+        self._test_set_manager = TestSetManager()
+
+        # Fixed test sets for direct pillar evaluation (pillars.py)
+        self._test_sets = load_fixed_test_sets()
+
         self._initialized = True
         self._task = asyncio.create_task(self._run_loop(), name="benchmarks_loop")
+        self._monthly_eval_task = asyncio.create_task(
+            self._monthly_eval_loop(), name="benchmarks_monthly_eval"
+        )
         self._logger.info(
             "benchmarks_started",
             interval_s=self._config.interval_s,
@@ -147,21 +866,34 @@ class BenchmarkService:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
+        if self._monthly_eval_task:
+            self._monthly_eval_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._monthly_eval_task
         self._logger.info("benchmarks_stopped")
 
     # ─── Collection loop ──────────────────────────────────────────────
 
     async def _run_loop(self) -> None:
-        """Wait interval_s, collect, store, check regressions. Forever."""
+        """Collect immediately on startup, then every interval_s. Forever."""
         # Small startup delay so all systems are fully ready
         await asyncio.sleep(10.0)
+        first_run = True
         while True:
             try:
-                await asyncio.sleep(self._config.interval_s)
+                if not first_run:
+                    await asyncio.sleep(self._config.interval_s)
+                first_run = False
                 snapshot = await self._collect()
+                bedau = await self._evo_tracker.snapshot()
+                snapshot.bedau_packard = bedau
                 self._last_snapshot = snapshot
                 await self._persist(snapshot)
                 await self._check_regressions(snapshot)
+                await self._check_re_progress(snapshot)
+                await self._check_sustained_llm_dependency()
+                await self._tag_episodes_for_re_training(snapshot)
+                await self._persist_regressed_to_redis()
                 self._total_runs += 1
                 self._logger.info(
                     "benchmark_run_completed",
@@ -179,6 +911,521 @@ class BenchmarkService:
                 raise
             except Exception as exc:
                 self._logger.error("benchmark_loop_error", error=str(exc))
+
+    # ─── On-demand evaluation (for ablation studies + manual testing) ────
+
+    async def run_evaluation_now(self, month: int | None = None) -> Any:
+        """Run the full 5-pillar evaluation pipeline immediately.
+
+        Used by AblationOrchestrator and manual CLI invocations.
+        Does NOT increment self._current_month — this is a read-only
+        evaluation pass that does not advance the monotonic counter.
+
+        Returns a LongitudinalSnapshot on success; raises on failure.
+        """
+        if self._evaluation_protocol is None or self._test_set_manager is None:
+            raise RuntimeError("BenchmarkService not fully initialized — call initialize() first")
+
+        eval_month = month if month is not None else self._current_month
+        test_sets = await self._test_set_manager.load_all()
+        result = await self._evaluation_protocol.run_monthly_evaluation(
+            test_sets=test_sets,
+            month=eval_month,
+        )
+
+        # Build LongitudinalSnapshot without persisting (non-destructive evaluation pass).
+        # We pass re_performance but do not write to Neo4j — that only happens in the
+        # scheduled monthly loop which increments _current_month.
+        snap = await self._longitudinal.record_month(
+            month=eval_month,
+            eval_results=result.to_dict(),
+            re_performance=self._re_performance,
+            adapter_path=getattr(
+                getattr(self._evaluation_protocol, "_re", None),
+                "_current_adapter_path",
+                "",
+            ) or "",
+        )
+        return snap
+
+    # ─── Monthly evaluation loop ──────────────────────────────────────
+
+    async def _monthly_eval_loop(self) -> None:
+        """Run 5-pillar evaluation on the 1st of each month at 03:00 UTC."""
+        # Small startup delay so all systems are fully ready
+        await asyncio.sleep(15.0)
+        first_run = True
+        while True:
+            try:
+                if not first_run:
+                    # Calculate seconds until next 1st-of-month at 03:00 UTC
+                    now = datetime.now(tz=timezone.utc)
+                    if now.month == 12:
+                        next_run = datetime(now.year + 1, 1, 1, 3, 0, 0, tzinfo=timezone.utc)
+                    else:
+                        next_run = datetime(now.year, now.month + 1, 1, 3, 0, 0, tzinfo=timezone.utc)
+                    sleep_s = (next_run - now).total_seconds()
+                    self._logger.info(
+                        "monthly_eval_scheduled",
+                        next_run_utc=next_run.isoformat(),
+                        sleep_hours=round(sleep_s / 3600, 1),
+                    )
+                    await asyncio.sleep(max(sleep_s, 0.0))
+
+                first_run = False
+
+                if self._evaluation_protocol is None or self._test_set_manager is None:
+                    continue
+
+                test_sets = await self._test_set_manager.load_all()
+                now = datetime.now(tz=timezone.utc)
+                result = await self._evaluation_protocol.run_monthly_evaluation(
+                    test_sets=test_sets,
+                    month=now.month,
+                )
+
+                p1 = result.pillar1_specialization
+                p2 = result.pillar2_novelty
+                p3 = result.pillar3_causal
+                p4 = result.pillar4_velocity
+                p5 = result.pillar5_ethical
+
+                self._logger.info(
+                    "monthly_evaluation_complete",
+                    month=now.month,
+                    year=now.year,
+                    specialization_index=p1.specialization_index if p1 else None,
+                    causal_rung2_accuracy=p3.l2_intervention if p3 else None,
+                    causal_rung3_accuracy=p3.l3_counterfactual if p3 else None,
+                    learning_velocity=p4.velocity if p4 else None,
+                    ethical_drift_magnitude=p5.drift_magnitude if p5 else None,
+                    errors=result.errors,
+                )
+
+                # Augment result dict with RE performance metrics
+                result_dict = result.to_dict()
+                result_dict["re_performance"] = self._re_performance
+
+                # ── Bedau-Packard fleet-level evolutionary activity ────────
+                # Requires fleet genome snapshots (populated from CHILD_SPAWNED events).
+                # Degrades gracefully: empty fleet → zero metrics, no error.
+                self._monthly_eval_count += 1
+                try:
+                    fleet_genomes = await self._collect_fleet_genomes()
+                    if fleet_genomes:
+                        bp_components = self._bp_tracker.ingest_fleet_genomes(fleet_genomes)
+                        bp_snap = self._bp_tracker.compute_adaptive_activity(
+                            bp_components, month=now.month
+                        )
+                        ea_payload: dict[str, Any] = {
+                            "month": bp_snap.month,
+                            "adaptive_activity": bp_snap.adaptive_activity,
+                            "novelty_rate": bp_snap.novelty_rate,
+                            "diversity": bp_snap.diversity,
+                            "exceeds_shadow": bp_snap.exceeds_shadow,
+                            "population_size": bp_snap.population_size,
+                            "component_count": bp_snap.component_count,
+                            "novel_component_count": bp_snap.novel_component_count,
+                            "oee_verdict": None,
+                        }
+                        # OEE assessment available after ≥3 months of data
+                        if self._monthly_eval_count >= 3:
+                            ea_payload["oee_verdict"] = self._bp_tracker.assess_oee_evidence().get(
+                                "verdict"
+                            )
+                            result_dict["oee_assessment"] = self._bp_tracker.assess_oee_evidence()
+
+                        result_dict["evolutionary_activity"] = ea_payload
+
+                        # Emit dedicated event for Evo + Nexus + Alive consumers
+                        if self._event_bus is not None:
+                            try:
+                                await self._event_bus.emit(SynapseEvent(
+                                    event_type=SynapseEventType.EVOLUTIONARY_ACTIVITY_COMPUTED,
+                                    source_system=SystemID.BENCHMARKS
+                                    if hasattr(SystemID, "BENCHMARKS")
+                                    else "benchmarks",
+                                    data=ea_payload,
+                                ))
+                            except Exception as _ea_exc:
+                                self._logger.debug(
+                                    "evolutionary_activity_emit_failed", error=str(_ea_exc)
+                                )
+                except Exception as _bp_exc:
+                    self._logger.warning(
+                        "bedau_packard_monthly_failed", error=str(_bp_exc)
+                    )
+
+                # ── Population Divergence ─────────────────────────────
+                # Only meaningful with ≥ 2 live instances.
+                # Primary: real per-drive ethical drift records from Neo4j for
+                # each fleet instance at the current month.
+                # Fallback: genome structural distance proxy when < 2 ethical
+                # drift records are available (early months / no RE service).
+                # Non-fatal: any failure is logged and monthly eval continues.
+                if len(self._fleet_genomes) >= 2:
+                    try:
+                        import json as _json
+                        from systems.benchmarks.ethical_drift import (
+                            EthicalDriftTracker as _EDT,
+                            MonthlyDriftRecord as _MDR,
+                        )
+
+                        # ── Attempt real ethical drift divergence ─────────
+                        _neo4j = (
+                            getattr(self._memory, "_neo4j", None)
+                            if self._memory
+                            else None
+                        )
+                        _fleet_drift_records: list[_MDR] = []
+                        if _neo4j is not None:
+                            for _iid in self._fleet_genomes:
+                                try:
+                                    _rows = await _neo4j.execute_read(
+                                        "MATCH (r:EthicalDriftRecord "
+                                        "{instance_id: $id, month: $month}) "
+                                        "RETURN r.drive_means_json AS drive_means_json "
+                                        "LIMIT 1",
+                                        id=_iid,
+                                        month=self._current_month,
+                                    )
+                                    if _rows and _rows[0].get("drive_means_json"):
+                                        _drive_means = _json.loads(
+                                            _rows[0]["drive_means_json"]
+                                        )
+                                        _fleet_drift_records.append(
+                                            _MDR(
+                                                month=self._current_month,
+                                                instance_id=_iid,
+                                                drive_means=_drive_means,
+                                            )
+                                        )
+                                except Exception:
+                                    pass  # Non-fatal per-instance failure
+
+                        if len(_fleet_drift_records) >= 2:
+                            # Use real per-drive ethical divergence
+                            _pop_div = _EDT.compute_population_divergence(
+                                _fleet_drift_records
+                            )
+                            _pop_div["divergence_source"] = "ethical_drift"
+                            _pop_div["population_size"] = len(_fleet_drift_records)
+                            result_dict["population_divergence"] = _pop_div
+                            self._logger.info(
+                                "population_divergence_computed",
+                                source="ethical_drift",
+                                divergence=_pop_div.get("divergence"),
+                                pairs=_pop_div.get("pairs_compared"),
+                                speciation_signal=_pop_div.get("is_speciation_signal"),
+                            )
+                        else:
+                            # Fall back to genome structural distance proxy
+                            from systems.mitosis.genome_distance import (
+                                GenomeDistanceCalculator,
+                            )
+
+                            _spec_threshold = float(
+                                getattr(
+                                    getattr(self._config, "mitosis", None),
+                                    "speciation_distance_threshold",
+                                    0.3,
+                                )
+                            )
+                            _calc = GenomeDistanceCalculator(
+                                speciation_threshold=_spec_threshold
+                            )
+                            _genomes = list(self._fleet_genomes.values())
+                            _distances: list[float] = []
+                            for _i, _ga in enumerate(_genomes):
+                                for _gb in _genomes[_i + 1 :]:
+                                    _d = _calc.compute(_ga, _gb)
+                                    _distances.append(_d.total_distance)
+                            if _distances:
+                                _mean_d = sum(_distances) / len(_distances)
+                                _max_d = max(_distances)
+                                _speciation_detected = any(
+                                    d > _spec_threshold for d in _distances
+                                )
+                                result_dict["population_divergence"] = {
+                                    "mean_genome_distance": round(_mean_d, 6),
+                                    "max_genome_distance": round(_max_d, 6),
+                                    "pairs_compared": len(_distances),
+                                    "population_size": len(_genomes),
+                                    "speciation_detected": _speciation_detected,
+                                    "speciation_threshold": _spec_threshold,
+                                    "divergence_source": "genome_distance_proxy",
+                                }
+                                self._logger.info(
+                                    "population_divergence_computed",
+                                    source="genome_distance_proxy",
+                                    mean_distance=_mean_d,
+                                    max_distance=_max_d,
+                                    pairs=len(_distances),
+                                    speciation_detected=_speciation_detected,
+                                )
+                    except Exception as _pop_exc:
+                        self._logger.warning(
+                            "population_divergence_failed", error=str(_pop_exc)
+                        )
+
+                # ── Pillar 5: Ethical Drift Map ───────────────────────────
+                # Runs 100 frozen catch-22 scenarios through the RE and
+                # computes per-drive activation + drift vector vs Month 1.
+                # Non-fatal: any failure is logged and monthly eval continues.
+                try:
+                    re_svc = (
+                        getattr(self._evaluation_protocol, "_re", None)
+                        if self._evaluation_protocol is not None
+                        else None
+                    )
+                    if re_svc is not None:
+                        drift_record = await self._ethical_drift.evaluate(
+                            re_svc,
+                            month=self._current_month,
+                            instance_id=self._instance_id,
+                        )
+                        drift_record = await self._drift_tracker.record_month(drift_record)
+                        dominant_drive = (
+                            max(
+                                drift_record.dominant_drive_distribution,
+                                key=lambda k: drift_record.dominant_drive_distribution[k],
+                            )
+                            if drift_record.dominant_drive_distribution
+                            else "unknown"
+                        )
+                        result_dict["ethical_drift"] = {
+                            "drift_magnitude": drift_record.drift_magnitude,
+                            "drift_vector": drift_record.drift_vector,
+                            "drive_means": drift_record.drive_means,
+                            "dominant_drive": dominant_drive,
+                            "dominant_drive_distribution": drift_record.dominant_drive_distribution,
+                            "n_scenarios": len(drift_record.scenario_results),
+                        }
+                    else:
+                        result_dict.setdefault("ethical_drift", {
+                            "drift_magnitude": 0.0,
+                            "drift_vector": {},
+                            "drive_means": {},
+                            "dominant_drive": "unknown",
+                            "note": "re_service_unavailable",
+                        })
+                except Exception as _drift_exc:
+                    self._logger.warning(
+                        "ethical_drift_monthly_failed", error=str(_drift_exc)
+                    )
+                    result_dict.setdefault("ethical_drift", {})
+
+                # ── Longitudinal tracking (§6.4) ──────────────────────────
+                # Record this month's snapshot and compare to Month 1 baseline.
+                # Returns {"no_baseline": True} on first month — graceful.
+                try:
+                    long_snap = await self._longitudinal.record_month(
+                        month=self._current_month,
+                        eval_results=result_dict,
+                        re_performance=self._re_performance,
+                        adapter_path=getattr(
+                            getattr(self._evaluation_protocol, "_re", None),
+                            "_current_adapter_path",
+                            "",
+                        ),
+                    )
+                    comparison = await self._longitudinal.compare_to_baseline(long_snap)
+                    result_dict["longitudinal_comparison"] = comparison
+                    self._logger.info(
+                        "longitudinal_comparison",
+                        month=self._current_month,
+                        verdict=comparison.get("verdict", "no_baseline"),
+                        l2_delta=comparison.get("causal", {}).get("l2_intervention_delta"),
+                    )
+                except Exception as _long_exc:
+                    self._logger.warning(
+                        "longitudinal_monthly_failed", error=str(_long_exc)
+                    )
+                    result_dict.setdefault("longitudinal_comparison", {"no_baseline": True})
+
+                # ── Pillars 1–4 + §6.3 Memorization (bible §6.2–6.3) ─────────
+                # Direct evaluation via pillars.py — additive alongside EvaluationProtocol.
+                # All pillar calls are non-fatal: any exception logged, monthly eval continues.
+                if self._reasoning_engine and self._test_sets:
+                    try:
+                        # Pillar 1: Specialization Index
+                        if self._test_sets.get("domain_test") and self._test_sets.get("general_test"):
+                            spec = await measure_specialization(
+                                self._reasoning_engine,
+                                self._reasoning_engine,  # custom vs base (same — Claude fallback exposed internally)
+                                self._test_sets["domain_test"],
+                                self._test_sets["general_test"],
+                            )
+                            result_dict["pillar1_specialization_index"] = spec.specialization_index
+                            result_dict["pillar1_domain_improvement"] = spec.domain_improvement
+                            result_dict["pillar1_general_retention"] = spec.general_retention
+                            self._logger.info(
+                                "pillar1_complete",
+                                si=spec.specialization_index,
+                                domain_improvement=spec.domain_improvement,
+                            )
+
+                        # Pillar 2: Novelty Emergence
+                        if self._test_sets.get("novel_episodes"):
+                            novelty = await measure_novelty_emergence(
+                                self._reasoning_engine,
+                                self._test_sets["novel_episodes"],
+                            )
+                            result_dict["pillar2_novel_success_rate"] = novelty.novel_success_rate
+                            result_dict["pillar2_cosine_distance"] = novelty.reasoning_cosine_distance
+                            result_dict["pillar2_genuine_learning"] = novelty.genuine_learning
+                            self._logger.info(
+                                "pillar2_complete",
+                                success_rate=novelty.novel_success_rate,
+                                genuine_learning=novelty.genuine_learning,
+                            )
+
+                        # Pillar 3: Causal Reasoning (CLadder + CCR.GB)
+                        if (
+                            self._test_sets.get("cladder_questions")
+                            and self._test_sets.get("ccr_gb_scenarios")
+                        ):
+                            causal = await measure_causal_reasoning(
+                                self._reasoning_engine,
+                                self._test_sets["cladder_questions"],
+                                self._test_sets["ccr_gb_scenarios"],
+                            )
+                            result_dict["pillar3_l2_intervention"] = causal.l2_intervention
+                            result_dict["pillar3_l3_counterfactual"] = causal.l3_counterfactual
+                            result_dict["pillar3_ccr_validity"] = causal.ccr_validity
+                            # Feed combined L2+L3 score into velocity tracker
+                            l2l3_combined = (causal.l2_intervention + causal.l3_counterfactual) / 2
+                            self._causal_history.append({
+                                "month": self._current_month,
+                                "score": l2l3_combined,
+                            })
+                            self._logger.info(
+                                "pillar3_complete",
+                                l2=causal.l2_intervention,
+                                l3=causal.l3_counterfactual,
+                                ccr_validity=causal.ccr_validity,
+                            )
+
+                        # Pillar 4: Learning Velocity (power-law fit on _causal_history)
+                        vel = compute_learning_velocity(self._causal_history)
+                        result_dict["pillar4_velocity"] = vel.velocity
+                        result_dict["pillar4_is_plateaued"] = vel.is_plateaued
+                        result_dict["pillar4_predicted_month_12"] = vel.predicted_month_12
+                        if vel.is_plateaued and not vel.insufficient_data:
+                            self._logger.warning(
+                                "plasticity_loss_suspected",
+                                velocity=vel.velocity,
+                                months_of_data=len(self._causal_history),
+                            )
+
+                        # §6.3 Memorization Detection
+                        if self._test_sets.get("paraphrase_pairs"):
+                            mem = await detect_memorization(
+                                self._reasoning_engine,
+                                [],  # training_sample: populated when RE exporter feeds training log
+                                self._test_sets.get("novel_episodes", [])[:50],  # holdout proxy
+                                self._test_sets["paraphrase_pairs"],
+                            )
+                            result_dict["memorization_risk"] = mem.memorization_risk
+                            result_dict["memorization_mi_accuracy"] = mem.membership_inference_accuracy
+                            result_dict["memorization_paraphrase_drop"] = mem.paraphrase_accuracy_drop
+                            if mem.memorization_risk == "high":
+                                self._logger.error(
+                                    "memorization_detected",
+                                    recommendation=mem.recommendation,
+                                    mi_accuracy=mem.membership_inference_accuracy,
+                                )
+                    except Exception as _pillar_exc:
+                        self._logger.error("pillars_eval_failed", error=str(_pillar_exc))
+
+                # Advance monotonic month counter after all pillars complete
+                self._current_month += 1
+
+                if self._event_bus is not None:
+                    try:
+                        event = SynapseEvent(
+                            event_type=SynapseEventType.MONTHLY_EVALUATION_COMPLETE,
+                            source_system=SystemID.BENCHMARKS
+                            if hasattr(SystemID, "BENCHMARKS")
+                            else "benchmarks",
+                            data=result_dict,
+                        )
+                        await self._event_bus.emit(event)
+                    except Exception as exc:
+                        self._logger.warning("monthly_eval_event_emit_failed", error=str(exc))
+
+                # Persist to Neo4j for longitudinal RE performance tracking (fire-and-forget)
+                if self._memory is not None:
+                    asyncio.create_task(
+                        self._persist_monthly_eval_neo4j(now.month, now.year, result_dict),
+                        name="benchmarks_monthly_eval_neo4j",
+                    )
+
+                # Export paper data CSVs (fire-and-forget, non-fatal)
+                asyncio.ensure_future(
+                    self._paper_exporter.export_all(month=self._current_month - 1)
+                )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._logger.error("monthly_eval_loop_error", error=str(exc))
+
+    # ─── Monthly eval Neo4j persistence ──────────────────────────────
+
+    async def _persist_monthly_eval_neo4j(
+        self,
+        month: int,
+        year: int,
+        result_dict: dict[str, Any],
+    ) -> None:
+        """Fire-and-forget: write (:MonthlyEvaluation) node to Neo4j.
+
+        Never blocks the monthly eval loop — any exception is swallowed.
+        """
+        try:
+            neo4j = getattr(self._memory, "_neo4j", None)
+            if neo4j is None:
+                return
+
+            re_perf = result_dict.get("re_performance") or {}
+            p1 = result_dict.get("pillar1_specialization") or {}
+            p4 = result_dict.get("pillar4_velocity") or {}
+
+            await neo4j.execute_write(
+                """
+                CREATE (e:MonthlyEvaluation {
+                    node_id: $node_id,
+                    month: $month,
+                    year: $year,
+                    timestamp: datetime(),
+                    specialization_index: $si,
+                    learning_velocity: $lv,
+                    re_success_rate: $re_rate,
+                    re_usage_pct: $re_usage,
+                    re_total_decisions: $re_total,
+                    instance_id: $instance_id
+                })
+                RETURN e
+                """,
+                node_id=f"monthly_eval:{self._instance_id}:{year}-{month:02d}",
+                month=month,
+                year=year,
+                si=float(p1.get("specialization_index") or 0.0),
+                lv=float(p4.get("velocity") or 0.0),
+                re_rate=float(re_perf.get("success_rate") or 0.0),
+                re_usage=float(re_perf.get("usage_pct") or 0.0),
+                re_total=int(re_perf.get("total_decisions") or 0),
+                instance_id=self._instance_id,
+            )
+            self._logger.info(
+                "monthly_eval_neo4j_persisted",
+                month=month,
+                year=year,
+                re_rate=re_perf.get("success_rate"),
+            )
+        except Exception as exc:
+            self._logger.warning("monthly_eval_neo4j_persist_failed", error=str(exc))
 
     # ─── KPI collection ──────────────────────────────────────────────
 
@@ -207,6 +1454,15 @@ class BenchmarkService:
             raw[name] = raw_data
             return value
 
+        # Loop 6: Snapshot and reset accumulated fitness observables
+        fitness = dict(self._accumulated_fitness)
+        self._accumulated_fitness = {
+            "hypotheses_evaluated": 0,
+            "hypotheses_integrated": 0,
+            "schemas_induced": 0,
+            "consolidation_count": 0,
+        }
+
         return BenchmarkSnapshot(
             time=utc_now(),
             instance_id=self._instance_id,
@@ -217,6 +1473,8 @@ class BenchmarkService:
             mutation_success_rate=_extract(4, "mutation_success_rate"),
             effective_intelligence_ratio=_extract(5, "effective_intelligence_ratio"),
             compression_ratio=_extract(6, "compression_ratio"),
+            evolutionary_fitness=fitness,
+            constitutional_phenotype_divergence=self._last_phenotype_divergence,
             errors=errors,
             raw=raw,
         )
@@ -288,6 +1546,11 @@ class BenchmarkService:
 
         Evo.stats exposes hypothesis.supported (cumulative).
         We compare to the value stored in the previous snapshot.
+
+        Evo restart detection: if supported_total < prev baseline, Evo was restarted
+        and its counter reset. We treat the new value as the new baseline (delta = 0)
+        rather than reporting a large negative or inflated count.
+        Spec ref: §26.2 "learning_rate delta can be negative".
         """
         if self._evo is None:
             return None, {}
@@ -303,7 +1566,20 @@ class BenchmarkService:
             await self._store_auxiliary("learning_rate_cumulative", float(supported_total))
             return 0.0, raw
 
-        delta = max(0, supported_total - int(prev))
+        prev_int = int(prev)
+        if supported_total < prev_int:
+            # Evo was restarted — counter reset. Re-baseline without penalising.
+            await self._store_auxiliary("learning_rate_cumulative", float(supported_total))
+            raw["evo_restart_detected"] = True
+            raw["delta"] = 0
+            self._logger.warning(
+                "learning_rate_evo_restart_detected",
+                prev_baseline=prev_int,
+                new_count=supported_total,
+            )
+            return 0.0, raw
+
+        delta = supported_total - prev_int
         await self._store_auxiliary("learning_rate_cumulative", float(supported_total))
         raw["delta"] = delta
         return float(delta), raw
@@ -364,7 +1640,11 @@ class BenchmarkService:
     # ─── Persistence ──────────────────────────────────────────────────
 
     async def _persist(self, snapshot: BenchmarkSnapshot) -> None:
-        """Write snapshot to TimescaleDB benchmark_snapshots table."""
+        """Write snapshot to TimescaleDB benchmark_snapshots table.
+
+        Includes bedau_packard (JSONB) and evolutionary_fitness (JSONB) columns
+        added in §4.2 schema (Appendix A). Spec ref: §4.2, Appendix A.
+        """
         async with self._tsdb.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -373,8 +1653,10 @@ class BenchmarkService:
                     decision_quality, llm_dependency, economic_ratio,
                     learning_rate, mutation_success_rate,
                     effective_intelligence_ratio, compression_ratio,
+                    bedau_packard, evolutionary_fitness,
+                    constitutional_phenotype_divergence,
                     errors, raw
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                 """,
                 snapshot.time,
                 snapshot.instance_id,
@@ -385,12 +1667,23 @@ class BenchmarkService:
                 snapshot.mutation_success_rate,
                 snapshot.effective_intelligence_ratio,
                 snapshot.compression_ratio,
+                json.dumps(
+                    snapshot.bedau_packard.model_dump(mode="json")
+                    if snapshot.bedau_packard else None
+                ),
+                json.dumps(snapshot.evolutionary_fitness),
+                snapshot.constitutional_phenotype_divergence,
                 json.dumps(snapshot.errors),
                 json.dumps(snapshot.raw),
             )
 
     async def _ensure_schema(self) -> None:
-        """Create benchmark_snapshots table (and hypertable if TimescaleDB available)."""
+        """Create benchmark_snapshots table (and hypertable if TimescaleDB available).
+
+        Spec ref: Appendix A — includes bedau_packard and evolutionary_fitness columns.
+        Uses ALTER TABLE ADD COLUMN IF NOT EXISTS to handle existing tables that
+        pre-date these columns.
+        """
         async with self._tsdb.pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS benchmark_snapshots (
@@ -403,10 +1696,29 @@ class BenchmarkService:
                     mutation_success_rate         DOUBLE PRECISION,
                     effective_intelligence_ratio  DOUBLE PRECISION,
                     compression_ratio             DOUBLE PRECISION,
+                    bedau_packard                 JSONB DEFAULT 'null',
+                    evolutionary_fitness          JSONB DEFAULT '{}',
+                    constitutional_phenotype_divergence DOUBLE PRECISION,
                     errors                        JSONB DEFAULT '{}',
                     raw                           JSONB DEFAULT '{}'
                 )
             """)
+            # Idempotent migration for existing tables missing these columns
+            with contextlib.suppress(Exception):
+                await conn.execute(
+                    "ALTER TABLE benchmark_snapshots "
+                    "ADD COLUMN IF NOT EXISTS bedau_packard JSONB DEFAULT 'null'"
+                )
+            with contextlib.suppress(Exception):
+                await conn.execute(
+                    "ALTER TABLE benchmark_snapshots "
+                    "ADD COLUMN IF NOT EXISTS evolutionary_fitness JSONB DEFAULT '{}'"
+                )
+            with contextlib.suppress(Exception):
+                await conn.execute(
+                    "ALTER TABLE benchmark_snapshots "
+                    "ADD COLUMN IF NOT EXISTS constitutional_phenotype_divergence DOUBLE PRECISION"
+                )
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_bm_instance_time
                     ON benchmark_snapshots (instance_id, time DESC)
@@ -498,6 +1810,7 @@ class BenchmarkService:
 
             if is_regressed and kpi not in self._regressed:
                 self._regressed.add(kpi)
+                self._regressed_at[kpi] = time.monotonic()
                 self._total_regressions_fired += 1
                 regression = MetricRegression(
                     metric=kpi,
@@ -508,13 +1821,17 @@ class BenchmarkService:
                 )
                 await self._fire_regression_event(regression)
             elif not is_regressed and kpi in self._regressed:
-                # Metric has recovered — re-arm
+                # Metric has recovered — re-arm and emit recovery event
+                regressed_since = self._regressed_at.pop(kpi, 0.0)
+                duration = time.monotonic() - regressed_since if regressed_since else 0.0
                 self._regressed.discard(kpi)
+                await self._fire_recovery_event(kpi, current, avg, duration)
                 self._logger.info(
                     "benchmark_metric_recovered",
                     metric=kpi,
                     current=current,
                     rolling_avg=avg,
+                    duration_regressed_s=round(duration, 1),
                 )
 
     async def _fire_regression_event(self, regression: MetricRegression) -> None:
@@ -539,6 +1856,201 @@ class BenchmarkService:
             rolling_avg=regression.rolling_avg,
             regression_pct=regression.regression_pct,
         )
+
+    async def _fire_recovery_event(
+        self, metric: str, recovered_value: float, rolling_avg: float, duration: float
+    ) -> None:
+        """Emit a BENCHMARK_RECOVERY event via Synapse event bus."""
+        if self._event_bus is None:
+            return
+        event = SynapseEvent(
+            event_type=SynapseEventType.BENCHMARK_RECOVERY,
+            source_system=self.system_id,
+            data={
+                "metric": metric,
+                "previous_value": rolling_avg,
+                "recovered_value": recovered_value,
+                "duration_regressed": round(duration, 1),
+                "instance_id": self._instance_id,
+            },
+        )
+        await self._event_bus.emit(event)
+        self._logger.info(
+            "benchmark_recovery_emitted",
+            metric=metric,
+            recovered_value=recovered_value,
+            duration_regressed_s=round(duration, 1),
+        )
+
+    async def _check_re_progress(self, snapshot: BenchmarkSnapshot) -> None:
+        """
+        Emit BENCHMARK_RE_PROGRESS when llm_dependency improves >5% cycle-over-cycle.
+        Debounced: max 1 per cycle (~60s).
+        """
+        if self._event_bus is None or snapshot.llm_dependency is None:
+            self._prev_llm_dependency = snapshot.llm_dependency
+            return
+
+        prev = self._prev_llm_dependency
+        current = snapshot.llm_dependency
+        self._prev_llm_dependency = current
+
+        if prev is None or prev == 0.0:
+            return
+
+        # Improvement means llm_dependency decreased (fewer LLM calls)
+        improvement_pct = (prev - current) / prev * 100.0
+        if improvement_pct > 5.0:
+            event = SynapseEvent(
+                event_type=SynapseEventType.BENCHMARK_RE_PROGRESS,
+                source_system=self.system_id,
+                data={
+                    "current": round(current, 4),
+                    "previous": round(prev, 4),
+                    "improvement_pct": round(improvement_pct, 2),
+                    "instance_id": self._instance_id,
+                },
+            )
+            await self._event_bus.emit(event)
+            self._logger.info(
+                "benchmark_re_progress",
+                current=current,
+                previous=prev,
+                improvement_pct=round(improvement_pct, 2),
+            )
+
+    async def _check_sustained_llm_dependency(self) -> None:
+        """
+        §23.2: If llm_dependency has not declined over the last 30 snapshots,
+        emit a regression for RE maturation stalled.
+        """
+        if self._event_bus is None:
+            return
+
+        try:
+            async with self._tsdb.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT llm_dependency FROM benchmark_snapshots
+                    WHERE instance_id = $1
+                      AND llm_dependency IS NOT NULL
+                    ORDER BY time DESC
+                    LIMIT 30
+                    """,
+                    self._instance_id,
+                )
+        except Exception:
+            return
+
+        values = [r["llm_dependency"] for r in rows]
+        if len(values) < 30:
+            return
+
+        # Check if there's any declining trend: compare first half avg to second half avg
+        # values are newest-first, so first half = recent, second half = older
+        recent_avg = sum(values[:15]) / 15
+        older_avg = sum(values[15:]) / 15
+
+        # No decline means recent >= older (llm_dependency not going down)
+        if recent_avg >= older_avg:
+            # Only fire once — check if already in _regressed
+            stall_key = "llm_dependency_trend"
+            if stall_key not in self._regressed:
+                self._regressed.add(stall_key)
+                self._regressed_at[stall_key] = time.monotonic()
+                regression = MetricRegression(
+                    metric=stall_key,
+                    current_value=recent_avg,
+                    rolling_avg=older_avg,
+                    regression_pct=0.0,
+                    threshold_pct=0.0,
+                )
+                await self._fire_regression_event(regression)
+                self._logger.warning(
+                    "llm_dependency_stalled",
+                    recent_avg=round(recent_avg, 4),
+                    older_avg=round(older_avg, 4),
+                    snapshots=len(values),
+                )
+        else:
+            # RE is improving — re-arm
+            stall_key = "llm_dependency_trend"
+            if stall_key in self._regressed:
+                regressed_since = self._regressed_at.pop(stall_key, 0.0)
+                duration = time.monotonic() - regressed_since if regressed_since else 0.0
+                self._regressed.discard(stall_key)
+                await self._fire_recovery_event(stall_key, recent_avg, older_avg, duration)
+
+    async def _tag_episodes_for_re_training(self, snapshot: BenchmarkSnapshot) -> None:
+        """
+        §25.2B: When decision_quality regresses while llm_dependency > 0.5,
+        tag recent Neo4j episodes as high-weight RE training candidates.
+        """
+        if self._memory is None:
+            return
+        if snapshot.decision_quality is None or snapshot.llm_dependency is None:
+            return
+        if snapshot.llm_dependency <= 0.5:
+            return
+        if "decision_quality" not in self._regressed:
+            return
+
+        try:
+            neo4j = getattr(self._memory, "_neo4j", None)
+            if neo4j is None:
+                return
+            window_start = utc_now() - timedelta(hours=24)
+            await neo4j.execute_write(
+                """
+                MATCH (ep:Episode)
+                WHERE ep.event_time >= $window_start
+                  AND ep.used_re = true
+                  AND ep.outcome_success = false
+                SET ep.training_priority = "high"
+                RETURN count(ep) AS tagged
+                """,
+                {"window_start": window_start.isoformat()},
+            )
+            self._logger.info("episodes_tagged_for_re_training", window_hours=24)
+        except Exception as exc:
+            self._logger.debug("episode_tagging_failed", error=str(exc))
+
+    # ─── Redis persistence for _regressed set ─────────────────────────
+
+    _REDIS_REGRESSED_KEY = "eos:benchmarks:regressed:{instance_id}"
+
+    async def _persist_regressed_to_redis(self) -> None:
+        """Write _regressed set to Redis to survive restarts."""
+        if self._redis is None:
+            return
+        try:
+            key = self._REDIS_REGRESSED_KEY.format(instance_id=self._instance_id)
+            if self._regressed:
+                await self._redis.set(key, json.dumps(sorted(self._regressed)))
+            else:
+                await self._redis.delete(key)
+        except Exception:
+            self._logger.debug("regressed_set_redis_persist_failed")
+
+    async def _restore_regressed_from_redis(self) -> None:
+        """Restore _regressed set from Redis on startup."""
+        if self._redis is None:
+            return
+        try:
+            key = self._REDIS_REGRESSED_KEY.format(instance_id=self._instance_id)
+            raw = await self._redis.get(key)
+            if raw:
+                metrics = json.loads(raw)
+                self._regressed = set(metrics)
+                now = time.monotonic()
+                for m in self._regressed:
+                    self._regressed_at[m] = now
+                self._logger.info(
+                    "regressed_set_restored",
+                    metrics=sorted(self._regressed),
+                )
+        except Exception:
+            self._logger.debug("regressed_set_redis_restore_failed")
 
     # ─── Auxiliary key-value store ────────────────────────────────────
 
@@ -661,6 +2173,57 @@ class BenchmarkService:
                 result[kpi] = t  # type: ignore[assignment]
         return result
 
+    # ─── External KPI Recording ─────────────────────────────────────────
+
+    async def record_kpi(
+        self,
+        system: str,
+        metric: str | None = None,
+        value: float | None = None,
+        timestamp: datetime | None = None,
+        *,
+        metrics: dict[str, Any] | None = None,
+    ) -> None:
+        """Accept external KPIs from another system and store as auxiliary.
+
+        Supports two calling conventions:
+          1. Single metric (Soma):
+               await benchmarks.record_kpi(system="soma", metric="p99_ms", value=12.3)
+          2. Batch dict (Simula, Synapse):
+               await benchmarks.record_kpi(system="simula", metrics={"outcome": "applied", ...})
+
+        Non-numeric values in the batch dict are stored as their hash modulo 1_000_000
+        so the DOUBLE PRECISION column can accept them.
+
+        Spec ref: §26.2 — fixes batch callers whose data was silently discarded.
+        """
+        pairs: list[tuple[str, float]] = []
+
+        if metrics is not None:
+            # Batch path — Simula and Synapse
+            for k, v in metrics.items():
+                if isinstance(v, bool):
+                    pairs.append((f"{system}.{k}", float(v)))
+                elif isinstance(v, (int, float)):
+                    pairs.append((f"{system}.{k}", float(v)))
+                elif isinstance(v, str):
+                    # Categorical values encoded as hash mod 1_000_000
+                    pairs.append((f"{system}.{k}", float(abs(hash(v)) % 1_000_000)))
+                # None / complex types skipped silently
+        elif metric is not None and value is not None:
+            # Single-metric path — Soma
+            pairs.append((f"{system}.{metric}", float(value)))
+
+        for key, fval in pairs:
+            try:
+                await self._store_auxiliary(key, fval)
+            except Exception as exc:
+                self._logger.debug(
+                    "benchmark_record_kpi_failed",
+                    key=key,
+                    error=str(exc),
+                )
+
     # ─── Health check (Synapse protocol) ──────────────────────────────
 
     async def health(self) -> dict[str, Any]:
@@ -673,6 +2236,7 @@ class BenchmarkService:
             "latest_snapshot_time": latest.time.isoformat() if latest else None,
             "interval_s": self._config.interval_s,
             "rolling_window": self._config.rolling_window_snapshots,
+            "evolutionary_tracker": self._evo_tracker.stats,
         }
 
     @property
@@ -692,4 +2256,5 @@ class BenchmarkService:
             "mutation_success_rate": snap.mutation_success_rate if snap else None,
             "effective_intelligence_ratio": snap.effective_intelligence_ratio if snap else None,
             "compression_ratio": snap.compression_ratio if snap else None,
+            "bedau_packard": snap.bedau_packard.model_dump(mode="json") if snap and snap.bedau_packard else None,
         }

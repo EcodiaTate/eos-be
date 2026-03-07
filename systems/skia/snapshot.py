@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from config import SkiaConfig
     from systems.identity.vault import IdentityVault
     from systems.skia.pinata_client import PinataClient
+    from systems.memory.service import MemoryService
 
 logger = structlog.get_logger("systems.skia.snapshot")
 
@@ -72,6 +73,7 @@ class StateSnapshotPipeline:
         redis: RedisClient,
         config: SkiaConfig,
         instance_id: str,
+        memory: MemoryService | None = None,
     ) -> None:
         self._neo4j = neo4j
         self._vault = vault
@@ -79,13 +81,24 @@ class StateSnapshotPipeline:
         self._redis = redis
         self._config = config
         self._instance_id = instance_id
+        self._memory: MemoryService | None = memory
         self._task: asyncio.Task[None] | None = None
         self._running = False
         self._log = logger.bind(component="skia.snapshot")
+        self._event_bus: Any = None  # EventBus | None
 
         # Stats
         self._total_snapshots: int = 0
         self._last_cid: str = ""
+        self._last_constitutional_genome: dict[str, Any] | None = None
+
+    def set_memory(self, memory: MemoryService) -> None:
+        """Wire the Memory service so snapshots include the constitutional genome."""
+        self._memory = memory
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Wire Synapse event bus so completed snapshots are broadcast."""
+        self._event_bus = event_bus
 
     @property
     def total_snapshots(self) -> int:
@@ -94,6 +107,11 @@ class StateSnapshotPipeline:
     @property
     def last_cid(self) -> str:
         return self._last_cid
+
+    @property
+    def last_constitutional_genome(self) -> dict[str, Any] | None:
+        """The constitutional genome bundled in the most recent snapshot."""
+        return self._last_constitutional_genome
 
     async def start(self) -> None:
         """Start the periodic snapshot loop."""
@@ -141,11 +159,30 @@ class StateSnapshotPipeline:
         if self._config.snapshot_include_edges and node_ids:
             edges = await self._export_edges(node_ids)
 
+        # 2b. Export constitutional genome from Memory so the organism's
+        #     phenotype survives instance death and can be inherited by any
+        #     shadow instance provisioned from this snapshot.
+        constitutional_genome: dict[str, Any] | None = None
+        if self._memory is not None:
+            try:
+                constitutional_genome = await self._memory.export_genome()
+                self._log.info(
+                    "constitutional_genome_exported",
+                    genome_keys=list(constitutional_genome.keys()) if constitutional_genome else [],
+                )
+            except Exception as genome_exc:
+                # Non-fatal: snapshot is still valuable without the genome.
+                self._log.warning(
+                    "constitutional_genome_export_failed",
+                    error=str(genome_exc),
+                )
+
         # 3. Serialize + compress
         payload = SnapshotPayload(
             instance_id=self._instance_id,
             nodes=nodes,
             edges=edges,
+            constitutional_genome=constitutional_genome,
         )
         raw_bytes = orjson.dumps(payload.model_dump(mode="json"))
         uncompressed_size = len(raw_bytes)
@@ -250,6 +287,7 @@ class StateSnapshotPipeline:
         # Update stats
         self._total_snapshots += 1
         self._last_cid = cid
+        self._last_constitutional_genome = constitutional_genome
 
         self._log.info(
             "snapshot_completed",
@@ -260,6 +298,28 @@ class StateSnapshotPipeline:
             encrypted_kb=encrypted_size // 1024,
             duration_ms=round(duration_ms, 1),
         )
+
+        # Broadcast snapshot completion on Synapse so observers (Benchmarks,
+        # Thymos, the observatory tracer) can measure snapshot cadence.
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SKIA_SNAPSHOT_COMPLETED,
+                    source_system="skia",
+                    data={
+                        "instance_id": self._instance_id,
+                        "cid": cid,
+                        "node_count": len(nodes),
+                        "edge_count": len(edges),
+                        "encrypted_size_bytes": encrypted_size,
+                        "duration_ms": round(duration_ms, 1),
+                        "snapshot_number": self._total_snapshots,
+                    },
+                ))
+            except Exception as _emit_exc:
+                self._log.debug("snapshot_event_emit_failed", error=str(_emit_exc))
+
         return manifest
 
     # ── Neo4j export ──────────────────────────────────────────────
@@ -352,7 +412,9 @@ async def restore_from_ipfs(
     pinata_gateway_url: str = "https://gateway.pinata.cloud",
     redis_client: RedisClient | None = None,
     instance_id: str = "",
-) -> None:
+    event_bus: Any = None,
+    memory: Any = None,
+) -> dict[str, Any] | None:
     """
     Download an encrypted snapshot from IPFS and restore into Neo4j.
 
@@ -360,12 +422,24 @@ async def restore_from_ipfs(
 
     Steps:
       1. Download encrypted blob from IPFS gateway
-      2. Decrypt with IdentityVault
+      2. Decrypt with IdentityVault (key_version read from manifest if available)
       3. Decompress gzip
       4. Import nodes and edges into Neo4j
       5. Write restoration_complete flag to Redis so the health endpoint
          can signal to the parent's _verify_handoff() that the graph is
          fully populated (not just that the HTTP server is up).
+      6. Apply constitutional genome — emit GENOME_EXTRACT_REQUEST via Synapse
+         and call memory.seed_genome() so Memory/Equor reinitialize from the
+         parent's drive weights instead of defaults.
+
+    Args:
+        event_bus: Optional Synapse EventBus. If provided, GENOME_EXTRACT_REQUEST
+            is emitted after restoration so Memory and Equor can reinitialize state.
+        memory: Optional MemoryService. If provided, memory.seed_genome() is called
+            directly with the extracted constitutional genome.
+
+    Returns the constitutional_genome dict extracted from the snapshot
+    (or None if absent), so callers can apply it to Memory/Equor on startup.
     """
     from systems.identity.vault import IdentityVault
     from systems.skia.pinata_client import PinataClient
@@ -387,7 +461,23 @@ async def restore_from_ipfs(
 
     log.info("ipfs_download_complete", size_bytes=len(encrypted_bytes))
 
-    # 2. Decrypt — the ciphertext is stored as ASCII Fernet token
+    # 2. Decrypt — the ciphertext is stored as ASCII Fernet token.
+    # Read key_version from the snapshot manifest in Redis if available.
+    # Falls back to 1 with a warning when the manifest lacks this field.
+    key_version = 1
+    if redis_client is not None:
+        try:
+            manifest_raw = await redis_client.get_json("skia:snapshot:manifest")
+            if isinstance(manifest_raw, dict):
+                recorded_version = manifest_raw.get("encryption_key_version")
+                if recorded_version is not None:
+                    key_version = int(recorded_version)
+                    log.info("key_version_from_manifest", key_version=key_version)
+                else:
+                    log.warning("key_version_not_in_manifest", fallback=key_version)
+        except Exception as kv_exc:
+            log.warning("key_version_lookup_failed", fallback=key_version, error=str(kv_exc))
+
     vault = IdentityVault(passphrase=vault_passphrase)
     from systems.identity.vault import SealedEnvelope
 
@@ -395,7 +485,7 @@ async def restore_from_ipfs(
         platform_id="skia",
         purpose="state_snapshot",
         ciphertext=encrypted_bytes.decode("ascii"),
-        key_version=1,
+        key_version=key_version,
     )
     compressed = vault.decrypt(envelope)
 
@@ -405,7 +495,13 @@ async def restore_from_ipfs(
     nodes: list[dict[str, Any]] = payload_data.get("nodes", [])
     edges: list[dict[str, Any]] = payload_data.get("edges", [])
 
-    log.info("snapshot_decoded", nodes=len(nodes), edges=len(edges))
+    constitutional_genome: dict[str, Any] | None = payload_data.get("constitutional_genome")
+    log.info(
+        "snapshot_decoded",
+        nodes=len(nodes),
+        edges=len(edges),
+        has_constitutional_genome=constitutional_genome is not None,
+    )
 
     # 4. Import into Neo4j
     # Use MERGE to avoid duplicates on re-import
@@ -453,3 +549,37 @@ async def restore_from_ipfs(
         restoration_flag_key = f"skia:restoration_complete:{instance_id or cid[:16]}"
         raw = redis_client.client
         await raw.set(restoration_flag_key, "1", ex=3600)
+
+    # 6. Apply constitutional genome so the revived organism inherits parent drive weights.
+    # Without this step, Memory and Equor reinitialize with default values and the
+    # organism loses its phenotype on every resurrection.
+    if constitutional_genome is not None:
+        # 6a. Seed Memory directly if available (fastest path — no event round-trip).
+        if memory is not None:
+            try:
+                await memory.seed_genome(constitutional_genome)
+                log.info("constitutional_genome_seeded_to_memory")
+            except Exception as mem_exc:
+                log.warning("memory_seed_genome_failed", error=str(mem_exc))
+
+        # 6b. Emit GENOME_EXTRACT_REQUEST so Memory and Equor can reinitialize
+        # their state from the genome payload via the event bus.
+        if event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.GENOME_EXTRACT_REQUEST,
+                    source_system="skia",
+                    data={
+                        "genome": constitutional_genome,
+                        "source": "ipfs_restoration",
+                        "cid": cid,
+                        "instance_id": instance_id,
+                    },
+                ))
+                log.info("genome_extract_request_emitted")
+            except Exception as bus_exc:
+                log.warning("genome_extract_request_failed", error=str(bus_exc))
+
+    # Return the constitutional genome so callers can apply it further if needed.
+    return constitutional_genome

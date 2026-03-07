@@ -6,11 +6,21 @@ to detect structural isomorphism. When two instances with different domains,
 different compression paths, and different experiences arrive at the same
 abstract structure, that convergence is evidence for ground truth.
 
-The comparison strips domain labels and compares:
-- Node count and type distribution
-- Edge count, type distribution, and connectivity pattern
-- Symmetry properties (chain, cycle, star, complete, etc.)
-- Invariant properties (if declared)
+The comparison uses two paths:
+
+  1. **WL-1 graph isomorphism approximation** (primary, Gap HIGH-1):
+     Weisfeiler-Lehman 1-dimensional colour refinement.  O(n·d·k) where n is
+     node count, d is mean degree, and k is iteration count (default 3).
+     WL-1 cannot distinguish all non-isomorphic graphs (e.g. regular graphs
+     with identical degree sequences) but catches the vast majority of cases
+     seen in world model fragment sizes (n < 100 typical).  When two graphs
+     produce the same canonical WL-1 histogram, they are isomorphic with high
+     probability.
+
+  2. **Legacy heuristic** (fallback):
+     Node count, edge count, type distributions, degree sequence, symmetry,
+     and invariant Jaccard.  Used when fragments lack node/edge lists for
+     WL-1 (e.g. older fragments serialised before AbstractStructure was typed).
 
 A high convergence_score (>= 0.7) from independent domains is the strongest
 epistemic signal Nexus can produce.
@@ -18,12 +28,15 @@ epistemic signal Nexus can produce.
 
 from __future__ import annotations
 
+import hashlib
+from collections import defaultdict
 from typing import Any
 
 import structlog
 
 from primitives.common import utc_now
 from systems.nexus.types import (
+    AbstractStructure,
     ConvergenceResult,
     ShareableWorldModelFragment,
     TriangulationMetadata,
@@ -32,10 +45,125 @@ from systems.nexus.types import (
 
 logger = structlog.get_logger("nexus.convergence")
 
+# ─── WL-1 Graph Isomorphism ──────────────────────────────────────
+
+
+def _wl1_hash(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    iterations: int = 3,
+) -> str:
+    """
+    Compute a Weisfeiler-Lehman 1-dimensional canonical hash for a graph.
+
+    Algorithm:
+      1. Initialise each node's colour from its ``type`` label.
+      2. For each iteration:
+         a. For every node, collect its current colour + sorted neighbour colours.
+         b. Hash that multiset to produce the node's new colour.
+      3. Produce a canonical histogram: sorted list of (colour, count) pairs.
+      4. SHA-256 the histogram string.
+
+    The resulting hash is the same for isomorphic graphs regardless of node
+    ordering.  Two graphs with identical hashes are isomorphic with high
+    probability (WL-1 is not complete — it cannot distinguish certain regular
+    graphs, but these are rare in world model fragment sizes).
+
+    Complexity: O(n · d · k) where n = node count, d = mean out-degree,
+    k = iterations.  Tractable for n < 1 000.
+
+    Returns empty string if the graph has no nodes (caller falls back to
+    legacy heuristics).
+    """
+    if not nodes:
+        return ""
+
+    n = len(nodes)
+
+    # Build adjacency list (directed: only outbound edges affect colour)
+    adjacency: dict[int, list[int]] = defaultdict(list)
+    for edge in edges:
+        src = edge.get("from", edge.get("source", -1))
+        dst = edge.get("to", edge.get("target", -1))
+        if isinstance(src, int) and isinstance(dst, int) and 0 <= src < n and 0 <= dst < n:
+            adjacency[src].append(dst)
+
+    # Initialise colours from node type labels
+    colours: list[str] = [str(node.get("type", "unknown")) for node in nodes]
+
+    for _ in range(iterations):
+        new_colours: list[str] = []
+        for i in range(n):
+            neighbour_colours = sorted(colours[j] for j in adjacency[i])
+            # Aggregate: own colour + sorted neighbour colours
+            aggregate = colours[i] + "|" + ",".join(neighbour_colours)
+            new_colours.append(hashlib.sha256(aggregate.encode()).hexdigest()[:16])
+        colours = new_colours
+
+    # Canonical histogram: count occurrences of each colour, sort for stability
+    hist: dict[str, int] = defaultdict(int)
+    for c in colours:
+        hist[c] += 1
+    canonical = str(sorted(hist.items()))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _wl1_similarity(hash_a: str, hash_b: str) -> float:
+    """
+    Convert two WL-1 hashes to a similarity score [0, 1].
+
+    Exact match → 1.0 (structurally isomorphic with high probability).
+    Any mismatch → 0.0 (definitely not isomorphic).
+
+    This binary decision is correct for WL-1: the hash is either a proof of
+    isomorphism (with high probability) or evidence of non-isomorphism.
+    We do NOT interpolate between hashes — Hamming distance on SHA-256 digests
+    is meaningless for this purpose.
+    """
+    if not hash_a or not hash_b:
+        return -1.0  # Sentinel: WL-1 unavailable, caller must use legacy path
+    return 1.0 if hash_a == hash_b else 0.0
+
+
+def _extract_graph_from_structure(
+    structure: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract (nodes, edges) from a legacy abstract_structure dict."""
+    raw_nodes = structure.get("nodes", [])
+    nodes: list[dict[str, Any]]
+    if isinstance(raw_nodes, int):
+        nodes = [{"type": "unknown", "index": i} for i in range(raw_nodes)]
+    elif isinstance(raw_nodes, list):
+        nodes = raw_nodes
+    else:
+        nodes = []
+
+    raw_edges = structure.get("edges", [])
+    edges: list[dict[str, Any]] = raw_edges if isinstance(raw_edges, list) else []
+    return nodes, edges
+
+
+def _get_graph(
+    fragment: ShareableWorldModelFragment,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Return (nodes, edges) preferring the typed AbstractStructure when available.
+    """
+    if fragment.typed_structure is not None:
+        return fragment.typed_structure.nodes, fragment.typed_structure.edges
+    return _extract_graph_from_structure(fragment.abstract_structure)
+
+
+# ─── ConvergenceDetector ────────────────────────────────────────
+
 
 class ConvergenceDetector:
     """
     Detects structural convergence between world model fragments.
+
+    Primary path: WL-1 graph isomorphism approximation (Gap HIGH-1).
+    Fallback path: legacy heuristics (node/edge counts, type distributions,
+    symmetry, invariants) for fragments without node/edge lists.
 
     Core operation: compare_structures strips domain labels and compares
     the abstract relational shape of two fragments. When different instances
@@ -43,8 +171,9 @@ class ConvergenceDetector:
     that structure has high triangulation confidence.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, wl1_iterations: int = 3) -> None:
         self._convergence_cache: dict[str, ConvergenceResult] = {}
+        self._wl1_iterations = wl1_iterations
 
     def compare_structures(
         self,
@@ -60,39 +189,83 @@ class ConvergenceDetector:
         shape. Returns a ConvergenceResult with a score from 0.0
         (no match) to 1.0 (identical structure, different domains).
 
+        WL-1 path (preferred):
+          - Used when both fragments have nodes lists (either via typed_structure
+            or via abstract_structure["nodes"] as a list).
+          - Produces an exact binary result: 1.0 (isomorphic) or 0.0 (not).
+          - Blended with size similarity (10%) to give partial credit for
+            near-matches caused by minor structural differences.
+
+        Legacy path (fallback):
+          - Used when node lists are unavailable.
+          - Heuristic score from count ratios, type distributions, degree
+            sequences, symmetry, and invariant overlap.
+
         peer_divergence_score: the measured divergence between the two
           source instances (from InstanceDivergenceMeasurer). When
-          provided, this is used directly as source_diversity — it is
-          the authoritative measure. When absent (e.g. comparing two
-          local fragments), falls back to a minimum of 0.3 if the
-          instance IDs differ.
+          provided, used directly as source_diversity. When absent,
+          falls back to a minimum of 0.3 if the instance IDs differ.
         """
         cache_key = _cache_key(fragment_a.fragment_id, fragment_b.fragment_id)
         cached = self._convergence_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        struct_a = fragment_a.abstract_structure
-        struct_b = fragment_b.abstract_structure
+        nodes_a, edges_a = _get_graph(fragment_a)
+        nodes_b, edges_b = _get_graph(fragment_b)
 
-        nodes_a = _extract_nodes(struct_a)
-        nodes_b = _extract_nodes(struct_b)
-        edges_a = _extract_edges(struct_a)
-        edges_b = _extract_edges(struct_b)
+        # ── WL-1 path ────────────────────────────────────────────
+        wl1_used = False
+        wl1_score: float | None = None
 
-        node_score, matched_nodes = _compare_node_topology(nodes_a, nodes_b)
-        edge_score, matched_edges = _compare_edge_topology(edges_a, edges_b)
-        symmetry_score = _compare_symmetry(struct_a, struct_b)
-        invariant_score = _compare_invariants(struct_a, struct_b)
+        if nodes_a and nodes_b:
+            hash_a = _wl1_hash(nodes_a, edges_a, iterations=self._wl1_iterations)
+            hash_b = _wl1_hash(nodes_b, edges_b, iterations=self._wl1_iterations)
+            raw = _wl1_similarity(hash_a, hash_b)
+            if raw >= 0.0:  # Both hashes valid
+                wl1_used = True
+                # Blend WL-1 result (90%) with node count ratio (10%) to give
+                # soft credit for graphs that are "almost" isomorphic structurally
+                # but differ by ±1 node (common in growing world models).
+                n_a, n_b = len(nodes_a), len(nodes_b)
+                size_ratio = min(n_a, n_b) / max(n_a, n_b) if max(n_a, n_b) > 0 else 1.0
+                wl1_score = raw * 0.90 + size_ratio * 0.10
 
-        convergence_score = (
-            node_score * 0.30
-            + edge_score * 0.35
-            + symmetry_score * 0.20
-            + invariant_score * 0.15
-        )
+        if wl1_used and wl1_score is not None:
+            convergence_score = wl1_score
+            matched_nodes = min(len(nodes_a), len(nodes_b))
+            matched_edges = min(len(edges_a), len(edges_b))
+        else:
+            # ── Legacy heuristic path ────────────────────────────
+            struct_a = (
+                fragment_a.typed_structure.to_legacy_dict()
+                if fragment_a.typed_structure
+                else fragment_a.abstract_structure
+            )
+            struct_b = (
+                fragment_b.typed_structure.to_legacy_dict()
+                if fragment_b.typed_structure
+                else fragment_b.abstract_structure
+            )
 
-        # Determine domain independence
+            ext_nodes_a = _extract_nodes(struct_a)
+            ext_nodes_b = _extract_nodes(struct_b)
+            ext_edges_a = _extract_edges(struct_a)
+            ext_edges_b = _extract_edges(struct_b)
+
+            node_score, matched_nodes = _compare_node_topology(ext_nodes_a, ext_nodes_b)
+            edge_score, matched_edges = _compare_edge_topology(ext_edges_a, ext_edges_b)
+            symmetry_score = _compare_symmetry(struct_a, struct_b)
+            invariant_score = _compare_invariants(struct_a, struct_b)
+
+            convergence_score = (
+                node_score * 0.30
+                + edge_score * 0.35
+                + symmetry_score * 0.20
+                + invariant_score * 0.15
+            )
+
+        # ── Domain independence ───────────────────────────────────
         domains_a = set(fragment_a.domain_labels)
         domains_b = set(fragment_b.domain_labels)
         domains_are_independent = (
@@ -101,17 +274,12 @@ class ConvergenceDetector:
             else False
         )
 
-        # Source diversity: use the measured instance divergence when available.
-        # This is the actual distance between the two source instances, which is
-        # what triangulation value depends on. Only fall back to a minimum floor
-        # when the caller doesn't have a divergence measurement yet.
+        # ── Source diversity ──────────────────────────────────────
         if peer_divergence_score is not None:
             source_diversity = max(0.0, min(peer_divergence_score, 1.0))
         elif fragment_a.source_instance_id != fragment_b.source_instance_id:
-            # Different instances, no measurement yet — conservative floor
             source_diversity = 0.3
         else:
-            # Same source instance (local-vs-local comparison)
             source_diversity = 0.0
 
         result = ConvergenceResult(
@@ -119,15 +287,16 @@ class ConvergenceDetector:
             fragment_b_id=fragment_b.fragment_id,
             convergence_score=min(convergence_score, 1.0),
             matched_nodes=matched_nodes,
-            total_nodes_a=len(nodes_a),
-            total_nodes_b=len(nodes_b),
+            total_nodes_a=len(nodes_a) if nodes_a else len(_extract_nodes(fragment_a.abstract_structure)),
+            total_nodes_b=len(nodes_b) if nodes_b else len(_extract_nodes(fragment_b.abstract_structure)),
             matched_edges=matched_edges,
-            total_edges_a=len(edges_a),
-            total_edges_b=len(edges_b),
+            total_edges_a=len(edges_a) if edges_a else len(_extract_edges(fragment_a.abstract_structure)),
+            total_edges_b=len(edges_b) if edges_b else len(_extract_edges(fragment_b.abstract_structure)),
             domains_are_independent=domains_are_independent,
             source_a_instance_id=fragment_a.source_instance_id,
             source_b_instance_id=fragment_b.source_instance_id,
             source_diversity=source_diversity,
+            wl1_used=wl1_used,
             detected_at=utc_now(),
         )
 
@@ -139,6 +308,7 @@ class ConvergenceDetector:
                 fragment_a=fragment_a.fragment_id,
                 fragment_b=fragment_b.fragment_id,
                 score=convergence_score,
+                wl1_used=wl1_used,
                 domains_independent=domains_are_independent,
                 source_diversity=source_diversity,
             )
@@ -189,7 +359,7 @@ class ConvergenceDetector:
         return count
 
 
-# ─── Structural Comparison Helpers ───────────────────────────────
+# ─── Structural Comparison Helpers (Legacy Path) ─────────────────
 
 
 def _cache_key(id_a: str, id_b: str) -> str:

@@ -405,6 +405,14 @@ class SimulaProxy:
     def set_synapse(self, synapse: Any) -> None:
         """No-op: the worker holds the real SimulaService with grid-metabolism subscription."""
 
+    def set_soma_ref(self, soma: Any) -> None:
+        """No-op: the worker process will wire Soma directly after its own initialization."""
+        self._logger.debug("soma_ref_wired_to_proxy")
+
+    def set_fovea_ref(self, fovea: Any) -> None:
+        """No-op: the worker process will wire Fovea directly after its own initialization."""
+        self._logger.debug("fovea_ref_wired_to_proxy")
+
     def subscribe_to_evolution_candidates(self, event_bus: Any) -> None:
         """
         Subscribe to EVOLUTION_CANDIDATE events on behalf of the worker.

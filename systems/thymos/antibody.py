@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
@@ -57,6 +58,8 @@ class AntibodyLibrary:
         self._cache: dict[str, Antibody] = {}  # fingerprint → antibody
         self._all: dict[str, Antibody] = {}  # id → antibody
         self._logger = logger.bind(system="thymos", component="antibody_library")
+        # Optional event callback — set by ThymosService for lifecycle event emission
+        self._on_event: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
 
     async def initialize(self) -> None:
         """Load antibodies from Neo4j into memory cache."""
@@ -381,6 +384,19 @@ class AntibodyLibrary:
             del self._cache[antibody.fingerprint]
         await self._persist_antibody(antibody)
 
+        # Emit ANTIBODY_RETIRED lifecycle event via callback
+        if self._on_event is not None:
+            try:
+                await self._on_event("antibody_retired", {
+                    "antibody_id": antibody.id,
+                    "fingerprint": antibody.fingerprint,
+                    "reason": "effectiveness_below_threshold",
+                    "final_success_rate": antibody.effectiveness,
+                    "total_uses": antibody.application_count,
+                })
+            except Exception:
+                pass  # Non-critical lifecycle emission
+
     def _extract_error_pattern(self, incident: Incident) -> str:
         """Extract a reusable error pattern from an incident."""
         # Use the first 200 chars of error message as a pattern
@@ -500,6 +516,106 @@ class AntibodyLibrary:
         if not active:
             return 1.0
         return sum(a.effectiveness for a in active) / len(active)
+
+    # ─── Federation Antibody Sync ────────────────────────────────────
+
+    def export_for_federation(self, max_count: int = 100) -> list[dict[str, Any]]:
+        """
+        Export top antibodies for sharing with federation peers.
+
+        Returns serialized antibody dicts sorted by effectiveness × application_count
+        (most proven fixes first). Only exports active (non-retired) antibodies with
+        effectiveness >= 0.5.
+        """
+        candidates = [
+            a for a in self._all.values()
+            if not a.retired and a.effectiveness >= 0.5
+        ]
+        candidates.sort(
+            key=lambda a: a.effectiveness * a.application_count,
+            reverse=True,
+        )
+
+        exported: list[dict[str, Any]] = []
+        for ab in candidates[:max_count]:
+            exported.append({
+                "fingerprint": ab.fingerprint,
+                "incident_class": ab.incident_class.value,
+                "source_system": ab.source_system,
+                "error_pattern": ab.error_pattern,
+                "repair_tier": ab.repair_tier.value,
+                "repair_spec": ab.repair_spec.model_dump(),
+                "root_cause_description": ab.root_cause_description,
+                "effectiveness": ab.effectiveness,
+                "application_count": ab.application_count,
+            })
+
+        self._logger.info(
+            "antibodies_exported_for_federation",
+            total_candidates=len(candidates),
+            exported=len(exported),
+        )
+        return exported
+
+    async def import_from_federation(
+        self,
+        antibodies: list[dict[str, Any]],
+        remote_instance_id: str,
+    ) -> int:
+        """
+        Import antibodies received from a federation peer.
+
+        Imported antibodies get a 10% effectiveness discount (untested locally)
+        and are tagged with their source instance. Skips duplicates (same fingerprint).
+        """
+        imported = 0
+        for ab_data in antibodies:
+            fingerprint = ab_data.get("fingerprint", "")
+            if not fingerprint or fingerprint in self._cache:
+                continue  # Skip duplicates
+
+            try:
+                repair_data = ab_data.get("repair_spec", {})
+                repair_spec = RepairSpec(**repair_data)
+            except Exception:
+                repair_spec = RepairSpec(tier=RepairTier.NOOP, action="unknown")
+
+            try:
+                incident_class = IncidentClass(ab_data.get("incident_class", "crash"))
+            except ValueError:
+                incident_class = IncidentClass.CRASH
+
+            try:
+                repair_tier = RepairTier(ab_data.get("repair_tier", 0))
+            except ValueError:
+                repair_tier = RepairTier.NOOP
+
+            antibody = Antibody(
+                id=new_id(),
+                fingerprint=fingerprint,
+                incident_class=incident_class,
+                source_system=ab_data.get("source_system", "unknown"),
+                error_pattern=ab_data.get("error_pattern", ""),
+                repair_tier=repair_tier,
+                repair_spec=repair_spec,
+                root_cause_description=ab_data.get("root_cause_description", ""),
+                source_incident_id=f"federation:{remote_instance_id}",
+                effectiveness=float(ab_data.get("effectiveness", 0.5)) * 0.9,
+                created_at=utc_now(),
+            )
+
+            self._cache[antibody.fingerprint] = antibody
+            self._all[antibody.id] = antibody
+            await self._persist_antibody(antibody)
+            imported += 1
+
+        self._logger.info(
+            "antibodies_imported_from_federation",
+            remote_instance_id=remote_instance_id,
+            offered=len(antibodies),
+            imported=imported,
+        )
+        return imported
 
     async def get_all_active(self) -> list[Antibody]:
         """Get all non-retired antibodies."""

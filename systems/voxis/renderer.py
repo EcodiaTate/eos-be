@@ -443,9 +443,11 @@ class ContentRenderer(BaseContentRenderer):
         # ── Step 6d: Conversation Dynamics Adaptation ────────────
         # Applied after audience -- dynamics can override based on real-time
         # conversational signals (repair mode, style convergence, etc.)
+        # Uses module-level apply_dynamics_to_strategy() to avoid instantiating
+        # a throwaway ConversationDynamicsEngine per render (AV2 fix).
         if dynamics is not None:
-            from systems.voxis.dynamics import ConversationDynamicsEngine
-            strategy = ConversationDynamicsEngine().apply_dynamics(strategy, dynamics)  # type: ignore[arg-type]
+            from systems.voxis.dynamics import apply_dynamics_to_strategy
+            strategy = apply_dynamics_to_strategy(strategy, dynamics)  # type: ignore[arg-type]
 
         # ── Step 7: Content Generation ────────────────────────────
         temperature = _compute_temperature(strategy, context.affect, self._base_temp)

@@ -185,16 +185,19 @@ class EvolutionAnalyticsEngine:
         )
         return analytics
 
-    async def get_category_success_rate(self, category: ChangeCategory) -> float:
+    async def get_category_success_rate(self, category: ChangeCategory) -> float | None:
         """
         Success rate for a specific change category.
         Used by ChangeSimulator for dynamic risk weighting.
-        Returns 0.5 (neutral) if no history exists for this category.
+
+        Returns None when no history exists for this category so callers can
+        distinguish "no data" from a genuine 50% success rate. Evo uses this
+        signal to learn category-specific priors rather than assuming neutral.
         """
         analytics = await self.compute_analytics()
         rate = analytics.category_rates.get(category.value)
         if rate is None or rate.total == 0:
-            return 0.5  # no data -- assume neutral
+            return None  # no_history_available — caller must decide default
         return rate.success_rate
 
     async def get_recent_rollback_rate(self, category: ChangeCategory) -> float:

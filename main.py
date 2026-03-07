@@ -194,6 +194,16 @@ from api.routers.logs import router as logs_router
 
 app.include_router(logs_router)
 
+# ─── Equor (Constitutional Ethics Engine) Router ─────────────────
+from api.routers.equor import router as equor_router
+
+app.include_router(equor_router)
+
+# ─── Observatory Router ─────────────────────────────────────────
+from api.routers.observatory import router as observatory_router
+
+app.include_router(observatory_router)
+
 # ─── Alive WebSocket on port 8000 (for Cloud Run) ────────────────
 # Cloud Run only exposes one port per container. The standalone ws_server
 # on port 8001 is unreachable, so we add a FastAPI WebSocket route here
@@ -212,11 +222,24 @@ def _ws_json(data: dict[str, Any]) -> str:
 @app.websocket("/ws/alive")
 async def alive_websocket(ws: WebSocket):
     """
-    Alive visualization WebSocket — mirrors the standalone ws_server behaviour.
+    Alive visualization WebSocket — Cloud Run single-port alternative (port 8000).
 
-    Streams two channels to the client:
-      {"stream": "affect",  "payload": {...}}  — polled from Atune at ~10 Hz
-      {"stream": "synapse", "payload": {...}}  — forwarded from Redis pub/sub
+    This endpoint is a **distinct protocol** from the standalone AliveWebSocketServer
+    on port 8001. It is NOT governed by Spec 11a and serves different consumers
+    (perception / decisions dashboard pages running in Cloud Run environments where
+    only one port is exposed).
+
+    Protocol schema:
+      {"stream": "affect",    "payload": {...}}  — 6D AffectState from Atune ~10Hz
+      {"stream": "synapse",   "payload": {...}}  — raw Synapse events (Redis pub/sub)
+      {"stream": "workspace", "payload": {...}}  — Atune workspace snapshot ~1Hz
+      {"stream": "outcomes",  "payload": {...}}  — Axon execution outcomes ~0.5Hz
+
+    Affect payload: valence, arousal, dominance, curiosity, care_activation,
+                    coherence_stress, ts
+
+    Do NOT merge this with the standalone server. See the protocol note in
+    ``systems/alive/ws_server.py`` for the rationale.
     """
     await ws.accept()
 
@@ -2150,7 +2173,7 @@ async def register_scheduler_task(body: dict[str, Any]):
     Currently supported built-in tasks:
     - "self_clock" — injects a periodic time-awareness percept (every 300s)
     """
-    from systems.atune.types import InputChannel
+    from systems.fovea.types import InputChannel
 
     name = body.get("name")
     task_key = body.get("task")
@@ -2300,7 +2323,7 @@ async def get_salience_heads():
     if fovea is None:
         return {"error": "fovea_not_wired", "heads": [], "meta_attention_mode": "fovea_driven"}
 
-    metrics = fovea._bridge.get_metrics() if hasattr(fovea, "_bridge") and fovea._bridge else None
+    metrics = fovea.get_metrics() if fovea is not None else None
 
     from systems.fovea.types import DEFAULT_ERROR_WEIGHTS
     dimension_weights = {k: round(v, 4) for k, v in DEFAULT_ERROR_WEIGHTS.items()}
@@ -2326,10 +2349,10 @@ async def get_salience_momentum():
     """
     fovea = getattr(app.state, "fovea", None)
     atune: AtuneService = app.state.atune
-    if fovea is None or not hasattr(fovea, "_bridge") or fovea._bridge is None:
+    if fovea is None:
         return {"note": "fovea_not_wired", "cycle_count": atune.cycle_count}
 
-    metrics = fovea._bridge.get_metrics()
+    metrics = fovea.get_metrics()
     return {
         "note": "Per-head momentum replaced by Fovea HabituationEngine.",
         "habituation": {
@@ -2348,12 +2371,10 @@ async def get_salience_bias():
     Returns Fovea's learned weight adjustments per error dimension instead.
     """
     fovea = getattr(app.state, "fovea", None)
-    if fovea is None or not hasattr(fovea, "_bridge") or fovea._bridge is None:
+    if fovea is None:
         return {"note": "fovea_not_wired", "biases": {}}
 
-    learner = fovea._bridge._weight_applicator
-    if learner is None:
-        return {"note": "weight_learner_not_active", "biases": {}}
+    learner = fovea.weight_learner
 
     weights = getattr(learner, "current_weights", {})
     return {
@@ -4412,6 +4433,7 @@ async def command_center_deploy_patch(payload: _DeployPatchPayload) -> _DeployPa
 import json as _json
 
 from fastapi.responses import StreamingResponse as _LogStreamingResponse
+from telemetry.logging import subscribe_logs, unsubscribe_logs
 
 
 @app.get("/api/v1/admin/logs/stream")

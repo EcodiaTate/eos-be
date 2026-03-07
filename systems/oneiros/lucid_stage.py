@@ -18,13 +18,19 @@ from __future__ import annotations
 
 import copy
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
-from primitives.common import new_id
+from primitives.common import new_id, utc_now
 from systems.oneiros.types import (
+    Dream,
+    DreamCoherence,
+    DreamInsight,
     DreamScenario,
+    DreamType,
+    InsightStatus,
     LucidDreamingReport,
     MutationSimulationReport,
     MutationTestResult,
@@ -80,6 +86,291 @@ class ConstitutionalCheckProtocol(Protocol):
         ...
 
 
+# ─── MetaCognition ──────────────────────────────────────────────
+
+
+class MetaCognition:
+    """
+    Self-reflective analysis of the organism's own dream patterns (Spec 13 §4.5).
+
+    Queries the DreamJournal for recurring themes across recent Dreams,
+    clusters them by semantic similarity (Jaccard over theme sets), and
+    promotes high-frequency theme clusters to CONCEPT nodes in Neo4j
+    with is_core_identity=True.  No LLM — pure graph + set arithmetic.
+
+    Runs every lucid stage regardless of whether Simula has mutations.
+    """
+
+    THEME_WINDOW_DAYS: int = 30
+    MIN_CLUSTER_FREQUENCY: int = 3        # themes must appear ≥3 dreams to persist
+    JACCARD_THRESHOLD: float = 0.25       # min overlap to merge theme clusters
+
+    def __init__(self, neo4j: Any) -> None:
+        self._neo4j = neo4j
+        self._logger = logger.bind(worker="meta_cognition")
+
+    async def run(self, sleep_cycle_id: str) -> dict[str, Any]:
+        """Discover recurring theme clusters → CONCEPT nodes. Returns summary dict."""
+        if self._neo4j is None:
+            return {"concepts_discovered": 0, "concepts_promoted": 0}
+
+        try:
+            theme_freq = await self._collect_theme_frequencies()
+            clusters = self._cluster_themes(theme_freq)
+            promoted = await self._promote_concepts(clusters, sleep_cycle_id)
+            self._logger.info(
+                "meta_cognition_complete",
+                theme_count=len(theme_freq),
+                clusters=len(clusters),
+                promoted=promoted,
+            )
+            return {
+                "concepts_discovered": len(clusters),
+                "concepts_promoted": promoted,
+            }
+        except Exception:
+            self._logger.exception("meta_cognition_error")
+            return {"concepts_discovered": 0, "concepts_promoted": 0}
+
+    async def _collect_theme_frequencies(self) -> Counter:
+        """Query recent Dreams for their theme lists."""
+        query = """
+        MATCH (d:Dream)
+        WHERE d.timestamp >= datetime() - duration({days: $days})
+        RETURN d.themes AS themes
+        """
+        try:
+            result = await self._neo4j.execute_read(
+                query, {"days": self.THEME_WINDOW_DAYS}
+            )
+            freq: Counter = Counter()
+            for record in result.records:
+                for theme in (record["themes"] or []):
+                    freq[theme] += 1
+            return freq
+        except Exception:
+            self._logger.exception("meta_cognition_theme_query_error")
+            return Counter()
+
+    def _cluster_themes(self, freq: Counter) -> list[list[str]]:
+        """
+        Greedy Jaccard clustering of co-occurring themes.
+        Returns list of clusters (each a list of related theme strings).
+        """
+        frequent = [t for t, c in freq.items() if c >= self.MIN_CLUSTER_FREQUENCY]
+        if not frequent:
+            return []
+
+        clusters: list[list[str]] = []
+        for theme in sorted(frequent, key=lambda t: -freq[t]):
+            merged = False
+            for cluster in clusters:
+                cluster_set = set(cluster)
+                theme_set = {theme}
+                intersection = len(cluster_set & theme_set)
+                union = len(cluster_set | theme_set)
+                if union > 0 and intersection / union >= self.JACCARD_THRESHOLD:
+                    cluster.append(theme)
+                    merged = True
+                    break
+            if not merged:
+                clusters.append([theme])
+
+        return clusters
+
+    async def _promote_concepts(
+        self, clusters: list[list[str]], sleep_cycle_id: str
+    ) -> int:
+        """MERGE each high-frequency cluster as a CONCEPT node in Neo4j."""
+        promoted = 0
+        for cluster in clusters:
+            primary_theme = cluster[0]
+            concept_id = new_id()
+            query = """
+            MERGE (c:CONCEPT {name: $name})
+            ON CREATE SET
+                c.id = $id,
+                c.is_core_identity = true,
+                c.themes = $themes,
+                c.first_seen_cycle = $cycle_id,
+                c.created_at = datetime()
+            ON MATCH SET
+                c.themes = $themes,
+                c.last_reinforced_cycle = $cycle_id,
+                c.last_reinforced_at = datetime()
+            RETURN c.id
+            """
+            try:
+                await self._neo4j.execute_write(
+                    query,
+                    {
+                        "name": primary_theme,
+                        "id": concept_id,
+                        "themes": cluster,
+                        "cycle_id": sleep_cycle_id,
+                    },
+                )
+                promoted += 1
+            except Exception:
+                self._logger.exception("concept_promote_error", theme=primary_theme)
+        return promoted
+
+
+# ─── DirectedExploration ────────────────────────────────────────
+
+
+class DirectedExploration:
+    """
+    Systematic variation of creative goals and high-coherence dream insights (Spec 13 §4.5).
+
+    Takes either:
+    - A creative_goal string (from OneirosService._creative_goal)
+    - High-coherence DreamInsights (coherence ≥ 0.85) from the last sleep cycle
+
+    Generates systematic variations using 4 operators:
+    1. Domain transfer  — "what if applied to domain X?"
+    2. Negation         — "what's the opposite / inverse?"
+    3. Amplification    — "taken to the extreme?"
+    4. Constraint       — "with resource constraint Y?"
+
+    Stores each variation as a DreamInsight (InsightStatus.PENDING) in Neo4j.
+    No LLM — operator templates applied programmatically.
+    """
+
+    OPERATORS: list[tuple[str, str]] = [
+        ("domain_transfer", "What if '{insight}' applied to domain '{domain}'?"),
+        ("negation", "What is the opposite or inverse of: '{insight}'?"),
+        ("amplification", "Taken to the extreme, '{insight}' implies what?"),
+        ("constraint", "Under tight resource constraints, how does '{insight}' change?"),
+    ]
+    HIGH_COHERENCE_THRESHOLD: float = 0.85
+    MAX_SOURCE_INSIGHTS: int = 5           # cap to avoid combinatorial explosion
+    EXPLORATION_DOMAINS: list[str] = [
+        "memory", "causal", "economic", "social", "temporal", "structural",
+    ]
+
+    def __init__(self, neo4j: Any) -> None:
+        self._neo4j = neo4j
+        self._logger = logger.bind(worker="directed_exploration")
+
+    async def run(
+        self,
+        sleep_cycle_id: str,
+        creative_goal: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate exploration variations. Returns summary dict."""
+        if self._neo4j is None:
+            return {"variations_generated": 0}
+
+        try:
+            sources = await self._gather_sources(sleep_cycle_id, creative_goal)
+            if not sources:
+                return {"variations_generated": 0}
+
+            count = 0
+            for source_text, domain in sources:
+                for operator_name, template in self.OPERATORS:
+                    variation_text = self._apply_operator(
+                        template, source_text, domain
+                    )
+                    await self._store_insight(
+                        variation_text, domain, sleep_cycle_id, operator_name
+                    )
+                    count += 1
+
+            self._logger.info(
+                "directed_exploration_complete",
+                sources=len(sources),
+                variations=count,
+            )
+            return {"variations_generated": count}
+        except Exception:
+            self._logger.exception("directed_exploration_error")
+            return {"variations_generated": 0}
+
+    async def _gather_sources(
+        self, sleep_cycle_id: str, creative_goal: str | None
+    ) -> list[tuple[str, str]]:
+        """Collect (text, domain) tuples from goal + high-coherence insights."""
+        sources: list[tuple[str, str]] = []
+
+        # 1. creative_goal from service
+        if creative_goal:
+            sources.append((creative_goal, "general"))
+
+        # 2. High-coherence DreamInsights from this cycle
+        query = """
+        MATCH (i:DreamInsight {sleep_cycle_id: $cycle_id})
+        WHERE i.coherence_score >= $threshold
+          AND i.status = 'pending'
+        RETURN i.insight_text AS text, i.domain AS domain
+        ORDER BY i.coherence_score DESC
+        LIMIT $limit
+        """
+        try:
+            result = await self._neo4j.execute_read(
+                query,
+                {
+                    "cycle_id": sleep_cycle_id,
+                    "threshold": self.HIGH_COHERENCE_THRESHOLD,
+                    "limit": self.MAX_SOURCE_INSIGHTS,
+                },
+            )
+            for record in result.records:
+                sources.append((record["text"] or "", record["domain"] or "general"))
+        except Exception:
+            self._logger.exception("directed_exploration_source_query_error")
+
+        return sources[: self.MAX_SOURCE_INSIGHTS]
+
+    def _apply_operator(self, template: str, insight: str, domain: str) -> str:
+        """Fill operator template. Picks a random exploration domain if none given."""
+        import random
+        exp_domain = domain if domain != "general" else random.choice(
+            self.EXPLORATION_DOMAINS
+        )
+        return template.format(insight=insight[:200], domain=exp_domain)
+
+    async def _store_insight(
+        self,
+        variation_text: str,
+        domain: str,
+        sleep_cycle_id: str,
+        operator_name: str,
+    ) -> None:
+        """Persist variation as a DreamInsight node in Neo4j."""
+        insight_id = new_id()
+        query = """
+        CREATE (i:DreamInsight {
+            id: $id,
+            dream_id: $dream_id,
+            sleep_cycle_id: $cycle_id,
+            insight_text: $text,
+            domain: $domain,
+            coherence_score: 0.5,
+            status: 'pending',
+            source_operator: $operator,
+            created_at: datetime()
+        })
+        """
+        try:
+            await self._neo4j.execute_write(
+                query,
+                {
+                    "id": insight_id,
+                    "dream_id": "directed_exploration",
+                    "cycle_id": sleep_cycle_id,
+                    "text": variation_text,
+                    "domain": domain,
+                    "operator": operator_name,
+                },
+            )
+        except Exception:
+            self._logger.exception(
+                "directed_exploration_store_error", operator=operator_name
+            )
+
+
 # ─── Constants ──────────────────────────────────────────────────
 
 SCENARIOS_PER_MUTATION: int = 5
@@ -93,7 +384,13 @@ APPLY_THRESHOLD: float = 0.0  # any positive delta is sufficient
 
 class LucidDreamingStage:
     """
-    Lucid Dreaming: controlled simulation of Simula mutation proposals.
+    Lucid Dreaming: controlled simulation of Simula mutation proposals,
+    metacognitive self-reflection, and directed creative exploration (Spec 13 §4.5).
+
+    Always runs:
+    - MetaCognition  — clusters recurring dream themes → CONCEPT nodes
+    - DirectedExploration — generates systematic variations from creative_goal
+                            and high-coherence insights
 
     When Simula has pending mutations:
     1. Fork world model with mutation applied (shadow)
@@ -102,8 +399,6 @@ class LucidDreamingStage:
     4. Compare predictions to produce performance_delta
     5. Check for constitutional violations
     6. Recommend apply or reject
-
-    If no mutations pending, returns empty report immediately.
     """
 
     def __init__(
@@ -112,34 +407,61 @@ class LucidDreamingStage:
         simula: SimulaProtocol | None = None,
         equor: ConstitutionalCheckProtocol | None = None,
         event_bus: EventBus | None = None,
+        neo4j: Any = None,
+        creative_goal: str | None = None,
     ) -> None:
         self._logos = logos
         self._simula = simula
         self._equor = equor
         self._event_bus = event_bus
+        self._creative_goal = creative_goal
         self._logger = logger.bind(stage="lucid_dreaming")
+        self._meta_cognition = MetaCognition(neo4j=neo4j)
+        self._directed_exploration = DirectedExploration(neo4j=neo4j)
 
     async def execute(
         self,
         checkpoint: SleepCheckpoint,
     ) -> LucidDreamingReport:
-        """Execute lucid dreaming: test all pending mutations."""
+        """Execute lucid dreaming: metacognition + directed exploration + mutation testing."""
         t0 = time.monotonic()
 
-        # If no Simula wired or no Logos available, skip entirely
+        # Always run metacognition and directed exploration (Spec 13 §4.5)
+        meta_result = await self._meta_cognition.run(sleep_cycle_id=checkpoint.id)
+        exploration_result = await self._directed_exploration.run(
+            sleep_cycle_id=checkpoint.id,
+            creative_goal=self._creative_goal,
+        )
+
+        # Mutation testing requires both Simula and Logos
         if self._simula is None:
-            self._logger.info("no_simula_available", note="skipping_lucid_dreaming")
-            return LucidDreamingReport()
+            self._logger.info("no_simula_available", note="skipping_mutation_testing")
+            elapsed = (time.monotonic() - t0) * 1000
+            return LucidDreamingReport(
+                concepts_discovered=meta_result.get("concepts_discovered", 0),
+                variations_generated=exploration_result.get("variations_generated", 0),
+                duration_ms=elapsed,
+            )
 
         if self._logos is None:
-            self._logger.info("no_logos_available", note="skipping_lucid_dreaming")
-            return LucidDreamingReport()
+            self._logger.info("no_logos_available", note="skipping_mutation_testing")
+            elapsed = (time.monotonic() - t0) * 1000
+            return LucidDreamingReport(
+                concepts_discovered=meta_result.get("concepts_discovered", 0),
+                variations_generated=exploration_result.get("variations_generated", 0),
+                duration_ms=elapsed,
+            )
 
         # Get pending mutations
         mutations = await self._simula.get_pending_mutations()
         if not mutations:
-            self._logger.info("no_pending_mutations", note="skipping_lucid_dreaming")
-            return LucidDreamingReport()
+            self._logger.info("no_pending_mutations", note="skipping_mutation_testing")
+            elapsed = (time.monotonic() - t0) * 1000
+            return LucidDreamingReport(
+                concepts_discovered=meta_result.get("concepts_discovered", 0),
+                variations_generated=exploration_result.get("variations_generated", 0),
+                duration_ms=elapsed,
+            )
 
         self._logger.info(
             "lucid_dreaming_starting",
@@ -194,6 +516,8 @@ class LucidDreamingStage:
             mutations_recommended_reject=reject_count,
             constitutional_violations_found=violation_count,
             reports=reports,
+            concepts_discovered=meta_result.get("concepts_discovered", 0),
+            variations_generated=exploration_result.get("variations_generated", 0),
             duration_ms=elapsed,
         )
 
@@ -203,6 +527,8 @@ class LucidDreamingStage:
             apply=apply_count,
             reject=reject_count,
             violations=violation_count,
+            concepts_discovered=report.concepts_discovered,
+            variations_generated=report.variations_generated,
             elapsed_ms=round(elapsed, 1),
         )
 
@@ -289,7 +615,7 @@ class LucidDreamingStage:
                     prior.mean += value
 
         elif mutation_type == "schema_addition":
-            from systems.logos.types import GenerativeSchema
+            from primitives.logos import GenerativeSchema
 
             schema = GenerativeSchema(
                 name=target,
@@ -345,7 +671,7 @@ class LucidDreamingStage:
         )
 
         if self._logos is not None:
-            schemas = self._logos.world_model.generative_schemas
+            schemas = self._logos.get_generative_schemas()
             domain_schemas = [
                 (sid, s) for sid, s in schemas.items()
                 if getattr(s, "domain", "") == domain

@@ -189,7 +189,7 @@ class ProcedureExtractor:
         episodes: list[Episode] = []
         try:
             for ep_id in episode_ids[:_MAX_EXAMPLES]:
-                results = await self._memory._neo4j.execute_read(
+                results = await self._memory.execute_read(
                     """
                     MATCH (e:Episode {id: $id})
                     RETURN e
@@ -210,7 +210,7 @@ class ProcedureExtractor:
             return
         try:
             steps_json = json.dumps([s.model_dump() for s in procedure.steps])
-            await self._memory._neo4j.execute_write(
+            await self._memory.execute_write(
                 """
                 MERGE (p:Procedure {id: $id})
                 SET p.name = $name,

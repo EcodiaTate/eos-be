@@ -533,6 +533,15 @@ class DecisionRecord(EOSBaseModel):
     tournament_id: str | None = None
     tournament_hypothesis_id: str | None = None
 
+    # RE training pipeline metadata (Spec §21)
+    # re_training_eligible: True when this record has a meaningful outcome
+    # signal (slow path with equor verdict). Gated to avoid poisoning the
+    # training queue with fast-path or budget-exhausted noise.
+    re_training_eligible: bool = False
+    # model_used: "claude" | "re" — which model generated the slow-path
+    # policies. "claude" until Thompson sampling routes to RE.
+    model_used: str = "claude"
+
 
 # ─── Counterfactual Record ────────────────────────────────────────
 

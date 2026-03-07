@@ -284,7 +284,7 @@ class ProcedureCodifier:
 
         try:
             steps_json = json.dumps([s.model_dump() for s in procedure.steps])
-            await self._memory._neo4j.execute_write(
+            await self._memory.execute_write(
                 """
                 MERGE (p:Procedure {id: $id})
                 SET p.name = $name,
@@ -317,7 +317,7 @@ class ProcedureCodifier:
                 if not episode_id:
                     continue
                 try:
-                    await self._memory._neo4j.execute_write(
+                    await self._memory.execute_write(
                         """
                         MATCH (p:Procedure {id: $proc_id})
                         MATCH (e:Episode {id: $ep_id})

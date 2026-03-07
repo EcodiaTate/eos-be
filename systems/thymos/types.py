@@ -18,33 +18,14 @@ from typing import Any
 from pydantic import Field
 
 from primitives.common import EOSBaseModel, new_id, utc_now
+from primitives.incident import IncidentClass, IncidentSeverity
 
 # ─── Enums ────────────────────────────────────────────────────────
 
-
-class IncidentSeverity(enum.StrEnum):
-    """How bad is it?"""
-
-    CRITICAL = "critical"  # System down, user impact, drives affected
-    HIGH = "high"  # System degraded, partial user impact
-    MEDIUM = "medium"  # Anomaly detected, no immediate user impact
-    LOW = "low"  # Cosmetic, informational, or transient
-    INFO = "info"  # Normal variance logged for pattern detection
-
-
-class IncidentClass(enum.StrEnum):
-    """What kind of failure is this?"""
-
-    CRASH = "crash"  # Unhandled exception, system death
-    DEGRADATION = "degradation"  # Slow or incorrect responses
-    CONTRACT_VIOLATION = "contract_violation"  # Inter-system SLA breach
-    LOOP_SEVERANCE = "loop_severance"  # Feedback loop not transmitting
-    DRIFT = "drift"  # Gradual metric deviation from baseline
-    PREDICTION_FAILURE = "prediction_failure"  # Active inference errors elevated
-    RESOURCE_EXHAUSTION = "resource_exhaustion"  # Budget exceeded
-    COGNITIVE_STALL = "cognitive_stall"  # Workspace cycle blocked or empty
-    ECONOMIC_THREAT = "economic_threat"  # Malicious on-chain activity detected
-    PROTOCOL_DEGRADATION = "protocol_degradation"  # DeFi protocol health declining
+# IncidentClass and IncidentSeverity are canonical primitives imported above.
+# They are re-exported here for backwards compatibility with existing thymos
+# internal code that does `from systems.thymos.types import IncidentClass`.
+__all__ = ["IncidentClass", "IncidentSeverity"]
 
 
 class RepairTier(int, enum.Enum):

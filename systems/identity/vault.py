@@ -22,6 +22,7 @@ Thread-safety: NOT thread-safe. Single-threaded asyncio like all EOS.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import secrets
 from typing import TYPE_CHECKING, Any
@@ -36,9 +37,13 @@ from pydantic import Field
 from primitives.common import EOSBaseModel, Identified, Timestamped, utc_now
 
 if TYPE_CHECKING:
-
     from systems.synapse.event_bus import EventBus
+    from systems.synapse.types import SynapseEvent, SynapseEventType
+
 logger = structlog.get_logger("identity.vault")
+
+# Vault ID used in event payloads when no per-instance ID is defined
+_VAULT_SINGLETON_ID = "identity_vault"
 
 
 # ─── Sealed Envelope (encrypted-at-rest container) ───────────────────────
@@ -80,6 +85,28 @@ class VaultConfig(EOSBaseModel):
 
     salt_bytes: int = Field(default=16, ge=16)
     """Salt length in bytes. 16 = 128-bit, matching Fernet's AES-128."""
+
+
+# ─── Vault Event (Synapse payload model) ────────────────────────────────
+
+
+class VaultEvent(EOSBaseModel):
+    """Structured payload for vault Synapse events."""
+
+    event_type: str
+    """One of: decrypt_failure | key_rotation_started | key_rotation_complete | key_rotation_failed"""
+
+    timestamp: datetime
+    """UTC time the event occurred."""
+
+    vault_id: str
+    """Identifier of the vault instance."""
+
+    error_type: str = ""
+    """For decrypt_failure: key_mismatch | tampered | unknown. Empty for rotation events."""
+
+    severity: str = "medium"
+    """low | medium | high | critical"""
 
 
 # ─── The Vault ──────────────────────────────────────────────────────────
@@ -131,6 +158,27 @@ class IdentityVault:
     def set_event_bus(self, event_bus: EventBus) -> None:
         """Wire Synapse event bus for vault lifecycle events."""
         self._event_bus = event_bus
+
+    # ─── Internal Event Helpers ───────────────────────────────────────
+
+    def _fire_event(self, event_type_name: str, payload: dict[str, Any]) -> None:
+        """Fire-and-forget a Synapse event from a synchronous context."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            event = SynapseEvent(
+                type=SynapseEventType[event_type_name],
+                data=payload,
+                source="identity_vault",
+            )
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self._event_bus.emit(event))
+        except Exception:
+            # Never let event emission crash a crypto operation
+            self._logger.warning("vault_event_emission_failed", event_type=event_type_name)
 
     @property
     def salt(self) -> bytes:
@@ -187,12 +235,30 @@ class IdentityVault:
         """
         try:
             plaintext = self._fernet.decrypt(envelope.ciphertext.encode("ascii"))
-        except InvalidToken:
+        except InvalidToken as exc:
+            # Distinguish key-version mismatch from general tamper/malform
+            error_type = (
+                "key_mismatch"
+                if envelope.key_version != self._key_version
+                else "tampered"
+            )
             self._logger.error(
                 "decrypt_failed",
                 envelope_id=envelope.id,
                 platform_id=envelope.platform_id,
                 purpose=envelope.purpose,
+                error_type=error_type,
+            )
+            self._fire_event(
+                "VAULT_DECRYPT_FAILED",
+                {
+                    "vault_id": _VAULT_SINGLETON_ID,
+                    "envelope_id": envelope.id,
+                    "platform_id": envelope.platform_id,
+                    "error_type": error_type,
+                    "key_version": envelope.key_version,
+                    "error": str(exc) or "InvalidToken",
+                },
             )
             raise
 
@@ -225,42 +291,81 @@ class IdentityVault:
 
         Raises InvalidToken if any envelope cannot be decrypted.
         """
-        # Phase 1: decrypt all under current key
-        plaintexts: list[tuple[SealedEnvelope, bytes]] = []
-        for env in envelopes:
-            pt = self.decrypt(env)
-            plaintexts.append((env, pt))
+        previous_version = self._key_version
 
-        # Phase 2: derive new key
-        salt = new_salt or secrets.token_bytes(self._config.salt_bytes)
-        new_fernet = self._derive_fernet(new_passphrase, salt)
-        new_version = self._key_version + 1
-
-        # Phase 3: re-encrypt
-        rotated: list[SealedEnvelope] = []
-        for old_env, pt in plaintexts:
-            ct = new_fernet.encrypt(pt).decode("ascii")
-            new_env = SealedEnvelope(
-                id=old_env.id,
-                platform_id=old_env.platform_id,
-                purpose=old_env.purpose,
-                ciphertext=ct,
-                key_version=new_version,
-                created_at=old_env.created_at,
-            )
-            rotated.append(new_env)
-
-        # Phase 4: swap to new key
-        self._fernet = new_fernet
-        self._salt = salt
-        self._key_version = new_version
-
-        self._logger.info(
-            "vault_key_rotated",
-            key_version=new_version,
-            envelopes_rotated=len(rotated),
+        self._fire_event(
+            "VAULT_KEY_ROTATION_STARTED",
+            {
+                "vault_id": _VAULT_SINGLETON_ID,
+                "previous_key_version": previous_version,
+                "envelope_count": len(envelopes),
+                "timestamp": utc_now().isoformat(),
+            },
         )
-        return rotated
+
+        try:
+            # Phase 1: decrypt all under current key
+            plaintexts: list[tuple[SealedEnvelope, bytes]] = []
+            for env in envelopes:
+                pt = self.decrypt(env)
+                plaintexts.append((env, pt))
+
+            # Phase 2: derive new key
+            salt = new_salt or secrets.token_bytes(self._config.salt_bytes)
+            new_fernet = self._derive_fernet(new_passphrase, salt)
+            new_version = self._key_version + 1
+
+            # Phase 3: re-encrypt
+            rotated: list[SealedEnvelope] = []
+            for old_env, pt in plaintexts:
+                ct = new_fernet.encrypt(pt).decode("ascii")
+                new_env = SealedEnvelope(
+                    id=old_env.id,
+                    platform_id=old_env.platform_id,
+                    purpose=old_env.purpose,
+                    ciphertext=ct,
+                    key_version=new_version,
+                    created_at=old_env.created_at,
+                )
+                rotated.append(new_env)
+
+            # Phase 4: swap to new key
+            self._fernet = new_fernet
+            self._salt = salt
+            self._key_version = new_version
+
+            self._logger.info(
+                "vault_key_rotated",
+                key_version=new_version,
+                envelopes_rotated=len(rotated),
+            )
+            self._fire_event(
+                "VAULT_KEY_ROTATION_COMPLETE",
+                {
+                    "vault_id": _VAULT_SINGLETON_ID,
+                    "new_key_version": new_version,
+                    "envelopes_rotated": len(rotated),
+                    "timestamp": utc_now().isoformat(),
+                },
+            )
+            return rotated
+
+        except Exception as exc:
+            self._logger.error(
+                "vault_key_rotation_failed",
+                previous_key_version=previous_version,
+                error=str(exc),
+            )
+            self._fire_event(
+                "VAULT_KEY_ROTATION_FAILED",
+                {
+                    "vault_id": _VAULT_SINGLETON_ID,
+                    "previous_key_version": previous_version,
+                    "error": str(exc),
+                    "timestamp": utc_now().isoformat(),
+                },
+            )
+            raise
 
     # ─── Convenience Methods ─────────────────────────────────────────
 

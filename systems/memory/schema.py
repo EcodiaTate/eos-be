@@ -29,6 +29,17 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT projection_basis_id IF NOT EXISTS FOR (pb:ProjectionBasis) REQUIRE pb.id IS UNIQUE",
     "CREATE CONSTRAINT consolidated_belief_id IF NOT EXISTS FOR (cb:ConsolidatedBelief) REQUIRE cb.id IS UNIQUE",
     "CREATE CONSTRAINT tournament_id IF NOT EXISTS FOR (t:HypothesisTournament) REQUIRE t.tournament_id IS UNIQUE",
+
+    # Intent/Outcome node types (RE training — Memory Spec 01 M7/SG3)
+    "CREATE CONSTRAINT intent_id IF NOT EXISTS FOR (i:Intent) REQUIRE i.id IS UNIQUE",
+    "CREATE CONSTRAINT outcome_id IF NOT EXISTS FOR (o:Outcome) REQUIRE o.id IS UNIQUE",
+
+    # CausalNode (Kairos Stream 4)
+    "CREATE CONSTRAINT causal_node_name IF NOT EXISTS FOR (cn:CausalNode) REQUIRE cn.name IS UNIQUE",
+
+    # Experiment/ExperimentResult (Evo Stream 5)
+    "CREATE CONSTRAINT experiment_id IF NOT EXISTS FOR (x:Experiment) REQUIRE x.id IS UNIQUE",
+    "CREATE CONSTRAINT experiment_result_id IF NOT EXISTS FOR (xr:ExperimentResult) REQUIRE xr.id IS UNIQUE",
 ]
 
 # ─── Indexes (performance) ───────────────────────────────────────
@@ -49,6 +60,9 @@ INDEXES = [
 
     # Consolidation
     "CREATE INDEX episode_consolidation IF NOT EXISTS FOR (e:Episode) ON (e.consolidation_level)",
+
+    # RE training enrichment — novelty score index for high-novelty episode queries
+    "CREATE INDEX episode_novelty IF NOT EXISTS FOR (e:Episode) ON (e.novelty_score)",
 
     # Belief half-life — accelerate aging scans and staleness queries
     "CREATE INDEX belief_halflife IF NOT EXISTS FOR (b:Belief) ON (b.half_life_days)",
@@ -71,6 +85,18 @@ INDEXES = [
     # Hypothesis tournaments — Thompson sampling A/B experiments (Evo Phase 2)
     "CREATE INDEX tournament_stage IF NOT EXISTS FOR (t:HypothesisTournament) ON (t.stage)",
     "CREATE INDEX tournament_winner IF NOT EXISTS FOR (t:HypothesisTournament) ON (t.winner_id)",
+
+    # Intent/Outcome — RE training decision/execution records
+    "CREATE INDEX intent_episode IF NOT EXISTS FOR (i:Intent) ON (i.episode_id)",
+    "CREATE INDEX intent_timestamp IF NOT EXISTS FOR (i:Intent) ON (i.timestamp)",
+    "CREATE INDEX outcome_intent IF NOT EXISTS FOR (o:Outcome) ON (o.intent_id)",
+
+    # CausalNode — Kairos causal graph
+    "CREATE INDEX causal_node_domain IF NOT EXISTS FOR (cn:CausalNode) ON (cn.domain)",
+
+    # Experiment — Evo experiment tracking
+    "CREATE INDEX experiment_hypothesis IF NOT EXISTS FOR (x:Experiment) ON (x.hypothesis_id)",
+    "CREATE INDEX experiment_status IF NOT EXISTS FOR (x:Experiment) ON (x.status)",
 ]
 
 # ─── Fulltext Indexes ────────────────────────────────────────────

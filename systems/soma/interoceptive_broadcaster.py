@@ -373,6 +373,8 @@ class InteroceptiveBroadcaster:
     @staticmethod
     def _action_for_urgency(urgency: float) -> InteroceptiveAction:
         """Map urgency to recommended action."""
+        if urgency >= 1.0:
+            return InteroceptiveAction.CEASE_OPERATION
         if urgency >= 0.9:
             return InteroceptiveAction.EMERGENCY_SAFE_MODE
         if urgency >= 0.7:

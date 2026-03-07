@@ -28,6 +28,7 @@ from primitives.common import utc_now
 from systems.identity.connector import (
     AuthorizationRequest,
     AuthorizationResponse,
+    ConnectorHealthReport,
     ConnectorStatus,
     OAuthTokenSet,
     PlatformAuthError,
@@ -120,6 +121,7 @@ class InstagramConnector(PlatformConnector):
         Step 1: POST to the basic display token endpoint for the short-lived token.
         Step 2: GET the long-lived token using the short-lived token + app secret.
         """
+        _t0 = self._start_timer()
         # Step 1: short-lived user access token (valid ~1 hour)
         short_resp = await self._http.post(
             self._client_config.token_url or _IG_SHORT_TOKEN_URL,
@@ -134,6 +136,9 @@ class InstagramConnector(PlatformConnector):
         )
 
         if short_resp.status_code != 200:
+            await self._emit_re_training_example(
+                "exchange_code", "failure", _t0, f"HTTP_{short_resp.status_code}"
+            )
             raise PlatformAuthError(
                 f"Instagram short-lived token exchange failed: {short_resp.status_code}",
                 platform_id=self.platform_id,
@@ -155,6 +160,9 @@ class InstagramConnector(PlatformConnector):
         )
 
         if long_resp.status_code != 200:
+            await self._emit_re_training_example(
+                "exchange_code", "failure", _t0, f"HTTP_{long_resp.status_code}"
+            )
             raise PlatformAuthError(
                 f"Instagram long-lived token exchange failed: {long_resp.status_code}",
                 platform_id=self.platform_id,
@@ -185,6 +193,7 @@ class InstagramConnector(PlatformConnector):
             "connector_authenticated",
             {"platform_id": self.platform_id, "envelope_id": envelope.id},
         )
+        await self._emit_re_training_example("exchange_code", "success", _t0)
         return token_set
 
     async def refresh_token(self) -> TokenRefreshResult:
@@ -202,6 +211,7 @@ class InstagramConnector(PlatformConnector):
         if current is None or not current.access_token:
             return TokenRefreshResult(success=False, error="No access token in vault")
 
+        _t0 = self._start_timer()
         try:
             resp = await self._http.get(
                 _IG_REFRESH_TOKEN_URL,
@@ -214,12 +224,16 @@ class InstagramConnector(PlatformConnector):
             self._credentials.refresh_failure_count += 1
             if self._credentials.refresh_failure_count >= 3:
                 self._credentials.status = ConnectorStatus.REFRESH_FAILED
+            await self._emit_re_training_example("refresh_token", "failure", _t0, type(exc).__name__)
             return TokenRefreshResult(success=False, error=str(exc))
 
         if resp.status_code != 200:
             self._credentials.refresh_failure_count += 1
             if self._credentials.refresh_failure_count >= 3:
                 self._credentials.status = ConnectorStatus.REFRESH_FAILED
+            await self._emit_re_training_example(
+                "refresh_token", "failure", _t0, f"HTTP_{resp.status_code}"
+            )
             return TokenRefreshResult(
                 success=False,
                 error=f"HTTP {resp.status_code}: {resp.text}",
@@ -248,6 +262,7 @@ class InstagramConnector(PlatformConnector):
             "connector_token_refreshed",
             {"platform_id": self.platform_id, "envelope_id": envelope.id},
         )
+        await self._emit_re_training_example("refresh_token", "success", _t0)
         return TokenRefreshResult(success=True, token_set=new_token_set)
 
     async def revoke(self) -> bool:
@@ -260,6 +275,7 @@ class InstagramConnector(PlatformConnector):
         if current is None:
             return True
 
+        _t0 = self._start_timer()
         try:
             resp = await self._http.delete(
                 _IG_REVOKE_URL,
@@ -268,45 +284,71 @@ class InstagramConnector(PlatformConnector):
             success = resp.status_code in (200, 204)
         except httpx.HTTPError as exc:
             self._logger.warning("revoke_failed", platform=self.platform_id, error=str(exc))
+            await self._emit_re_training_example("revoke", "failure", _t0, type(exc).__name__)
             return False
 
         if success and self._credentials is not None:
             self._credentials.status = ConnectorStatus.REVOKED
         await self._emit_event("connector_revoked", {"platform_id": self.platform_id})
+        await self._emit_re_training_example(
+            "revoke", "success" if success else "failure", _t0,
+            "" if success else f"HTTP_{resp.status_code}",
+        )
         return success
 
     # ─── Health ───────────────────────────────────────────────────────
 
-    async def check_health(self) -> bool:
+    async def check_health(self) -> ConnectorHealthReport:
         """
         Verify token validity by fetching the authenticated user's profile.
 
         GET https://graph.instagram.com/me?fields=id,name&access_token=...
 
-        Returns True if the API responds with HTTP 200 and a user id.
+        Updates the consecutive health failure counter and emits SYSTEM_DEGRADED
+        after 3 consecutive failures (via the base class logic).
         """
+        report = self.health_report()
+        _t0 = self._start_timer()
+
         token = await self.get_access_token()
         if not token:
-            return False
+            self._consecutive_health_failures += 1
+            if self._consecutive_health_failures >= 3:
+                await self._emit_degraded()
+            await self._emit_re_training_example("check_health", "failure", _t0, "no_token")
+            return report
 
+        is_healthy = False
+        error_type = ""
         try:
             resp = await self._http.get(
                 _IG_ME_URL,
                 params={"fields": "id,name", "access_token": token},
             )
+            if resp.status_code == 200:
+                data = resp.json()
+                is_healthy = bool(data.get("id"))
+            else:
+                error_type = f"HTTP_{resp.status_code}"
+                self._logger.warning(
+                    "health_check_bad_status",
+                    platform=self.platform_id,
+                    status=resp.status_code,
+                )
         except httpx.HTTPError as exc:
+            error_type = type(exc).__name__
             self._logger.warning("health_check_failed", platform=self.platform_id, error=str(exc))
-            return False
 
-        if resp.status_code != 200:
-            self._logger.warning(
-                "health_check_bad_status",
-                platform=self.platform_id,
-                status=resp.status_code,
-            )
-            return False
+        if is_healthy:
+            self._consecutive_health_failures = 0
+            report.status = ConnectorStatus.ACTIVE
+        else:
+            self._consecutive_health_failures += 1
+            if self._consecutive_health_failures >= 3:
+                await self._emit_degraded()
 
-        data = resp.json()
-        valid = bool(data.get("id"))
-        self._logger.debug("health_check_complete", platform=self.platform_id, valid=valid)
-        return valid
+        await self._emit_re_training_example(
+            "check_health", "success" if is_healthy else "failure", _t0, error_type
+        )
+        self._logger.debug("health_check_complete", platform=self.platform_id, healthy=is_healthy)
+        return report

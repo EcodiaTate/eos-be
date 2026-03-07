@@ -348,8 +348,11 @@ class LocalDockerSpawner:
             "ECODIAOS_NICHE_NAME": child_config.niche.name,
             "ECODIAOS_NICHE_DESCRIPTION": child_config.niche.description,
             # ── Genome inheritance ──
+            "ECODIAOS_ORGANISM_GENOME_ID": child_config.organism_genome_id,
             "ECODIAOS_BELIEF_GENOME_ID": child_config.belief_genome_id,
             "ECODIAOS_SIMULA_GENOME_ID": child_config.simula_genome_id,
+            "ECODIAOS_EQUOR_GENOME_ID": child_config.equor_genome_id,
+            "ECODIAOS_AXON_GENOME_ID": child_config.axon_genome_id,
             "ECODIAOS_GENERATION": str(child_config.generation),
             # ── Server ports (inside the container, always default) ──
             "ECODIAOS_SERVER__PORT": str(_INTERNAL_HTTP_PORT),

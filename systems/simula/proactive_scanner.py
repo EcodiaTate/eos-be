@@ -63,6 +63,7 @@ from systems.simula.evolution_types import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
+    from typing import Any as _Any
 
     from clients.neo4j import Neo4jClient
     from systems.synapse.event_bus import EventBus
@@ -76,6 +77,14 @@ _REPEAT_FAILURE_MIN = 3                  # Min occurrences for REPEAT_FAILURE pa
 _RECURRING_ERROR_MIN = 4                 # Min occurrences for RECURRING_ERROR pattern
 _MAINTENANCE_GOAL_AGE_MINUTES = 30       # Goals older than this are candidates
 _SYSTEM_HEALTHY_QUIESCE_MINUTES = 10     # No failure for this long = system healthy
+
+# Soma urgency thresholds for adaptive scan acceleration.
+# When Soma reports high urgency (organism under allostatic distress), the scanner
+# shortens its interval so repairs are initiated faster.
+_SOMA_URGENCY_HIGH = 0.7      # urgency >= this → use accelerated interval
+_SOMA_URGENCY_CRITICAL = 0.9  # urgency >= this → use minimum interval
+_SCAN_INTERVAL_ACCELERATED_FACTOR = 0.4  # 40% of normal interval
+_SCAN_INTERVAL_CRITICAL_FACTOR = 0.15    # 15% of normal interval
 
 # ── Pattern detection result ──────────────────────────────────────────────────
 
@@ -154,11 +163,19 @@ class ProactiveScanner:
         *,
         scan_interval_s: float | None = None,
         goal_audit_interval_s: float | None = None,
+        sweep_stale_flags_fn: Callable[[], None] | None = None,
+        incident_limit_per_cycle: int = 1000,
+        scan_interval_accelerated_factor: float = 0.4,
+        scan_interval_critical_factor: float = 0.15,
     ) -> None:
         self._neo4j = neo4j
         self._event_bus = event_bus
         self._process = process_proposal_fn
+        # Called once per scan to let service.py clear time-expired flags
+        # (e.g. evo consolidation stall) that only auto-clear inside process_proposal.
+        self._sweep_stale_flags = sweep_stale_flags_fn
         self._log = logger
+        self._shutdown_flag: bool = False  # Graceful shutdown signal
 
         self._scan_interval_s: float = float(
             scan_interval_s
@@ -171,6 +188,9 @@ class ProactiveScanner:
         self._dry_run: bool = (
             os.environ.get("SIMULA_PROACTIVE_DRY_RUN", "false").lower() == "true"
         )
+        self._incident_limit = incident_limit_per_cycle
+        self._scan_interval_accelerated_factor = scan_interval_accelerated_factor
+        self._scan_interval_critical_factor = scan_interval_critical_factor
 
         self.stats = ProactiveScannerStats()
         self.stats.dry_run = self._dry_run
@@ -184,14 +204,65 @@ class ProactiveScanner:
         # GoalAuditor timer state
         self._last_goal_audit_at: datetime | None = None
 
+        # Soma ref for urgency-driven scan acceleration (optional, wired after init)
+        self._soma_ref: Any | None = None
+
+    def set_soma_ref(self, soma: Any) -> None:
+        """Wire SomaService so the scanner can accelerate under allostatic distress."""
+        self._soma_ref = soma
+
     # ─── Main supervision loop ────────────────────────────────────────────────
+
+    def _effective_scan_interval(self) -> float:
+        """
+        Return the scan interval adjusted for Soma urgency.
+
+        Under high allostatic distress the scanner wakes more frequently so
+        repairs are initiated before the organism degrades further:
+          - urgency >= _SOMA_URGENCY_CRITICAL → 15% of base interval
+          - urgency >= _SOMA_URGENCY_HIGH     → 40% of base interval
+          - otherwise                          → base interval (no change)
+        """
+        if self._soma_ref is None:
+            return self._scan_interval_s
+        try:
+            state = self._soma_ref.get_current_state()
+            if state is None:
+                return self._scan_interval_s
+            urgency: float = float(getattr(state, "urgency", 0.0))
+            if urgency >= _SOMA_URGENCY_CRITICAL:
+                interval = self._scan_interval_s * self._scan_interval_critical_factor
+                self._log.debug(
+                    "proactive_scanner_accelerated_critical",
+                    urgency=round(urgency, 3),
+                    interval_s=round(interval, 1),
+                )
+                return interval
+            if urgency >= _SOMA_URGENCY_HIGH:
+                interval = self._scan_interval_s * self._scan_interval_accelerated_factor
+                self._log.debug(
+                    "proactive_scanner_accelerated_high",
+                    urgency=round(urgency, 3),
+                    interval_s=round(interval, 1),
+                )
+                return interval
+        except Exception as exc:
+            self._log.debug("proactive_scanner_soma_urgency_read_failed", error=str(exc))
+        return self._scan_interval_s
+
+    def shutdown(self) -> None:
+        """Signal graceful shutdown; run_forever() loop checks this flag."""
+        self._shutdown_flag = True
+        self._log.info("proactive_scanner_shutdown_signaled")
 
     async def run_forever(self) -> None:
         """
-        Infinite loop: scan every N seconds; audit goals every M seconds.
+        Infinite loop: scan every N seconds (adaptive); audit goals every M seconds.
 
-        Designed to be wrapped in supervised_task() — the outer supervisor
-        handles restarts, so this loop exits cleanly on CancelledError.
+        The scan interval shrinks when Soma reports high urgency so the scanner
+        reacts faster under allostatic distress. Designed to be wrapped in
+        supervised_task() — the outer supervisor handles restarts, so this loop
+        exits cleanly on CancelledError.
         """
         self.stats.scanner_alive = True
         self._log.info(
@@ -199,10 +270,11 @@ class ProactiveScanner:
             interval_s=self._scan_interval_s,
             goal_audit_interval_s=self._goal_audit_interval_s,
             dry_run=self._dry_run,
+            soma_coupled=self._soma_ref is not None,
         )
 
         try:
-            while True:
+            while not self._shutdown_flag:
                 # ProactiveScanner — Task 1
                 await self._run_scan()
 
@@ -216,7 +288,7 @@ class ProactiveScanner:
                     await self._run_goal_audit()
                     self._last_goal_audit_at = utc_now()
 
-                await asyncio.sleep(self._scan_interval_s)
+                await asyncio.sleep(self._effective_scan_interval())
         except asyncio.CancelledError:
             self.stats.scanner_alive = False
             self._log.info("proactive_scanner_stopped")
@@ -241,6 +313,14 @@ class ProactiveScanner:
 
     async def _run_scan(self) -> None:
         """Single scan cycle — detect patterns, generate proposals."""
+        # Sweep time-expired flags (e.g. evo stall) so they don't persist
+        # indefinitely when no evo proposals are arriving to trigger auto-clear.
+        if self._sweep_stale_flags is not None:
+            try:
+                self._sweep_stale_flags()
+            except Exception as exc:
+                self._log.debug("proactive_scanner_sweep_flags_failed", error=str(exc))
+
         if self._neo4j is None:
             self._log.warning("proactive_scanner_no_neo4j_skipping")
             return
@@ -251,6 +331,17 @@ class ProactiveScanner:
             return
 
         patterns = self._detect_patterns(incidents)
+
+        # Limit proposals per scan to prevent batch overload (Corpus E #108)
+        # Limit is tunable via SimulaConfig.proactive_scan_incident_limit_per_cycle
+        if len(patterns) > self._incident_limit:
+            self._log.warning(
+                "proactive_scanner_pattern_limit_exceeded",
+                detected=len(patterns),
+                limit=self._incident_limit,
+                truncated=len(patterns) - self._incident_limit,
+            )
+            patterns = patterns[:self._incident_limit]
 
         proposals_generated = 0
         proposals_approved = 0
@@ -311,6 +402,85 @@ class ProactiveScanner:
                 # Remove from cache so it can be retried next scan
                 async with self._pattern_proposal_lock:
                     self._proposed_patterns.discard(pattern_key)
+
+        # ── Corpus 14 §9: Autonomous drive coupling ───────────────────────────
+        # If Soma reports allostatic_load > 0.7 or coherence < 0.3, the organism
+        # is in constitutional distress. Generate a proactive repair proposal
+        # without waiting for Thymos incidents to accumulate.
+        if self._soma_ref is not None and not self._dry_run:
+            try:
+                soma_state = self._soma_ref.get_current_state()
+                if soma_state is not None:
+                    allostatic_load: float = float(
+                        getattr(soma_state, "allostatic_load", 0.0)
+                    )
+                    coherence: float = float(
+                        getattr(soma_state, "coherence", 1.0)
+                    )
+                    _drive_crisis = allostatic_load > 0.7 or coherence < 0.3
+                    _drive_key = f"drive_crisis:{round(allostatic_load, 1)}:{round(coherence, 1)}"
+
+                    async with self._pattern_proposal_lock:
+                        _already_proposed = _drive_key in self._proposed_patterns
+
+                    if _drive_crisis and not _already_proposed:
+                        _crisis_desc = (
+                            f"Autonomous repair: organism in constitutional distress "
+                            f"(allostatic_load={allostatic_load:.2f}, coherence={coherence:.2f}). "
+                            f"Reduce error accumulation and restore homeostatic baseline."
+                        )
+                        _crisis_proposal = EvolutionProposal(
+                            id=new_id(),
+                            source="simula_drive_coupling",
+                            category=ChangeCategory.ADD_SYSTEM_CAPABILITY,
+                            description=_crisis_desc[:500],
+                            change_spec=ChangeSpec(
+                                capability_description=_crisis_desc,
+                                affected_systems=["soma"],
+                                additional_context=(
+                                    f"Drive coupling trigger: allostatic_load={allostatic_load:.3f}, "
+                                    f"coherence={coherence:.3f}. Thresholds: load>0.7 or coherence<0.3."
+                                ),
+                            ),
+                            evidence=[f"soma_state:{allostatic_load:.3f}:{coherence:.3f}"],
+                            expected_benefit=(
+                                "Reduce allostatic load and restore coherence drive toward ≥0.3, "
+                                "preventing constitutional misalignment cascade."
+                            ),
+                            risk_assessment=(
+                                "Drive-coupled autonomous repair. Organism is in distress — "
+                                "delay cost exceeds intervention risk."
+                            ),
+                        )
+                        async with self._pattern_proposal_lock:
+                            self._proposed_patterns.add(_drive_key)
+
+                        self._log.warning(
+                            "proactive_scanner_drive_crisis_proposal",
+                            allostatic_load=round(allostatic_load, 3),
+                            coherence=round(coherence, 3),
+                            proposal_id=_crisis_proposal.id,
+                        )
+                        try:
+                            _crisis_result = await self._process(_crisis_proposal)
+                            proposals_generated += 1
+                            if _crisis_result.status == ProposalStatus.APPLIED:
+                                proposals_applied += 1
+                                proposals_approved += 1
+                            elif _crisis_result.status in (
+                                ProposalStatus.APPROVED,
+                                ProposalStatus.AWAITING_GOVERNANCE,
+                            ):
+                                proposals_approved += 1
+                        except Exception as _crisis_exc:
+                            self._log.warning(
+                                "proactive_scanner_drive_crisis_proposal_failed",
+                                error=str(_crisis_exc),
+                            )
+                            async with self._pattern_proposal_lock:
+                                self._proposed_patterns.discard(_drive_key)
+            except Exception as _soma_exc:
+                self._log.debug("proactive_scanner_soma_check_failed", error=str(_soma_exc))
 
         # Prune the pattern cache to avoid unbounded growth
         # (keep only the 200 most recent patterns)
@@ -659,28 +829,27 @@ class ProactiveScanner:
             import hashlib
 
             from systems.synapse.types import SynapseEvent, SynapseEventType
-            from systems.thymos.types import Incident, IncidentClass, IncidentSeverity
 
-            incident = Incident(
-                incident_class=IncidentClass.CRASH,
-                severity=IncidentSeverity.HIGH,
-                fingerprint=hashlib.md5(
+            incident_data = {
+                "incident_class": "crash",
+                "severity": "high",
+                "fingerprint": hashlib.md5(
                     f"proactive_scanner_{error_type}".encode()
                 ).hexdigest(),
-                source_system="simula",
-                error_type=error_type,
-                error_message=error_message,
-                context={"component": "proactive_scanner"},
-                affected_systems=["simula"],
-                blast_radius=0.5,
-                user_visible=False,
-            )
+                "source_system": "simula",
+                "error_type": error_type,
+                "error_message": error_message,
+                "context": {"component": "proactive_scanner"},
+                "affected_systems": ["simula"],
+                "blast_radius": 0.5,
+                "user_visible": False,
+            }
 
             await self._event_bus.emit(
                 SynapseEvent(
                     event_type=SynapseEventType.SYSTEM_FAILED,
                     source_system="simula",
-                    data={"incident": incident.model_dump()},
+                    data={"incident": incident_data},
                 )
             )
             self._log.debug(

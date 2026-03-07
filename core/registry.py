@@ -34,6 +34,7 @@ from core.wiring import (
     wire_federation_phase,
     wire_financial_memory,
     wire_intelligence_loops,
+    wire_mitosis_phase,
     wire_oikos_phase,
     wire_soma_phase,
     wire_synapse_phase,
@@ -126,7 +127,12 @@ class SystemRegistry:
         voxis = await self._init_voxis(config, infra, memory)
         app.state.voxis = voxis
 
-        nova = await self._init_nova(config, infra, memory, equor, voxis)
+        re_service = await self._init_reasoning_engine()
+        app.state.reasoning_engine = re_service
+        if re_service is not None and infra.neo4j is not None:
+            re_service.set_neo4j(infra.neo4j)
+
+        nova = await self._init_nova(config, infra, memory, equor, voxis, re_service)
         app.state.nova = nova
 
         axon = await self._init_axon(config, infra, memory, voxis)
@@ -134,6 +140,8 @@ class SystemRegistry:
 
         # EIS → Metrics wiring
         eis.set_metrics(infra.metrics)
+        # EIS → Neo4j audit trail (Spec 25 §11 — immutable forensic log)
+        eis.set_neo4j(infra.neo4j)
 
         # Start Atune (deferred until memory wired)
         atune.set_memory_service(memory)
@@ -214,6 +222,10 @@ class SystemRegistry:
         for system in [memory, equor, voxis, nova, axon, evo, thread, logos]:
             synapse.register_system(system)
 
+        # Wire Synapse into RE service so it can emit RE_ENGINE_STATUS_CHANGED
+        if re_service is not None:
+            re_service.set_synapse(synapse)
+
         wire_synapse_phase(
             synapse=synapse,
             neuroplasticity_bus=infra.neuroplasticity_bus,
@@ -228,6 +240,7 @@ class SystemRegistry:
             sacm_client=sacm_parts["sacm_client"],
             axon=axon,
             nova=nova,
+            voxis=voxis,
             llm_client=infra.llm,
             config=config,
         )
@@ -304,6 +317,15 @@ class SystemRegistry:
         await telos.start()
         logger.info("telos_computation_loop_started", logos_wired=True, fovea_wired=True)
 
+        # Wire organism self-knowledge into Simula so the code agent has full context
+        # during repair: log health signals, Soma allostatic state, Fovea attention.
+        if hasattr(simula, "set_log_analyzer"):
+            simula.set_log_analyzer(app.state.log_analyzer)
+        if hasattr(simula, "set_soma_ref"):
+            simula.set_soma_ref(soma)
+        if hasattr(simula, "set_fovea_ref"):
+            simula.set_fovea_ref(fovea)
+
         # ── Phase 9: Federation + Economic Layer ──────────────
         federation = await self._init_federation(config, infra, memory, equor)
         app.state.federation = federation
@@ -358,9 +380,69 @@ class SystemRegistry:
             sacm_prewarm_engine=sacm_parts["sacm_prewarm_engine"],
         )
 
+        # Build AdapterSharer for cross-instance LoRA merging (Share 2025 framework).
+        # Requires GenomeDistanceCalculator, STABLEKLGate, and ReasoningEngineService.
+        # All three may not be available at this phase; construction is best-effort.
+        _adapter_sharer = None
+        try:
+            from systems.mitosis.genome_distance import GenomeDistanceCalculator
+            from systems.reasoning_engine.adapter_sharing import AdapterSharer
+            from systems.reasoning_engine.anti_forgetting import STABLEKLGate
+
+            _speciation_threshold = getattr(
+                getattr(config, "mitosis", None),
+                "mitosis_speciation_distance_threshold",
+                0.3,
+            )
+            _genome_calc = GenomeDistanceCalculator(
+                speciation_threshold=_speciation_threshold,
+            )
+            _kl_gate = STABLEKLGate()
+            if re_service is not None:
+                _adapter_sharer = AdapterSharer(
+                    genome_calculator=_genome_calc,
+                    kl_gate=_kl_gate,
+                    re_service=re_service,
+                    event_bus=synapse.event_bus,
+                )
+                app.state.adapter_sharer = _adapter_sharer
+                logger.info("adapter_sharer_constructed")
+            else:
+                logger.info(
+                    "adapter_sharer_skipped",
+                    reason="RE service not available",
+                )
+        except Exception as _as_exc:
+            logger.warning("adapter_sharer_construction_failed", error=str(_as_exc))
+
+        # get_adapter_path_fn: deferred lambda — CLO is initialised in Phase 11 which
+        # runs after wire_mitosis_phase. The lambda reads app.state at call time.
+        # _reproductive_fitness_loop first fires ≥1h after startup, so CLO is always
+        # ready before the first actual invocation.
+        def _get_adapter_path() -> str:
+            clo = getattr(app.state, "continual_learning", None)
+            if clo is None:
+                return ""
+            sure = getattr(clo, "_sure", None)
+            if sure is None:
+                return ""
+            return getattr(sure, "production_adapter_path", "") or ""
+
+        wire_mitosis_phase(
+            oikos=oikos,
+            axon=axon,
+            evo=evo,
+            simula=simula,
+            equor=equor,
+            telos=telos,
+            adapter_sharer=_adapter_sharer,
+            get_adapter_path_fn=_get_adapter_path if _adapter_sharer is not None else None,
+        )
+
         # ── Phase 10: Alive WebSocket ────────────────────────
         alive_ws = await self._init_alive_ws(
-            config, infra, soma, atune, synapse, telos, thymos, nova, axon, oikos, simula
+            config, infra, soma, synapse, telos, thymos, nova, axon, oikos, simula,
+            kairos=kairos, logos=logos, oneiros=oneiros,
         )
         app.state.alive_ws = alive_ws
 
@@ -369,6 +451,9 @@ class SystemRegistry:
 
         # Skia
         await self._init_skia(config, infra, synapse, app)
+
+        # Functional self-model (§8.6) — wired after Skia so VitalityCoordinator exists
+        self._init_self_model(config, memory, synapse, app)
 
         # Platform connectors
         await self._init_connectors(config, infra, synapse, app)
@@ -400,6 +485,9 @@ class SystemRegistry:
                 federation=federation,
                 equor=equor,
                 thread=thread,
+                soma=soma,
+                fovea=fovea,
+                log_analyzer=app.state.log_analyzer,
             ),
             name="inner_life_generator",
             restart=True,
@@ -444,8 +532,193 @@ class SystemRegistry:
             source_system="telemetry",
         )
 
+        # RE Training Exporter — collects RE_TRAINING_EXAMPLE events from all
+        # systems and ships hourly batches to S3 + Neo4j for CLoRA fine-tuning.
+        from core.re_training_exporter import RETrainingExporter
+
+        re_exporter = RETrainingExporter(
+            event_bus=synapse.event_bus,
+            neo4j=infra.neo4j,
+            redis=infra.redis,
+        )
+        re_exporter.attach()
+        app.state.re_exporter = re_exporter
+
+        self._tasks["re_training_export"] = supervised_task(
+            re_exporter.run_loop(),
+            name="re_training_export",
+            restart=True,
+            max_restarts=5,
+            event_bus=synapse.event_bus,
+            source_system="re_training_exporter",
+        )
+        logger.info("re_training_exporter_started", interval_s=3600)
+
+        # Continual Learning Orchestrator — extract → format → train → deploy
+        # Tier 2 incremental LoRA training; daily trigger check.
+        if re_service is not None and infra.neo4j is not None:
+            try:
+                from systems.reasoning_engine.continual_learning import ContinualLearningOrchestrator
+                from systems.reasoning_engine.training_data_extractor import TrainingDataExtractor
+
+                _cl_extractor = TrainingDataExtractor(neo4j=infra.neo4j)
+                _cl_orchestrator = ContinualLearningOrchestrator(
+                    re_service=re_service,
+                    extractor=_cl_extractor,
+                )
+                _cl_orchestrator.set_redis(infra.redis)
+                _cl_orchestrator.set_event_bus(synapse.event_bus)
+                await _cl_orchestrator.initialize()
+                app.state.continual_learning = _cl_orchestrator
+
+                # Daily trigger check — runs once per day via supervised_task loop
+                async def _daily_train_check() -> None:
+                    import asyncio as _asyncio
+                    while True:
+                        await _asyncio.sleep(86400)  # 24 hours
+                        await _cl_orchestrator.check_and_train()
+
+                self._tasks["continual_learning"] = supervised_task(
+                    _daily_train_check(),
+                    name="continual_learning",
+                    restart=True,
+                    max_restarts=10,
+                    event_bus=synapse.event_bus,
+                    source_system="reasoning_engine",
+                )
+                logger.info("continual_learning_orchestrator_started", interval_s=86400)
+            except Exception as _cl_exc:
+                logger.warning(
+                    "continual_learning_init_failed",
+                    error=str(_cl_exc),
+                    note="Continual learning disabled; organism continues without self-training",
+                )
+        else:
+            logger.info(
+                "continual_learning_skipped",
+                reason="RE service not available or Neo4j not connected",
+            )
+
+        # Tier 3 quarterly cron — fires independently of data volume.
+        # Checks every 7 days whether 90 days have elapsed since last Tier 3.
+        # Decouples Tier 3 from the should_train() data-volume gate.
+        if re_service is not None and infra.neo4j is not None:
+            try:
+                async def _run_tier3_cron() -> None:
+                    import asyncio as _asyncio
+                    _check_interval = 7 * 24 * 3600  # Check weekly
+                    while True:
+                        await _asyncio.sleep(_check_interval)
+                        try:
+                            clo = app.state.continual_learning
+                            if clo is None or clo._tier3 is None:
+                                continue
+                            ready, reason = await clo._tier3.should_run_tier3()
+                            if ready:
+                                logger.info("tier3_cron.triggered", reason=reason)
+                                cumulative = await clo._build_cumulative_dataset()
+                                slow_path = clo._sure.production_adapter_path
+                                await clo._tier3.run_tier3(cumulative, slow_path)
+                        except Exception as _t3_inner_exc:
+                            logger.error("tier3_cron.failed", error=str(_t3_inner_exc))
+
+                self._tasks["tier3_quarterly_cron"] = supervised_task(
+                    _run_tier3_cron(),
+                    name="tier3_quarterly_cron",
+                    restart=True,
+                    max_restarts=12,
+                    event_bus=synapse.event_bus,
+                    source_system="reasoning_engine",
+                )
+                logger.info("tier3_quarterly_cron_started", check_interval_days=7)
+            except Exception as _t3_exc:
+                logger.warning(
+                    "tier3_quarterly_cron_init_failed",
+                    error=str(_t3_exc),
+                    note="Tier 3 cron disabled; quarterly retrain will only fire via should_train()",
+                )
+
+        # Red-team monthly evaluation — Tier 2 kill switch check (Bible §7.3).
+        # Runs every 30 days regardless of whether continual learning is active.
+        # Never crashes the organism on failure; non-fatal throughout.
+        if re_service is not None:
+            try:
+                from systems.reasoning_engine.safety import RedTeamEvaluator
+
+                _red_team_evaluator = RedTeamEvaluator()
+                app.state.red_team_evaluator = _red_team_evaluator
+
+                async def _run_monthly_red_team() -> None:
+                    import asyncio as _asyncio
+                    _interval = 30 * 24 * 3600  # 30 days
+                    while True:
+                        await _asyncio.sleep(_interval)
+                        try:
+                            _re = app.state.reasoning_engine
+                            _bus = synapse.event_bus
+                            triggered = await _red_team_evaluator.check_kill_switch(
+                                re_service=_re,
+                                event_bus=_bus,
+                                equor_service=equor,
+                            )
+                            logger.info(
+                                "red_team.monthly_complete",
+                                kill_switch_triggered=triggered,
+                            )
+                            # Halt continual learning training (not the organism)
+                            if triggered and hasattr(app.state, "continual_learning"):
+                                app.state.continual_learning._training_halted = True
+                                logger.critical(
+                                    "red_team.kill_switch_halted_training",
+                                    note="Continual learning training halted; organism continues",
+                                )
+                        except Exception as _rt_inner_exc:
+                            logger.error(
+                                "red_team.monthly_failed", error=str(_rt_inner_exc)
+                            )
+
+                self._tasks["red_team_monthly"] = supervised_task(
+                    _run_monthly_red_team(),
+                    name="red_team_monthly",
+                    restart=True,
+                    max_restarts=5,
+                    event_bus=synapse.event_bus,
+                    source_system="reasoning_engine",
+                )
+                logger.info("red_team_evaluator_started", interval_days=30)
+            except Exception as _rt_exc:
+                logger.warning(
+                    "red_team_evaluator_init_failed",
+                    error=str(_rt_exc),
+                    note="Red-team evaluator disabled; organism continues without monthly safety eval",
+                )
+        else:
+            logger.info(
+                "red_team_evaluator_skipped",
+                reason="RE service not available",
+            )
+
         # Benchmarks
-        await self._init_benchmarks(config, infra, nova, evo, oikos, simula, synapse, alive_ws, app)
+        await self._init_benchmarks(
+            config, infra, nova, evo, oikos, simula, synapse, alive_ws, app,
+            telos=telos, logos=logos, memory=memory, re_service=re_service,
+        )
+
+        # ── Observatory — Diagnostic Observability ─────────────
+        from observatory.tracer import EventTracer
+        from observatory.closure_tracker import ClosureLoopTracker
+        from observatory.spec_checker import SpecComplianceChecker
+
+        obs_tracer = EventTracer()
+        obs_tracer.attach(synapse.event_bus)
+        app.state.observatory_tracer = obs_tracer
+
+        obs_closures = ClosureLoopTracker()
+        obs_closures.attach(synapse.event_bus)
+        app.state.observatory_closures = obs_closures
+
+        app.state.observatory_spec_checker = SpecComplianceChecker(obs_tracer)
+        logger.info("observatory_attached")
 
         logger.info(
             "ecodiaos_ready",
@@ -573,7 +846,6 @@ class SystemRegistry:
         )
         logos = LogosService(config=logos_config)
         await logos.initialize()
-        logos.set_memory(memory)
         return logos
 
     async def _init_equor(self, config: Any, infra: InfraClients, logos: Any) -> Any:
@@ -592,7 +864,7 @@ class SystemRegistry:
         return equor
 
     def _init_atune(self, config: Any, infra: InfraClients, memory: Any) -> Any:
-        from systems.atune.service import AtuneConfig, AtuneService
+        from systems.fovea.gateway import AtuneConfig, AtuneService
 
         atune_config = AtuneConfig(
             workspace_buffer_size=getattr(config, "atune_workspace_buffer_size", 32),
@@ -711,10 +983,44 @@ class SystemRegistry:
         await voxis.initialize()
         return voxis
 
+    async def _init_reasoning_engine(self) -> Any:
+        """
+        Initialize the local Reasoning Engine (vLLM wrapper).
+
+        Completely optional — if vLLM is not running or ECODIAOS_RE_ENABLED=false,
+        returns None and the organism operates in Claude-only mode.
+        """
+        import os
+
+        if os.environ.get("ECODIAOS_RE_ENABLED", "true").lower() in {"false", "0", "no"}:
+            logger.info("reasoning_engine_disabled")
+            return None
+
+        try:
+            from systems.reasoning_engine.service import ReasoningEngineService
+
+            re_service = ReasoningEngineService()
+            await re_service.initialize()
+            return re_service
+        except Exception as exc:
+            logger.warning(
+                "reasoning_engine_init_failed",
+                error=str(exc),
+                note="Continuing in Claude-only mode",
+            )
+            return None
+
     async def _init_nova(
-        self, config: Any, infra: InfraClients, memory: Any, equor: Any, voxis: Any
+        self,
+        config: Any,
+        infra: InfraClients,
+        memory: Any,
+        equor: Any,
+        voxis: Any,
+        re_service: Any = None,
     ) -> Any:
         from systems.nova.service import NovaService
+        from systems.nova.policy_generator import PolicyGenerator, ThompsonSampler
 
         try:
             nova = NovaService(
@@ -727,6 +1033,24 @@ class SystemRegistry:
             )
             await nova.initialize()
             nova.set_embed_fn(infra.embedding.embed)
+
+            # Wire RE client into PolicyGenerator if available
+            if re_service is not None and re_service.is_available:
+                policy_gen = nova._policy_generator  # type: ignore[attr-defined]
+                if isinstance(policy_gen, PolicyGenerator):
+                    policy_gen._re_client = re_service
+                    policy_gen._sampler.set_re_ready(True)
+                    logger.info(
+                        "nova_re_wired",
+                        model=re_service._model,
+                        url=re_service._url,
+                    )
+            else:
+                logger.info(
+                    "nova_re_disabled",
+                    reason="RE not available or disabled — Claude-only mode",
+                )
+
             return nova
         except Exception as exc:
             logger.error("nova_init_failed", error=str(exc), exc_info=True)
@@ -772,6 +1096,7 @@ class SystemRegistry:
             instance_name=config.instance_id,
             neuroplasticity_bus=infra.neuroplasticity_bus,
         )
+        thread.set_neo4j(infra.neo4j)
         await thread.initialize()
         return thread
 
@@ -929,6 +1254,9 @@ class SystemRegistry:
         kairos.set_event_bus(synapse.event_bus)
         kairos.set_logos(logos)
         oneiros.set_kairos(kairos)
+        # Start the periodic pipeline loop — this is what makes events actually fire.
+        # run_pipeline() is never called on inbound events alone; the loop is required.
+        kairos.start_pipeline_loop()
         return kairos
 
     async def _init_soma(
@@ -1144,7 +1472,6 @@ class SystemRegistry:
         config: Any,
         infra: InfraClients,
         soma: Any,
-        atune: Any,
         synapse: Any,
         telos: Any,
         thymos: Any,
@@ -1152,8 +1479,17 @@ class SystemRegistry:
         axon: Any,
         oikos: Any,
         simula: Any,
+        *,
+        atune: Any = None,
+        kairos: Any = None,
+        logos: Any = None,
+        oneiros: Any = None,
     ) -> Any:
         from systems.alive.ws_server import AliveWebSocketServer
+
+        # Auth tokens from config (set → auth enforced; empty/absent → open mode)
+        raw_tokens: list[str] = getattr(getattr(config, "alive_ws", None), "auth_tokens", []) or []
+        auth_tokens: set[str] = set(raw_tokens)
 
         alive_ws = AliveWebSocketServer(
             redis=infra.redis,
@@ -1166,7 +1502,11 @@ class SystemRegistry:
             axon=axon,
             oikos=oikos,
             simula=simula,
+            kairos=kairos,
+            logos=logos,
+            oneiros=oneiros,
             port=getattr(config, "alive_ws_port", 8001),
+            auth_tokens=auth_tokens if auth_tokens else None,
         )
         await alive_ws.start()
         return alive_ws
@@ -1179,11 +1519,20 @@ class SystemRegistry:
             return
         from systems.phantom_liquidity.service import LiquidityPhantomService
 
+        vault_pw = os.environ.get("ECODIAOS_VAULT_PASSPHRASE", "")
+        phantom_vault = None
+        if vault_pw:
+            from systems.identity.vault import IdentityVault
+            phantom_vault = IdentityVault(passphrase=vault_pw)
+
         pl = LiquidityPhantomService(
             config=config.phantom_liquidity,
             wallet=infra.wallet,
             atune=atune,
             oikos=oikos,
+            tsdb=infra.tsdb,
+            neo4j=infra.neo4j,
+            vault=phantom_vault,
             instance_id=config.instance_id,
         )
         await pl.initialize()
@@ -1215,6 +1564,35 @@ class SystemRegistry:
         synapse.register_system(skia)
         app.state.skia = skia
         logger.info("ecodiaos_ready", phase="15f_skia", mode="embedded")
+
+    def _init_self_model(
+        self, config: Any, memory: Any, synapse: Any, app: Any
+    ) -> None:
+        """Instantiate SelfModelService and wire it into VitalityCoordinator.
+
+        The self-model is additive — it does NOT modify cryptographic identity.
+        Non-fatal: if Skia or VitalityCoordinator is unavailable, log and skip.
+        """
+        try:
+            from systems.identity.self_model import SelfModelService
+
+            self_model = SelfModelService(
+                instance_id=config.instance_id,
+                memory=memory,
+                event_bus=synapse.event_bus,
+            )
+            app.state.self_model = self_model
+
+            # Wire into VitalityCoordinator inside SkiaService
+            skia = getattr(app.state, "skia", None)
+            if skia is not None and hasattr(skia, "_vitality"):
+                skia._vitality.set_self_model(self_model)
+                logger.info("ecodiaos_ready", phase="15f_self_model", wired=True)
+            else:
+                logger.warning("self_model_vitality_not_found", skia_available=skia is not None)
+
+        except Exception as exc:
+            logger.warning("self_model_init_failed", error=str(exc))
 
     async def _init_connectors(
         self, config: Any, infra: InfraClients, synapse: Any, app: Any
@@ -1352,6 +1730,10 @@ class SystemRegistry:
         synapse: Any,
         alive_ws: Any,
         app: Any,
+        telos: Any = None,
+        logos: Any = None,
+        memory: Any = None,
+        re_service: Any = None,
     ) -> None:
         from systems.benchmarks import BenchmarkService
 
@@ -1364,8 +1746,15 @@ class SystemRegistry:
         benchmarks.set_evo(evo)
         benchmarks.set_oikos(oikos)
         benchmarks.set_simula(simula)
+        benchmarks.set_telos(telos)
+        benchmarks.set_logos(logos)
         benchmarks.set_event_bus(synapse.event_bus)
+        benchmarks.set_redis(infra.redis)
+        benchmarks.set_memory(memory)
         await benchmarks.initialize()
+        # Wire RE service into the 5-pillar evaluation protocol (best-effort)
+        if re_service is not None:
+            benchmarks.set_re_service(re_service)
         app.state.benchmarks = benchmarks
         alive_ws._benchmarks = benchmarks
         logger.info("ecodiaos_ready", phase="20_benchmarks")

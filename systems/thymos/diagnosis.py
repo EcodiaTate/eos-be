@@ -222,15 +222,66 @@ class CausalAnalyzer:
     If all upstream systems are healthy, the failure is local.
     """
 
-    def __init__(self, health_provider: Any = None) -> None:
+    _GRAPH_CACHE_TTL_S = 300.0  # Re-query Neo4j every 5 minutes
+
+    def __init__(self, health_provider: Any = None, neo4j_client: Any = None) -> None:
         """
         Args:
             health_provider: Object with get_record(system_id) -> health dict.
                              Typically the Synapse HealthMonitor.
+            neo4j_client: Optional Neo4jClient for querying the dependency graph
+                          from Memory instead of using hardcoded _UPSTREAM_DEPS.
         """
         self._health = health_provider
+        self._neo4j = neo4j_client
+        self._graph_deps: dict[str, list[str]] | None = None
+        self._graph_loaded_at: float = 0.0
         self._recent_incidents: dict[str, list[Incident]] = {}  # system_id → recent
         self._logger = logger.bind(system="thymos", component="causal_analyzer")
+
+    async def _load_deps_from_graph(self) -> dict[str, list[str]] | None:
+        """Query Neo4j for DEPENDS_ON relationships between system nodes."""
+        if self._neo4j is None:
+            return None
+        try:
+            results = await self._neo4j.execute_read(
+                "MATCH (a:System)-[:DEPENDS_ON]->(b:System) "
+                "RETURN a.system_id AS source, b.system_id AS target"
+            )
+            deps: dict[str, list[str]] = {}
+            for row in results:
+                src = row.get("source", "")
+                tgt = row.get("target", "")
+                if src and tgt:
+                    deps.setdefault(src, []).append(tgt)
+            self._logger.debug(
+                "graph_deps_loaded",
+                system_count=len(deps),
+                edge_count=sum(len(v) for v in deps.values()),
+            )
+            return deps
+        except Exception as exc:
+            self._logger.warning(
+                "graph_deps_load_failed",
+                error=str(exc),
+            )
+            return None
+
+    async def get_upstream_deps(self) -> dict[str, list[str]]:
+        """
+        Return the system dependency graph. Prefers Neo4j graph data (cached
+        for 5 minutes), falls back to hardcoded _UPSTREAM_DEPS.
+        """
+        now = utc_now().timestamp()
+        if (
+            self._graph_deps is None
+            or now - self._graph_loaded_at > self._GRAPH_CACHE_TTL_S
+        ):
+            loaded = await self._load_deps_from_graph()
+            if loaded:
+                self._graph_deps = loaded
+                self._graph_loaded_at = now
+        return self._graph_deps if self._graph_deps else _UPSTREAM_DEPS
 
     def record_incident(self, incident: Incident) -> None:
         """Record an incident for cross-system correlation."""
@@ -246,7 +297,8 @@ class CausalAnalyzer:
         """
         Trace the root cause of an incident through upstream dependencies.
         """
-        upstream = _UPSTREAM_DEPS.get(incident.source_system, [])
+        deps = await self.get_upstream_deps()
+        upstream = deps.get(incident.source_system, [])
 
         if not upstream:
             return CausalChain(
@@ -296,7 +348,7 @@ class CausalAnalyzer:
             chain = [root, incident.source_system]
 
             # Recurse one level deeper — is the upstream's upstream also failing?
-            deeper_upstream = _UPSTREAM_DEPS.get(root, [])
+            deeper_upstream = deps.get(root, [])
             for deeper in deeper_upstream:
                 deeper_recent = self._recent_incidents.get(deeper, [])
                 now = utc_now()
@@ -348,6 +400,8 @@ class CausalAnalyzer:
             return None
 
         now = utc_now()
+        # Use cached graph deps if available, otherwise hardcoded fallback
+        deps = self._graph_deps if self._graph_deps else _UPSTREAM_DEPS
 
         # Collect all distinct source systems
         source_systems = {inc.source_system for inc in incidents}
@@ -359,7 +413,7 @@ class CausalAnalyzer:
         # Build the set of systems that are "unhealthy" — either have recent
         # incidents or are flagged by the health monitor.
         unhealthy_systems: set[str] = set()
-        for system_id in set(_UPSTREAM_DEPS.keys()) | source_systems:
+        for system_id in set(deps.keys()) | source_systems:
             # Recent incident check
             recent = self._recent_incidents.get(system_id, [])
             if any((now - i.timestamp).total_seconds() < 120.0 for i in recent):
@@ -377,7 +431,7 @@ class CausalAnalyzer:
         # upstream system that is unhealthy.
         for inc in incidents:
             visited: set[str] = set()
-            queue = list(_UPSTREAM_DEPS.get(inc.source_system, []))
+            queue = list(deps.get(inc.source_system, []))
             while queue:
                 up = queue.pop(0)
                 if up in visited:
@@ -390,7 +444,7 @@ class CausalAnalyzer:
                     upstream_scores[up] = upstream_scores.get(up, 0) + 0.5
                 # Walk deeper
                 queue.extend(
-                    dep for dep in _UPSTREAM_DEPS.get(up, []) if dep not in visited
+                    dep for dep in deps.get(up, []) if dep not in visited
                 )
 
         if not upstream_scores:

@@ -22,17 +22,14 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime  # noqa: TC003 — Pydantic requires at runtime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pydantic import Field
 
 from primitives.affect import AffectState
 from primitives.common import EOSBaseModel, Identified, Timestamped, new_id, utc_now
-
-if TYPE_CHECKING:
-
-    from primitives.constitutional import ConstitutionalCheck
-    from primitives.intent import Intent
+from primitives.constitutional import ConstitutionalCheck
+from primitives.intent import Intent
 # ─── Enums ────────────────────────────────────────────────────────
 
 
@@ -161,6 +158,9 @@ class ExecutionContext(EOSBaseModel):
     started_at: datetime = Field(default_factory=utc_now)
 
     model_config = {"arbitrary_types_allowed": True}
+
+
+ExecutionContext.model_rebuild()
 
 
 # ─── Execution Budget & Rate Limiting ────────────────────────────

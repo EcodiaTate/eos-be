@@ -173,3 +173,31 @@ class KairosInvariantProtocol(Protocol):
         specific observations with a single general rule.
         """
         ...
+
+
+# ─── Kairos: Logos MDL Query Interface ──────────────────────────
+
+
+@runtime_checkable
+class LogosEngineProtocol(Protocol):
+    """
+    Protocol for Kairos to query Logos about per-invariant MDL accounting.
+
+    Kairos uses these queries to compute the intelligence ratio contribution
+    of each invariant: how many observations does it explain, and how much
+    does the world model description length grow without it?
+    """
+
+    def count_observations_explained_by(self, invariant_id: str) -> int:
+        """
+        Return the number of episodes / observations the invariant explains.
+        Returns 0 if the invariant is unknown.
+        """
+        ...
+
+    def estimate_description_length_without(self, invariant_id: str) -> float:
+        """
+        Estimate world model total description length (bits) without this invariant.
+        Returns current complexity unchanged when the invariant is unknown.
+        """
+        ...

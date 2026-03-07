@@ -13,7 +13,7 @@ import pytest
 
 from config import EvoConfig
 from primitives.affect import AffectState
-from systems.atune.types import (
+from systems.fovea.types import (
     MemoryContext,
     SalienceVector,
     WorkspaceBroadcast,

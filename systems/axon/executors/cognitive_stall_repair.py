@@ -99,8 +99,7 @@ class CognitiveStallRepairExecutor(Executor):
         self._repairs_failed: int = 0
         self._logger = logger.bind(system="axon.executor.cognitive_stall_repair")
 
-    @classmethod
-    def validate_params(cls, params: dict[str, Any]) -> ValidationResult:
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         try:
             CognitiveStallRepairInput(**params)
             return ValidationResult(valid=True)
@@ -117,7 +116,7 @@ class CognitiveStallRepairExecutor(Executor):
 
         Returns detailed results of each repair phase for audit trail.
         """
-        validation = self.validate_params(params)
+        validation = await self.validate_params(params)
         if not validation.valid:
             return ExecutionResult(
                 success=False,
@@ -222,18 +221,17 @@ class CognitiveStallRepairExecutor(Executor):
         try:
             # Drain stale contributions by contributing a high-priority
             # recovery signal that displaces low-salience stale percepts
-            from systems.atune.types import WorkspaceContribution
-
-            recovery_contribution = WorkspaceContribution(
-                source_system="axon.repair",
-                content=f"Cognitive stall recovery signal for {input_data.system_id}",
-                priority=0.95,  # High priority to displace stale items
-                metadata={
+            # Use dict payload to avoid cross-system import from fovea
+            recovery_contribution = {
+                "source_system": "axon.repair",
+                "content": f"Cognitive stall recovery signal for {input_data.system_id}",
+                "priority": 0.95,  # High priority to displace stale items
+                "metadata": {
                     "repair_type": "cognitive_stall",
                     "system_id": input_data.system_id,
                     "perception_rate": input_data.perception_rate,
                 },
-            )
+            }
             self._atune.contribute(recovery_contribution)
 
             # If Atune exposes threshold control, lower it to admit new percepts
@@ -377,7 +375,7 @@ class CognitiveStallRepairExecutor(Executor):
             self._logger.debug("recovery_event_emit_failed", error=str(e))
 
     async def rollback(
-        self, context: ExecutionContext, params: dict[str, Any]
+        self, execution_id: str, context: ExecutionContext,
     ) -> RollbackResult:
         """Repair operations are forward-moving and non-destructive."""
         return RollbackResult(success=True)

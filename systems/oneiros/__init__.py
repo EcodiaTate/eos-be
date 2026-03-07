@@ -19,18 +19,22 @@ from systems.oneiros.lucid_stage import LucidDreamingStage
 
 # v2 modules -- Phase C (REM)
 from systems.oneiros.rem_stage import (
+    AffectProcessor,
     AnalogyDiscoverer,
     CrossDomainSynthesizer,
     DreamGenerator,
+    EthicalDigestion,
     REMStage,
 )
 from systems.oneiros.scheduler import SleepScheduler
 from systems.oneiros.service import OneirosService
 from systems.oneiros.slow_wave import (
+    BeliefCompressor,
     CausalGraphReconstructor,
     HypothesisGraveyard,
     MemoryLadder,
     SlowWaveStage,
+    SynapticDownscaler,
 )
 from systems.oneiros.types import (
     STAGE_DURATION_FRACTION,
@@ -57,16 +61,13 @@ from systems.oneiros.types import (
     InsightStatus,
     # v2 types -- Phase D (Lucid Dreaming + Emergence)
     LucidDreamingReport,
-    LucidResult,
     MemoryClassification,
     MemoryLadderReport,
     MutationSimulationReport,
     MutationTestResult,
-    NREMConsolidationResult,
     OneirosHealthSnapshot,
     PreAttentionCache,
     PreAttentionEntry,
-    REMDreamResult,
     REMStageReport,
     RungResult,
     SleepCheckpoint,
@@ -98,9 +99,6 @@ __all__ = [
     "Dream",
     "DreamInsight",
     "SleepCycle",
-    "NREMConsolidationResult",
-    "REMDreamResult",
-    "LucidResult",
     "DreamCycleResult",
     "WakeDegradation",
     "OneirosHealthSnapshot",

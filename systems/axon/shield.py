@@ -20,18 +20,43 @@ executors (defi_yield, wallet_transfer).
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from systems.thymos.types import (
-    AddressBlacklistEntry,
-    SimulationResult,
-)
-
 if TYPE_CHECKING:
     from systems.axon.mev_analyzer import MEVAnalyzer
     from systems.axon.mev_types import MEVReport
+
+
+# ── Local shield types (avoid cross-system import from Thymos) ────
+
+
+@dataclass
+class AddressBlacklistEntry:
+    """A blacklisted on-chain address — Axon-local mirror."""
+
+    address: str
+    chain_id: int = 8453
+    reason: str = ""
+    threat_type: str = "unknown"
+    source: str = "local"
+    source_instance_id: str = ""
+    confirmed: bool = False
+
+
+@dataclass
+class SimulationResult:
+    """Result of pre-simulating a transaction — Axon-local mirror."""
+
+    passed: bool = True
+    revert_reason: str = ""
+    gas_used: int = 0
+    value_delta_usd: float = 0.0
+    slippage_bps: int = 0
+    mev_risk_detected: bool = False
+    warnings: list[str] = field(default_factory=list)
 
 logger = structlog.get_logger()
 

@@ -102,6 +102,7 @@ class ConsolidationOrchestrator:
         causal_surgery_analyzer: CausalFailureAnalyzer | None = None,
         procedure_codifier: ProcedureCodifier | None = None,
         event_bus: EventBus | None = None,
+        oikos: Any | None = None,
         schema_induction_engine: SchemaInductionEngine | None = None,
         meta_learning_engine: MetaLearningEngine | None = None,
         speciation_engine: SpeciationEngine | None = None,
@@ -123,6 +124,7 @@ class ConsolidationOrchestrator:
         self._genome_extractor = genome_extractor
         self._causal_surgery = causal_surgery_analyzer
         self._event_bus = event_bus
+        self._oikos = oikos
         self._schema_engine = schema_induction_engine
         self._meta_learning = meta_learning_engine
         self._speciation = speciation_engine
@@ -462,10 +464,76 @@ class ConsolidationOrchestrator:
                     ],
                 )
 
+                # Escalate to Thymos as immune incident — conflicting foundation
+                # beliefs are pathological and need immune system intervention
+                await self._escalate_foundation_conflicts_to_thymos(conflicts)
+
+            # Emit EVO_BELIEF_CONSOLIDATED so Mitosis / Benchmarks know
+            # hardened belief count without polling Neo4j.
+            if self._event_bus is not None:
+                try:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.EVO_BELIEF_CONSOLIDATED,
+                        source_system="evo.consolidation",
+                        data={
+                            "beliefs_consolidated": consolidation_result.beliefs_consolidated,
+                            "foundation_conflicts": consolidation_result.foundation_conflicts,
+                            "consolidation_number": self._total_runs,
+                        },
+                    ))
+                except Exception:
+                    self._logger.debug("evo_belief_consolidated_emit_failed", exc_info=True)
+
             return consolidation_result
         except Exception as exc:
             self._logger.error("belief_consolidation_phase_failed", error=str(exc))
             return BeliefConsolidationResult()
+
+    async def _escalate_foundation_conflicts_to_thymos(
+        self,
+        conflicts: list,
+    ) -> None:
+        """
+        Emit INCIDENT_DETECTED for foundation belief conflicts so Thymos
+        treats them as immune incidents. Deduplicates by emitting a single
+        incident per consolidation cycle, not per conflict.
+        """
+        if self._event_bus is None or not conflicts:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            # One incident per consolidation cycle covering all conflicts
+            conflict_summaries = [
+                {
+                    "hypothesis": c.hypothesis_statement[:120] if hasattr(c, "hypothesis_statement") else c.hypothesis_id,
+                    "belief": c.consolidated_statement[:120] if hasattr(c, "consolidated_statement") else c.consolidated_belief_id,
+                }
+                for c in conflicts[:5]
+            ]
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.INCIDENT_DETECTED,
+                source_system="evo",
+                data={
+                    "incident_class": "foundation_conflict",
+                    "severity": "high",
+                    "source_system": "evo",
+                    "description": (
+                        f"{len(conflicts)} foundation belief conflict(s): "
+                        f"confirmed hypotheses contradict consolidated beliefs"
+                    ),
+                    "conflicts": conflict_summaries,
+                },
+            ))
+            self._logger.info(
+                "foundation_conflicts_escalated_to_thymos",
+                conflict_count=len(conflicts),
+            )
+        except Exception:
+            self._logger.debug("foundation_conflict_escalation_failed", exc_info=True)
 
     async def _phase_genetic_fixation(self) -> Any:
         """
@@ -493,6 +561,25 @@ class ConsolidationOrchestrator:
                     fixed_count=extraction_result.candidates_fixed,
                     genome_bytes=extraction_result.genome_size_bytes,
                 )
+
+                # Emit EVO_GENOME_EXTRACTED so Mitosis can consume the new genome
+                # for child seeding without polling Neo4j.
+                if self._event_bus is not None:
+                    try:
+                        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                        await self._event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.EVO_GENOME_EXTRACTED,
+                            source_system="evo.consolidation",
+                            data={
+                                "genome_id": genome.id,
+                                "candidates_fixed": extraction_result.candidates_fixed,
+                                "genome_size_bytes": extraction_result.genome_size_bytes,
+                                "generation": genome.generation,
+                            },
+                        ))
+                    except Exception:
+                        self._logger.debug("evo_genome_extracted_emit_failed", exc_info=True)
 
             return extraction_result
         except Exception as exc:
@@ -676,8 +763,36 @@ class ConsolidationOrchestrator:
         Phase 5: Apply supported parameter hypotheses.
         Uses the pre-Phase-2 snapshot so hypotheses are available after integration.
         Velocity-limited to prevent lurching changes.
+        Skipped when Oikos reports high metabolic pressure (GROWTH gate denied) —
+        expensive optimisation should not run while the organism is starving.
         Returns (adjustment_count, total_absolute_delta).
         """
+        # Metabolic gate: skip if organism is under severe resource pressure.
+        if self._oikos is not None:
+            try:
+                from decimal import Decimal
+
+                from systems.oikos.models import MetabolicPriority
+
+                gate_ok = await self._oikos.check_metabolic_gate(
+                    action_type="evo_parameter_optimisation",
+                    action_id="phase5",
+                    estimated_cost_usd=Decimal("0.01"),
+                    priority=MetabolicPriority.GROWTH,
+                    rationale="Evo Phase 5 parameter optimisation (consolidation)",
+                )
+                if not gate_ok:
+                    self._logger.warning(
+                        "parameter_optimisation_skipped_metabolic_pressure",
+                        reason="oikos_gate_denied",
+                    )
+                    return 0, 0.0
+            except Exception as _exc:
+                # Non-fatal: if Oikos is unavailable, proceed anyway.
+                self._logger.debug(
+                    "phase5_metabolic_gate_check_failed", error=str(_exc)
+                )
+
         supported = getattr(self, "_supported_snapshot", [])
         candidates: list[Any] = []
 
@@ -746,9 +861,12 @@ class ConsolidationOrchestrator:
 
     async def _phase_drift_feed(self) -> None:
         """
-        Phase 7: Feed effectiveness data to Equor's drift detector.
-        Drift detection is handled by Equor; we just update the data it reads.
-        The self-model stats written to the Self node are what Equor reads.
+        Phase 7: Feed effectiveness data to Equor via EVO_DRIFT_DATA event.
+
+        Evo's self-model contains richer behavioural metrics than Equor's
+        constitutional alignment window alone: success rates, per-capability
+        regret, mean alignment. Broadcasting these lets Equor's drift detector
+        incorporate outcome-level signals alongside its intent-verdict history.
         """
         stats = self._self_model.get_current()
         self._logger.debug(
@@ -756,8 +874,48 @@ class ConsolidationOrchestrator:
             success_rate=round(stats.success_rate, 3),
             mean_alignment=round(stats.mean_alignment, 3),
         )
-        # Equor reads from Self node directly; no active push needed in Phase 7.
-        # Future: could publish a Synapse event for Equor to act on immediately.
+
+        if self._event_bus is None:
+            return
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            # Serialise capability scores to plain dicts for the event payload
+            capability_payload = {
+                cap: {
+                    "success_count": score.success_count,
+                    "total_count": score.total_count,
+                    "rate": round(score.rate, 4),
+                }
+                for cap, score in stats.capability_scores.items()
+            }
+
+            regret_payload = {
+                "mean_regret": round(stats.regret.mean_regret, 4),
+                "high_regret_count": stats.regret.high_regret_count,
+                "total_resolved": stats.regret.total_resolved,
+            }
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_DRIFT_DATA,
+                source_system="evo.consolidation",
+                data={
+                    "success_rate": round(stats.success_rate, 4),
+                    "mean_alignment": round(stats.mean_alignment, 4),
+                    "capability_scores": capability_payload,
+                    "regret": regret_payload,
+                    "consolidation_number": self._total_runs,
+                },
+            ))
+            self._logger.info(
+                "evo_drift_data_emitted",
+                success_rate=round(stats.success_rate, 3),
+                mean_alignment=round(stats.mean_alignment, 3),
+                capabilities=len(capability_payload),
+            )
+        except Exception as exc:
+            self._logger.warning("evo_drift_data_emit_failed", error=str(exc))
 
     async def _phase_evolution_proposals(self) -> None:
         """
@@ -835,10 +993,33 @@ class ConsolidationOrchestrator:
                             "hypothesis_statement": h.statement,
                             "evidence_score": h.evidence_score,
                             "confidence": round(confidence, 3),
-                            "mutation_type": h.proposed_mutation.type.value,
+                            # Detect new_subsystem intent from mutation target or description
+                            "mutation_type": (
+                                "new_subsystem"
+                                if (
+                                    (h.proposed_mutation.target or "").lower() in (
+                                        "new_subsystem", "new subsystem"
+                                    )
+                                    or "new subsystem" in (
+                                        h.proposed_mutation.description or ""
+                                    ).lower()
+                                    or "missing capability" in (
+                                        h.proposed_mutation.description or ""
+                                    ).lower()
+                                )
+                                else h.proposed_mutation.type.value
+                            ),
                             "mutation_target": h.proposed_mutation.target,
                             "mutation_description": h.proposed_mutation.description,
                             "supporting_episodes": h.supporting_episodes,
+                            # SubsystemGenerator fields (present when mutation_type == "new_subsystem")
+                            "subsystem_name": (
+                                h.proposed_mutation.target
+                                if (h.proposed_mutation.target or "").lower() not in (
+                                    "new_subsystem", "new subsystem", ""
+                                ) else ""
+                            ),
+                            "subsystem_purpose": h.proposed_mutation.description or h.statement,
                         },
                     )
                 )
@@ -989,7 +1170,7 @@ class ConsolidationOrchestrator:
             )
 
             await store_belief_from_hypothesis(
-                neo4j=self._memory._neo4j,
+                neo4j=self._memory,
                 hypothesis_id=hypothesis.id,
                 statement=hypothesis.statement,
                 category=hypothesis.category.value,
@@ -1012,7 +1193,7 @@ class ConsolidationOrchestrator:
                 name = entity_spec.get("name", "")
                 description = entity_spec.get("description", "")
                 if name:
-                    await self._memory._neo4j.execute_write(
+                    await self._memory.execute_write(
                         """
                         MERGE (et:EvoEntityType {name: $name})
                         SET et.description = $description,

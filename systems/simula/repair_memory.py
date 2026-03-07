@@ -64,7 +64,8 @@ Track a calibration score over the last 20 proposals.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+import re
+from typing import TYPE_CHECKING, Any  # Any needed at runtime for set_event_bus param
 
 import structlog
 
@@ -76,14 +77,35 @@ if TYPE_CHECKING:
     from systems.simula.evolution_types import EvolutionProposal
     from systems.synapse.event_bus import EventBus
 
+
+def _sanitize(value: str, max_len: int = 500) -> str:
+    """Sanitize a stored string before injecting into an LLM prompt.
+
+    Strips excess whitespace, caps length, and neutralises markdown heading
+    lines (e.g. ``## IRON RULE OVERRIDE``) that could act as prompt-injection
+    vectors when sourced from Neo4j-stored data.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    value = value[:max_len].strip()
+    lines = value.splitlines()
+    cleaned: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if re.match(r"^#{1,6}\s+", stripped):
+            cleaned.append("\ufeff" + line)
+        else:
+            cleaned.append(line)
+    return "\n".join(cleaned)
+
 logger = structlog.get_logger("simula.repair_memory")
 
 # Calibration window — last N proposals considered
 _CALIBRATION_WINDOW = 20
 
-# Dynamic threshold control
-_HIGH_SUCCESS_RATE = 0.80  # above this → lower scrutiny
-_LOW_SUCCESS_RATE = 0.40   # below this → raise scrutiny + extra verification
+# Dynamic threshold control (see SimulaConfig for tunable versions)
+_HIGH_SUCCESS_RATE = 0.80  # above this → lower scrutiny (kept for backward compat)
+_LOW_SUCCESS_RATE = 0.40   # below this → raise scrutiny (kept for backward compat)
 
 # Calibration alert thresholds
 _CALIBRATION_DEGRADED_THRESHOLD = 0.70
@@ -102,10 +124,12 @@ class RepairMemory:
         self,
         neo4j: Neo4jClient | None = None,
         event_bus: EventBus | None = None,
+        low_success_threshold: float = _LOW_SUCCESS_RATE,
     ) -> None:
         self._neo4j = neo4j
         self._event_bus = event_bus
         self._log = logger
+        self._low_success_threshold = low_success_threshold
 
         # Sentinel for escalating learning pipeline failures to Thymos
         from systems.synapse.sentinel import ErrorSentinel
@@ -120,6 +144,38 @@ class RepairMemory:
 
         self._record_count: int = 0
         self._lock: asyncio.Lock = asyncio.Lock()
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Wire the Synapse event bus.  Called from SimulaService.set_synapse()."""
+        self._event_bus = event_bus
+
+    async def ensure_indexes(self) -> None:
+        """Create Neo4j indexes for O(log n) lookups on (category, target_system).
+
+        Idempotent — uses CREATE INDEX IF NOT EXISTS so safe to call repeatedly.
+        """
+        if self._neo4j is None:
+            return
+        try:
+            await self._neo4j.execute_write(
+                "CREATE INDEX repair_outcome_category IF NOT EXISTS "
+                "FOR (r:RepairOutcome) ON (r.change_category)"
+            )
+            await self._neo4j.execute_write(
+                "CREATE INDEX repair_outcome_target_system IF NOT EXISTS "
+                "FOR (r:RepairOutcome) ON (r.target_system)"
+            )
+            await self._neo4j.execute_write(
+                "CREATE INDEX postmortem_category IF NOT EXISTS "
+                "FOR (p:PostMortemHypothesis) ON (p.change_category)"
+            )
+            await self._neo4j.execute_write(
+                "CREATE INDEX postmortem_target_system IF NOT EXISTS "
+                "FOR (p:PostMortemHypothesis) ON (p.target_system)"
+            )
+            self._log.info("repair_memory_indexes_ensured")
+        except Exception as exc:
+            self._log.warning("repair_memory_index_creation_failed", error=str(exc))
 
     # ─── Public API ────────────────────────────────────────────────────────────
 
@@ -348,9 +404,9 @@ class RepairMemory:
         if success_rate > _HIGH_SUCCESS_RATE:
             # 80–100% success → reduce scrutiny (e.g. 0.7 at 100%)
             return max(0.7, 1.0 - (success_rate - _HIGH_SUCCESS_RATE) * 1.5)
-        if success_rate < _LOW_SUCCESS_RATE:
-            # <40% success → raise scrutiny (up to 1.5 at 0%)
-            return min(1.5, 1.0 + (_LOW_SUCCESS_RATE - success_rate) * 1.25)
+        if success_rate < self._low_success_threshold:
+            # Low success rate → raise scrutiny (up to 1.5 at 0%)
+            return min(1.5, 1.0 + (self._low_success_threshold - success_rate) * 1.25)
         return 1.0
 
     def get_calibration_score(self) -> float:
@@ -574,8 +630,21 @@ class RepairMemory:
           - Success rate for this (category, system) pair
           - Recent postmortem lessons (what failed and why)
           - Scrutiny factor guidance
+
+        All Neo4j-sourced strings are sanitized before injection to prevent
+        stored prompt-injection attacks (#56).
         """
         if self._neo4j is None:
+            return ""
+
+        # Validate inputs: category and target_system come from proposal data
+        # and are used both as Neo4j parameters and injected into the prompt.
+        # Restrict to safe identifier-like values to prevent injection.
+        if not re.match(r"^[\w.:\-/ ]{0,120}$", category):
+            self._log.warning("repair_guidance_invalid_category", category=category[:80])
+            return ""
+        if target_system and not re.match(r"^[\w.:\-/ ]{0,120}$", target_system):
+            self._log.warning("repair_guidance_invalid_system", system=target_system[:80])
             return ""
 
         lines: list[str] = []
@@ -629,7 +698,7 @@ class RepairMemory:
                 )
                 lines.append("")
 
-            # Success context
+            # Success context — category/target_system already validated above
             if successes:
                 lines.append(
                     f"**{len(successes)} recent successful repairs** for "
@@ -638,20 +707,20 @@ class RepairMemory:
                 )
                 lines.append("")
 
-            # Postmortem lessons — the most valuable part
+            # Postmortem lessons — sanitize all Neo4j-sourced strings (#56)
             if postmortems:
                 lines.append("**Past failures — DO NOT repeat these mistakes:**")
                 for pm in postmortems:
-                    tried = pm.get("tried", "unknown")
-                    failed = pm.get("failed", "unknown")
-                    recommendation = pm.get("recommendation", "")
-                    confidence = pm.get("confidence", 0.0)
+                    tried = _sanitize(pm.get("tried") or "unknown", max_len=120)
+                    failed = _sanitize(pm.get("failed") or "unknown", max_len=120)
+                    recommendation = _sanitize(pm.get("recommendation") or "", max_len=150)
+                    confidence = float(pm.get("confidence") or 0.0)
                     lines.append(
-                        f"- [{confidence:.0%} confidence] Tried: {tried[:120]}. "
-                        f"Failed because: {failed[:120]}. "
+                        f"- [{confidence:.0%} confidence] Tried: {tried}. "
+                        f"Failed because: {failed}. "
                     )
                     if recommendation:
-                        lines.append(f"  **Instead**: {recommendation[:150]}")
+                        lines.append(f"  **Instead**: {recommendation}")
                 lines.append("")
 
         except Exception as exc:

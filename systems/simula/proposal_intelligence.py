@@ -216,7 +216,9 @@ class ProposalIntelligence:
         for prefix, group in prefix_groups.items():
             if len(group) < 2:
                 continue
-            rep = group[0]
+            # Corpus 14 §10: tie-break by timestamp — newest proposal is the representative
+            # so the most recent description wins when merging near-identical proposals.
+            rep = max(group, key=lambda p: getattr(p, "created_at", p.id))
             members = [p.id for p in group]
             clustered_ids.update(members)
             clusters.append(ProposalCluster(
@@ -236,7 +238,8 @@ class ProposalIntelligence:
         for key, group in cat_system_groups.items():
             if len(group) < 2:
                 continue
-            rep = group[0]
+            # Corpus 14 §10: newest proposal as representative
+            rep = max(group, key=lambda p: getattr(p, "created_at", p.id))
             members = [p.id for p in group]
             clustered_ids.update(members)
             clusters.append(ProposalCluster(
@@ -321,17 +324,23 @@ class ProposalIntelligence:
 
             if len(group) >= 2:
                 clustered.add(i)
-                member_ids = [proposals[idx].id for idx in group]
+                group_proposals = [proposals[idx] for idx in group]
+                # Corpus 14 §10: newest proposal wins as representative
+                rep_proposal = max(
+                    group_proposals, key=lambda p: getattr(p, "created_at", p.id)
+                )
+                rep_idx = group[group_proposals.index(rep_proposal)]
+                member_ids = [p.id for p in group_proposals]
                 similarities = []
                 for idx in group:
-                    if idx == group[0]:
+                    if idx == rep_idx:
                         similarities.append(1.0)
                     else:
-                        sim = cosine_similarity(embeddings[group[0]], embeddings[idx])
+                        sim = cosine_similarity(embeddings[rep_idx], embeddings[idx])
                         similarities.append(round(sim, 3))
 
                 clusters.append(ProposalCluster(
-                    representative_id=member_ids[0],
+                    representative_id=rep_proposal.id,
                     member_ids=member_ids,
                     similarity_scores=similarities,
                     merge_recommendation=(
@@ -397,8 +406,13 @@ class ProposalIntelligence:
                     valid = [i for i in indices if 0 <= i < len(proposals)]
                     if len(valid) >= 2:
                         members = [proposals[i].id for i in valid]
+                        # Corpus 14 §10: newest proposal as representative
+                        _rep_llm = max(
+                            [proposals[i] for i in valid],
+                            key=lambda p: getattr(p, "created_at", p.id),
+                        )
                         clusters.append(ProposalCluster(
-                            representative_id=members[0],
+                            representative_id=_rep_llm.id,
                             member_ids=members,
                             similarity_scores=[0.6] * len(members),
                             merge_recommendation=reason or "LLM-detected similarity",

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import time
 from pathlib import Path
@@ -250,6 +251,18 @@ class RepairAgent:
                 )
                 attempt.diagnosis = diagnosis
 
+                # Budget check after each expensive LLM phase
+                if self._cumulative_cost >= self._cost_budget:
+                    logger.warning(
+                        "repair_budget_exceeded_mid_attempt",
+                        phase="diagnose",
+                        attempt=attempt_num,
+                        cost=round(self._cumulative_cost, 6),
+                        budget=self._cost_budget,
+                    )
+                    attempts.append(attempt)
+                    return self._build_result(RepairStatus.BUDGET_EXCEEDED, attempts, start)
+
                 # Phase 2: LOCALIZE (reasoning model + tools)
                 attempt.phase = RepairPhase.LOCALIZE
                 localization = await self._localize(
@@ -263,6 +276,18 @@ class RepairAgent:
                     diagnosis, localization, broken_files
                 )
                 attempt.fix_generation = fix_gen
+
+                # Budget check after generate_fix
+                if self._cumulative_cost >= self._cost_budget:
+                    logger.warning(
+                        "repair_budget_exceeded_mid_attempt",
+                        phase="generate_fix",
+                        attempt=attempt_num,
+                        cost=round(self._cumulative_cost, 6),
+                        budget=self._cost_budget,
+                    )
+                    attempts.append(attempt)
+                    return self._build_result(RepairStatus.BUDGET_EXCEEDED, attempts, start)
 
                 # Phase 4: VERIFY (run tests + lint + type check)
                 attempt.phase = RepairPhase.VERIFY
@@ -312,6 +337,21 @@ class RepairAgent:
                     "repair_attempt_error",
                     attempt=attempt_num,
                 )
+
+            # Exponential backoff with jitter between failed attempts so consecutive
+            # LLM calls don't hammer the API on transient rate-limit errors.
+            # Only sleep if there's another attempt remaining and time allows.
+            if attempt_num < self._max_retries - 1:
+                _remaining = self._timeout_s - (time.monotonic() - start)
+                _backoff = min(2.0 ** attempt_num * 0.5 + random.uniform(0, 0.5), 8.0)
+                if _remaining > _backoff + 5.0:  # keep at least 5s for the next attempt
+                    logger.debug(
+                        "repair_retry_backoff",
+                        attempt=attempt_num,
+                        backoff_s=round(_backoff, 2),
+                        remaining_s=round(_remaining, 1),
+                    )
+                    await asyncio.sleep(_backoff)
 
         # All retries exhausted
         return self._build_result(RepairStatus.FAILED, attempts, start)

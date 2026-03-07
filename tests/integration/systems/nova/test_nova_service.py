@@ -22,7 +22,7 @@ from config import NovaConfig
 from primitives.affect import AffectState
 from primitives.common import DriveAlignmentVector, new_id
 from primitives.memory_trace import SelfNode
-from systems.atune.types import SalienceVector, WorkspaceBroadcast, WorkspaceContext
+from systems.fovea.types import SalienceVector, WorkspaceBroadcast, WorkspaceContext
 from systems.nova.service import NovaService
 from systems.nova.types import (
     Goal,

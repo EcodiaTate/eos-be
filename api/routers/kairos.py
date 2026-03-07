@@ -187,7 +187,7 @@ async def get_tier3_invariants(
     if kairos is None:
         return []
 
-    from systems.kairos.types import CausalInvariantTier
+    from primitives.causal import CausalInvariantTier
 
     tier3 = kairos.hierarchy.get_by_tier(CausalInvariantTier.TIER_3_SUBSTRATE)
 

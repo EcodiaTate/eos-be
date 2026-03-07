@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from primitives.affect import AffectState
-from systems.atune.types import ActiveGoalSummary, WorkspaceBroadcast
+from primitives.common import DriveAlignmentVector, SystemID
+from primitives.re_training import RETrainingExample
 from systems.nova.belief_updater import BeliefUpdater
 from systems.nova.cognition_cost import (
     CognitionCostCalculator,
@@ -69,6 +71,7 @@ if TYPE_CHECKING:
     from primitives.intent import Intent
     from systems.axon.service import AxonService
     from systems.equor.service import EquorService
+    from systems.fovea.types import ActiveGoalSummary, WorkspaceBroadcast
     from systems.memory.service import MemoryService
     from systems.voxis.service import VoxisService
 
@@ -201,9 +204,18 @@ class NovaService:
         # Thymos reference — wired via set_thymos() if called.
         self._thymos: Any = None
 
+        # Thread — narrative identity; receives THREAD_COMMIT_REQUEST events (Gap 4)
+        self._thread: Any = None
+
         # True once initialize() completes successfully. Used by health() to
         # distinguish "not yet initialised" from "initialised but idle".
         self._initialized: bool = False
+
+        # ── Metabolic gating ──────────────────────────────────────────────
+        self._starvation_level: str = "nominal"
+
+        # ── Motor degradation flag (Loop 2) ─────────────────────────────
+        self._motor_degraded: bool = False
 
     # ─── Lifecycle ────────────────────────────────────────────────
 
@@ -243,7 +255,7 @@ class NovaService:
 
         # Build cognition cost calculator from config
         self._cost_calculator: CognitionCostCalculator | None = None
-        if self._config.cognition_cost_enabled:
+        if self._config.enable_cognition_budgeting:
             cost_rates = CostRates(
                 llm_input_per_token=self._config.cost_llm_input_per_1m_tokens / 1_000_000,
                 llm_output_per_token=self._config.cost_llm_output_per_1m_tokens / 1_000_000,
@@ -285,7 +297,7 @@ class NovaService:
             cost_calculator=self._cost_calculator,
         )
 
-        self._intent_router = IntentRouter(voxis=self._voxis)
+        self._intent_router = IntentRouter(event_bus=self._synapse)
 
         self._deliberation_engine = DeliberationEngine(
             goal_manager=self._goal_manager,
@@ -298,10 +310,11 @@ class NovaService:
             cost_calculator=self._cost_calculator,
         )
 
-        # If set_axon() was called before initialize(), wire it now.
-        if self._axon is not None:
-            self._intent_router.set_axon(self._axon)
-            self._logger.info("axon_wired_to_nova_deferred")
+        # Wire Equor unavailability callback so the deliberation engine can
+        # trigger a Thymos DEGRADATION incident when Equor is unreachable.
+        self._deliberation_engine.set_equor_failure_callback(self._on_equor_failure)
+
+        # IntentRouter is bus-mediated — no Axon wiring needed here.
 
         self._logger.info(
             "nova_initialized",
@@ -310,10 +323,17 @@ class NovaService:
             drive_weights=self._drive_weights,
         )
 
+        # Wire Neo4j into belief updater for persistence and restore beliefs.
+        neo4j = self._memory.get_neo4j()
+        if neo4j is not None:
+            self._belief_updater.set_neo4j(neo4j)
+            restored = await self._belief_updater.restore_from_neo4j()
+            if restored > 0:
+                self._logger.info("beliefs_restored_on_init", count=restored)
+
         # Restore persisted goals from Neo4j after a process restart.
         # Pass Synapse health records so stale maintenance goals (older than
         # 30 min, target system healthy) are suppressed before entering memory.
-        neo4j = getattr(self._memory, "_neo4j", None)
         if neo4j is not None:
             health_records = (
                 self._synapse._health.get_all_records()
@@ -338,6 +358,13 @@ class NovaService:
                 instance_factory=self._build_policy_generator,
             )
 
+        # Gap 6: Load induced procedure templates from Neo4j into fast-path matching.
+        if neo4j is not None:
+            asyncio.create_task(
+                self._load_induced_procedures(neo4j),
+                name="nova_load_induced_procedures",
+            )
+
         self._initialized = True
 
     def set_synapse(self, synapse: Any) -> None:
@@ -349,10 +376,67 @@ class NovaService:
         from systems.synapse.types import SynapseEventType
 
         event_bus = getattr(synapse, "event_bus", synapse)
+
+        # Propagate the resolved EventBus into IntentRouter so _route_to_axon
+        # and _route_to_voxis can emit events. IntentRouter is constructed during
+        # initialize() before set_synapse() is called, so _bus is None until here.
+        if self._intent_router is not None:
+            self._intent_router._bus = event_bus
         if hasattr(event_bus, "subscribe"):
             event_bus.subscribe(
                 SynapseEventType.INTEROCEPTIVE_PERCEPT,
                 self._on_interoceptive_percept,
+            )
+            # Closure Loop 2: Axon motor degradation → replan with adjusted thresholds
+            event_bus.subscribe(
+                SynapseEventType.MOTOR_DEGRADATION_DETECTED,
+                self._on_motor_degradation,
+            )
+            # Closure Loop 5: Soma felt-sense → continuous threshold modulation
+            event_bus.subscribe(
+                SynapseEventType.SOMA_TICK,
+                self._on_soma_tick,
+            )
+            event_bus.subscribe(
+                SynapseEventType.METABOLIC_PRESSURE,
+                self._on_metabolic_pressure,
+            )
+            # Evo weight adjustment: learn better policy selection over time
+            event_bus.subscribe(
+                SynapseEventType.EVO_WEIGHT_ADJUSTMENT,
+                self._on_evo_weight_adjustment,
+            )
+            # Hypothesis update: Evo tournament results → update EFE weight priors
+            event_bus.subscribe(
+                SynapseEventType.HYPOTHESIS_UPDATE,
+                self._on_hypothesis_update,
+            )
+            # Oneiros consolidation: sleep cycle completed → refresh beliefs from
+            # consolidated Memory nodes so Nova's world model incorporates the
+            # organism's latest sleep-compressed knowledge.
+            event_bus.subscribe(
+                SynapseEventType.ONEIROS_CONSOLIDATION_COMPLETE,
+                self._on_oneiros_consolidation,
+            )
+            # Gap 7: Governance goal injection — external override of goal agenda
+            event_bus.subscribe(
+                SynapseEventType.GOAL_OVERRIDE,
+                self._on_goal_override,
+            )
+            # Logos cognitive pressure → reduce EFE horizon under memory pressure
+            event_bus.subscribe(
+                SynapseEventType.COGNITIVE_PRESSURE,
+                self._on_cognitive_pressure,
+            )
+            # Axon execution lifecycle — log to DecisionRecord, update Thompson scores.
+            # Replaces any direct import of Axon types; all Axon→Nova comms via bus.
+            event_bus.subscribe(
+                SynapseEventType.AXON_EXECUTION_REQUEST,
+                self._on_axon_execution_request,
+            )
+            event_bus.subscribe(
+                SynapseEventType.AXON_EXECUTION_RESULT,
+                self._on_axon_execution_result,
             )
 
         self._logger.info("synapse_wired_to_nova")
@@ -437,6 +521,624 @@ class NovaService:
             epicenter=epicenter,
             urgency=round(urgency, 3),
         )
+        # Emit NOVA_GOAL_INJECTED so the bus signals this external goal injection
+        if self._synapse is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                asyncio.create_task(
+                    self._synapse.event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.NOVA_GOAL_INJECTED,
+                        source_system="nova",
+                        data={
+                            "goal_id": goal.id,
+                            "description": goal.description[:200],
+                            "source": "soma_interoceptive",
+                            "priority": round(goal.priority, 4),
+                            "urgency": round(urgency, 3),
+                        },
+                    )),
+                    name=f"nova_goal_injected_{goal.id[:8]}",
+                )
+            except Exception:
+                pass
+
+    # ─── Closure Loop 2: motor degradation → replan ─────────────────────
+
+    async def _on_motor_degradation(self, event: Any) -> None:
+        """
+        Handle MOTOR_DEGRADATION_DETECTED from Axon (Closure Loop 2).
+
+        1. Shift deliberation into high-urgency mode.
+        2. If current active plan uses the degraded executor AND is <80% done,
+           trigger replan by abandoning the current goal's intent and re-deliberating.
+        3. Emit POLICY_SELECTED as the closure loop response (timeout 30s).
+        """
+        data = getattr(event, "data", {}) or {}
+        success_rate: float = data.get("success_rate", 1.0)
+        affected: list[str] = data.get("affected_executors", [])
+
+        self._logger.warning(
+            "motor_degradation_received",
+            success_rate=success_rate,
+            affected_executors=affected,
+        )
+
+        if self._deliberation_engine is not None:
+            self._deliberation_engine.update_somatic_thresholds(
+                urgency=0.8, arousal=0.7,
+            )
+
+        self._motor_degraded = success_rate < 0.3
+
+        # Check if any pending intent uses a degraded executor
+        if affected and self._goal_manager is not None:
+            for intent_id, pending in list(self._pending_intents.items()):
+                uses_degraded = any(ex in affected for ex in pending.executors)
+                if not uses_degraded:
+                    continue
+
+                # Check goal completion % — don't replan if >80% done
+                goal = self._goal_manager.get_goal(pending.goal_id)
+                if goal is not None and goal.progress > 0.8:
+                    self._logger.info(
+                        "motor_degradation_skip_replan_near_complete",
+                        goal_id=goal.id,
+                        progress=round(goal.progress, 2),
+                    )
+                    continue
+
+                # Abandon the affected intent and let next cycle replan
+                self._pending_intents.pop(intent_id, None)
+                self._logger.info(
+                    "motor_degradation_triggered_replan",
+                    intent_id=intent_id,
+                    goal_id=pending.goal_id,
+                    degraded_executors=affected,
+                )
+
+        # Emit POLICY_SELECTED as closure loop response
+        if self._synapse is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.POLICY_SELECTED,
+                    source_system="nova",
+                    data={
+                        "trigger": "motor_degradation_response",
+                        "affected_executors": affected,
+                        "success_rate": success_rate,
+                        "action": "replan_triggered" if self._motor_degraded else "thresholds_adjusted",
+                    },
+                ))
+            except Exception:
+                self._logger.debug("motor_degradation_response_emit_failed", exc_info=True)
+
+    # ─── Closure Loop 5: Soma tick → continuous threshold modulation ───
+
+    async def _on_soma_tick(self, event: Any) -> None:
+        """
+        Handle SOMA_TICK — continuous somatic modulation of deliberation
+        (Closure Loop 5: Soma→Nova felt-sense → behavioral bias).
+
+        Every theta cycle, Soma broadcasts urgency, arousal, and energy;
+        Nova adjusts EFE thresholds as a soft bias (not a hard override —
+        Nova retains agency over policy selection).
+
+        High urgency → prefer faster/cheaper plans (reduce policy K).
+        Low energy → prefer conservative plans, delay non-essential goals.
+        """
+        data = getattr(event, "data", {}) or {}
+        somatic = data.get("somatic_state", data)
+        urgency: float = somatic.get("urgency", 0.0)
+        arousal: float = somatic.get("arousal_sensed", 0.0)
+        energy: float = somatic.get("energy", 1.0)
+
+        if self._deliberation_engine is not None:
+            self._deliberation_engine.update_somatic_thresholds(urgency, arousal)
+
+            # Soft bias: high urgency → fewer candidate policies (faster decisions)
+            if urgency > 0.7:
+                self._deliberation_engine.modulate_policy_k_from_pressure(
+                    urgency * 0.5,  # Soft — halve the effect to retain agency
+                )
+
+            # Soft bias: low energy → reduce policy generation diversity
+            if energy < 0.3:
+                self._deliberation_engine.modulate_policy_k_from_pressure(
+                    max(urgency * 0.5, 0.6),  # Conservative: fewer alternatives
+                )
+
+        # Emit POLICY_SELECTED as closure loop response (timeout 15s)
+        if self._synapse is not None and (urgency > 0.5 or energy < 0.4):
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.POLICY_SELECTED,
+                    source_system="nova",
+                    data={
+                        "trigger": "somatic_modulation_response",
+                        "urgency": round(urgency, 3),
+                        "arousal": round(arousal, 3),
+                        "energy": round(energy, 3),
+                        "action": "bias_adjusted",
+                    },
+                ))
+            except Exception:
+                pass
+
+    async def _on_cognitive_pressure(self, event: Any) -> None:
+        """Handle COGNITIVE_PRESSURE from Logos — reduce EFE horizon under memory pressure.
+
+        Spec 21 §MEDIUM-5: when Logos utilization > 0.85, Nova shifts to cheaper
+        deliberation by reducing the number of policies generated (policy K cap).
+        This prevents deliberation from consuming scarce cognitive budget.
+
+        pressure 0.00–0.85 → no change (full deliberation)
+        pressure 0.85–0.95 → moderate reduction (policy K modulated to 0.4 pressure)
+        pressure 0.95+     → minimal horizon (policy K modulated to 0.8 pressure)
+        """
+        if self._deliberation_engine is None:
+            return
+        data = getattr(event, "data", {}) or {}
+        pressure = float(data.get("pressure", 0.0))
+
+        if pressure < 0.85:
+            self._deliberation_engine.modulate_policy_k_from_pressure(0.0)
+        elif pressure < 0.95:
+            self._deliberation_engine.modulate_policy_k_from_pressure(0.4)
+        else:
+            self._deliberation_engine.modulate_policy_k_from_pressure(0.8)
+
+        self._logger.debug(
+            "nova_cognitive_pressure_response",
+            pressure=round(pressure, 3),
+        )
+
+    async def _on_axon_execution_request(self, event: Any) -> None:
+        """
+        Handle AXON_EXECUTION_REQUEST from Axon (Spec 06 decoupling).
+
+        Nova observes the upcoming action and caches it so that when the
+        matching AXON_EXECUTION_RESULT arrives, it can update Thompson scores
+        and goal progress without a direct Axon import.
+
+        Replaces: direct import of systems.axon.types.DecisionRecord at runtime.
+        """
+        data = getattr(event, "data", {}) or {}
+        intent_id = data.get("intent_id", "")
+        if not intent_id:
+            return
+        # Cache lightweight pre-execution context for Thompson update on result
+        self._pending_axon_requests: dict[str, Any] = getattr(
+            self, "_pending_axon_requests", {}
+        )
+        self._pending_axon_requests[intent_id] = {
+            "action_types": data.get("action_types", []),
+            "goal": data.get("goal", ""),
+            "risky": data.get("risky", False),
+        }
+        self._logger.debug(
+            "axon_execution_request_observed",
+            intent_id=intent_id,
+            action_types=data.get("action_types", []),
+        )
+
+    async def _on_axon_execution_result(self, event: Any) -> None:
+        """
+        Handle AXON_EXECUTION_RESULT from Axon (Spec 06 decoupling).
+
+        Updates Thompson sampler scores from the observed execution outcome.
+        This is the bus-first replacement for the direct Nova.process_outcome()
+        call that Axon's pipeline previously used as a fallback.
+        """
+        data = getattr(event, "data", {}) or {}
+        intent_id = data.get("intent_id", "")
+        success = bool(data.get("success", False))
+        failure_reason = data.get("failure_reason") or ""
+        duration_ms = int(data.get("duration_ms", 0))
+
+        # Resolve any cached pre-execution context
+        pending: dict[str, Any] = getattr(self, "_pending_axon_requests", {})
+        pre = pending.pop(intent_id, {})
+
+        self._logger.debug(
+            "axon_execution_result_observed",
+            intent_id=intent_id,
+            success=success,
+            duration_ms=duration_ms,
+            failure_reason=failure_reason[:80] if failure_reason else "",
+        )
+
+        # Update Thompson sampler if policy generator supports it
+        if (
+            self._policy_generator is not None
+            and hasattr(self._policy_generator, "record_outcome")
+        ):
+            try:
+                _redis_for_outcome = (
+                    getattr(self._memory, "_redis", None)
+                    or getattr(self._synapse, "_redis", None)
+                )
+                self._policy_generator.record_outcome(
+                    intent_id=intent_id,
+                    success=success,
+                    redis=_redis_for_outcome,
+                )
+            except Exception:
+                pass
+
+        # ── RE outcome tracking → Redis + Synapse ─────────────────────────
+        # Resolve which model handled this intent via the decision record ring buffer.
+        model_used = "claude"
+        decision_type = ""
+        for dr in reversed(self._decision_records):
+            if getattr(dr, "intent_id", None) == intent_id:
+                model_used = getattr(dr, "model_used", "claude")
+                decision_type = getattr(dr, "goal_description", "")[:100]
+                break
+
+        if model_used == "re" and self._policy_generator is not None:
+            sampler = getattr(self._policy_generator, "_sampler", None)
+            if sampler is not None:
+                # Record outcome into Thompson sampler (Beta-Bernoulli update)
+                try:
+                    sampler.record_outcome("re", success)
+                except Exception:
+                    pass
+
+                # Write canonical RE success-rate Redis keys (non-fatal)
+                rate = 0.5
+                try:
+                    rate = sampler.get_success_rate()
+                except Exception:
+                    pass
+
+                value_gained = float(data.get("value_gained") or 0.0)
+
+                _redis = getattr(self._memory, "_redis", None) or getattr(self._synapse, "_redis", None)
+                if _redis is not None:
+                    try:
+                        await _redis.set("eos:re:success_rate_7d", str(rate))
+                        await _redis.set("eos:re:thompson_success_rate", str(rate))
+                    except Exception:
+                        pass
+
+                # Emit RE_DECISION_OUTCOME for Benchmarks + Evo (non-fatal)
+                _bus = getattr(self._synapse, "event_bus", self._synapse)
+                if _bus is not None:
+                    try:
+                        from systems.synapse.types import SynapseEvent, SynapseEventType
+                        await _bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.RE_DECISION_OUTCOME,
+                            source_system="nova",
+                            data={
+                                "source": "re",
+                                "success": success,
+                                "value": value_gained,
+                                "success_rate": rate,
+                                "decision_type": decision_type,
+                            },
+                        ))
+                    except Exception:
+                        pass
+
+        # Flag motor degradation for Nova's replanning heuristic (Loop 2)
+        if not success and failure_reason in (
+            "rate_limited", "circuit_open", "budget_exceeded"
+        ):
+            self._motor_degraded = True
+
+    async def _on_metabolic_pressure(self, event: Any) -> None:
+        """Handle METABOLIC_PRESSURE — adjust Nova deliberation depth by starvation level."""
+        data = getattr(event, "data", {}) or {}
+        level = data.get("starvation_level", "")
+        if not level:
+            return
+        old = self._starvation_level
+        self._starvation_level = level
+        if level != old:
+            self._logger.info(
+                "nova_starvation_level_changed",
+                old=old, new=level,
+            )
+            await self._adjust_for_starvation(level)
+
+    async def _adjust_for_starvation(self, level: str) -> None:
+        """System-specific degradation for Nova.
+
+        AUSTERITY: reduce planning depth (fewer alternatives considered), use cached beliefs
+        EMERGENCY: only process high-salience percepts, skip proactive planning
+        CRITICAL: halt — no deliberation, pass-through only
+        """
+        if self._deliberation_engine is None:
+            return
+        if level in ("nominal", "cautious"):
+            # Restore full deliberation depth
+            self._deliberation_engine.modulate_policy_k_from_pressure(0.0)
+        elif level == "austerity":
+            # Reduce planning depth — fewer alternative policies generated
+            self._deliberation_engine.modulate_policy_k_from_pressure(0.6)
+        elif level == "emergency":
+            # Minimal planning — single best policy only
+            self._deliberation_engine.modulate_policy_k_from_pressure(0.9)
+        # CRITICAL: gated at receive_broadcast entry — full halt
+
+    async def _on_evo_weight_adjustment(self, event: Any) -> None:
+        """
+        Handle EVO_WEIGHT_ADJUSTMENT — Evo tunes Nova's policy selection weights.
+
+        This is how the organism's planning improves over time: Evo discovers
+        which EFE components predict outcomes best and adjusts their weights.
+        """
+        data = getattr(event, "data", {}) or {}
+        target = data.get("target_system", "")
+        if target and target != "nova":
+            return  # Not for us
+
+        weights = data.get("weights", {})
+        if not weights:
+            return
+
+        self._logger.info(
+            "evo_weight_adjustment_received",
+            weights=weights,
+            reason=data.get("reason", ""),
+        )
+        self.update_efe_weights(weights)
+
+    async def _on_hypothesis_update(self, event: Any) -> None:
+        """
+        Handle HYPOTHESIS_UPDATE — Evo tournament concludes or hypothesis
+        changes probability mass.
+
+        Nova uses this to prime its EFE weight priors: when a hypothesis
+        about policy effectiveness is confirmed, the corresponding EFE
+        component weight rises; when falsified, it drops.
+
+        Spec §20 — HYPOTHESIS_UPDATE subscription (previously unsubscribed).
+        """
+        data = getattr(event, "data", {}) or {}
+        hypothesis_id = data.get("hypothesis_id", "")
+        winner = data.get("winner")  # str | None — name of winning hypothesis branch
+        confidence = float(data.get("confidence", 0.5))
+        tournament_id = data.get("tournament_id")
+
+        self._logger.info(
+            "hypothesis_update_received",
+            hypothesis_id=hypothesis_id,
+            tournament_id=tournament_id,
+            winner=winner,
+            confidence=confidence,
+        )
+
+        # Map hypothesis ID patterns to EFE components they test.
+        # Evo encodes the component under test in the hypothesis ID prefix.
+        # E.g. "efe_epistemic:..." → adjust epistemic weight.
+        if not hypothesis_id or self._efe_evaluator is None:
+            return
+
+        component_map = {
+            "efe_epistemic": "epistemic",
+            "efe_pragmatic": "pragmatic",
+            "efe_constitutional": "constitutional",
+            "efe_feasibility": "feasibility",
+            "efe_risk": "risk",
+        }
+        matched_component: str | None = None
+        for prefix, component in component_map.items():
+            if hypothesis_id.startswith(prefix):
+                matched_component = component
+                break
+
+        if matched_component is None:
+            return  # Not an EFE-targeting hypothesis
+
+        current = self._efe_evaluator.weights
+        current_val = getattr(current, matched_component, 0.2)
+        # Adjust weight toward evidence: winner confirmed → raise weight
+        # proportional to confidence delta from 0.5 baseline.
+        delta = (confidence - 0.5) * 0.1  # max ±0.05 per update
+        new_val = min(0.95, max(0.05, current_val + delta))
+        if abs(new_val - current_val) > 0.001:
+            self.update_efe_weights({matched_component: new_val})
+            self._logger.info(
+                "efe_weight_adjusted_from_hypothesis",
+                component=matched_component,
+                old=round(current_val, 4),
+                new=round(new_val, 4),
+                confidence=confidence,
+            )
+
+    async def _on_oneiros_consolidation(self, event: Any) -> None:
+        """
+        Handle ONEIROS_CONSOLIDATION_COMPLETE — refresh Nova's beliefs from
+        sleep-consolidated Memory nodes.
+
+        Oneiros compresses episodic memory into schemas and consolidated beliefs
+        during the sleep cycle. Without this hook Nova's beliefs drift from
+        Memory's ground truth: new schemas are invisible until the next broadcast
+        happens to retrieve them. By pulling a fresh retrieval pass after each
+        sleep cycle, Nova's world model tracks the organism's consolidated state.
+
+        Spec §20 ONEIROS_CONSOLIDATION_COMPLETE — previously unsubscribed (SG4 partial).
+        """
+        data = getattr(event, "data", {}) or {}
+        cycle_id = data.get("cycle_id", "")
+        episodes_consolidated = int(data.get("episodes_consolidated", 0))
+
+        self._logger.info(
+            "oneiros_consolidation_received",
+            cycle_id=cycle_id,
+            episodes_consolidated=episodes_consolidated,
+        )
+
+        if self._memory is None or self._goal_manager is None:
+            return
+
+        # Query Memory for consolidated beliefs relevant to current goals.
+        # Pull the top active goal as an anchor — if no goals, use a generic
+        # self-model query so beliefs stay grounded after sleep.
+        active_goals = self._goal_manager.active_goals
+        query_text = (
+            active_goals[0].description if active_goals
+            else "self model world knowledge consolidated beliefs"
+        )
+
+        try:
+            result = await self._memory.retrieve(
+                query_text=query_text,
+                max_results=15,
+                salience_floor=0.3,
+            )
+            if result and result.traces:
+                # Treat consolidated high-salience traces as "successful observations"
+                # to raise overall belief confidence — sleep consolidation means
+                # the organism's knowledge is more coherent, not less.
+                high_salience_count = sum(
+                    1 for t in result.traces if t.unified_score >= 0.5
+                )
+                if high_salience_count > 0:
+                    self._belief_updater.update_from_outcome(
+                        outcome_description=f"oneiros_consolidation:{cycle_id}",
+                        success=True,
+                        precision=min(0.9, high_salience_count / 15),
+                    )
+                    self._logger.info(
+                        "beliefs_refreshed_after_consolidation",
+                        cycle_id=cycle_id,
+                        high_salience_traces=high_salience_count,
+                    )
+                    # Flush to Neo4j so updated confidence persists across restarts
+                    asyncio.create_task(
+                        self._flush_beliefs_safe(),
+                        name=f"nova_belief_flush_post_sleep_{cycle_id[:8]}",
+                    )
+        except Exception as exc:
+            self._logger.debug(
+                "oneiros_belief_refresh_failed",
+                cycle_id=cycle_id,
+                error=str(exc),
+            )
+
+    async def _on_goal_override(self, event: Any) -> None:
+        """
+        Handle GOAL_OVERRIDE — governance or federation injects a goal into Nova's agenda.
+
+        Validates the payload, creates a Goal with GoalSource.GOVERNANCE, and emits
+        GOAL_ACCEPTED or GOAL_REJECTED so the caller has a clear signal.
+
+        Gap 7 — GOAL_OVERRIDE implementation (2026-03-07).
+        """
+        from primitives.common import DriveAlignmentVector, new_id
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        data = getattr(event, "data", {}) or {}
+        description: str = str(data.get("description", "")).strip()
+        importance: float = float(data.get("importance", 0.5))
+        urgency: float = float(data.get("urgency", 0.5))
+        source: str = str(data.get("source", "")).strip()
+        injected_by: str = str(data.get("injected_by", "governance")).strip()
+        raw_alignment: dict = data.get("drive_alignment", {})
+
+        # ── Validation ──────────────────────────────────────────────────
+        rejection_reason: str | None = None
+        if not description:
+            rejection_reason = "description is empty"
+        elif not source:
+            rejection_reason = "source is empty"
+        elif not (0.0 <= importance <= 1.0):
+            rejection_reason = f"importance {importance} out of range [0, 1]"
+        elif not (0.0 <= urgency <= 1.0):
+            rejection_reason = f"urgency {urgency} out of range [0, 1]"
+
+        if rejection_reason is not None:
+            self._logger.warning(
+                "goal_override_rejected",
+                reason=rejection_reason,
+                injected_by=injected_by,
+            )
+            if self._synapse is not None:
+                try:
+                    await self._synapse.event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.GOAL_REJECTED,
+                        source_system="nova",
+                        data={
+                            "description": description,
+                            "reason": rejection_reason,
+                            "source": source,
+                            "injected_by": injected_by,
+                        },
+                    ))
+                except Exception as exc:
+                    self._logger.debug("goal_rejected_emit_failed", error=str(exc))
+            return
+
+        # ── Accept: create goal with GOVERNANCE source ───────────────────
+        if self._goal_manager is None:
+            self._logger.warning("goal_override_received_but_goal_manager_not_init")
+            return
+
+        alignment = DriveAlignmentVector(
+            coherence=float(raw_alignment.get("coherence", 0.0)),
+            care=float(raw_alignment.get("care", 0.0)),
+            growth=float(raw_alignment.get("growth", 0.0)),
+            honesty=float(raw_alignment.get("honesty", 0.0)),
+        )
+        goal = Goal(
+            id=new_id(),
+            description=description,
+            source=GoalSource.GOVERNANCE,
+            priority=round(importance * 0.5 + urgency * 0.5, 4),
+            urgency=urgency,
+            importance=importance,
+            drive_alignment=alignment,
+            status=GoalStatus.ACTIVE,
+        )
+        self._goal_manager.add_goal(goal)
+
+        # Persist to Neo4j fire-and-forget
+        neo4j = self._memory.get_neo4j()
+        if neo4j is not None:
+            asyncio.create_task(
+                persist_goal(neo4j, goal),
+                name=f"nova_persist_gov_goal_{goal.id[:8]}",
+            )
+
+        self._logger.info(
+            "goal_override_accepted",
+            goal_id=goal.id,
+            description=description[:80],
+            injected_by=injected_by,
+        )
+        if self._synapse is not None:
+            try:
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.GOAL_ACCEPTED,
+                    source_system="nova",
+                    data={
+                        "goal_id": goal.id,
+                        "description": description,
+                        "importance": importance,
+                        "source": source,
+                        "injected_by": injected_by,
+                    },
+                ))
+                # NOVA_GOAL_INJECTED: governance goal accepted into agenda
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.NOVA_GOAL_INJECTED,
+                    source_system="nova",
+                    data={
+                        "goal_id": goal.id,
+                        "description": description[:200],
+                        "source": source,
+                        "injected_by": injected_by,
+                        "priority": round(goal.priority, 4),
+                    },
+                ))
+            except Exception as exc:
+                self._logger.debug("goal_accepted_emit_failed", error=str(exc))
 
     def set_telos(self, telos: Any) -> None:
         """Wire Telos so deliberation can weight policies by effective_I impact."""
@@ -457,18 +1159,53 @@ class NovaService:
 
     def set_axon(self, axon: AxonService) -> None:
         """
-        Wire Axon into Nova's intent router after both are initialised.
-        This enables Step 5 of the cognitive cycle: ACT.
-
-        If called before initialize(), the axon is stored and applied at the
-        end of initialize() so the router is always correctly wired.
+        Store Axon reference for begin_cycle() heartbeat calls.
+        IntentRouter no longer holds a direct Axon reference — routing is
+        via AXON_EXECUTION_REQUEST Synapse events.
         """
         self._axon = axon
-        if self._intent_router is not None:
-            self._intent_router.set_axon(axon)
-            self._logger.info("axon_wired_to_nova")
-        else:
-            self._logger.debug("set_axon_stored_pending_initialize")
+        self._logger.info("axon_wired_to_nova")
+
+    async def _emit_re_training_example(
+        self,
+        category: str,
+        instruction: str,
+        input_context: str,
+        output: str,
+        outcome_quality: float,
+        episode_id: str = "",
+        cost_usd: Decimal = Decimal("0"),
+        latency_ms: int = 0,
+        reasoning_trace: str = "",
+        alternatives: list[str] | None = None,
+        constitutional_alignment: DriveAlignmentVector | None = None,
+    ) -> None:
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            example = RETrainingExample(
+                source_system=SystemID.NOVA,
+                episode_id=episode_id,
+                instruction=instruction,
+                input_context=input_context,
+                output=output,
+                outcome_quality=outcome_quality,
+                category=category,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                reasoning_trace=reasoning_trace,
+                alternatives_considered=alternatives or [],
+                constitutional_alignment=constitutional_alignment or DriveAlignmentVector(),
+            )
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                data=example.model_dump(mode="json"),
+                source_system="nova",
+            ))
+        except Exception:
+            self._logger.debug("re_training_emit_failed", exc_info=True)
 
     async def shutdown(self) -> None:
         """Graceful shutdown."""
@@ -529,8 +1266,8 @@ class NovaService:
         # Reset Axon's per-cycle budget at each heartbeat so the budget
         # window aligns with the cognitive rhythm rather than relying solely
         # on the 30-second auto-reset timer.
-        if self._intent_router._axon is not None:
-            self._intent_router._axon.begin_cycle()
+        if self._axon is not None:
+            self._axon.begin_cycle()
 
         # ── 1. Skip if organism is busy with heavy external actions ──
         # Lightweight internal executors (store_insight, observe, query_memory,
@@ -625,6 +1362,11 @@ class NovaService:
                 self._equor.review(intent),
                 timeout=self._config.slow_path_timeout_ms / 1000.0,
             )
+        except (TimeoutError, asyncio.TimeoutError, OSError, ConnectionError) as exc:
+            reason = f"equor_heartbeat_unavailable: {exc!s}"
+            self._logger.warning("heartbeat_equor_unavailable", error=str(exc))
+            self._on_equor_failure(reason)
+            return  # do-nothing fallback — no unreviewed intent dispatched
         except Exception as exc:
             self._logger.warning("heartbeat_equor_error", error=str(exc))
             return
@@ -735,6 +1477,11 @@ class NovaService:
         self._thymos = thymos
         self._logger.info("thymos_wired_to_nova")
 
+    def set_thread(self, thread: Any) -> None:
+        """Wire Thread so Nova can commit decision epochs to narrative identity."""
+        self._thread = thread
+        self._logger.info("thread_wired_to_nova")
+
     def _get_or_create_hunt_goal(self) -> Goal:
         """
         Return the existing active hunt goal or create a new one.
@@ -822,6 +1569,10 @@ class NovaService:
         if self._deliberation_engine is None:
             return  # Not yet initialized
 
+        # ── Metabolic gate: halt deliberation under CRITICAL starvation ──
+        if self._starvation_level == "critical":
+            return
+
         self._total_broadcasts += 1
         self._last_deliberation_at = time.monotonic()
         self._current_affect = broadcast.affect
@@ -830,8 +1581,24 @@ class NovaService:
         # the previous broadcast's fire-and-forget tasks haven't drained.
         await asyncio.sleep(0)
 
-        # ── Belief update (≤50ms) ──
+        # ── Belief update (≤50ms) — lightweight, always runs ──
         delta = self._belief_updater.update_from_broadcast(broadcast)
+
+        # Emit evolutionary observable on belief revision
+        if delta.involves_belief_conflict():
+            asyncio.create_task(
+                self._emit_evolutionary_observable(
+                    observable_type="belief_revision",
+                    value=self._belief_updater.beliefs.free_energy,
+                    is_novel=True,
+                    metadata={
+                        "broadcast_id": broadcast.broadcast_id,
+                        "source": broadcast.source,
+                        "confidence": round(self._belief_updater.beliefs.overall_confidence, 4),
+                    },
+                ),
+                name=f"nova_evo_belief_{broadcast.broadcast_id[:8]}",
+            )
 
         # ── Retrieve relevant memories (best-effort, non-blocking) ──
         memory_traces = await self._retrieve_relevant_memories_safe(broadcast)
@@ -886,6 +1653,13 @@ class NovaService:
             except Exception as exc:
                 self._logger.debug("soma_urgency_check_error", error=str(exc))
 
+        # ── Metabolic gate: EMERGENCY — only process high-salience percepts ──
+        if self._starvation_level == "emergency":
+            salience = getattr(broadcast, "salience", 0.0)
+            if salience < 0.7:
+                self._total_do_nothing += 1
+                return
+
         # ── Deliberate (≤5000ms total) ──
         intent, record, rejected_policies = await self._deliberation_engine.deliberate(
             broadcast=broadcast,
@@ -929,6 +1703,37 @@ class NovaService:
             # Budget recovered — reset consecutive counter.
             self._consecutive_budget_exhausted = 0
 
+        # ── Emit BUDGET_PRESSURE early warning (before full exhaustion) ──
+        # is_pressured fires at 60% of the exhaustion threshold — giving Soma
+        # time to register Nova's metabolic load before the organism freezes.
+        # (Spec §20 BUDGET_PRESSURE — open gap closed.)
+        if (
+            self._synapse is not None
+            and self._deliberation_engine is not None
+            and self._deliberation_engine.fe_budget.is_pressured
+            and not self._deliberation_engine.fe_budget.is_exhausted
+        ):
+            try:
+                from systems.synapse.types import SynapseEvent as _SE
+                from systems.synapse.types import SynapseEventType as _SET
+
+                _budget = self._deliberation_engine.fe_budget
+                asyncio.create_task(
+                    self._synapse.event_bus.emit(_SE(
+                        event_type=_SET.BUDGET_PRESSURE,
+                        source_system="nova",
+                        data={
+                            "spent_nats": round(_budget.spent_nats, 4),
+                            "budget_nats": round(_budget.budget_nats, 4),
+                            "utilisation": round(_budget.utilisation, 4),
+                            "path": record.path,
+                        },
+                    )),
+                    name=f"nova_budget_pressure_{broadcast.broadcast_id[:8]}",
+                )
+            except Exception:
+                pass
+
         # ── Emit Synapse feedback events (fire-and-forget, non-blocking) ──
         if self._synapse is not None:
             try:
@@ -948,6 +1753,48 @@ class NovaService:
                     )),
                     name=f"nova_belief_updated_{broadcast.broadcast_id[:8]}",
                 )
+                # NOVA_BELIEF_STABILISED: emit when beliefs settle into a high-
+                # confidence, low-VFE state — signals predictive mind at rest.
+                # Threshold: confidence ≥ 0.75 AND free_energy ≤ 0.25 AND no conflict.
+                _beliefs = self._belief_updater.beliefs
+                if (
+                    _beliefs.overall_confidence >= 0.75
+                    and _beliefs.free_energy <= 0.25
+                    and not delta.involves_belief_conflict()
+                ):
+                    asyncio.create_task(
+                        self._synapse.event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.NOVA_BELIEF_STABILISED,
+                            source_system="nova",
+                            data={
+                                "percept_id": broadcast.broadcast_id,
+                                "confidence": round(_beliefs.overall_confidence, 4),
+                                "free_energy": round(_beliefs.free_energy, 4),
+                                "entity_count": len(_beliefs.entities),
+                            },
+                        )),
+                        name=f"nova_belief_stabilised_{broadcast.broadcast_id[:8]}",
+                    )
+                # Emit BELIEFS_CHANGED for Memory consolidation pipeline
+                if not delta.is_empty():
+                    asyncio.create_task(
+                        self._synapse.event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.BELIEFS_CHANGED,
+                            source_system="nova",
+                            data={
+                                "entity_count": len(self._belief_updater.beliefs.entities),
+                                "free_energy": round(
+                                    self._belief_updater.beliefs.free_energy, 4,
+                                ),
+                                "confidence": round(
+                                    self._belief_updater.beliefs.overall_confidence, 4,
+                                ),
+                                "delta_entities_added": len(delta.entity_additions),
+                                "delta_entities_updated": len(delta.entity_updates),
+                            },
+                        )),
+                        name=f"nova_beliefs_changed_{broadcast.broadcast_id[:8]}",
+                    )
                 if intent is not None:
                     asyncio.create_task(
                         self._synapse.event_bus.emit(SynapseEvent(
@@ -970,10 +1817,97 @@ class NovaService:
             except Exception as exc:
                 self._logger.debug("synapse_emit_error", error=str(exc))
 
+        # ── Emit DELIBERATION_RECORD for Thread narrative + Benchmarks ──
+        if self._synapse is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                asyncio.create_task(
+                    self._synapse.event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.DELIBERATION_RECORD,
+                        source_system="nova",
+                        data={
+                            "goal_id": record.goal_id or "",
+                            "policies_considered": record.policies_generated,
+                            "selected_policy": record.selected_policy_name,
+                            "selection_reasoning": (
+                                intent.decision_trace.reasoning[:300]
+                                if intent and intent.decision_trace else record.path
+                            ),
+                            "confidence": round(
+                                self._belief_updater.beliefs.overall_confidence, 4,
+                            ),
+                            "deliberation_time_ms": record.latency_ms,
+                            "path": record.path,
+                        },
+                    )),
+                    name=f"nova_delib_record_{broadcast.broadcast_id[:8]}",
+                )
+            except Exception:
+                self._logger.debug("deliberation_record_emit_failed", exc_info=True)
+
+        # ── RE training: planning deliberation ──
+        # Compute Axon completion rate proxy for outcome_quality
+        _total_outcomes = self._total_outcomes_success + self._total_outcomes_failure
+        _axon_success_rate = (
+            self._total_outcomes_success / _total_outcomes
+            if _total_outcomes > 0 else 0.5
+        )
+        asyncio.create_task(
+            self._emit_re_training_example(
+                category="planning_deliberation",
+                instruction=(
+                    f"Goal: {intent.goal.description[:200]}"
+                    if intent else "Deliberate on workspace broadcast"
+                ),
+                input_context=(
+                    f"world_model={{vfe={self._belief_updater.beliefs.free_energy:.3f}, "
+                    f"confidence={self._belief_updater.beliefs.overall_confidence:.3f}, "
+                    f"entities={len(self._belief_updater.beliefs.entities)}}}, "
+                    f"broadcast={{source={broadcast.source}, "
+                    f"salience={broadcast.salience.composite:.3f}}}, "
+                    f"affect={{valence={broadcast.affect.valence:.3f}, "
+                    f"arousal={broadcast.affect.arousal:.3f}}}, "
+                    f"policies_available={record.policies_generated}, "
+                    f"path={record.path}"
+                ),
+                output=(
+                    f"selected={record.selected_policy_name}, "
+                    f"reasoning={intent.decision_trace.reasoning[:300] if intent and intent.decision_trace else 'silence'}"
+                ),
+                outcome_quality=_axon_success_rate,
+                episode_id=broadcast.broadcast_id,
+                reasoning_trace=(
+                    intent.decision_trace.reasoning[:500]
+                    if intent and intent.decision_trace else record.path
+                ),
+                alternatives=[
+                    p.description[:200] for p in rejected_policies
+                ] if rejected_policies else [],
+            ),
+            name=f"nova_re_emit_{broadcast.broadcast_id[:8]}",
+        )
+
         # ── Route intent if one was produced ──
         if intent is not None:
             self._total_intents_issued += 1
             await self._dispatch_intent(intent, broadcast, record)
+
+            # Emit evolutionary observable for planning innovation
+            asyncio.create_task(
+                self._emit_evolutionary_observable(
+                    observable_type="planning_innovation",
+                    value=round(intent.priority, 4),
+                    is_novel=True,
+                    metadata={
+                        "intent_id": intent.id,
+                        "path": record.path,
+                        "goal": intent.goal.description[:200],
+                        "policies_considered": len(rejected_policies) + 1 if rejected_policies else 1,
+                    },
+                ),
+                name=f"nova_evo_plan_{intent.id[:8]}",
+            )
 
             # ── Archive rejected policies as counterfactual episodes ──
             if rejected_policies:
@@ -1006,17 +1940,44 @@ class NovaService:
 
         # ── Goal maintenance (every 100 broadcasts) ──
         if self._total_broadcasts % 100 == 0 and self._goal_manager:
-            self._goal_manager.expire_stale_goals()
+            _expired = self._goal_manager.expire_stale_goals()
             self._goal_manager.prune_retired_goals()
+            # Emit GOAL_ABANDONED for each stale-abandoned goal so the bus
+            # reflects goal lifecycle events (Spec §20 — open gap closed).
+            if _expired and self._synapse is not None:
+                for _eg in _expired:
+                    asyncio.create_task(
+                        self._emit_goal_lifecycle_event(
+                            event_name="goal_abandoned",
+                            goal=_eg,
+                            reason="suspended_too_long",
+                        ),
+                        name=f"nova_goal_abandoned_{_eg.id[:8]}",
+                    )
             self._expire_stale_pending_intents()
             self._expire_stale_pending_counterfactuals()
             # Sync stale suspended goals to Neo4j (fire-and-forget)
-            _maint_neo4j = getattr(self._memory, "_neo4j", None)
+            _maint_neo4j = self._memory.get_neo4j()
             if _maint_neo4j is not None:
                 asyncio.create_task(
                     abandon_stale_goals(_maint_neo4j),
                     name="nova_abandon_stale_goals",
                 )
+            # ── Gap 5: Conflict detection every 100 broadcasts ──────────
+            _conflicts = self._goal_manager.detect_conflicts(
+                self._goal_manager.active_goals
+            )
+            if _conflicts and self._synapse is not None:
+                asyncio.create_task(
+                    self._emit_goal_conflicts(_conflicts),
+                    name="nova_goal_conflict_check",
+                )
+
+        # ── Persist dirty beliefs to Neo4j (batched, every 10 changes) ──
+        asyncio.create_task(
+            self._flush_beliefs_safe(),
+            name=f"nova_belief_persist_{broadcast.broadcast_id[:8]}",
+        )
 
         # ── Decay unobserved entity beliefs (background maintenance) ──
         self._belief_updater.decay_unobserved_entities()
@@ -1027,13 +1988,27 @@ class NovaService:
         """Add a goal directly (called by governance or test harness)."""
         assert self._goal_manager is not None
         result = self._goal_manager.add_goal(goal)
+        # Emit evolutionary observable for novel goal adoption
+        asyncio.create_task(
+            self._emit_evolutionary_observable(
+                observable_type="novel_goal",
+                value=result.priority,
+                is_novel=True,
+                metadata={
+                    "goal_id": result.id,
+                    "description": result.description[:200],
+                    "source": result.source.value if hasattr(result.source, "value") else str(result.source),
+                },
+            ),
+            name=f"nova_evo_goal_{result.id[:8]}",
+        )
         # Embed the goal description for salience-guided attention
         asyncio.create_task(
             self._embed_goal(result),
             name=f"nova_embed_goal_{result.id[:8]}",
         )
         # Persist to Neo4j so goal survives process restarts
-        neo4j = getattr(self._memory, "_neo4j", None)
+        neo4j = self._memory.get_neo4j()
         if neo4j is not None:
             asyncio.create_task(
                 persist_goal(neo4j, result),
@@ -1104,6 +2079,15 @@ class NovaService:
             if is_bounty_solve:
                 self._process_bounty_solve_failure(outcome)
 
+        # ── Compute graded pragmatic value for counterfactual regret signal ──
+        # outcome_quality × goal_achievement_degree × (1 - regret_estimate)
+        # regret_estimate is 0 here — the actual regret delta is computed later
+        # in _resolve_counterfactuals against estimated_pragmatic_value.
+        # goal_achievement_degree defaults to 1.0/0.0 when no goal context.
+        _outcome_quality = 1.0 if outcome.success else 0.0
+        _goal_achievement_degree: float = _outcome_quality  # refined below if goal known
+        _actual_pragmatic: float = _outcome_quality  # overwritten if goal context found
+
         # Update goal progress if we know which goal this intent served
         if pending and self._goal_manager:
             goal = self._goal_manager.get_goal(pending.goal_id)
@@ -1116,6 +2100,10 @@ class NovaService:
                     progress_delta = 0.8  # Bounty actually paid — highest reward
                 else:
                     progress_delta = 0.3 if outcome.success else 0.0
+                # Graded signal: normalize progress_delta to [0, 1].
+                # Max delta is 0.8 (bounty_paid); divide by 0.8 to keep range [0, 1].
+                _goal_achievement_degree = progress_delta / 0.8
+                _actual_pragmatic = round(_outcome_quality * _goal_achievement_degree, 4)
                 new_progress = min(1.0, goal.progress + progress_delta)
                 updated_goal = self._goal_manager.update_progress(
                     goal.id,
@@ -1124,7 +2112,7 @@ class NovaService:
                 )
                 # Persist status/progress change to Neo4j (fire-and-forget)
                 if updated_goal is not None:
-                    _neo4j = getattr(self._memory, "_neo4j", None)
+                    _neo4j = self._memory.get_neo4j()
                     if _neo4j is not None:
                         asyncio.create_task(
                             update_goal_status(
@@ -1134,6 +2122,16 @@ class NovaService:
                                 updated_goal.progress,
                             ),
                             name=f"nova_update_goal_status_{updated_goal.id[:8]}",
+                        )
+                    # Emit GOAL_ACHIEVED so the organism's goal lifecycle is
+                    # visible on the Synapse bus (Spec §20 — open gap closed).
+                    if updated_goal.status == GoalStatus.ACHIEVED and self._synapse is not None:
+                        asyncio.create_task(
+                            self._emit_goal_lifecycle_event(
+                                event_name="goal_achieved",
+                                goal=updated_goal,
+                            ),
+                            name=f"nova_goal_achieved_{updated_goal.id[:8]}",
                         )
 
         # ── Forward tournament outcome to Evo ──
@@ -1156,8 +2154,50 @@ class NovaService:
         cf_records = self._pending_counterfactuals.pop(outcome.intent_id, [])
         if cf_records:
             asyncio.create_task(
-                self._resolve_counterfactuals(cf_records, outcome),
+                self._resolve_counterfactuals(cf_records, outcome, _actual_pragmatic),
                 name=f"nova_cf_resolve_{outcome.intent_id[:8]}",
+            )
+
+        # ── Emit HYPOTHESIS_FEEDBACK for all slow-path outcomes ──
+        # Previously only emitted for tournament-tagged outcomes; now emits
+        # for every dispatched intent so Evo's Thompson sampler learns from
+        # all slow-path deliberations, not just A/B experiments.
+        # (Spec §20 HYPOTHESIS_FEEDBACK partial → resolved.)
+        if pending is not None and self._synapse is not None:
+            # Regret = mean regret from resolved counterfactuals if available,
+            # else None (counterfactuals resolve asynchronously).
+            regret: float | None = None
+            if cf_records:
+                resolved_regrets = [
+                    r.regret for r in cf_records if r.regret is not None
+                ]
+                if resolved_regrets:
+                    regret = sum(resolved_regrets) / len(resolved_regrets)
+
+            asyncio.create_task(
+                self._emit_hypothesis_feedback(
+                    intent_id=outcome.intent_id,
+                    success=outcome.success,
+                    regret=regret,
+                    policy_name=pending.policy_name,
+                    goal_id=pending.goal_id,
+                ),
+                name=f"nova_hyp_feedback_{outcome.intent_id[:8]}",
+            )
+
+        # ── Gap 4: Emit THREAD_COMMIT_REQUEST to record narrative epoch ──
+        # Thread receives every resolved outcome so it can maintain temporal
+        # coherence of the organism's narrative identity (Spec 15).
+        if pending is not None and self._synapse is not None:
+            asyncio.create_task(
+                self._emit_thread_commit_request(
+                    intent_id=outcome.intent_id,
+                    goal_id=pending.goal_id,
+                    policy_name=pending.policy_name,
+                    outcome_quality=_actual_pragmatic,
+                    success=outcome.success,
+                ),
+                name=f"nova_thread_commit_{outcome.intent_id[:8]}",
             )
 
         self._logger.info(
@@ -1643,22 +2683,18 @@ class NovaService:
                 }
 
         # ── 2. Neo4j reachability ─────────────────────────────────────────
-        neo4j = getattr(self._memory, "_neo4j", None)
-        if neo4j is None:
-            components["neo4j"] = {"status": "not_wired"}
-            issues.append("neo4j client not available")
-        else:
-            try:
-                neo4j_result = await asyncio.wait_for(neo4j.health_check(), timeout=3.0)
-                components["neo4j"] = neo4j_result
-                if neo4j_result.get("status") != "connected":
-                    issues.append("neo4j unreachable")
-            except TimeoutError:
-                components["neo4j"] = {"status": "timeout"}
-                issues.append("neo4j health check timed out")
-            except Exception as exc:
-                components["neo4j"] = {"status": "error", "error": str(exc)}
-                issues.append(f"neo4j error: {exc}")
+        try:
+            mem_health = await asyncio.wait_for(self._memory.health(), timeout=3.0)
+            neo4j_result = mem_health.get("neo4j", {})
+            components["neo4j"] = neo4j_result
+            if neo4j_result.get("status") != "connected":
+                issues.append("neo4j unreachable")
+        except TimeoutError:
+            components["neo4j"] = {"status": "timeout"}
+            issues.append("neo4j health check timed out")
+        except Exception as exc:
+            components["neo4j"] = {"status": "error", "error": str(exc)}
+            issues.append(f"neo4j error: {exc}")
 
         # ── 3. Goal set occupancy ─────────────────────────────────────────
         goal_stats: dict[str, Any] = {}
@@ -1791,10 +2827,12 @@ class NovaService:
         Returns minimal goal summaries for Fovea's goal-relevance weighting.
         Fovea uses goal embeddings to boost salience of goal-relevant content.
         """
+        from systems.fovea.types import ActiveGoalSummary as _ActiveGoalSummary
+
         if self._goal_manager is None:
             return []
         return [
-            ActiveGoalSummary(
+            _ActiveGoalSummary(
                 id=g.id,
                 target_embedding=self._goal_embeddings.get(g.id, []),
                 priority=g.priority,
@@ -1816,7 +2854,257 @@ class NovaService:
     def beliefs(self) -> Any:
         return self._belief_updater.beliefs
 
+    # ─── Evolutionary Observable Emission ─────────────────────────
+
+    async def _emit_evolutionary_observable(
+        self,
+        observable_type: str,
+        value: float,
+        is_novel: bool,
+        metadata: dict | None = None,
+    ) -> None:
+        """Emit an evolutionary observable event via Synapse."""
+        bus = getattr(self._synapse, "event_bus", None) if self._synapse else None
+        if bus is None:
+            return
+        try:
+            from primitives.evolutionary import EvolutionaryObservable
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            obs = EvolutionaryObservable(
+                source_system=SystemID.NOVA,
+                instance_id="",
+                observable_type=observable_type,
+                value=value,
+                is_novel=is_novel,
+                metadata=metadata or {},
+            )
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system="nova",
+                data=obs.model_dump(mode="json"),
+            )
+            await bus.emit(event)
+        except Exception:
+            pass
+
     # ─── Private ──────────────────────────────────────────────────
+
+    async def _emit_goal_lifecycle_event(
+        self,
+        event_name: str,
+        goal: Goal,
+        reason: str = "",
+    ) -> None:
+        """
+        Emit GOAL_ACHIEVED or GOAL_ABANDONED on the Synapse bus.
+
+        Closes the goal lifecycle visibility gap (Spec §20). Called
+        fire-and-forget after update_progress returns ACHIEVED status,
+        or after expire_stale_goals abandons suspended goals.
+        """
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            event_type = (
+                SynapseEventType.GOAL_ACHIEVED
+                if event_name == "goal_achieved"
+                else SynapseEventType.GOAL_ABANDONED
+            )
+            data: dict[str, object] = {
+                "goal_id": goal.id,
+                "description": goal.description[:200],
+                "source": goal.source.value,
+                "progress": round(goal.progress, 4),
+                "drive_alignment": {
+                    "coherence": goal.drive_alignment.coherence,
+                    "care": goal.drive_alignment.care,
+                    "growth": goal.drive_alignment.growth,
+                    "honesty": goal.drive_alignment.honesty,
+                },
+            }
+            if reason:
+                data["reason"] = reason
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=event_type,
+                source_system="nova",
+                data=data,
+            ))
+        except Exception as exc:
+            self._logger.debug(f"goal_lifecycle_emit_failed_{event_name}", error=str(exc))
+
+    async def _emit_goal_conflicts(
+        self,
+        conflicts: list[tuple[Goal, Goal, str]],
+    ) -> None:
+        """
+        Emit GOAL_CONFLICT_DETECTED for each detected pair of conflicting goals.
+
+        Telos subscribes to adjust drive topology; Equor may use this for
+        escalation if a conflict involves floor drives (Care, Honesty).
+
+        Gap 5 — multi-goal conflict detection (2026-03-07).
+        """
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            for goal_a, goal_b, conflict_desc in conflicts:
+                # Suggest resolution: suspend lower-priority goal
+                if goal_a.priority >= goal_b.priority:
+                    suggestion = f"Consider suspending '{goal_b.description[:60]}' (lower priority)"
+                else:
+                    suggestion = f"Consider suspending '{goal_a.description[:60]}' (lower priority)"
+
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.GOAL_CONFLICT_DETECTED,
+                    source_system="nova",
+                    data={
+                        "goal_a_id": goal_a.id,
+                        "goal_b_id": goal_b.id,
+                        "conflict_type": conflict_desc.split(":")[0],
+                        "description": conflict_desc,
+                        "resolution_suggestion": suggestion,
+                    },
+                ))
+                self._logger.info(
+                    "goal_conflict_detected",
+                    goal_a=goal_a.id,
+                    goal_b=goal_b.id,
+                    conflict=conflict_desc[:80],
+                )
+        except Exception as exc:
+            self._logger.debug("goal_conflict_emit_failed", error=str(exc))
+
+    def _on_equor_failure(self, reason: str) -> None:
+        """
+        Callback fired by DeliberationEngine when Equor is unreachable or times out.
+
+        Logs a Thymos DEGRADATION incident so the immune system can track
+        constitutional gate unavailability and trigger repair if recurrent.
+        The caller always falls back to do-nothing — no intent is dispatched
+        without review. Never bypass; never proceed silently.
+        """
+        self._logger.warning("equor_unavailable", reason=reason)
+        if self._thymos is not None:
+            try:
+                from systems.thymos.types import (
+                    Incident,
+                    IncidentClass,
+                    IncidentSeverity,
+                )
+
+                incident = Incident(
+                    incident_class=IncidentClass.DEGRADATION,
+                    severity=IncidentSeverity.HIGH,
+                    fingerprint="nova:equor_unavailable",
+                    source_system="nova",
+                    error_type="EquorUnavailable",
+                    error_message=f"Equor constitutional gate unavailable: {reason[:200]}",
+                    context={"reason": reason},
+                    affected_systems=["nova", "equor"],
+                    blast_radius=0.8,  # High — every intent now passes without review
+                )
+                asyncio.create_task(
+                    self._thymos.on_incident(incident),
+                    name="nova_equor_unavailable_incident",
+                )
+            except Exception as exc:
+                self._logger.debug("equor_unavailable_thymos_escalation_failed", error=str(exc))
+
+    async def _emit_hypothesis_feedback(
+        self,
+        intent_id: str,
+        success: bool,
+        regret: float | None,
+        policy_name: str,
+        goal_id: str,
+    ) -> None:
+        """
+        Emit HYPOTHESIS_FEEDBACK on Synapse for every dispatched-intent outcome.
+
+        Evo uses this event to update Thompson sampling weights for the
+        policy class (decision path) — closing the gap where non-tournament
+        deliberations were invisible to the learning loop.
+
+        Spec §20 HYPOTHESIS_FEEDBACK — partial → resolved (2026-03-07).
+        Spec §22 SPEC GAPS — partial → resolved.
+        """
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            # Identify the decision path from the most recent decision record
+            # that matches this intent, so Evo can bucket feedback by path type.
+            decision_path = "unknown"
+            for dr in reversed(self._decision_records):
+                if dr.intent_dispatched:
+                    decision_path = dr.path
+                    break
+
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.HYPOTHESIS_FEEDBACK,
+                source_system="nova",
+                data={
+                    "intent_id": intent_id,
+                    "success": success,
+                    "regret": regret,
+                    "policy_name": policy_name,
+                    "decision_path": decision_path,
+                    "goal_id": goal_id,
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("hypothesis_feedback_emit_failed", error=str(exc))
+
+    async def _emit_thread_commit_request(
+        self,
+        intent_id: str,
+        goal_id: str,
+        policy_name: str,
+        outcome_quality: float,
+        success: bool,
+    ) -> None:
+        """
+        Emit THREAD_COMMIT_REQUEST so Thread can record this decision epoch in
+        the organism's narrative identity chain (Spec 15).
+
+        Gap 4 — Thread integration (2026-03-07).
+        """
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            # Build drive alignment snapshot from current drive weights
+            drive_alignment = {k: round(v, 4) for k, v in self._drive_weights.items()}
+
+            # Build a brief human-readable decision summary for the narrative
+            outcome_word = "succeeded" if success else "failed"
+            summary = (
+                f"Policy '{policy_name}' {outcome_word} "
+                f"(quality={round(outcome_quality, 3)}) "
+                f"for intent {intent_id[:8]}"
+            )
+
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.THREAD_COMMIT_REQUEST,
+                source_system="nova",
+                data={
+                    "intent_id": intent_id,
+                    "goal_id": goal_id,
+                    "policy_name": policy_name,
+                    "outcome_quality": outcome_quality,
+                    "drive_alignment": drive_alignment,
+                    "decision_summary": summary,
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("thread_commit_request_emit_failed", error=str(exc))
 
     async def _handle_budget_exhaustion(self, broadcast_id: str) -> None:
         """
@@ -1952,6 +3240,35 @@ class NovaService:
                 self._deliberation_engine.last_equor_check
                 if self._deliberation_engine else None
             )
+            goal_id = getattr(intent.goal, "id", None) or intent.goal.description[:50]
+
+            # Emit INTENT_SUBMITTED before routing — audit trail before the
+            # intent leaves Nova (Spec §20 open gap closed).
+            if self._synapse is not None:
+                try:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                    asyncio.create_task(
+                        self._synapse.event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.INTENT_SUBMITTED,
+                            source_system="nova",
+                            data={
+                                "intent_id": intent.id,
+                                "goal_id": goal_id,
+                                "policy_name": decision_record.selected_policy_name
+                                if decision_record else "",
+                                "path": decision_record.path if decision_record else "",
+                                "efe_score": (
+                                    min(decision_record.efe_scores.values())
+                                    if decision_record and decision_record.efe_scores else None
+                                ),
+                            },
+                        )),
+                        name=f"nova_intent_submitted_{intent.id[:8]}",
+                    )
+                except Exception:
+                    pass
+
             route = await self._intent_router.route(
                 intent=intent,
                 affect=broadcast.affect,
@@ -1961,19 +3278,39 @@ class NovaService:
             if route != "internal":
                 self._total_intents_approved += 1
                 # Track pending intent
-                # Use the actual goal ID when available, fall back to description
-                goal_id = getattr(intent.goal, "id", None) or intent.goal.description[:50]
+                executors = [s.executor for s in intent.plan.steps]
                 self._pending_intents[intent.id] = PendingIntent(
                     intent_id=intent.id,
                     goal_id=goal_id,
                     routed_to=route,
-                    executors=[s.executor for s in intent.plan.steps],
+                    executors=executors,
                     # Carry tournament context so outcomes can be fed back to Evo
                     tournament_id=decision_record.tournament_id if decision_record else None,
                     tournament_hypothesis_id=(
                         decision_record.tournament_hypothesis_id if decision_record else None
                     ),
                 )
+
+                # Emit INTENT_ROUTED after successful dispatch (Spec §20 open gap closed).
+                if self._synapse is not None:
+                    try:
+                        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                        asyncio.create_task(
+                            self._synapse.event_bus.emit(SynapseEvent(
+                                event_type=SynapseEventType.INTENT_ROUTED,
+                                source_system="nova",
+                                data={
+                                    "intent_id": intent.id,
+                                    "goal_id": goal_id,
+                                    "routed_to": route,
+                                    "executors": executors,
+                                },
+                            )),
+                            name=f"nova_intent_routed_{intent.id[:8]}",
+                        )
+                    except Exception:
+                        pass
         except Exception as exc:
             self._logger.error("intent_dispatch_failed", intent_id=intent.id, error=str(exc))
             self._total_intents_blocked += 1
@@ -2040,23 +3377,7 @@ class NovaService:
             episode_meta: dict[str, dict[str, Any]] = {}
             if episode_ids and self._memory is not None:
                 try:
-                    rows = await self._memory._neo4j.execute_read(
-                        """
-                        MATCH (ep:Episode)
-                        WHERE ep.id IN $ids
-                        RETURN ep.id AS id,
-                               ep.affect_valence AS affect_valence,
-                               ep.source AS source,
-                               ep.event_time AS event_time
-                        """,
-                        {"ids": episode_ids},
-                    )
-                    for row in rows:
-                        episode_meta[row["id"]] = {
-                            "affect_valence": row.get("affect_valence"),
-                            "source": row.get("source"),
-                            "event_time": row.get("event_time"),
-                        }
+                    episode_meta = await self._memory.get_episodes_meta(episode_ids)
                 except Exception:
                     pass  # Meta enrichment is best-effort; proceed without it
 
@@ -2163,14 +3484,9 @@ class NovaService:
         records: list[CounterfactualRecord],
     ) -> None:
         """Fire-and-forget: write counterfactual episodes to Neo4j."""
-        from systems.memory.episodic import store_counterfactual_episode
-
         for record in records:
             try:
-                await store_counterfactual_episode(
-                    self._memory._neo4j,
-                    record,
-                )
+                await self._memory.store_counterfactual_episode(record)
             except Exception as exc:
                 self._logger.debug(
                     "counterfactual_persist_failed",
@@ -2182,6 +3498,7 @@ class NovaService:
         self,
         records: list[CounterfactualRecord],
         outcome: IntentOutcome,
+        actual_pragmatic: float | None = None,
     ) -> None:
         """
         Resolve counterfactual episodes with regret when outcome arrives.
@@ -2189,19 +3506,19 @@ class NovaService:
         Regret = estimated_pragmatic_value - actual_pragmatic_value
         Positive regret means the counterfactual was estimated to perform better
         than the actual outcome — i.e. the organism might have chosen poorly.
-        """
-        from systems.memory.episodic import (
-            link_counterfactual_to_outcome,
-            resolve_counterfactual,
-        )
 
-        actual_pragmatic = 1.0 if outcome.success else 0.0
+        actual_pragmatic is a continuous [0.0, 1.0] signal computed as:
+            outcome_quality × goal_achievement_degree × (1 - regret_estimate)
+        This gives Evo's Thompson sampler a real gradient rather than a binary flip.
+        Falls back to 1.0/0.0 if no graded value is supplied (e.g. no goal context).
+        """
+        if actual_pragmatic is None:
+            actual_pragmatic = 1.0 if outcome.success else 0.0
 
         for record in records:
             try:
                 regret = record.estimated_pragmatic_value - actual_pragmatic
-                await resolve_counterfactual(
-                    self._memory._neo4j,
+                await self._memory.resolve_counterfactual(
                     record_id=record.id,
                     outcome_success=outcome.success,
                     actual_pragmatic_value=actual_pragmatic,
@@ -2209,8 +3526,7 @@ class NovaService:
                 )
                 # Link to outcome episode if available
                 if outcome.episode_id:
-                    await link_counterfactual_to_outcome(
-                        self._memory._neo4j,
+                    await self._memory.link_counterfactual_to_outcome(
                         counterfactual_id=record.id,
                         outcome_episode_id=outcome.episode_id,
                     )
@@ -2248,11 +3564,284 @@ class NovaService:
                 count=len(expired),
             )
 
+    async def _flush_beliefs_safe(self) -> None:
+        """Fire-and-forget: persist dirty beliefs to Neo4j."""
+        try:
+            await self._belief_updater.persist_beliefs()
+        except Exception:
+            self._logger.debug("belief_flush_failed", exc_info=True)
+
     def _record_decision(self, record: DecisionRecord) -> None:
-        """Store decision record for observability (ring buffer)."""
+        """Store decision record for observability (ring buffer) and persist to Neo4j."""
         self._decision_records.append(record)
         if len(self._decision_records) > self._max_decision_records:
             self._decision_records = self._decision_records[-self._max_decision_records:]
+        asyncio.create_task(
+            self._persist_decision_record(record),
+            name=f"nova_persist_decision_{record.broadcast_id[:8]}",
+        )
+
+    async def _persist_decision_record(self, record: DecisionRecord) -> None:
+        """
+        Fire-and-forget: write (:Decision) node to Neo4j and (if re_training_eligible)
+        push to Redis Stream re_training_queue for the RE training pipeline.
+
+        Gap 1 — DecisionRecord Neo4j persistence.
+        Gap 2 — RE training data emission to Redis Stream.
+        """
+        # ── Gap 1: Neo4j ──────────────────────────────────────────────────
+        neo4j = self._memory.get_neo4j()
+        if neo4j is not None:
+            try:
+                efe_score: float | None = None
+                if record.efe_scores:
+                    efe_score = min(record.efe_scores.values())
+
+                query = """
+                MERGE (d:Decision {id: $id})
+                SET d.intent_id          = $intent_id,
+                    d.broadcast_id       = $broadcast_id,
+                    d.policy_type        = $policy_type,
+                    d.path               = $path,
+                    d.efe_score          = $efe_score,
+                    d.model_used         = $model_used,
+                    d.re_training_eligible = $re_training_eligible,
+                    d.slow_path          = $slow_path,
+                    d.timestamp          = $timestamp
+                WITH d
+                CALL {
+                    WITH d
+                    MATCH (g:Goal {id: $goal_id})
+                    MERGE (d)-[:MOTIVATED_BY]->(g)
+                }
+                IN TRANSACTIONS OF 1 ROW
+                RETURN d.id
+                """
+                # Simpler version without CALL {} for broader Neo4j compatibility:
+                cypher = """
+                MERGE (d:Decision {id: $id})
+                SET d.intent_id            = $intent_id,
+                    d.broadcast_id         = $broadcast_id,
+                    d.policy_type          = $policy_type,
+                    d.path                 = $path,
+                    d.efe_score            = $efe_score,
+                    d.model_used           = $model_used,
+                    d.re_training_eligible = $re_training_eligible,
+                    d.slow_path            = $slow_path,
+                    d.timestamp            = $timestamp
+                """
+                await neo4j.execute_write(
+                    cypher,
+                    parameters={
+                        "id": record.broadcast_id,
+                        "intent_id": record.intent_id or "",
+                        "broadcast_id": record.broadcast_id,
+                        "policy_type": record.selected_policy or "",
+                        "path": record.path,
+                        "efe_score": efe_score,
+                        "model_used": record.model_used,
+                        "re_training_eligible": record.re_training_eligible,
+                        "slow_path": record.path == "slow",
+                        "timestamp": record.timestamp.isoformat() if hasattr(record, "timestamp") else "",
+                    },
+                )
+                # Link to Goal if known
+                if record.goal_id:
+                    link_cypher = """
+                    MATCH (d:Decision {id: $decision_id})
+                    MATCH (g:Goal {id: $goal_id})
+                    MERGE (d)-[:MOTIVATED_BY]->(g)
+                    """
+                    await neo4j.execute_write(
+                        link_cypher,
+                        parameters={"decision_id": record.broadcast_id, "goal_id": record.goal_id},
+                    )
+            except Exception as exc:
+                self._logger.debug("decision_persist_neo4j_failed", error=str(exc))
+
+        # ── Gap 2: Redis Stream re_training_queue ─────────────────────────
+        if record.re_training_eligible:
+            try:
+                import json
+
+                redis = getattr(self._memory, "_redis", None)
+                if redis is None:
+                    redis = getattr(self._synapse, "_redis", None)
+                if redis is not None:
+                    payload = {
+                        "stream": "nova_deliberation",
+                        "broadcast_id": record.broadcast_id,
+                        "intent_id": record.intent_id or "",
+                        "goal_id": record.goal_id or "",
+                        "path": record.path,
+                        "selected_policy": record.selected_policy or "",
+                        "efe_scores": json.dumps(record.efe_scores or {}),
+                        "model_used": record.model_used,
+                        "slow_path": "1" if record.path == "slow" else "0",
+                    }
+                    await redis.xadd("re_training_queue", payload)
+            except Exception as exc:
+                self._logger.debug("decision_re_stream_failed", error=str(exc))
+
+        # ── Gap 6: Induce procedure template from successful slow-path decisions ──
+        # Criteria: slow path, intent was dispatched, EFE < -0.3 (clear winner)
+        if (
+            record.path == "slow"
+            and record.intent_dispatched
+            and record.selected_policy
+            and record.efe_scores
+            and min(record.efe_scores.values()) < -0.3
+            and neo4j is not None
+        ):
+            asyncio.create_task(
+                self._induce_procedure_from_record(record, neo4j),
+                name=f"nova_induce_procedure_{record.broadcast_id[:8]}",
+            )
+
+    async def _induce_procedure_from_record(
+        self,
+        record: DecisionRecord,
+        neo4j: Any,
+    ) -> None:
+        """
+        Persist a successful slow-path decision as an induced (:Procedure) node in
+        Neo4j and inject it into _DYNAMIC_PROCEDURES for fast-path matching.
+
+        Induction criteria (applied by caller):
+        - Path = slow
+        - Intent was dispatched
+        - Best EFE score < −0.3 (clear winner, not just less-bad)
+
+        Gap 6 — procedure template induction (2026-03-07).
+        """
+        try:
+            from primitives.common import new_id
+            from systems.nova.policy_generator import register_dynamic_procedure
+
+            procedure_id = new_id()
+            name = record.selected_policy or "induced_procedure"
+            efe_score = min(record.efe_scores.values()) if record.efe_scores else 0.0
+
+            cypher = """
+            MERGE (p:Procedure {name: $name})
+            ON CREATE SET
+                p.id            = $id,
+                p.source        = 'nova_induction',
+                p.domain        = $domain,
+                p.efe_score     = $efe_score,
+                p.success_rate  = $success_rate,
+                p.induction_count = 1,
+                p.created_at    = $timestamp
+            ON MATCH SET
+                p.efe_score     = ($efe_score + p.efe_score) / 2.0,
+                p.induction_count = p.induction_count + 1,
+                p.success_rate  = CASE
+                    WHEN p.induction_count > 0
+                    THEN (p.success_rate * p.induction_count + 1.0) / (p.induction_count + 1)
+                    ELSE 0.9
+                END
+            RETURN p.id, p.success_rate, p.induction_count
+            """
+            # Infer domain from goal_id or selected_policy name
+            domain = "general"
+            if record.goal_id:
+                # Map known goal prefixes to domains
+                for kw, dom in (
+                    ("bounty", "economic"), ("care", "care"),
+                    ("coherence", "coherence"), ("memory", "epistemic"),
+                ):
+                    if kw in (record.goal_id or "").lower():
+                        domain = dom
+                        break
+
+            await neo4j.execute_read(
+                cypher,
+                parameters={
+                    "id": procedure_id,
+                    "name": name,
+                    "domain": domain,
+                    "efe_score": round(efe_score, 4),
+                    "success_rate": 0.9,
+                    "timestamp": record.timestamp.isoformat() if hasattr(record, "timestamp") else "",
+                },
+            )
+
+            # Register into the fast-path dynamic procedure pool so the organism
+            # can reuse this pattern without an LLM call next time.
+            register_dynamic_procedure({
+                "name": name,
+                "condition": lambda b, _n=name: (
+                    _n.lower().replace("_", " ").split()[0]
+                    in str(getattr(getattr(b, "content", None), "content", "") or "").lower()
+                ),
+                "domain": domain,
+                "steps": [{"action_type": "observe", "description": f"Execute {name} procedure"}],
+                "success_rate": 0.9,
+                "effort": "medium",
+                "time_horizon": "short",
+            })
+
+            self._logger.info(
+                "procedure_induced",
+                name=name,
+                domain=domain,
+                efe_score=round(efe_score, 4),
+            )
+        except Exception as exc:
+            self._logger.debug("procedure_induction_failed", error=str(exc))
+
+    async def _load_induced_procedures(self, neo4j: Any) -> None:
+        """
+        Load all induced (:Procedure) nodes from Neo4j into _DYNAMIC_PROCEDURES
+        so the fast path can pattern-match against them without LLM calls.
+
+        Called once at end of initialize(). Also callable after sleep to pick up
+        Oneiros-consolidated procedures.
+
+        Gap 6 — procedure template induction (2026-03-07).
+        """
+        try:
+            from systems.nova.policy_generator import (
+                clear_dynamic_procedures,
+                register_dynamic_procedure,
+            )
+
+            cypher = """
+            MATCH (p:Procedure {source: 'nova_induction'})
+            WHERE p.success_rate >= 0.7
+            RETURN p.name AS name, p.domain AS domain,
+                   p.success_rate AS success_rate, p.induction_count AS count
+            ORDER BY p.success_rate DESC
+            LIMIT 50
+            """
+            result = await neo4j.execute_read(cypher, parameters={})
+            records = result.records if hasattr(result, "records") else []
+
+            loaded = 0
+            for row in records:
+                name = row.get("name") or ""
+                domain = row.get("domain") or "general"
+                success_rate = float(row.get("success_rate") or 0.9)
+                if not name:
+                    continue
+                register_dynamic_procedure({
+                    "name": name,
+                    "condition": lambda b, _n=name: (
+                        _n.lower().replace("_", " ").split()[0]
+                        in str(getattr(getattr(b, "content", None), "content", "") or "").lower()
+                    ),
+                    "domain": domain,
+                    "steps": [{"action_type": "observe", "description": f"Execute {name} procedure"}],
+                    "success_rate": success_rate,
+                    "effort": "medium",
+                    "time_horizon": "short",
+                })
+                loaded += 1
+
+            if loaded:
+                self._logger.info("induced_procedures_loaded", count=loaded)
+        except Exception as exc:
+            self._logger.debug("induced_procedure_load_failed", error=str(exc))
 
     def _has_active_coherence_goal(self) -> bool:
         """Check if there's already an active coherence-repair goal."""

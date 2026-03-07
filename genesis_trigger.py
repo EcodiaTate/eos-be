@@ -136,7 +136,7 @@ async def genesis(
         Intent,
     )
     from primitives.percept import Content, Percept
-    from systems.atune.types import WorkspaceContribution
+    from systems.fovea.types import WorkspaceContribution
     from systems.nova.types import Goal, GoalSource, GoalStatus
     from systems.oikos.economic_simulator import EconomicSimulator
     from systems.oikos.models import (

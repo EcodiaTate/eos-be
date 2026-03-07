@@ -249,8 +249,10 @@ class AnomalyDetector:
         if data.get("action") == "block":
             self._block_times.append(now)
 
-        # Track drive states from soma ticks
-        if event_type == "soma_tick" and "drives" in data:
+        # Track drive states from Soma interoceptive percepts.
+        # Soma emits INTEROCEPTIVE_PERCEPT (not soma_tick); payload carries
+        # drive pressures under the "drives" key alongside urgency/affect.
+        if event_type in ("interoceptive_percept", "soma_tick") and "drives" in data:
             self._drive_history.append((now, data["drives"]))
             for drive_name, drive_value in data["drives"].items():
                 self._drive_baseline[drive_name].update(drive_value)
@@ -485,7 +487,7 @@ class AnomalyDetector:
                         observed_value=value,
                         baseline_value=baseline.mean if baseline else 0.0,
                         deviation_sigma=sigma,
-                        event_types_involved=["soma_tick"],
+                        event_types_involved=["interoceptive_percept"],
                         metadata={"drive_name": drive_name},
                         recommended_action=f"Investigate {drive_name} drive pressure source",
                     ))
@@ -509,7 +511,7 @@ class AnomalyDetector:
                                 ),
                                 observed_value=rate,
                                 baseline_value=0.0,
-                                event_types_involved=["soma_tick"],
+                                event_types_involved=["interoceptive_percept"],
                                 metadata={"drive_name": drive_name, "rate_per_min": rate},
                                 recommended_action=f"Monitor {drive_name} drive trajectory",
                             ))

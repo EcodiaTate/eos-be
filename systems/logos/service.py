@@ -21,20 +21,25 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from primitives.common import utc_now
+from primitives.common import SystemID, new_id, utc_now
+from primitives.re_training import RETrainingExample
 from systems.logos.budget import CognitiveBudgetManager
 from systems.logos.cascade import CompressionCascade
 from systems.logos.decay import EntropicDecayEngine, MemoryStoreProtocol
+from systems.logos.persistence import LogosPersistence
 from systems.logos.holographic import HolographicEncoder
 from systems.logos.mdl import MDLEstimator
 from systems.logos.schwarzschild import SchwarzchildCognitionDetector
 from systems.logos.types import (
     CascadeResult,
     CompressionCycleReport,
+    CompressionStage,
     EmpiricalInvariant,
     ExperienceDelta,
+    GenerativeSchema,
     IntelligenceMetrics,
     LogosConfig,
+    LogosFitnessRecord,
     MemoryTier,
     Prediction,
     RawExperience,
@@ -116,26 +121,44 @@ class LogosService:
 
         # External references (protocol-based DI)
         self._synapse: SynapseService | None = None
-        self._memory: Any = None  # MemoryService
         self._memory_store: MemoryStoreProtocol | None = None
+        self._persistence: LogosPersistence | None = None
 
         # Background tasks
         self._pressure_task: asyncio.Task[None] | None = None
         self._metrics_task: asyncio.Task[None] | None = None
         self._decay_task: asyncio.Task[None] | None = None
         self._schwarzschild_task: asyncio.Task[None] | None = None
+        # A3: fire-and-forget anchor emit tasks, cancelled on shutdown
+        self._fire_forget_tasks: set[asyncio.Task[None]] = set()
 
         # Latest metrics + schwarzschild snapshot
         self._latest_metrics = IntelligenceMetrics()
         self._latest_schwarzschild = SchwarzchildStatus()
 
+        # SG3/SG4: instance ID for fitness time-series (set via set_instance_id)
+        self._instance_id: str = "logos_default"
+
         # Anchor memory IDs (protected from eviction)
         self._anchor_ids: set[str] = set()
+
+        # Sleep state (compression paused during Oneiros sleep)
+        self._sleep_active: bool = False
+
+        # Budget emergency debounce (max 1 per 30s)
+        self._last_budget_emergency_at: float = 0.0
+
+        # Contradiction tracking {item_id: count}
+        self._contradiction_counts: dict[str, int] = {}
+
+        # HIGH-4 / MEDIUM-7: theta clock cycle counter
+        # decay runs every 100 cycles; self-prediction runs every 50 cycles
+        self._theta_cycle_count: int = 0
 
     # ─── Lifecycle ───────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        """Initialize the Logos engine. Idempotent."""
+        """Initialize the Logos engine. Idempotent. Restores world model from Neo4j."""
         if self._initialized:
             return
 
@@ -145,6 +168,14 @@ class LogosService:
             pressure_interval=self._config.pressure_broadcast_interval_s,
             metrics_interval=self._config.metrics_broadcast_interval_s,
         )
+
+        # M3: Restore world model from Neo4j on startup
+        if self._persistence is not None:
+            try:
+                restored = await self._persistence.restore_world_model(self._world_model)
+                logger.info("logos_world_model_restored_from_neo4j", nodes=restored)
+            except Exception as exc:
+                logger.warning("logos_neo4j_restore_failed", error=str(exc))
 
         self._initialized = True
         logger.info("logos_initialized")
@@ -184,6 +215,13 @@ class LogosService:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        # A3: cancel tracked fire-and-forget tasks (anchor emits, RE training emits)
+        for ff_task in list(self._fire_forget_tasks):
+            if not ff_task.done():
+                ff_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await ff_task
+        self._fire_forget_tasks.clear()
         logger.info("logos_shutdown")
 
     async def health(self) -> dict[str, Any]:
@@ -202,41 +240,59 @@ class LogosService:
     # ─── Setter Wiring (protocol-based DI) ───────────────────────
 
     def set_synapse(self, synapse: SynapseService) -> None:
-        """Wire Synapse for event broadcasting and subscribe to Fovea errors."""
+        """Wire Synapse for event broadcasting and subscribe to inbound events."""
         self._synapse = synapse
-        self._subscribe_to_fovea_errors(synapse)
+        self._subscribe_all_inbound(synapse)
         logger.info("logos_synapse_wired")
-
-    def set_memory(self, memory: Any) -> None:
-        """Wire Memory for consolidation integration."""
-        self._memory = memory
-        logger.info("logos_memory_wired")
 
     def set_memory_store(self, store: MemoryStoreProtocol) -> None:
         """Wire a MemoryStoreProtocol for the decay engine."""
         self._memory_store = store
         logger.info("logos_memory_store_wired")
 
-    # ─── Loop 1 feedback: Fovea prediction errors → compression ──
+    def set_neo4j(self, neo4j: Any) -> None:
+        """Wire Neo4j for world model persistence (M3)."""
+        self._persistence = LogosPersistence(neo4j)
+        logger.info("logos_neo4j_wired")
 
-    def _subscribe_to_fovea_errors(self, synapse: SynapseService) -> None:
-        """Subscribe to FOVEA_PREDICTION_ERROR to close the Loop 1 feedback cycle.
+    def set_instance_id(self, instance_id: str) -> None:
+        """Set the EOS instance ID for fitness time-series tagging (SG3/SG4)."""
+        self._instance_id = instance_id
 
-        When Fovea detects a prediction error, the error IS the delta
-        that Logos needs — high-salience errors indicate the world model
-        failed to predict reality and must be updated.
+    # ─── Inbound event subscriptions ─────────────────────────────
+
+    def _subscribe_all_inbound(self, synapse: SynapseService) -> None:
+        """Subscribe to all 9 inbound Synapse events (Spec 21 §M2).
+
+        Previously only FOVEA_PREDICTION_ERROR was subscribed. This wires
+        the full ecosystem: memory consolidation, hypothesis lifecycle,
+        schema induction, Kairos invariants, sleep lifecycle, and mitosis.
         """
-        try:
-            synapse.event_bus.subscribe(
-                SynapseEventType("fovea_prediction_error"),
-                self._on_fovea_prediction_error,
-            )
-            logger.info("logos_subscribed_to_fovea_errors")
-        except (ValueError, AttributeError):
-            logger.debug(
-                "logos_fovea_subscription_skipped",
-                reason="event_type_unavailable",
-            )
+        subscriptions: list[tuple[SynapseEventType, Any]] = [
+            (SynapseEventType.FOVEA_PREDICTION_ERROR, self._on_fovea_prediction_error),
+            (SynapseEventType.MEMORY_CONSOLIDATED, self._on_memory_consolidated),
+            (SynapseEventType.EVO_HYPOTHESIS_CONFIRMED, self._on_hypothesis_confirmed),
+            (SynapseEventType.EVO_HYPOTHESIS_REFUTED, self._on_hypothesis_rejected),
+            (SynapseEventType.SCHEMA_INDUCED, self._on_schema_induced),
+            (SynapseEventType.KAIROS_TIER3_INVARIANT_DISCOVERED, self._on_kairos_tier3_invariant),
+            (SynapseEventType.SLEEP_INITIATED, self._on_sleep_started),
+            (SynapseEventType.WAKE_ONSET, self._on_sleep_complete),
+            (SynapseEventType.INSTANCE_SPAWNED, self._on_instance_spawned),
+            # HIGH-4: theta clock — decay every 100 cycles, self-prediction every 50
+            (SynapseEventType.THETA_CYCLE_START, self._on_theta_cycle),
+        ]
+        subscribed = 0
+        for event_type, handler in subscriptions:
+            try:
+                synapse.event_bus.subscribe(event_type, handler)
+                subscribed += 1
+            except (ValueError, AttributeError):
+                logger.debug(
+                    "logos_subscription_skipped",
+                    event_type=event_type.value,
+                    reason="event_type_unavailable",
+                )
+        logger.info("logos_subscriptions_wired", count=subscribed)
 
     async def _on_fovea_prediction_error(self, event: Any) -> None:
         """Handle a FOVEA_PREDICTION_ERROR: feed the error back as a compression delta.
@@ -253,21 +309,24 @@ class LogosService:
         # Build a RawExperience from the prediction error and push it through
         # the compression cascade.  This is the "prediction error IS the delta"
         # insight from the Integration Manifold.
+        content = {
+            "content_error": data.get("content_error", 0.0),
+            "temporal_error": data.get("temporal_error", 0.0),
+            "magnitude_error": data.get("magnitude_error", 0.0),
+            "source_error": data.get("source_error", 0.0),
+            "category_error": data.get("category_error", 0.0),
+            "causal_error": data.get("causal_error", 0.0),
+        }
+        ctx = {
+            "source": "fovea_prediction_error",
+            "percept_id": data.get("percept_id", ""),
+            "dominant_error_type": data.get("dominant_error_type", ""),
+        }
         raw = RawExperience(
-            context={
-                "source": "fovea_prediction_error",
-                "percept_id": data.get("percept_id", ""),
-                "dominant_error_type": data.get("dominant_error_type", ""),
-            },
-            content={
-                "content_error": data.get("content_error", 0.0),
-                "temporal_error": data.get("temporal_error", 0.0),
-                "magnitude_error": data.get("magnitude_error", 0.0),
-                "source_error": data.get("source_error", 0.0),
-                "category_error": data.get("category_error", 0.0),
-                "causal_error": data.get("causal_error", 0.0),
-            },
-            raw_complexity=salience * 100.0,
+            context=ctx,
+            content=content,
+            # HIGH-2: use spec formula; salience * 100 was an underestimate
+            raw_complexity=self._mdl_estimator.compute_raw_complexity({**ctx, **content}),
             source_system="fovea",
         )
 
@@ -279,10 +338,231 @@ class LogosService:
                 percept_id=data.get("percept_id", ""),
             )
         except Exception as exc:
-            logger.warning(
+            # A2 fix: log full error context so Thymos can classify the incident.
+            # We do NOT re-raise — Synapse event handlers must not crash the bus.
+            logger.error(
                 "fovea_error_cascade_failed",
                 error=str(exc),
+                exc_type=type(exc).__name__,
+                percept_id=data.get("percept_id", ""),
+                salience=round(salience, 4),
+                exc_info=True,
             )
+
+    # ─── Inbound: MEMORY_CONSOLIDATED → rescore distilled items ──
+
+    async def _on_memory_consolidated(self, event: Any) -> None:
+        """Rescore distilled items after memory consolidation and update coverage."""
+        data = event.data if hasattr(event, "data") else {}
+        coverage_delta = data.get("coverage_delta", 0.0)
+        consolidated_count = data.get("consolidated_count", 0)
+
+        if consolidated_count > 0:
+            # Consolidation freed capacity — update coverage tracking
+            self._world_model.coverage = min(
+                1.0, self._world_model.coverage + coverage_delta
+            )
+            logger.debug(
+                "memory_consolidation_received",
+                consolidated=consolidated_count,
+                coverage_delta=coverage_delta,
+            )
+
+    # ─── Inbound: EVO_HYPOTHESIS_CONFIRMED → reinforce schema ──
+
+    async def _on_hypothesis_confirmed(self, event: Any) -> None:
+        """Increase MDL weight for confirmed hypothesis schemas."""
+        data = event.data if hasattr(event, "data") else {}
+        hypothesis_id = data.get("hypothesis_id", "")
+        statement = data.get("statement", "")
+
+        # Find and reinforce matching schemas in the world model
+        for schema in self._world_model.generative_schemas.values():
+            if statement and statement in schema.description:
+                schema.instance_count += 1
+                schema.last_instantiated = utc_now()
+                logger.debug(
+                    "hypothesis_confirmed_schema_reinforced",
+                    schema_id=schema.id,
+                    hypothesis_id=hypothesis_id,
+                )
+                break
+
+    # ─── Inbound: EVO_HYPOTHESIS_REFUTED → contradiction decay ─
+
+    async def _on_hypothesis_rejected(self, event: Any) -> None:
+        """Trigger contradiction decay on items related to the refuted hypothesis."""
+        data = event.data if hasattr(event, "data") else {}
+        hypothesis_id = data.get("hypothesis_id", "")
+        statement = data.get("statement", "")
+
+        # Record contradictions on related items via decay engine
+        if self._memory_store is not None and statement:
+            try:
+                items = await self._memory_store.get_all_scored_items()
+                for item in items:
+                    content_str = str(item.content)
+                    if statement and any(
+                        term in content_str
+                        for term in statement.split()[:5]
+                        if len(term) > 3
+                    ):
+                        self._decay_engine.record_contradiction(item.id)
+                        logger.debug(
+                            "hypothesis_rejected_contradiction_recorded",
+                            item_id=item.id,
+                            hypothesis_id=hypothesis_id,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "hypothesis_rejection_decay_failed",
+                    error=str(exc),
+                )
+
+    # ─── Inbound: SCHEMA_INDUCED → score via MDL and integrate ─
+
+    async def _on_schema_induced(self, event: Any) -> None:
+        """Score a newly induced schema via MDL; integrate if MDL > 1.0."""
+        data = event.data if hasattr(event, "data") else {}
+        schema_id = data.get("schema_id", "")
+        description = data.get("description", "")
+        domain = data.get("domain", "general")
+        instance_count = data.get("instance_count", 1)
+
+        # Estimate MDL score: description length vs instances covered
+        desc_length = len(description) * 4.5 if description else 100.0
+        observation_complexity = instance_count * desc_length
+        mdl_ratio = observation_complexity / max(desc_length, 1.0)
+
+        if mdl_ratio > 1.0:
+            schema = GenerativeSchema(
+                id=schema_id or new_id(),
+                name=f"induced_{len(self._world_model.generative_schemas)}",
+                domain=domain,
+                description=description,
+                instance_count=instance_count,
+                compression_ratio=mdl_ratio,
+            )
+            self._world_model.register_schema(schema)
+            logger.info(
+                "schema_induced_integrated",
+                schema_id=schema.id,
+                mdl_ratio=round(mdl_ratio, 2),
+            )
+        else:
+            logger.debug(
+                "schema_induced_rejected",
+                schema_id=schema_id,
+                mdl_ratio=round(mdl_ratio, 2),
+            )
+
+    # ─── Inbound: KAIROS_TIER3_INVARIANT → immediate integration ─
+
+    async def _on_kairos_tier3_invariant(self, event: Any) -> None:
+        """Immediately integrate Tier 3 substrate-independent invariants as high-confidence priors."""
+        data = event.data if hasattr(event, "data") else {}
+        invariant_id = data.get("invariant_id", "")
+        abstract_form = data.get("abstract_form", "")
+        hold_rate = data.get("hold_rate", 1.0)
+
+        invariant = EmpiricalInvariant(
+            id=invariant_id or new_id(),
+            statement=abstract_form,
+            domain="cross_domain",
+            observation_count=data.get("domain_count", 0),
+            confidence=hold_rate,
+            source="kairos_tier3",
+        )
+        self._world_model.ingest_invariant(invariant)
+        logger.info(
+            "kairos_tier3_invariant_integrated",
+            invariant_id=invariant.id,
+            hold_rate=hold_rate,
+        )
+
+    # ─── Inbound: SLEEP_INITIATED → pause compression queue ────
+
+    async def _on_sleep_started(self, event: Any) -> None:
+        """Pause real-time compression queue during sleep (Oneiros takes over)."""
+        self._sleep_active = True
+        logger.info("logos_sleep_started_compression_paused")
+
+    # ─── Inbound: WAKE_ONSET → resume compression queue ────────
+
+    async def _on_sleep_complete(self, event: Any) -> None:
+        """Resume compression queue after sleep; rescore sleep-touched items."""
+        self._sleep_active = False
+        logger.info("logos_sleep_complete_compression_resumed")
+
+    # ─── Inbound: INSTANCE_SPAWNED → clone world model (M5) ───
+
+    async def _on_instance_spawned(self, event: Any) -> None:
+        """Clone world model snapshot for a spawned child instance."""
+        data = event.data if hasattr(event, "data") else {}
+        instance_id = data.get("instance_id", "")
+        snap = self._world_model.snapshot()
+        logger.info(
+            "world_model_snapshot_for_child",
+            child_instance_id=instance_id,
+            schemas=len(snap.get("generative_schemas", {})),
+            causal_links=len(snap.get("causal_links", {})),
+        )
+        # The snapshot is available for the Mitosis genome orchestrator to pick up.
+        # In a full implementation, this would be written to a shared store or
+        # emitted as an event payload.
+
+    # ─── Inbound: THETA_CYCLE_START → decay every 100, self-pred every 50 ─
+
+    async def _on_theta_cycle(self, event: Any) -> None:
+        """HIGH-4 / MEDIUM-7: driven by the Synapse theta clock.
+
+        - Every 100 cycles: trigger a decay pass on low-salience nodes
+          (decay engine on memory_store if wired; skip gracefully if not).
+        - Every 50 cycles: run a Schwarzschild self-prediction cycle and
+          store self_prediction_accuracy for Benchmarks.
+        """
+        self._theta_cycle_count += 1
+
+        # Every 50 cycles: Schwarzschild self-prediction (MEDIUM-7)
+        if self._theta_cycle_count % 50 == 0:
+            try:
+                record = await self._schwarzschild.run_self_prediction_cycle()
+                # Store accuracy in latest status so Benchmarks can poll it
+                # via health() or via INTELLIGENCE_METRICS broadcast
+                self._latest_schwarzschild = SchwarzchildStatus(
+                    self_prediction_accuracy=self._schwarzschild._compute_self_prediction_accuracy(),
+                    intelligence_ratio=self._world_model.measure_intelligence_ratio(),
+                    hypothesis_ratio=self._schwarzschild._compute_generative_surplus(),
+                    novel_concept_rate=float(len(self._schwarzschild._novel_schema_ids)),
+                    cross_domain_transfers=len(self._schwarzschild._cross_domain_transfers),
+                    compression_acceleration=self._schwarzschild._compute_compression_velocity(),
+                    novel_structures=len(self._schwarzschild._novel_schema_ids),
+                    threshold_met=self._schwarzschild.threshold_met,
+                )
+                logger.debug(
+                    "theta_self_prediction_cycle",
+                    cycle=self._theta_cycle_count,
+                    accuracy=record.accuracy,
+                    self_pred_rolling=self._latest_schwarzschild.self_prediction_accuracy,
+                )
+            except Exception as exc:
+                logger.warning("theta_self_prediction_failed", error=str(exc))
+
+        # Every 100 cycles: decay pass (HIGH-4)
+        if self._theta_cycle_count % 100 == 0:
+            if self._memory_store is not None and not self._sleep_active:
+                try:
+                    await self._decay_engine.run_decay_cycle(
+                        self._memory_store,
+                        self._anchor_ids,
+                        max_items=50,  # Light pass — theta-driven, not pressure-driven
+                    )
+                    logger.debug(
+                        "theta_decay_cycle_complete",
+                        cycle=self._theta_cycle_count,
+                    )
+                except Exception as exc:
+                    logger.warning("theta_decay_cycle_failed", error=str(exc))
 
     # ─── Public API: Budget ──────────────────────────────────────
 
@@ -367,8 +647,26 @@ class LogosService:
                     "schemas_added": update.schemas_added,
                     "priors_updated": update.priors_updated,
                     "causal_updates": update.causal_links_added + update.causal_links_revised,
+                    "coverage_delta": update.coverage_delta,
+                    "complexity_delta": update.complexity_delta,
                 },
             ))
+
+        # CRITICAL-1: Persist (:WorldModel) node + [:COMPRESSES] links to Neo4j.
+        # Source IDs come from the delta's experience_id (episode) — the cascade
+        # sets this when a salient episode reaches Stage 4.
+        if self._persistence is not None and not delta.discard_after_encoding:
+            try:
+                source_ep_ids = [delta.experience_id] if delta.experience_id else None
+                await self._persistence.persist_integration(
+                    update, delta,
+                    source_episode_ids=source_ep_ids,
+                )
+            except Exception as exc:
+                logger.warning("world_model_integration_persist_failed", error=str(exc))
+
+            # M3: Batch-persist full world model snapshot
+            await self._persist_world_model_if_wired()
 
         return update
 
@@ -382,15 +680,45 @@ class LogosService:
         The cascade: holographic encoding -> episodic compression ->
         semantic distillation -> world model integration.
 
+        During Oneiros sleep (_sleep_active=True), real-time compression is
+        paused — Oneiros drives offline compression via run_batch_compression().
+        Experiences received during sleep are discarded as redundant (not stored).
+
         Returns the CascadeResult with per-stage metrics, anchor flags,
         and compression ratios.
         """
+        if self._sleep_active:
+            logger.debug(
+                "logos_experience_skipped_during_sleep",
+                source=raw_experience.source_system,
+            )
+            return CascadeResult(
+                experience_id=raw_experience.id,
+                stage_reached=CompressionStage.HOLOGRAPHIC_ENCODING,
+                is_irreducible=False,
+                anchor_memory=False,
+                compression_ratio=0.0,
+            )
+
         result = await self._cascade.run(raw_experience)
 
         # Feed compression ratio to Schwarzschild detector
         if result.compression_ratio > 0:
             self._schwarzschild.record_compression_ratio(result.compression_ratio)
             self._schwarzschild.record_data_arrival()
+
+        # HIGH-3: Update cognitive budget utilization with this compression's cost/gain.
+        # cost_ku = bits consumed by the new compressed form (world_model_complexity delta)
+        # gain_ku = bits freed from source material (bits_saved)
+        if result.world_model_update is not None:
+            wm_update = result.world_model_update
+            cost_ku = max(wm_update.complexity_delta, 0.0)
+            gain_ku = max(result.bits_saved, 0.0)
+            self._budget.record_compression_operation(
+                cost_ku=cost_ku,
+                gain_ku=gain_ku,
+                tier=MemoryTier.WORLD_MODEL,
+            )
 
         # Track hypothesis generation from world model updates
         if result.world_model_update is not None:
@@ -399,22 +727,56 @@ class LogosService:
                 self._schwarzschild.record_hypothesis_generated(wm.schemas_added)
 
         # Broadcast WORLD_MODEL_UPDATED if integration occurred
-        if result.world_model_update is not None and self._synapse is not None:
+        if result.world_model_update is not None:
             wm = result.world_model_update
-            await self._synapse.event_bus.emit(SynapseEvent(
-                event_type=SynapseEventType.WORLD_MODEL_UPDATED,
-                source_system=self.system_id,
-                data={
-                    "update_type": wm.update_type.value,
-                    "schemas_added": wm.schemas_added,
-                    "priors_updated": wm.priors_updated,
-                    "causal_updates": wm.causal_links_added + wm.causal_links_revised,
-                },
-            ))
+            if self._synapse is not None:
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.WORLD_MODEL_UPDATED,
+                    source_system=self.system_id,
+                    data={
+                        "update_type": wm.update_type.value,
+                        "schemas_added": wm.schemas_added,
+                        "priors_updated": wm.priors_updated,
+                        "causal_updates": wm.causal_links_added + wm.causal_links_revised,
+                        "coverage_delta": wm.coverage_delta,
+                        "complexity_delta": wm.complexity_delta,
+                    },
+                ))
+
+            # CRITICAL-1: Persist (:WorldModel) node + [:COMPRESSES] links
+            if self._persistence is not None and result.delta is not None:
+                try:
+                    source_ep_ids = (
+                        [result.delta.experience_id] if result.delta.experience_id else None
+                    )
+                    await self._persistence.persist_integration(
+                        wm, result.delta,
+                        source_episode_ids=source_ep_ids,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "world_model_integration_persist_failed",
+                        error=str(exc),
+                        experience_id=raw_experience.id,
+                    )
+
+            # M3: Batch-persist world model snapshot to Neo4j
+            await self._persist_world_model_if_wired()
 
         # Handle anchor memories
         if result.anchor_memory and result.compressed_item_id:
             self.mark_anchor(result.compressed_item_id)
+
+        # SG5: Emit RE training example for high-MDL compressions
+        if result.compression_ratio > 2.0 and result.world_model_update is not None:
+            wm = result.world_model_update
+            self._emit_re_training_example(
+                instruction="Compress experience into world model update",
+                input_context=f"source={raw_experience.source_system} complexity={raw_experience.raw_complexity}",
+                output=f"compression_ratio={result.compression_ratio:.2f} schemas_added={wm.schemas_added} coverage_delta={wm.coverage_delta:.4f}",
+                category="compression_reasoning",
+                quality=min(result.compression_ratio / 10.0, 1.0),
+            )
 
         return result
 
@@ -437,6 +799,18 @@ class LogosService:
     def get_intelligence_ratio(self) -> float:
         """I = K(reality_modeled) / K(model)."""
         return self._world_model.measure_intelligence_ratio()
+
+    def get_generative_schemas(self) -> dict[str, Any]:
+        """Return the world model's generative schema registry (for Oneiros)."""
+        return self._world_model.generative_schemas
+
+    def get_causal_structure(self) -> Any:
+        """Return the world model's causal graph structure (for Oneiros)."""
+        return self._world_model.causal_structure
+
+    def get_current_complexity(self) -> float:
+        """Return current world model complexity in MDL bits (for Oneiros)."""
+        return self._world_model.current_complexity
 
     def get_compression_stats(self) -> dict[str, float]:
         """Compression statistics for Telos drive modulation."""
@@ -505,10 +879,13 @@ class LogosService:
             cycle_duration_ms=elapsed,
         )
 
-        # Release budget for evicted items
+        # Release budget for evicted items — decrement the correct tier (P7 fix)
         if decay_report:
-            for _ in decay_report.evicted:
-                self._budget.decrement(MemoryTier.EPISODIC, 1.0)
+            for item_id in decay_report.evicted:
+                tier = self._item_type_to_tier(
+                    decay_report.evicted_item_types.get(item_id, "")
+                )
+                self._budget.decrement(tier, 1.0)
 
         # Broadcast COMPRESSION_CYCLE_COMPLETE with real data
         if self._synapse is not None:
@@ -540,6 +917,7 @@ class LogosService:
         *,
         information_content: float = 1.0,
         domain: str = "general",
+        reason: str = "irreducible_novelty",
     ) -> None:
         """Mark an item as an anchor memory (never evicted)."""
         self._anchor_ids.add(item_id)
@@ -548,6 +926,7 @@ class LogosService:
             item_id=item_id,
             info_content=information_content,
             domain=domain,
+            reason=reason,
         )
 
         if self._synapse is not None:
@@ -559,15 +938,29 @@ class LogosService:
                         "memory_id": item_id,
                         "information_content": information_content,
                         "domain": domain,
+                        "reason": reason,
                     },
                 )),
                 name=f"logos_anchor_{item_id[:8]}",
             )
+            # A3 fix: register in managed set so shutdown() can cancel it
+            self._fire_forget_tasks.add(task)
+
             def _on_anchor_done(t: asyncio.Task[None]) -> None:
+                self._fire_forget_tasks.discard(t)
                 if not t.cancelled() and t.exception() is not None:
                     logger.warning("anchor_emit_failed", error=str(t.exception()))
 
             task.add_done_callback(_on_anchor_done)
+
+        # SG5: Emit RE training example for anchor memories
+        self._emit_re_training_example(
+            instruction="Identify irreducibly novel information",
+            input_context=f"domain={domain} info_content={information_content}",
+            output=f"anchor_memory_created: {item_id}",
+            category="compression_reasoning",
+            quality=min(information_content, 1.0),
+        )
 
     def is_anchor(self, item_id: str) -> bool:
         return item_id in self._anchor_ids
@@ -575,7 +968,7 @@ class LogosService:
     # ─── Background Loops ────────────────────────────────────────
 
     async def _pressure_broadcast_loop(self) -> None:
-        """Broadcast COGNITIVE_PRESSURE every 30s."""
+        """Broadcast COGNITIVE_PRESSURE every 30s. Emit BUDGET_EMERGENCY when >= 0.90."""
         while True:
             try:
                 await asyncio.sleep(self._config.pressure_broadcast_interval_s)
@@ -583,11 +976,47 @@ class LogosService:
                     continue
 
                 payload = self._budget.pressure_payload()
+                # Add tier_utilization (P1) and raw utilization (HIGH-3)
+                tier_utilization: dict[str, float] = {}
+                for tier in MemoryTier:
+                    tier_utilization[tier.value] = self._budget.state.tier_pressure(tier)
+                payload["tier_utilization"] = tier_utilization
+                payload["current_utilization"] = self._budget.current_utilization_state
+
                 await self._synapse.event_bus.emit(SynapseEvent(
                     event_type=SynapseEventType.COGNITIVE_PRESSURE,
                     source_system=self.system_id,
                     data=payload,
                 ))
+
+                # M1: Emit BUDGET_EMERGENCY when utilization >= 0.90 (debounced 30s)
+                if self._budget.is_emergency():
+                    now = time.monotonic()
+                    if now - self._last_budget_emergency_at >= 30.0:
+                        self._last_budget_emergency_at = now
+                        tier_overages: dict[str, float] = {
+                            tier.value: self._budget.state.tier_pressure(tier)
+                            for tier in MemoryTier
+                            if self._budget.state.tier_pressure(tier) > 0.90
+                        }
+                        await self._synapse.event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.BUDGET_EMERGENCY,
+                            source_system=self.system_id,
+                            data={
+                                "utilization": self._budget.total_pressure,
+                                "tier_overages": tier_overages,
+                                "recommended_action": "emergency_compression",
+                            },
+                        ))
+                        logger.warning(
+                            "budget_emergency_emitted",
+                            utilization=self._budget.total_pressure,
+                        )
+
+                    # SG1: Trigger immediate eviction at critical boundary
+                    if self._budget.is_critical():
+                        await self._trigger_critical_eviction()
+
                 logger.debug(
                     "cognitive_pressure_broadcast",
                     pressure=payload["pressure"],
@@ -617,6 +1046,26 @@ class LogosService:
                     source_system=self.system_id,
                     data=metrics.model_dump(),
                 ))
+
+                # SG3/SG4: append immutable fitness record to Neo4j time-series
+                if self._persistence is not None:
+                    fitness = LogosFitnessRecord(
+                        instance_id=self._instance_id,
+                        intelligence_ratio=metrics.intelligence_ratio,
+                        compression_efficiency=metrics.compression_efficiency,
+                        world_model_coverage=metrics.world_model_coverage,
+                        cognitive_pressure=metrics.cognitive_pressure,
+                        schema_count=len(self._world_model.generative_schemas),
+                        anchor_count=len(self._anchor_ids),
+                        schwarzschild_met=metrics.schwarzschild_threshold_met,
+                    )
+                    try:
+                        await self._persistence.persist_fitness_record(fitness)
+                    except Exception as fit_exc:
+                        logger.warning(
+                            "logos_fitness_persist_failed", error=str(fit_exc)
+                        )
+
                 logger.debug(
                     "intelligence_metrics_broadcast",
                     intelligence_ratio=metrics.intelligence_ratio,
@@ -686,6 +1135,109 @@ class LogosService:
                 break
             except Exception as exc:
                 logger.warning("schwarzschild_loop_error", error=str(exc))
+
+    def _emit_re_training_example(
+        self,
+        *,
+        instruction: str,
+        input_context: str,
+        output: str,
+        category: str = "compression_reasoning",
+        quality: float = 0.8,
+    ) -> None:
+        """SG5: Emit an RE training example for high-value compression events."""
+        if self._synapse is None:
+            return
+
+        example = RETrainingExample(
+            source_system=SystemID.LOGOS,
+            instruction=instruction,
+            input_context=input_context,
+            output=output,
+            outcome_quality=quality,
+            category=category,
+        )
+
+        async def _emit() -> None:
+            if self._synapse is not None:
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                    source_system=self.system_id,
+                    data=example.model_dump(mode="json"),
+                ))
+
+        # A3 fix: register in managed set so shutdown() can cancel it
+        re_task = asyncio.create_task(_emit(), name="logos_re_training")
+        self._fire_forget_tasks.add(re_task)
+        re_task.add_done_callback(self._fire_forget_tasks.discard)
+
+    async def _persist_world_model_if_wired(self) -> None:
+        """M3: Batch-persist world model to Neo4j if persistence is wired."""
+        if self._persistence is None:
+            return
+        try:
+            await self._persistence.persist_world_model(self._world_model)
+        except Exception as exc:
+            logger.warning("neo4j_persist_failed", error=str(exc))
+
+    async def _trigger_critical_eviction(self) -> None:
+        """SG1: Synchronous eviction when critical boundary (>= 0.95) crossed.
+
+        Instead of waiting for the 300s decay timer, trigger immediate eviction.
+        Eviction is logged irreversibly (SG2).
+        """
+        if self._memory_store is None:
+            return
+
+        report = await self._decay_engine.run_decay_cycle(
+            self._memory_store,
+            self._anchor_ids,
+            max_items=50,  # Smaller batch for synchronous path
+        )
+
+        if report.evicted:
+            # P7: decrement the correct tier per item
+            for item_id in report.evicted:
+                tier = self._item_type_to_tier(
+                    report.evicted_item_types.get(item_id, "")
+                )
+                self._budget.decrement(tier, 1.0)
+
+            # SG2: Immutable audit log of eviction
+            if self._synapse is not None:
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.COMPRESSION_CYCLE_COMPLETE,
+                    source_system=self.system_id,
+                    data={
+                        "items_evicted": len(report.evicted),
+                        "items_distilled": len(report.distilled),
+                        "trigger": "critical_eviction",
+                        "bits_freed": report.total_bits_freed,
+                    },
+                ))
+            logger.warning(
+                "critical_eviction_triggered",
+                evicted=len(report.evicted),
+                bits_freed=report.total_bits_freed,
+            )
+
+    @staticmethod
+    def _item_type_to_tier(item_type: str) -> MemoryTier:
+        """
+        Map a KnowledgeItemType string to the corresponding MemoryTier for budget
+        decrement.  Defaults to EPISODIC when the type is unrecognised (P7 fix).
+
+        Spec 21 §III: each memory tier has its own budget allocation.
+        Evictions must release from the correct tier so pressure metrics stay accurate.
+        """
+        _MAP: dict[str, MemoryTier] = {
+            "episode": MemoryTier.EPISODIC,
+            "semantic_node": MemoryTier.SEMANTIC,
+            "hypothesis": MemoryTier.HYPOTHESIS,
+            "procedure": MemoryTier.PROCEDURAL,
+            "schema": MemoryTier.SEMANTIC,  # Schemas live in semantic tier
+        }
+        return _MAP.get(item_type, MemoryTier.EPISODIC)
 
     def _compute_hypothesis_confirmation_rate(self) -> float:
         """

@@ -27,7 +27,7 @@ import base64
 import json
 import time
 import zlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -194,6 +194,11 @@ class SimulaGenomeExtractor:
         analytics = await self._extract_category_analytics()
         procedures = await self._extract_procedures()
         metadata = await self._extract_metadata()
+        dafny_specs = await self._extract_dafny_specifications()
+        lean_lemmas = await self._extract_lean_lemma_catalog()
+        router_weights = await self._extract_reasoning_router_weights()
+        proof_heuristics = await self._extract_proof_search_heuristics()
+        inspector_calibration = await self._extract_inspector_confidence_calibration()
 
         result.mutations_included = len(mutations)
         result.abstractions_included = len(abstractions)
@@ -217,6 +222,11 @@ class SimulaGenomeExtractor:
             efe_calibration=calibration,
             category_analytics=analytics,
             procedures=procedures,
+            dafny_specifications=dafny_specs,
+            lean_lemma_catalog=lean_lemmas,
+            reasoning_router_weights=router_weights,
+            proof_search_heuristics=proof_heuristics,
+            inspector_confidence_calibration=inspector_calibration,
             total_proposals_processed=metadata.get("total_processed", 0),
             total_proposals_applied=metadata.get("total_applied", 0),
             total_rollbacks=metadata.get("total_rollbacks", 0),
@@ -479,6 +489,145 @@ class SimulaGenomeExtractor:
                 usage_count=int(row.get("usage_count", 0)),
             ))
         return records
+
+    async def _extract_dafny_specifications(self) -> list[dict[str, Any]]:
+        """Extract learned Dafny specifications from the spec library."""
+        try:
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (s:DafnySpec)
+                WHERE s.verified = true
+                RETURN s.name AS name,
+                       s.module AS module,
+                       s.spec_text AS spec_text,
+                       s.usage_count AS usage_count,
+                       s.confidence AS confidence
+                ORDER BY s.usage_count DESC
+                LIMIT 200
+                """,
+            )
+        except Exception as exc:
+            self._log.warning("genome_extract_dafny_specs_failed", error=str(exc))
+            return []
+
+        return [
+            {
+                "name": str(row.get("name", "")),
+                "module": str(row.get("module", "")),
+                "spec_text": str(row.get("spec_text", "")),
+                "usage_count": int(row.get("usage_count", 0)),
+                "confidence": float(row.get("confidence", 0.5)),
+            }
+            for row in rows
+        ]
+
+    async def _extract_lean_lemma_catalog(self) -> list[dict[str, Any]]:
+        """Extract proven Lean lemmas from the lemma catalog."""
+        try:
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (l:LeanLemma)
+                WHERE l.proven = true
+                RETURN l.name AS name,
+                       l.statement AS statement,
+                       l.proof_sketch AS proof_sketch,
+                       l.category AS category,
+                       l.usage_count AS usage_count
+                ORDER BY l.usage_count DESC
+                LIMIT 200
+                """,
+            )
+        except Exception as exc:
+            self._log.warning("genome_extract_lean_lemmas_failed", error=str(exc))
+            return []
+
+        return [
+            {
+                "name": str(row.get("name", "")),
+                "statement": str(row.get("statement", "")),
+                "proof_sketch": str(row.get("proof_sketch", "")),
+                "category": str(row.get("category", "")),
+                "usage_count": int(row.get("usage_count", 0)),
+            }
+            for row in rows
+        ]
+
+    async def _extract_reasoning_router_weights(self) -> dict[str, dict[str, float]]:
+        """Extract Thompson sampling weights from the ReasoningRouter."""
+        try:
+            from systems.simula.reasoning_router import ReasoningRouter
+
+            # Try to load persisted weights from Neo4j
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (r:ReasoningRouterState)
+                RETURN r.weights AS weights
+                ORDER BY r.updated_at DESC
+                LIMIT 1
+                """,
+            )
+            if rows:
+                raw = rows[0].get("weights", "{}")
+                if isinstance(raw, str):
+                    return json.loads(raw)
+                if isinstance(raw, dict):
+                    return raw
+        except Exception as exc:
+            self._log.warning("genome_extract_router_weights_failed", error=str(exc))
+        return {}
+
+    async def _extract_proof_search_heuristics(self) -> dict[str, Any]:
+        """Extract proof search heuristic parameters (timeouts, strategies, priorities)."""
+        try:
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (h:ProofSearchHeuristic)
+                RETURN h.name AS name,
+                       h.value AS value,
+                       h.updated_at AS updated_at
+                ORDER BY h.updated_at DESC
+                LIMIT 50
+                """,
+            )
+        except Exception as exc:
+            self._log.warning("genome_extract_proof_heuristics_failed", error=str(exc))
+            return {}
+
+        heuristics: dict[str, Any] = {}
+        for row in rows:
+            name = str(row.get("name", ""))
+            if name:
+                heuristics[name] = row.get("value")
+        return heuristics
+
+    async def _extract_inspector_confidence_calibration(self) -> list[dict[str, Any]]:
+        """Extract inspector confidence calibration data (predicted vs actual vuln severity)."""
+        try:
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (c:InspectorCalibration)
+                RETURN c.predicted_severity AS predicted_severity,
+                       c.actual_severity AS actual_severity,
+                       c.target AS target,
+                       c.confidence AS confidence,
+                       c.measured_at AS measured_at
+                ORDER BY c.measured_at DESC
+                LIMIT 100
+                """,
+            )
+        except Exception as exc:
+            self._log.warning("genome_extract_inspector_calibration_failed", error=str(exc))
+            return []
+
+        return [
+            {
+                "predicted_severity": str(row.get("predicted_severity", "")),
+                "actual_severity": str(row.get("actual_severity", "")),
+                "target": str(row.get("target", "")),
+                "confidence": float(row.get("confidence", 0.5)),
+            }
+            for row in rows
+        ]
 
     async def _extract_metadata(self) -> dict[str, float | int]:
         """Extract aggregate metadata for the genome."""

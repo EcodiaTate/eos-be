@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
     from systems.simula.agents.test_designer import TestDesignerAgent
     from systems.simula.agents.test_executor import TestExecutorAgent
+    from systems.simula.analytics import EvolutionAnalyticsEngine
     from systems.simula.code_agent import SimulaCodeAgent
     from systems.simula.health import HealthChecker
     from systems.simula.rollback import RollbackManager
@@ -65,6 +66,7 @@ class ChangeApplicator:
         static_analysis_bridge: StaticAnalysisBridge | None = None,
         agent_coder_enabled: bool = False,
         agent_coder_max_iterations: int = 3,
+        analytics: EvolutionAnalyticsEngine | None = None,
     ) -> None:
         self._agent = code_agent
         self._rollback = rollback_manager
@@ -75,6 +77,7 @@ class ChangeApplicator:
         self._static_bridge = static_analysis_bridge
         self._agent_coder_enabled = agent_coder_enabled
         self._agent_coder_max_iterations = agent_coder_max_iterations
+        self._analytics = analytics
         self._logger = logger.bind(system="simula.applicator")
 
     async def apply(
@@ -97,10 +100,69 @@ class ChangeApplicator:
 
         if proposal.category == ChangeCategory.ADJUST_BUDGET:
             return await self._apply_budget(proposal)
-        elif self._agent_coder_enabled and self._test_designer and self._test_executor:
+        use_agent_coder = await self._select_strategy(proposal)
+        if use_agent_coder:
             return await self._apply_via_agent_coder(proposal)
         else:
             return await self._apply_via_code_agent(proposal)
+
+    # ── Strategy Selection ────────────────────────────────────────────────────
+
+    async def _select_strategy(self, proposal: EvolutionProposal) -> bool:
+        """
+        Decide whether to use the AgentCoder 3-agent pipeline or the standard
+        code agent for this proposal.
+
+        Decision tree (consulted in order):
+          1. If agent_coder is not configured (no test_designer/executor), always False.
+          2. If agent_coder is disabled in config, check analytics override (below).
+          3. If analytics show the AgentCoder pipeline has a higher category success rate
+             than code_agent by a margin >= 0.05, prefer agent_coder.
+          4. Fall back to the config flag.
+
+        The analytics engine tracks per-strategy outcomes via the proposal's
+        `agent_coder_iterations` field (>0 → AgentCoder was used).  Categories
+        with insufficient history (< 5 samples) use the config flag.
+        """
+        if not (self._test_designer and self._test_executor):
+            return False
+
+        if self._analytics is None:
+            return self._agent_coder_enabled
+
+        try:
+            category = proposal.category
+
+            # Query per-strategy success rates from analytics
+            analytics = await self._analytics.compute_analytics()
+            rate = analytics.category_rates.get(category.value)
+            if rate is None or rate.total < 5:
+                return self._agent_coder_enabled
+
+            # agent_coder_success_rate is tracked separately when available
+            agent_coder_rate = analytics.category_rates.get(
+                f"{category.value}:agent_coder"
+            )
+            code_agent_rate = analytics.category_rates.get(
+                f"{category.value}:code_agent"
+            )
+
+            if agent_coder_rate and code_agent_rate and agent_coder_rate.total >= 5:
+                margin = agent_coder_rate.success_rate - code_agent_rate.success_rate
+                use_agent_coder = margin >= 0.05
+                self._logger.info(
+                    "strategy_selected_by_analytics",
+                    category=category.value,
+                    agent_coder_rate=round(agent_coder_rate.success_rate, 3),
+                    code_agent_rate=round(code_agent_rate.success_rate, 3),
+                    margin=round(margin, 3),
+                    use_agent_coder=use_agent_coder,
+                )
+                return use_agent_coder
+        except Exception as exc:
+            self._logger.warning("strategy_analytics_error", error=str(exc))
+
+        return self._agent_coder_enabled
 
     # ── Budget Adjustment (direct config update) ──────────────────────────────
 

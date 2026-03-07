@@ -37,6 +37,8 @@ from systems.identity.connector import (
     TokenRefreshResult,
     TokenType,
 )
+from systems.identity.genome import IdentityGenomeExtractor
+from systems.identity.identity import IdentitySystem, compute_constitutional_hash
 from systems.identity.manager import CertificateManager
 from systems.identity.totp import (
     TOTPConfig,
@@ -78,6 +80,10 @@ __all__ = [
     "TokenExchangeRequest",
     "TokenRefreshResult",
     "TokenType",
+    # Identity System (Spec 23)
+    "IdentitySystem",
+    "IdentityGenomeExtractor",
+    "compute_constitutional_hash",
     # TOTP (Phase 16h)
     "TOTPConfig",
     "TOTPGenerator",

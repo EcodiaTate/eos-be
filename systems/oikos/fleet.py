@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import enum
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -191,6 +191,8 @@ class FleetManager:
         self._negative_streak: dict[str, int] = {}
         # Blacklisted instance IDs — cannot receive genomes
         self._blacklisted: set[str] = set()
+        # Timestamp when each instance was first blacklisted
+        self._blacklist_since: dict[str, datetime] = {}
         # Selection history for observability
         self._selection_history: list[SelectionRecord] = []
         # Role assignment history
@@ -236,7 +238,8 @@ class FleetManager:
         self._prune_tracking(living_ids, state.child_instances)
 
         # 2. Selection pressure
-        self._evaluate_selection_pressure(living)
+        sel_records = self._evaluate_selection_pressure(living)
+        await self._enforce_blacklist(sel_records)
 
         # 3. Role specialization (only when population >= threshold)
         if len(living) >= self._config.fleet_specialization_threshold:
@@ -299,6 +302,8 @@ class FleetManager:
             # Determine verdict
             if streak >= blacklist_threshold:
                 verdict = SelectionVerdict.BLACKLISTED
+                if child.instance_id not in self._blacklisted:
+                    self._blacklist_since[child.instance_id] = utc_now()
                 self._blacklisted.add(child.instance_id)
                 reason = (
                     f"economic ratio < 1.0 for {streak} consecutive periods "
@@ -311,6 +316,7 @@ class FleetManager:
                 verdict = SelectionVerdict.FIT
                 # Un-blacklist if they recover
                 self._blacklisted.discard(child.instance_id)
+                self._blacklist_since.pop(child.instance_id, None)
                 reason = f"economic ratio {ratio} >= 1.0"
 
             record = SelectionRecord(
@@ -333,6 +339,84 @@ class FleetManager:
                 )
 
         return records
+
+    async def _enforce_blacklist(self, records: list[SelectionRecord]) -> None:
+        """
+        Emit CHILD_BLACKLISTED for newly blacklisted children and enforce
+        economic consequences: no seed capital, excluded from federation.
+        """
+        if self._event_bus is None:
+            return
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        for rec in records:
+            if rec.verdict == SelectionVerdict.BLACKLISTED:
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.CHILD_BLACKLISTED,
+                    source_system="oikos.fleet",
+                    data={
+                        "child_instance_id": rec.child_instance_id,
+                        "consecutive_negative_periods": rec.consecutive_negative_periods,
+                        "economic_ratio": str(rec.economic_ratio),
+                        "blacklisted_since": self._blacklist_since.get(
+                            rec.child_instance_id, utc_now()
+                        ).isoformat(),
+                        "reason": rec.reason,
+                        # Enforcement flags consumed by MitosisFleetService
+                        "no_seed_capital": True,
+                        "exclude_from_federation": True,
+                    },
+                ))
+
+    async def check_decommission_candidates(
+        self,
+        state: EconomicState,
+        decommission_after_days: int = 7,
+    ) -> None:
+        """
+        Emit CHILD_DECOMMISSION_PROPOSED for blacklisted children with no
+        economic activity for decommission_after_days days.
+
+        Called from the monthly fleet evaluation cycle.
+        """
+        if self._event_bus is None:
+            return
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        cutoff = utc_now() - timedelta(days=decommission_after_days)
+
+        for child in state.child_instances:
+            if child.instance_id not in self._blacklisted:
+                continue
+            if child.status in (ChildStatus.DEAD, ChildStatus.INDEPENDENT):
+                continue
+            since = self._blacklist_since.get(child.instance_id)
+            if since is None or since > cutoff:
+                continue
+            # No economic activity = net income for 7d still zero/negative
+            if child.net_income_7d > Decimal("0"):
+                continue
+
+            self._logger.warning(
+                "child_decommission_proposed",
+                child_id=child.instance_id,
+                blacklisted_since=since.isoformat(),
+                net_income_7d=str(child.net_income_7d),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.CHILD_DECOMMISSION_PROPOSED,
+                source_system="oikos.fleet",
+                data={
+                    "child_instance_id": child.instance_id,
+                    "blacklisted_since": since.isoformat(),
+                    "days_blacklisted": (utc_now() - since).days,
+                    "net_income_7d": str(child.net_income_7d),
+                    "net_worth_usd": str(child.current_net_worth_usd),
+                    "niche": child.niche,
+                },
+            ))
 
     # ─── Role Specialization ────────────────────────────────────
 
@@ -468,6 +552,10 @@ class FleetManager:
 
     # ─── Metrics Computation ────────────────────────────────────
 
+    def get_metrics(self, state: EconomicState) -> FleetMetrics:
+        """Public alias for _compute_metrics — use this in API routers and external callers."""
+        return self._compute_metrics(state)
+
     def _compute_metrics(self, state: EconomicState) -> FleetMetrics:
         """Compute population-level metrics from current state."""
         all_children = state.child_instances
@@ -595,6 +683,7 @@ class FleetManager:
         for instance_id in dead_or_gone:
             self._negative_streak.pop(instance_id, None)
             self._blacklisted.discard(instance_id)
+            self._blacklist_since.pop(instance_id, None)
             # Keep role in history but remove from active tracking
             self._roles.pop(instance_id, None)
 

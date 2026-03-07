@@ -47,6 +47,16 @@ logger = structlog.get_logger("systems.skia.heartbeat")
 # Prefix used by RedisClient for the pub/sub channel
 _REDIS_PREFIX = "eos"
 
+# CRITICAL systems whose heartbeat silence is an emergency.
+# Detection window is halved to 45s (vs 90s for non-critical systems).
+CRITICAL_SYSTEMS: frozenset[str] = frozenset({"equor", "thymos", "memory"})
+
+# The field in a heartbeat event payload that identifies which system emitted it.
+_HEARTBEAT_SYSTEM_FIELD = "system"
+
+# 45s = 9 × 5s misses (observation) — CRITICAL threshold
+_CRITICAL_FAILURE_THRESHOLD = 9
+
 
 class HeartbeatMonitor:
     """
@@ -61,12 +71,21 @@ class HeartbeatMonitor:
         redis: Redis,
         config: SkiaConfig,
         on_death_confirmed: Callable[[], Awaitable[None]] | None = None,
+        on_critical_system_silent: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._redis = redis
         self._config = config
         self._on_death_confirmed = on_death_confirmed
+        # Optional callback invoked when a CRITICAL system goes silent for ≥45s.
+        # Receives the system name (e.g. "equor", "thymos", "memory").
+        self._on_critical_system_silent = on_critical_system_silent
         self._state = HeartbeatState()
         self._last_event_time: float = time.monotonic()
+        # Per-CRITICAL-system last heartbeat times (tracks individual system health)
+        self._critical_system_last_seen: dict[str, float] = {
+            s: time.monotonic() for s in CRITICAL_SYSTEMS
+        }
+        self._critical_system_alerted: set[str] = set()
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._pubsub_task: asyncio.Task[None] | None = None
@@ -121,8 +140,25 @@ class HeartbeatMonitor:
                         ignore_subscribe_messages=True, timeout=1.0
                     )
                     if message is not None and message.get("type") == "message":
-                        self._last_event_time = time.monotonic()
+                        now = time.monotonic()
+                        self._last_event_time = now
                         self._state.last_heartbeat_at = utc_now()
+                        # Track per-CRITICAL-system last seen time.
+                        # Heartbeat events may carry a "system" field in their JSON payload.
+                        try:
+                            import json as _json
+                            raw_data = message.get("data", b"")
+                            if isinstance(raw_data, bytes):
+                                raw_data = raw_data.decode("utf-8", errors="ignore")
+                            if raw_data:
+                                payload = _json.loads(raw_data)
+                                system_name = payload.get(_HEARTBEAT_SYSTEM_FIELD, "")
+                                if system_name in CRITICAL_SYSTEMS:
+                                    self._critical_system_last_seen[system_name] = now
+                                    # Clear alert if system has recovered
+                                    self._critical_system_alerted.discard(system_name)
+                        except Exception:
+                            pass  # Non-JSON messages are fine — organic heartbeat
 
             except asyncio.CancelledError:
                 break
@@ -148,6 +184,11 @@ class HeartbeatMonitor:
                 break
 
             self._state.last_check_at = utc_now()
+
+            # -- CRITICAL system gap check (45s threshold) --
+            # Fires independently of the organism-level 90s check.
+            await self._check_critical_systems()
+
             elapsed = time.monotonic() - self._last_event_time
             threshold_s = self._config.heartbeat_poll_interval_s * 2
 
@@ -197,6 +238,51 @@ class HeartbeatMonitor:
                     )
                     if self._on_death_confirmed:
                         await self._on_death_confirmed()
+
+    # ── CRITICAL system gap detection ─────────────────────────────
+
+    async def _check_critical_systems(self) -> None:
+        """Detect when Equor, Thymos, or Memory go silent for ≥45s.
+
+        CRITICAL systems are high-stakes: Equor gates all Intents, Thymos is the
+        immune system, and Memory is the organism's substrate of selfhood. Their
+        silence is an emergency that should not wait the full 90s detection window.
+
+        45s = _CRITICAL_FAILURE_THRESHOLD (9) × heartbeat_poll_interval_s (5s).
+
+        Fires ``on_critical_system_silent(system_name)`` once per silence event.
+        Clears automatically when the system emits a new heartbeat.
+        """
+        critical_threshold_s = (
+            _CRITICAL_FAILURE_THRESHOLD * self._config.heartbeat_poll_interval_s
+        )
+        now = time.monotonic()
+
+        for system_name in CRITICAL_SYSTEMS:
+            last_seen = self._critical_system_last_seen.get(system_name, now)
+            silence_s = now - last_seen
+
+            if silence_s >= critical_threshold_s:
+                if system_name not in self._critical_system_alerted:
+                    self._critical_system_alerted.add(system_name)
+                    self._log.warning(
+                        "critical_system_silent",
+                        system=system_name,
+                        silence_s=round(silence_s, 1),
+                        threshold_s=critical_threshold_s,
+                    )
+                    if self._on_critical_system_silent is not None:
+                        try:
+                            await self._on_critical_system_silent(system_name)
+                        except Exception as exc:
+                            self._log.error(
+                                "critical_system_callback_failed",
+                                system=system_name,
+                                error=str(exc),
+                            )
+            else:
+                # Recovered — clear alert state so it can fire again after next gap
+                self._critical_system_alerted.discard(system_name)
 
     # ── Active confirmation probes ────────────────────────────────
 

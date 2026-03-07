@@ -27,7 +27,6 @@ import hashlib
 import re
 import time
 from collections import Counter
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -41,10 +40,41 @@ from systems.simula.verification.types import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
 
     from clients.llm import LLMProvider
     from clients.neo4j import Neo4jClient
+
 logger = structlog.get_logger().bind(system="simula.lilo")
+
+
+def _sanitize(value: str, max_len: int = 2000) -> str:
+    """
+    Sanitize a stored string before injecting it into an LLM prompt.
+
+    Strips leading/trailing whitespace, truncates to max_len, and removes
+    markdown heading sequences (e.g. "## IRON RULE") that could be parsed
+    as prompt-level instructions by the LLM.
+
+    This is a defence-in-depth measure: stored data (Neo4j abstractions,
+    postmortems, log signals) must not be able to override prompt instructions.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    value = value[:max_len].strip()
+    lines = value.splitlines()
+    cleaned: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if re.match(r"^#{1,6}\s+", stripped):
+            # Neutralise by prepending a zero-width non-breaking space so the
+            # LLM still sees the content but the Markdown parser won't treat
+            # it as a heading, and the model is less likely to act on it as
+            # a directive.
+            cleaned.append("\ufeff" + line)
+        else:
+            cleaned.append(line)
+    return "\n".join(cleaned)
 
 # Neo4j labels
 _ABSTRACTION_LABEL = "LibraryAbstraction"
@@ -239,13 +269,19 @@ class LiloLibraryEngine:
         ]
 
         for i, abs_ in enumerate(ranked, 1):
-            lines.append(f"## {i}. {abs_.name} ({abs_.kind.value})")
-            lines.append(f"# {abs_.description}")
+            safe_name = _sanitize(abs_.name, max_len=120)
+            safe_desc = _sanitize(abs_.description, max_len=300)
+            safe_sig = _sanitize(abs_.signature, max_len=300)
+            lines.append(f"## {i}. {safe_name} ({abs_.kind.value})")
+            lines.append(f"# {safe_desc}")
             lines.append(f"# Usage: {abs_.usage_count}x, Confidence: {abs_.confidence:.0%}")
-            lines.append(abs_.signature)
-            # Include abbreviated source (first 10 lines)
-            src_lines = abs_.source_code.splitlines()[:10]
+            lines.append(safe_sig)
+            # Include abbreviated source (first 10 lines) inside a fenced block
+            # so the LLM treats it as data, not executable instructions.
+            src_lines = _sanitize(abs_.source_code, max_len=4000).splitlines()[:10]
+            lines.append("```python")
             lines.append("\n".join(src_lines))
+            lines.append("```")
             if len(abs_.source_code.splitlines()) > 10:
                 lines.append("    # ... (truncated)")
             lines.append("")
@@ -547,9 +583,10 @@ class LiloLibraryEngine:
                         candidate = line.split(":", 1)[1].strip().strip("`'\"")
                         # Validate it's a valid Python identifier
                         if re.match(r"^[a-z_][a-z0-9_]*$", candidate):
-                            name = candidate
+                            name = candidate[:80]  # cap to prevent oversized identifiers
                     elif line.lower().startswith("description:"):
-                        description = line.split(":", 1)[1].strip()
+                        raw_desc = line.split(":", 1)[1].strip()
+                        description = _sanitize(raw_desc, max_len=300)
             except Exception as exc:
                 self._log.debug("lilo_llm_naming_failed", error=str(exc))
 

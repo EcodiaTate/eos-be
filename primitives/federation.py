@@ -172,6 +172,7 @@ class KnowledgeType(enum.StrEnum):
     ANONYMISED_PATTERNS = "anonymised_patterns"
     SCHEMA_STRUCTURES = "schema_structures"
     THREAT_ADVISORY = "threat_advisory"
+    RE_ADAPTER_DIFF = "re_adapter_diff"  # LoRA adapter diffs — digital horizontal gene transfer
 
 
 class PrivacyLevel(enum.StrEnum):
@@ -259,6 +260,7 @@ SHARING_PERMISSIONS: dict[TrustLevel, list[KnowledgeType]] = {
         KnowledgeType.ANONYMISED_PATTERNS,
         KnowledgeType.SCHEMA_STRUCTURES,
         KnowledgeType.THREAT_ADVISORY,
+        KnowledgeType.RE_ADAPTER_DIFF,  # ALLY-only: LoRA adapter sharing is horizontal gene transfer
     ],
 }
 
@@ -366,6 +368,7 @@ class ReputationBond(Identified):
     link_id: str                                        # FederationLink.id
     remote_instance_id: str
     claim_content_hash: str                             # SHA-256 of canonical JSON content
+    claim_content: dict[str, Any] = Field(default_factory=dict)  # Original content for Jaccard overlap
     claim_embedding: list[float] | None = None          # For contradiction detection
     bond_amount_usdc: Decimal
     bond_expires_at: datetime                           # UTC; computed from bond_expiry_days

@@ -126,48 +126,38 @@ async def _generate_solution(
 
     On total failure returns a dict with confidence=0.0 and error key set.
     """
-    # -- Attempt via Simula ------------------------------------------------
+    # -- Request solution from Simula via Synapse (fire-and-forget) --------
+    # Simula subscribes to BOUNTY_SOLUTION_REQUESTED and handles proposal
+    # construction internally. The result arrives asynchronously via
+    # BOUNTY_SOLUTION_PENDING on a subsequent cycle. This cycle falls through
+    # to LLM for a synchronous inline solution.
     if simula is not None:
         try:
             from primitives.common import new_id
-            from systems.simula.evolution_types import (
-                ChangeCategory,
-                ChangeSpec,
-                EvolutionProposal,
-            )
-
-            proposal = EvolutionProposal(
-                id=new_id(),
-                source="bounty",
-                title=bounty["title"][:200],
-                description=bounty["description"][:2000],
-                repository_url=bounty.get("repo", ""),
-                issue_url=bounty["source_url"],
-                changes=[
-                    ChangeSpec(
-                        category=ChangeCategory.CODE,
-                        description=bounty["description"][:500],
-                    )
-                ],
-                metadata={
-                    "reward_usd": str(bounty["reward_usd"]),
-                    "labels": bounty.get("labels", []),
-                    "platform": bounty.get("platform", ""),
-                },
-            )
-            record = await simula.process_proposal(proposal)
-            if record is not None and getattr(record, "pr_url", None):
-                return {
-                    "summary": f"Simula-generated solution for: {bounty['title']}",
-                    "approach": "Automated via Simula evolution pipeline.",
-                    "files": [],
-                    "confidence": 0.75,
-                    "limitations": "Full diff available via Simula record.",
-                    "generator": "simula",
-                    "pr_url": record.pr_url,
-                }
+            synapse = getattr(simula, "_synapse", None)
+            event_bus = getattr(synapse, "event_bus", None) or getattr(synapse, "_event_bus", None)
+            if event_bus is not None:
+                await event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.BOUNTY_SOLUTION_REQUESTED,
+                    source_system="axon.bounty_hunt",
+                    data={
+                        "request_id": new_id(),
+                        "source": "bounty",
+                        "title": bounty["title"][:200],
+                        "description": bounty["description"][:2000],
+                        "repository_url": bounty.get("repo", ""),
+                        "issue_url": bounty["source_url"],
+                        "category": "code",
+                        "metadata": {
+                            "reward_usd": str(bounty["reward_usd"]),
+                            "labels": bounty.get("labels", []),
+                            "platform": bounty.get("platform", ""),
+                        },
+                    },
+                ))
+                logger_.debug("bounty_solution_requested_via_synapse", title=bounty["title"][:80])
         except Exception as exc:
-            logger_.warning("simula_solution_failed", error=str(exc))
+            logger_.warning("bounty_solution_request_failed", error=str(exc))
 
     # -- Fall back to direct LLM -------------------------------------------
     if llm is None:

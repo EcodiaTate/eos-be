@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from systems.phantom_liquidity.types import PhantomLiquidityPool
 
 logger = structlog.get_logger()
-NPM_ADDRESS = "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f4"
+NPM_ADDRESS = "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"
 _MAX_UINT128 = 2**128 - 1
 _SLIPPAGE_BPS = 500
 _DEADLINE_S = 1200
@@ -193,7 +193,9 @@ class PhantomLiquidityExecutor:
         return None
 
     async def _parse_mint_receipt(self, w3: Any, tx_hash: str) -> tuple[int, int, int]:
-        INC_LIQ = "0x3067048beee31b25b2f1681f88dac838c60bfd8b"
+        # Full 32-byte keccak256 of IncreaseLiquidity(uint256,uint128,uint256,uint256)
+        # Spec §4.1 — token_id is indexed topic[1]; liquidity/amount0/amount1 in data
+        INC_LIQ = "0x3067048beee31b25b2f1681f88dac838c60bfd8b75c9c62c9b72dd6b9d1d6b19"
         try:
             receipt = await self._wait_for_receipt(w3, tx_hash)
             if not receipt:
@@ -202,11 +204,13 @@ class PhantomLiquidityExecutor:
                 topics = entry.get("topics", [])
                 if not topics:
                     continue
-                t0 = topics[0].hex() if isinstance(topics[0], bytes) else str(topics[0])
-                if not t0.startswith(INC_LIQ):
+                t0_raw = topics[0]
+                t0 = ("0x" + t0_raw.hex()) if isinstance(t0_raw, bytes) else str(t0_raw)
+                if t0.lower() != INC_LIQ:
                     continue
                 raw_data = entry.get("data", "0x")
                 raw = (raw_data.hex() if isinstance(raw_data, bytes) else raw_data).replace("0x", "")
+                # data layout: [liquidity uint128][amount0 uint256][amount1 uint256] (3 × 32 bytes)
                 if len(raw) < 192:  # noqa: PLR2004
                     continue
                 t1 = topics[1]

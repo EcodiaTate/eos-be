@@ -175,6 +175,7 @@ class ReputationStakingManager:
             link_id=link.id,
             remote_instance_id=link.remote_instance_id,
             claim_content_hash=content_hash,
+            claim_content=claim.content,
             claim_embedding=claim.embedding,
             bond_amount_usdc=amount,
             bond_expires_at=expires_at,
@@ -588,16 +589,13 @@ class ReputationStakingManager:
 
     def _extract_words_from_hash_source(self, bond: ReputationBond) -> set[str]:
         """
-        Extract words for a bonded claim. Since we only store the hash,
-        we search active bonds for matching claims. If we can't recover
-        the original content, return empty set (which will cause high
-        divergence and conservative contradiction detection).
+        Extract words for a bonded claim from stored content.
+
+        Uses the claim_content field (stored alongside the hash since Phase 2).
+        Falls back to empty set for legacy bonds that lack stored content.
         """
-        # We don't store original content — only the hash. For contradiction
-        # detection we rely primarily on embedding similarity. The word overlap
-        # check is a secondary heuristic. Return empty set if we can't recover
-        # words, which means the jaccard similarity will be 0.0, passing the
-        # divergence threshold — this is the conservative (trigger contradiction) path.
+        if bond.claim_content:
+            return self._extract_words(bond.claim_content)
         return set()
 
     @staticmethod

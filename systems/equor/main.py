@@ -24,7 +24,6 @@ from clients.redis import RedisClient
 from clients.timescaledb import TimescaleDBClient
 from config import load_config, load_seed
 from systems.equor.service import EquorService
-from systems.memory.service import MemoryService
 from telemetry.logging import setup_logging
 from telemetry.metrics import MetricCollector
 
@@ -75,6 +74,7 @@ async def lifespan(app: FastAPI):
     app.state.embedding = embedding_client
 
     # ── 5. Initialize Memory service ──────────────────────────
+    from systems.memory.service import MemoryService
     memory = MemoryService(neo4j_client, embedding_client)
     await memory.initialize()
     app.state.memory = memory

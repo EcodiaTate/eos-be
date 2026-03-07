@@ -649,7 +649,7 @@ async def get_config(request: Request) -> NovaConfigResponse:
             use_llm_efe_estimation=bool(getattr(cfg, "use_llm_efe_estimation", True)),
             heartbeat_interval_seconds=int(getattr(cfg, "heartbeat_interval_seconds", 3600)),
             hunger_balance_threshold_usd=float(getattr(cfg, "hunger_balance_threshold_usd", 50.0)),
-            cognition_cost_enabled=bool(getattr(cfg, "cognition_cost_enabled", True)),
+            cognition_cost_enabled=bool(getattr(cfg, "enable_cognition_budgeting", True)),
             cognition_budget_low=float(getattr(cfg, "cognition_budget_low", 0.10)),
             cognition_budget_medium=float(getattr(cfg, "cognition_budget_medium", 0.50)),
             cognition_budget_high=float(getattr(cfg, "cognition_budget_high", 2.00)),

@@ -22,6 +22,7 @@ import structlog
 
 if TYPE_CHECKING:
     from systems.evo.service import EvoService
+    from systems.kairos.pipeline import KairosPipeline
     from systems.logos.service import LogosService
     from systems.nexus.types import DivergencePressure
     from systems.thymos.service import ThymosService
@@ -62,6 +63,7 @@ class LogosWorldModelAdapter:
             "pattern": schema.pattern,
             "instance_count": schema.instance_count,
             "compression_ratio": schema.compression_ratio,
+            "federation_confidence": getattr(schema, "federation_confidence", 0.0),
         }
 
     def get_domain_coverage(self) -> list[str]:
@@ -107,24 +109,21 @@ class LogosWorldModelAdapter:
         new_confidence: float,
     ) -> bool:
         """
-        Update the compression_ratio of a schema as a proxy for epistemic
-        confidence.  Nexus calls this when convergence raises a fragment's
-        triangulation_confidence, feeding the improvement back into the
-        world model.
+        Update the federation-derived epistemic confidence for a schema.
+
+        Writes to the dedicated `federation_confidence` field on the schema,
+        preserving `compression_ratio` for its original Logos-internal semantics
+        (MDL scoring, Schwarzschild threshold).
 
         Returns True if the schema was found and updated.
         """
         schema = self._wm.generative_schemas.get(schema_id)
         if schema is None:
             return False
-        # Use compression_ratio as the epistemic confidence carrier.
-        # Triangulation confidence replaces the raw ratio when it is higher,
-        # embodying the principle that cross-instance validation increases
-        # the epistemic status of a schema.
-        if new_confidence > schema.compression_ratio:
-            schema.compression_ratio = min(new_confidence * 10.0, schema.compression_ratio * 1.5)
+        if new_confidence > getattr(schema, "federation_confidence", 0.0):
+            schema.federation_confidence = min(new_confidence, 1.0)
             logger.debug(
-                "schema_epistemic_confidence_updated",
+                "schema_federation_confidence_updated",
                 schema_id=schema_id,
                 new_confidence=round(new_confidence, 3),
             )
@@ -143,9 +142,14 @@ class LogosWorldModelAdapter:
         across multiple diverse instances are the highest-quality world model
         components.  Logos ingests them as EmpiricalInvariants so they are
         protected from entropic decay.
+
+        Constructs the EmpiricalInvariant lazily — the import is deferred to
+        runtime (not module level) to keep the adapter bridge narrowly scoped.
+        Adapter files are the sanctioned cross-system bridge; this lazy import
+        is the approved pattern for type construction across system boundaries.
         """
         from primitives.common import new_id, utc_now
-        from systems.logos.types import EmpiricalInvariant
+        from primitives.logos import EmpiricalInvariant
 
         statement = abstract_structure.get("description", str(abstract_structure)[:120])
         invariant = EmpiricalInvariant(
@@ -163,6 +167,22 @@ class LogosWorldModelAdapter:
             statement=statement[:60],
             confidence=round(triangulation_confidence, 3),
         )
+
+    def get_federation_confidence(self, schema_id: str) -> float | None:
+        """
+        Return the federation-derived confidence for a schema.
+
+        Delegates to the NexusService if wired; returns None otherwise.
+        This enables Logos to query Nexus on-demand for epistemic status.
+        """
+        nexus = getattr(self, "_nexus", None)
+        if nexus is not None:
+            return nexus.get_federation_confidence(schema_id)
+        return None
+
+    def set_nexus(self, nexus: Any) -> None:
+        """Wire back-reference to NexusService for on-demand confidence queries."""
+        self._nexus = nexus
 
 
 class EvoHypothesisSourceAdapter:
@@ -203,20 +223,69 @@ class ThymosNexusSinkAdapter:
         """
         Translate divergence pressure into a Thymos growth drive increment.
 
-        High pressure_magnitude means the instance is too similar to peers —
-        it should explore frontier domains.  We nudge growth proportionally.
+        Delegates to ThymosService.receive_divergence_pressure() — the public
+        API that encapsulates the drive-state mutation.
         """
-        drive_state = getattr(self._thymos, "_drive_state", None)
-        if drive_state is None:
-            return
-
-        nudge = pressure.pressure_magnitude * 0.15
-        current = getattr(drive_state, "growth", 0.0)
-        drive_state.growth = min(1.0, current + nudge)
-
+        self._thymos.receive_divergence_pressure(pressure)
         logger.debug(
-            "divergence_pressure_applied_to_thymos",
+            "divergence_pressure_routed",
             magnitude=round(pressure.pressure_magnitude, 3),
-            growth_nudge=round(nudge, 3),
-            new_growth=round(drive_state.growth, 3),
         )
+
+
+class KairosCausalSourceAdapter:
+    """
+    Adapts KairosPipeline to KairosCausalSourceProtocol.
+
+    Enables Nexus to pull Tier 3 causal invariants from Kairos,
+    closing the bidirectional sync loop.
+    """
+
+    def __init__(self, kairos: KairosPipeline) -> None:
+        self._kairos = kairos
+
+    def get_tier3_invariants(self) -> list[dict[str, Any]]:
+        from primitives.causal import CausalInvariantTier
+
+        hierarchy = self._kairos.hierarchy
+        tier3 = hierarchy.get_by_tier(CausalInvariantTier.TIER_3_SUBSTRATE)
+        return [self._invariant_to_dict(inv) for inv in tier3]
+
+    def get_invariants_since(self, since_timestamp: str) -> list[dict[str, Any]]:
+        from datetime import datetime, timezone
+        from primitives.causal import CausalInvariantTier
+
+        try:
+            cutoff = datetime.fromisoformat(since_timestamp)
+        except (ValueError, TypeError):
+            return []
+
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+
+        hierarchy = self._kairos.hierarchy
+        all_invariants = hierarchy.get_all()
+        return [
+            self._invariant_to_dict(inv)
+            for inv in all_invariants
+            if getattr(inv, "discovered_at", None) is not None
+            and inv.discovered_at >= cutoff
+        ]
+
+    @staticmethod
+    def _invariant_to_dict(inv: Any) -> dict[str, Any]:
+        return {
+            "id": inv.id,
+            "abstract_form": getattr(inv, "abstract_form", {}),
+            "invariance_hold_rate": getattr(inv, "invariance_hold_rate", 0.0),
+            "applicable_domains": [
+                {
+                    "domain": d.domain,
+                    "substrate": getattr(d, "substrate", ""),
+                    "observation_count": getattr(d, "observation_count", 0),
+                }
+                for d in getattr(inv, "applicable_domains", [])
+            ],
+            "description_length_bits": getattr(inv, "description_length_bits", 0.0),
+            "discovered_at": str(getattr(inv, "discovered_at", "")),
+        }

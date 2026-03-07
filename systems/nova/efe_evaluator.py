@@ -613,15 +613,3 @@ def _identify_uncertain_domains(beliefs: BeliefState) -> str:
     return "; ".join(uncertain) if uncertain else "no specific uncertainties identified"
 
 
-def _parse_json_response(raw: str) -> dict[str, object] | None:
-    """Safely parse a JSON response from the LLM."""
-    try:
-        text = raw.strip()
-        if text.startswith("```"):
-            parts = text.split("```")
-            text = parts[1] if len(parts) > 1 else text
-            if text.startswith("json"):
-                text = text[4:]
-        return json.loads(text.strip())  # type: ignore[no-any-return]
-    except Exception:
-        return None

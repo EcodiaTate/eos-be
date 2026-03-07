@@ -190,6 +190,15 @@ class NicheRegistry:
         self._barriers: dict[str, ReproductiveBarrier] = {}  # "a::b" → barrier
         self._hypothesis_to_niche: dict[str, str] = {}  # hyp_id → niche_id
         self._logger = logger.bind(system="evo.cognitive_niche")
+        # Cached starvation level from Oikos — updated via set_starvation_level().
+        # Niche expansion is blocked when the organism is starving or critical
+        # (GROWTH gate semantics: creating new isolated cognitive ecosystems
+        # costs ongoing metabolic budget beyond the immediate cycle).
+        self._starvation_level: str = "nominal"
+
+    def set_starvation_level(self, level: str) -> None:
+        """Update cached Oikos starvation level (called by EvoService event handler)."""
+        self._starvation_level = level
 
     # ─── Niche Creation ─────────────────────────────────────────────────────
 
@@ -210,6 +219,16 @@ class NicheRegistry:
             return None
 
         if len(species.member_ids) < _MIN_NICHE_POPULATION:
+            return None
+
+        # Metabolic gate: niche expansion requires GROWTH-level resources.
+        # Block when Oikos signals starvation or critical pressure.
+        if self._starvation_level in ("starving", "critical", "terminal"):
+            self._logger.warning(
+                "niche_creation_blocked_metabolic_pressure",
+                starvation_level=self._starvation_level,
+                species=species.name,
+            )
             return None
 
         genealogy = NicheGenealogy(

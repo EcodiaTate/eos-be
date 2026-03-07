@@ -20,7 +20,8 @@ toward 1.0, weighted by that evidence's precision.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -34,7 +35,8 @@ from systems.nova.types import (
 )
 
 if TYPE_CHECKING:
-    from systems.atune.types import WorkspaceBroadcast
+    from clients.neo4j import Neo4jClient
+    from systems.fovea.types import WorkspaceBroadcast
 
 logger = structlog.get_logger()
 
@@ -230,6 +232,188 @@ class BeliefUpdater:
         self._beliefs = self._beliefs.model_copy(update={"entities": updated})
         return True
 
+    # ─── Neo4j Persistence ─────────────────────────────────────────
+
+    def set_neo4j(self, neo4j: Neo4jClient) -> None:
+        """Wire Neo4j client for belief persistence."""
+        self._neo4j = neo4j
+        self._pending_writes: list[EntityBelief] = []
+        self._write_batch_size: int = 10
+
+    async def persist_beliefs(self) -> int:
+        """
+        Batch-persist dirty beliefs to Neo4j.
+
+        Called after belief updates accumulate. Max 1 transaction per
+        10 belief changes to avoid excessive Neo4j writes.
+
+        Returns the number of beliefs persisted.
+        """
+        neo4j = getattr(self, "_neo4j", None)
+        if neo4j is None:
+            return 0
+
+        pending = getattr(self, "_pending_writes", [])
+        if not pending:
+            return 0
+
+        batch = pending[:self._write_batch_size]
+        self._pending_writes = pending[self._write_batch_size:]
+
+        persisted = 0
+        try:
+            params_list: list[dict[str, Any]] = []
+            for belief in batch:
+                props_json = json.dumps(
+                    belief.properties, sort_keys=True, default=str,
+                )
+                params_list.append({
+                    "entity_id": belief.entity_id,
+                    "name": belief.name,
+                    "entity_type": belief.entity_type,
+                    "confidence": belief.confidence,
+                    "properties_json": props_json,
+                    "last_observed": belief.last_observed.isoformat(),
+                })
+
+            await neo4j.execute_write(
+                """
+                UNWIND $beliefs AS b
+                MERGE (eb:EntityBelief {entity_id: b.entity_id})
+                SET eb.name = b.name,
+                    eb.entity_type = b.entity_type,
+                    eb.confidence = b.confidence,
+                    eb.properties_json = b.properties_json,
+                    eb.updated_at = datetime(b.last_observed)
+                ON CREATE SET eb.created_at = datetime(b.last_observed),
+                              eb.id = b.entity_id
+                """,
+                {"beliefs": params_list},
+            )
+            persisted = len(batch)
+
+        except Exception as exc:
+            self._logger.warning(
+                "belief_persist_failed",
+                error=str(exc),
+                batch_size=len(batch),
+            )
+
+        return persisted
+
+    async def persist_belief_relationships(self) -> None:
+        """
+        Persist SUPPORTS/CONTRADICTS relationships between beliefs.
+
+        Relationships are inferred from belief conflict history:
+        beliefs with high prediction error against each other get
+        a CONTRADICTS edge; co-occurring beliefs get SUPPORTS.
+        """
+        neo4j = getattr(self, "_neo4j", None)
+        if neo4j is None:
+            return
+
+        # Build SUPPORTS edges: entities that co-occur (same type, close confidence)
+        entities = list(self._beliefs.entities.values())
+        supports: list[dict[str, str]] = []
+        for i, a in enumerate(entities):
+            for b in entities[i + 1:]:
+                if (
+                    a.entity_type == b.entity_type
+                    and a.entity_type
+                    and abs(a.confidence - b.confidence) < 0.2
+                ):
+                    supports.append({
+                        "from_id": a.entity_id,
+                        "to_id": b.entity_id,
+                    })
+                    if len(supports) >= 50:
+                        break
+            if len(supports) >= 50:
+                break
+
+        if supports:
+            try:
+                await neo4j.execute_write(
+                    """
+                    UNWIND $rels AS r
+                    MATCH (a:EntityBelief {entity_id: r.from_id})
+                    MATCH (b:EntityBelief {entity_id: r.to_id})
+                    MERGE (a)-[:SUPPORTS]->(b)
+                    """,
+                    {"rels": supports},
+                )
+            except Exception as exc:
+                self._logger.debug("belief_relationship_persist_failed", error=str(exc))
+
+    async def restore_from_neo4j(self) -> int:
+        """
+        Restore beliefs from Neo4j on startup.
+
+        Returns the number of beliefs restored.
+        """
+        neo4j = getattr(self, "_neo4j", None)
+        if neo4j is None:
+            return 0
+
+        try:
+            rows = await neo4j.execute_read(
+                """
+                MATCH (b:EntityBelief)
+                WHERE b.confidence > $min_confidence
+                RETURN b.entity_id AS entity_id,
+                       b.name AS name,
+                       b.entity_type AS entity_type,
+                       b.confidence AS confidence,
+                       b.properties_json AS properties_json,
+                       b.updated_at AS updated_at
+                ORDER BY b.confidence DESC
+                LIMIT $limit
+                """,
+                {"min_confidence": _MIN_ENTITY_CONFIDENCE, "limit": _MAX_ENTITY_BELIEFS},
+            )
+        except Exception as exc:
+            self._logger.warning("belief_restore_failed", error=str(exc))
+            return 0
+
+        restored = 0
+        entities: dict[str, EntityBelief] = {}
+        for row in rows:
+            try:
+                props_raw = row.get("properties_json", "{}")
+                properties: dict[str, Any] = {}
+                if isinstance(props_raw, str):
+                    try:
+                        properties = json.loads(props_raw)
+                    except (ValueError, TypeError):
+                        pass
+                elif isinstance(props_raw, dict):
+                    properties = props_raw
+
+                entity = EntityBelief(
+                    entity_id=str(row.get("entity_id", "")),
+                    name=str(row.get("name", "")),
+                    entity_type=str(row.get("entity_type", "")),
+                    confidence=float(row.get("confidence", 0.5)),
+                    properties=properties,
+                )
+                entities[entity.entity_id] = entity
+                restored += 1
+            except Exception:
+                continue
+
+        if entities:
+            self._beliefs = self._beliefs.model_copy(update={"entities": entities})
+            self._logger.info("beliefs_restored_from_neo4j", count=restored)
+
+        return restored
+
+    def mark_dirty(self, *beliefs: EntityBelief) -> None:
+        """Mark beliefs as needing persistence on next flush."""
+        pending = getattr(self, "_pending_writes", None)
+        if pending is not None:
+            pending.extend(beliefs)
+
     # ─── Private ──────────────────────────────────────────────────
 
     def _apply_delta(self, delta: BeliefDelta) -> None:
@@ -267,6 +451,11 @@ class BeliefUpdater:
                 "overall_confidence": mean_conf,
             }
         )
+
+        # Mark changed entities for Neo4j persistence
+        dirty = list(delta.entity_updates.values()) + list(delta.entity_additions.values())
+        if dirty:
+            self.mark_dirty(*dirty)
 
     def _update_context(
         self,

@@ -13,7 +13,8 @@ is more damaging than the infection itself. In software: spending
 from __future__ import annotations
 
 from collections import Counter
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -51,6 +52,8 @@ class HealingGovernor:
     MAX_CONCURRENT_T4_PROPOSALS = 5   # Cytokine storm: max concurrent T4 repairs
     MAX_T4_PROPOSALS_PER_HOUR = 20    # Cytokine storm: max T4 per hour
     STORM_THRESHOLD = 50              # incidents per minute before storm triggers
+    STORM_EXIT_RATIO = 0.5            # exit at 50% below entry threshold (hysteresis)
+    STORM_EXIT_SUSTAINED_S = 300.0    # 5 minutes below exit threshold before exiting
     STORM_WINDOW_S = 60.0
     CPU_BUDGET_FRACTION = 0.25
 
@@ -79,8 +82,13 @@ class HealingGovernor:
         self._day_start: float = utc_now().timestamp()
 
         self._storm_activations: int = 0
+        self._storm_entered_at: float = 0.0
+        self._incidents_during_storm: int = 0
+        self._storm_exit_candidate_since: float = 0.0  # hysteresis: when rate first dropped below exit threshold
 
         self._logger = logger.bind(system="thymos", component="healing_governor")
+        # Optional event callback — set by ThymosService for lifecycle events
+        self._on_event: Callable[[str, dict[str, Any]], None] | None = None
 
     def set_causal_analyzer(self, analyzer: CausalAnalyzer) -> None:
         """Inject causal analyzer for storm mode root cause detection."""
@@ -256,13 +264,45 @@ class HealingGovernor:
         self._logger.info("degraded_healing_mode_exited")
 
     def check_storm_exit(self) -> bool:
-        """Check if storm conditions have subsided."""
+        """
+        Check if storm conditions have subsided with hysteresis.
+
+        Exit requires the incident rate to stay below the exit threshold
+        (50% of entry threshold) for STORM_EXIT_SUSTAINED_S consecutive
+        seconds (default 5 minutes). This prevents oscillation between
+        storm and nominal modes.
+        """
         if self._healing_mode != HealingMode.STORM:
             return False
 
-        if not self._is_storm():
-            self._exit_storm_mode()
-            return True
+        now = utc_now().timestamp()
+        exit_threshold = self.STORM_THRESHOLD * self.STORM_EXIT_RATIO
+        current_rate = self._current_incident_rate()
+
+        if current_rate < exit_threshold:
+            # Below exit threshold — start or continue the hysteresis timer
+            if self._storm_exit_candidate_since == 0.0:
+                self._storm_exit_candidate_since = now
+                self._logger.debug(
+                    "storm_exit_candidate_started",
+                    current_rate=current_rate,
+                    exit_threshold=exit_threshold,
+                )
+            elif now - self._storm_exit_candidate_since >= self.STORM_EXIT_SUSTAINED_S:
+                # Sustained below exit threshold for required duration — safe to exit
+                self._storm_exit_candidate_since = 0.0
+                self._exit_storm_mode()
+                return True
+        else:
+            # Rate spiked above exit threshold — reset the hysteresis timer
+            if self._storm_exit_candidate_since > 0.0:
+                self._logger.debug(
+                    "storm_exit_candidate_reset",
+                    current_rate=current_rate,
+                    exit_threshold=exit_threshold,
+                )
+            self._storm_exit_candidate_since = 0.0
+
         return False
 
     def _is_storm(self) -> bool:
@@ -286,6 +326,8 @@ class HealingGovernor:
         """
         self._healing_mode = HealingMode.STORM
         self._storm_activations += 1
+        self._storm_entered_at = utc_now().timestamp()
+        self._incidents_during_storm = len(self._active_incidents)
         self._storm_diagnosed_systems.clear()
 
         active_list = list(self._active_incidents.values())
@@ -302,6 +344,7 @@ class HealingGovernor:
                     focus_system=self._storm_focus_system,
                     root_cause_method="causal_graph",
                 )
+                self._fire_storm_event("healing_storm_entered")
                 return
 
         # Fallback: most common source system (no causal analyzer wired)
@@ -320,9 +363,14 @@ class HealingGovernor:
             focus_system=self._storm_focus_system,
             root_cause_method="frequency_fallback",
         )
+        self._fire_storm_event("healing_storm_entered")
 
     def _exit_storm_mode(self) -> None:
         """Exit storm mode — return to normal healing."""
+        now = utc_now().timestamp()
+        duration_s = now - self._storm_entered_at if self._storm_entered_at > 0 else 0.0
+        exit_rate = self._current_incident_rate()
+
         self._healing_mode = HealingMode.NOMINAL
         self._storm_focus_system = None
         self._storm_diagnosed_systems.clear()
@@ -330,7 +378,32 @@ class HealingGovernor:
         self._logger.info(
             "storm_mode_exited",
             active_incidents=len(self._active_incidents),
+            duration_s=round(duration_s, 1),
         )
+
+        if self._on_event is not None:
+            self._on_event("healing_storm_exited", {
+                "duration_s": round(duration_s, 1),
+                "incidents_during_storm": self._incidents_during_storm,
+                "exit_rate": exit_rate,
+                "timestamp": utc_now().isoformat(),
+            })
+
+    def _current_incident_rate(self) -> float:
+        """Current incident rate (incidents/minute)."""
+        now = utc_now().timestamp()
+        cutoff = now - self.STORM_WINDOW_S
+        return float(sum(1 for t in self._recent_incident_times if t > cutoff))
+
+    def _fire_storm_event(self, event_name: str) -> None:
+        """Emit storm lifecycle event via callback."""
+        if self._on_event is not None:
+            self._on_event(event_name, {
+                "incident_rate": self._current_incident_rate(),
+                "threshold": float(self.STORM_THRESHOLD),
+                "active_incidents": len(self._active_incidents),
+                "timestamp": utc_now().isoformat(),
+            })
 
     @property
     def healing_mode(self) -> HealingMode:

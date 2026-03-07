@@ -22,6 +22,7 @@ from systems.logos.types import (
     CascadeResult,
     CompressionStage,
     ExperienceDelta,
+    GenerativeSchema,
     RawExperience,
     SalientEpisode,
     SemanticExtraction,
@@ -135,6 +136,18 @@ class CompressionCascade:
         self._episode_buffer.append(episode)
         stage_metrics.append(s3_metrics)
 
+        # P5: Register Stage 3 schemas in the world model (previously lost)
+        for schema_id in extraction.schemas:
+            schema = GenerativeSchema(
+                id=schema_id,
+                name=f"distilled_{self.total_distilled}",
+                domain=raw_experience.context.get("domain", "general"),
+                description="; ".join(extraction.entities[:5]),
+                pattern=dict(episode.content),
+                instance_count=len(extraction.episode_refs),
+            )
+            self._world_model.register_schema(schema)
+
         # -- Stage 4: World Model Integration -----------------------
         wm_update: WorldModelUpdate | None = None
         s4_bits_in = (
@@ -216,19 +229,6 @@ class CompressionCascade:
             raw_bits=raw_bits,
             distilled_bits=distilled_bits,
         )
-
-    def flush_episode_buffer(self) -> list[SalientEpisode]:
-        """Drain the episode buffer (for batch processing by decay engine)."""
-        buf = list(self._episode_buffer)
-        self._episode_buffer.clear()
-        return buf
-
-    def reset_counters(self) -> None:
-        self.total_cascaded = 0
-        self.total_discarded_stage2 = 0
-        self.total_distilled = 0
-        self.total_integrated = 0
-        self.total_anchors = 0
 
     # --- Stage 2: Episodic Compression ----------------------------
 

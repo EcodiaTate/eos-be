@@ -30,39 +30,19 @@ from primitives.common import (
 # --- Enums -------------------------------------------------------------------
 
 
-class ChangeCategory(enum.StrEnum):
-    ADD_EXECUTOR = "add_executor"
-    ADD_INPUT_CHANNEL = "add_input_channel"
-    ADD_PATTERN_DETECTOR = "add_pattern_detector"
-    ADJUST_BUDGET = "adjust_budget"
-    MODIFY_CONTRACT = "modify_contract"
-    ADD_SYSTEM_CAPABILITY = "add_system_capability"
-    MODIFY_CYCLE_TIMING = "modify_cycle_timing"
-    CHANGE_CONSOLIDATION = "change_consolidation"
-    # BUG_FIX: runtime errors that Simula can autonomously fix
-    # (missing attributes, unregistered executors, KeyErrors in config, method signature mismatches).
-    # Low blast radius by definition — no governance gate required. Skips heavy simulation.
-    BUG_FIX = "bug_fix"
-    # Constitutional amendment: changes drive weights via the formal
-    # amendment pipeline (deliberation -> shadow -> vote -> adoption).
-    # Governance-required, not FORBIDDEN -- the community vote path
-    # provides the safety boundary that FORBIDDEN enforces for direct mods.
-    CONSTITUTIONAL_AMENDMENT = "constitutional_amendment"
-    MODIFY_EQUOR = "modify_equor"
-    MODIFY_CONSTITUTION = "modify_constitution"
-    MODIFY_INVARIANTS = "modify_invariants"
-    MODIFY_SELF_EVOLUTION = "modify_self_evolution"
+# Re-exported from primitives so Thymos and other systems can import these
+# without a cross-system violation.  All other code that already imports
+# from this module continues to work unchanged.
+from primitives.evolution import ChangeCategory as ChangeCategory  # noqa: E402
+from primitives.evolution import ProposalStatus as ProposalStatus  # noqa: E402
 
 
-class ProposalStatus(enum.StrEnum):
-    PROPOSED = "proposed"
-    SIMULATING = "simulating"
-    AWAITING_GOVERNANCE = "awaiting_governance"
-    APPROVED = "approved"
-    APPLYING = "applying"
-    APPLIED = "applied"
-    ROLLED_BACK = "rolled_back"
-    REJECTED = "rejected"
+class ProposalSource(enum.StrEnum):
+    """Source of proposal origin — used instead of string comparisons."""
+    EVO = "evo"
+    THYMOS = "thymos"
+    AXON = "axon"
+    PROACTIVE = "proactive"
 
 
 class RiskLevel(enum.StrEnum):
@@ -189,12 +169,20 @@ class ProposalResult(EOSBaseModel):
 
     status: ProposalStatus
     reason: str = ""
+    error: str = ""  # Truncated to 1000 chars if necessary (see validator below)
     version: int | None = None
     governance_record_id: str | None = None
     files_changed: list[str] = Field(default_factory=list)
     # Bounty Hunter integration: PR submitted on behalf of this proposal
     pr_url: str = ""
     pr_number: int | None = None
+    # Canary deployment plan attached when risk_level == MODERATE (Spec §7)
+    canary_plan: "CanaryDeploymentPlan | None" = None
+
+    def model_post_init(self, __context: Any) -> None:
+        """Cap error field at 1000 chars to prevent unbounded truncation."""
+        if len(self.error) > 1000:
+            self.error = self.error[:997] + "..."
 
 
 class EvolutionProposal(Identified, Timestamped):
@@ -234,6 +222,20 @@ class EvolutionProposal(Identified, Timestamped):
     dream_coherence_score: float | None = None
     # Sleep cycle that produced this proposal.
     dream_sleep_cycle_id: str | None = None
+    # ── Corpus 14 §11: Per-proposal token budget tracking ─────────────────────
+    # Token budget allocated to this proposal. Starts at the system max and is
+    # decremented as LLM calls consume tokens across simulation/counterfactual/etc.
+    # 0 means unlimited (budget tracking not active).
+    token_budget: int = 0       # 0 = unlimited; >0 = per-proposal cap
+    tokens_consumed: int = 0    # cumulative tokens used across all stages
+
+    @property
+    def remaining_token_budget(self) -> int:
+        """Remaining token budget. Returns maxsize when unlimited."""
+        import sys
+        if self.token_budget <= 0:
+            return sys.maxsize
+        return max(0, self.token_budget - self.tokens_consumed)
 
 
 class FileSnapshot(EOSBaseModel):
@@ -356,6 +358,18 @@ class EvolutionRecord(Identified, Timestamped):
     # Bounty Hunter integration: PR created from this evolution
     pr_url: str = ""
     pr_number: int | None = None
+    # ── Corpus 14 §8: MemoryTrace standardization (Spec 01 bi-temporal episode format) ──
+    # EvolutionRecord participates in Memory's bi-temporal knowledge graph.
+    # episode_id links this record to its MemoryTrace in Neo4j.
+    # perception_time = when the proposal was first received (event_time in bi-temporal).
+    # reflection_time = when the outcome was recorded (ingestion_time in bi-temporal).
+    episode_id: str = ""           # UUID linking to MemoryTrace node in Neo4j
+    perception_time: datetime | None = None   # proposal created_at (event_time)
+    reflection_time: datetime | None = None   # applied_at (ingestion_time)
+    # ── Corpus 14 §13: Identity scope (Spec 23) ───────────────────────────────
+    # Records which instance produced this mutation for cryptographic audit.
+    # Before applying, service verifies this matches the current instance_id.
+    identity_id: str = ""          # ECODIAOS_INSTANCE_ID of the recording instance
 
 
 class CodeChangeResult(EOSBaseModel):
@@ -368,6 +382,9 @@ class CodeChangeResult(EOSBaseModel):
     lint_passed: bool = True
     tests_passed: bool = True
     test_output: str = ""
+    # LLM token budget tracking
+    total_tokens: int = 0          # cumulative input+output tokens across all turns
+    system_prompt_tokens: int = 0  # tokens consumed by system prompt (static budget)
     # Stage 1A: Extended-thinking model metrics
     used_extended_thinking: bool = False
     reasoning_tokens: int = 0
@@ -478,6 +495,139 @@ class EnrichedSimulationResult(SimulationResult):
     counterfactual_regression_rate: float = 0.0
     dependency_blast_radius: int = 0
     caution_adjustment: CautionAdjustment | None = None
+
+
+# --- Canary Deployment Models ------------------------------------------------
+
+
+class CanaryTrafficStep(EOSBaseModel):
+    """One step in a canary traffic ramp schedule.
+
+    Spec ref: Section 7 — Canary Deployment.
+    """
+
+    traffic_percentage: int  # 0–100
+    hold_duration: str        # e.g. "1 hour", "2 hours"
+    rollback_criteria: list[str] = Field(default_factory=list)
+
+
+class CanaryDeploymentPlan(EOSBaseModel):
+    """Graduated traffic-ramp plan for MODERATE-risk proposals.
+
+    When simulation yields RiskLevel.MODERATE, the change is applied
+    immediately but traffic is shifted incrementally.  The plan is stored
+    on the EvolutionRecord so the ProactiveScanner and Thymos can monitor
+    health at each ramp step and trigger rollback if criteria are violated.
+
+    Spec ref: Section 7 — Temporal Simulation & Forward Modeling.
+    """
+
+    proposal_id: str
+    initial_traffic_percentage: int = 10
+    increase_schedule: list[CanaryTrafficStep] = Field(default_factory=list)
+    rollback_criteria: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+    rolled_back: bool = False
+    rollback_reason: str = ""
+
+    @classmethod
+    def default_for_proposal(cls, proposal_id: str) -> "CanaryDeploymentPlan":
+        """Build the standard 4-step ramp plan from spec §7."""
+        return cls(
+            proposal_id=proposal_id,
+            initial_traffic_percentage=10,
+            increase_schedule=[
+                CanaryTrafficStep(
+                    traffic_percentage=10,
+                    hold_duration="1 hour",
+                    rollback_criteria=["error_rate > 5%", "latency_p99 > 200ms"],
+                ),
+                CanaryTrafficStep(
+                    traffic_percentage=25,
+                    hold_duration="2 hours",
+                    rollback_criteria=["error_rate > 5%", "latency_p99 > 200ms"],
+                ),
+                CanaryTrafficStep(
+                    traffic_percentage=50,
+                    hold_duration="4 hours",
+                    rollback_criteria=["error_rate > 3%", "latency_p99 > 150ms"],
+                ),
+                CanaryTrafficStep(
+                    traffic_percentage=100,
+                    hold_duration="ongoing",
+                    rollback_criteria=[],
+                ),
+            ],
+            rollback_criteria=["error_rate > 5%", "latency_p99 > 200ms"],
+        )
+
+
+# --- Constraint Satisfaction Models ------------------------------------------
+
+
+class ConstraintViolation(EOSBaseModel):
+    """A specific Iron Rule or invariant violated by a proposal.
+
+    Spec ref: Section 8 — Constraint Satisfaction in Imagined Scenarios.
+    """
+
+    constraint_id: str   # e.g. "equor_immutability", "drive_normalization"
+    description: str = ""
+    severity: str = "hard"  # "hard" (blocks proposal) | "soft" (advisory)
+
+
+# --- Structured Health & Metrics Models --------------------------------------
+
+
+class SimulaComponentHealth(EOSBaseModel):
+    """Health status of a single Simula sub-system component.
+
+    Spec ref: Section 17 — Health & Monitoring.
+    """
+
+    name: str
+    status: str  # "healthy" | "degraded" | "disabled" | "unhealthy"
+    detail: str = ""
+
+
+class SimulaMetrics(EOSBaseModel):
+    """Operational KPI snapshot for the Simula system.
+
+    Spec ref: Section 17 — Health & Monitoring.
+    """
+
+    proposals_processed: int = 0
+    proposals_applied: int = 0
+    proposals_rolled_back: int = 0
+    proposals_rejected: int = 0
+    proposals_deduplicated: int = 0
+    proposals_awaiting_governance: int = 0
+    active_proposals: int = 0
+    current_version: int = 0
+
+    success_rate: float = 0.0    # applied / processed
+    rollback_rate: float = 0.0   # rolled_back / applied
+
+    evolution_velocity: float = 0.0  # proposals applied per hour (from analytics)
+    mean_simulation_risk: float = 0.0
+
+    grid_state: str = "normal"
+    starvation_level: str = "nominal"
+
+
+class HealthStatus(EOSBaseModel):
+    """Full liveness + component health report for GET /simula/health.
+
+    Spec ref: Section 17 — Health & Monitoring.
+    """
+
+    service: str = "simula"
+    status: str  # "healthy" | "degraded" | "unhealthy"
+    components: list[SimulaComponentHealth] = Field(default_factory=list)
+    metrics: SimulaMetrics = Field(default_factory=SimulaMetrics)
+    reason: str = ""
+    checked_at: datetime = Field(default_factory=utc_now)
 
 
 # --- Bridge Models -----------------------------------------------------------
@@ -599,6 +749,40 @@ class RankedProposalQueue(EOSBaseModel):
     breakdowns: list[ProposalEFEBreakdown] = Field(default_factory=list)
     recommended: EvolutionProposal | None = None                # Top-ranked proposal
     scored_at: datetime = Field(default_factory=utc_now)
+
+
+class RiskWeightVector(EOSBaseModel):
+    """
+    Learnable weights for the risk synthesis composite score.
+
+    Default values match the original hard-coded spec (§11):
+      base=0.40, counterfactual=0.20, dependency=0.15, resource=0.10, alignment=0.15
+
+    Evo tunes these by writing (:RiskWeights) nodes to Neo4j via
+    ChangeSimulator.persist_weights() / ChangeSimulator.load_weights().
+    The weights are normalised to sum=1.0 before use; any individual weight
+    must stay in [0.05, 0.70] to prevent degenerate collapse.
+    """
+
+    w_base: float = 0.40
+    w_counterfactual: float = 0.20
+    w_dependency: float = 0.15
+    w_resource: float = 0.10
+    w_alignment: float = 0.15
+    updated_at: datetime = Field(default_factory=utc_now)
+
+    def normalised(self) -> "RiskWeightVector":
+        """Return a copy with weights normalised to sum=1.0."""
+        total = self.w_base + self.w_counterfactual + self.w_dependency + self.w_resource + self.w_alignment
+        if total == 0:
+            return RiskWeightVector()
+        return RiskWeightVector(
+            w_base=self.w_base / total,
+            w_counterfactual=self.w_counterfactual / total,
+            w_dependency=self.w_dependency / total,
+            w_resource=self.w_resource / total,
+            w_alignment=self.w_alignment / total,
+        )
 
 
 class EFECalibrationRecord(EOSBaseModel):

@@ -156,10 +156,12 @@ class FinancialEncoder:
         event_bus.subscribe(
             SynapseEventType.WALLET_TRANSFER_CONFIRMED,
             self._on_wallet_transfer_confirmed,
+            timeout_s=6.0,  # embedding (≤5s timeout) + Neo4j write; must exceed _EMBED_TIMEOUT_S
         )
         event_bus.subscribe(
             SynapseEventType.REVENUE_INJECTED,
             self._on_revenue_injected,
+            timeout_s=6.0,  # embedding (≤5s timeout) + Neo4j write; must exceed _EMBED_TIMEOUT_S
         )
         self._logger.info(
             "financial_encoder_attached",

@@ -10,6 +10,7 @@ Endpoints:
   POST /api/v1/mitosis/evaluate        - Run fitness evaluation (no spawn)
   POST /api/v1/mitosis/spawn           - Enqueue spawn_child via Axon
   POST /api/v1/mitosis/terminate/{id}  - Terminate child container
+  POST /api/v1/mitosis/fleet/rescue/{id} - Rescue a struggling child
 """
 from __future__ import annotations
 
@@ -23,6 +24,12 @@ from pydantic import BaseModel
 
 logger = structlog.get_logger("api.mitosis")
 router = APIRouter()
+
+
+def _dynamic_max_children(net_worth: Any) -> int:
+    """Dynamic population cap: max(5, floor(net_worth / 1000))."""
+    import math
+    return max(5, math.floor(float(net_worth) / 1000))
 
 
 # --- Request models ---
@@ -108,7 +115,8 @@ async def get_mitosis_status(request: Request) -> dict[str, Any]:
         }
 
     state = oikos.snapshot()
-    fitness = mitosis_engine.evaluate_fitness(state)
+    dynamic_cap = _dynamic_max_children(state.total_net_worth)
+    fitness = mitosis_engine.evaluate_fitness(state, max_children_override=dynamic_cap)
 
     # Children live on EconomicState.child_instances (no separate child_manager attr)
     children = state.child_instances
@@ -214,8 +222,7 @@ async def get_mitosis_fleet(request: Request) -> dict[str, Any]:
     metrics_dict: dict[str, Any] | None = None
     try:
         state = oikos.snapshot()
-        # FleetManager has no public get_metrics(); use _compute_metrics(state)
-        m = fleet_mgr._compute_metrics(state)
+        m = fleet_mgr.get_metrics(state)
         metrics_dict = {
             "timestamp": m.timestamp.isoformat(),
             "total_children": m.total_children,
@@ -308,7 +315,8 @@ async def trigger_evaluate(request: Request) -> dict[str, Any]:
         return {"fit": False, "reasons": ["MitosisEngine not initialized"], "seed_config": None}
 
     state = oikos.snapshot()
-    fitness = mitosis_engine.evaluate_fitness(state)
+    dynamic_cap = _dynamic_max_children(state.total_net_worth)
+    fitness = mitosis_engine.evaluate_fitness(state, max_children_override=dynamic_cap)
 
     if not fitness.fit:
         return {"fit": False, "reasons": fitness.reasons, "seed_config": None}
@@ -360,7 +368,8 @@ async def trigger_spawn(body: SpawnRequest, request: Request) -> dict[str, Any]:
         return {"status": "error", "message": "MitosisEngine not initialized"}
 
     state = oikos.snapshot()
-    fitness = mitosis_engine.evaluate_fitness(state)
+    dynamic_cap = _dynamic_max_children(state.total_net_worth)
+    fitness = mitosis_engine.evaluate_fitness(state, max_children_override=dynamic_cap)
     if not fitness.fit:
         return {"status": "error", "message": "Parent not fit for reproduction", "reasons": fitness.reasons}
 
@@ -395,7 +404,6 @@ async def trigger_spawn(body: SpawnRequest, request: Request) -> dict[str, Any]:
     # Axon has no enqueue_action(). Build an Intent + ExecutionRequest and call axon.execute().
     try:
         from primitives.common import AutonomyLevel, Verdict
-        from primitives.constitutional import ConstitutionalCheck
         from primitives.intent import Action, ActionSequence, GoalDescriptor, Intent
         from systems.axon.types import ExecutionRequest
 
@@ -427,12 +435,24 @@ async def trigger_spawn(body: SpawnRequest, request: Request) -> dict[str, Any]:
             autonomy_level_granted=AutonomyLevel.STEWARD,
         )
 
-        equor_check = ConstitutionalCheck(
-            intent_id=intent.id,
-            verdict=Verdict.APPROVED,
-            confidence=1.0,
-            reasoning="Dashboard-initiated spawn — pre-approved by operator",
-        )
+        # Route through Equor for constitutional review — no bypasses
+        equor_service = getattr(request.app.state, "equor", None)
+        if equor_service is not None:
+            equor_check = await equor_service.review(intent)
+            if equor_check.verdict == Verdict.DENIED:
+                return {
+                    "status": "denied",
+                    "message": f"Constitutional review denied: {equor_check.reasoning}",
+                    "intent_id": intent.id,
+                }
+        else:
+            # Equor not initialized — fail closed, do not silently approve
+            logger.warning("equor_not_available_for_spawn", intent_id=intent.id)
+            return {
+                "status": "error",
+                "message": "Equor constitutional review service not available",
+                "intent_id": intent.id,
+            }
 
         outcome = await axon.execute(
             ExecutionRequest(
@@ -504,4 +524,45 @@ async def terminate_child(child_id: str, request: Request) -> dict[str, Any]:
         return {"status": "error", "message": "Termination returned False"}
     except Exception as exc:
         logger.exception("mitosis_terminate_failed", child_id=child_id, error=str(exc))
+        return {"status": "error", "message": str(exc)}
+
+
+@router.post("/api/v1/mitosis/fleet/rescue/{child_id}")
+async def rescue_child(child_id: str, request: Request) -> dict[str, Any]:
+    """Execute a rescue transfer to restore a struggling child's runway to 60 days."""
+    oikos = request.app.state.oikos
+    if oikos is None:
+        return {"status": "error", "message": "Oikos not initialized"}
+
+    state = oikos.snapshot()
+    match = next((c for c in state.child_instances if c.instance_id == child_id), None)
+    if match is None:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    from systems.oikos.models import ChildStatus
+
+    if match.status != ChildStatus.STRUGGLING:
+        return {
+            "status": "error",
+            "message": f"Child is not struggling (current status: {match.status.value})",
+        }
+
+    # Get fleet_service from the SpawnChildExecutor
+    axon = getattr(request.app.state, "axon", None)
+    fleet_service = None
+    if axon is not None:
+        spawn_executor = axon.get_executor("spawn_child")
+        fleet_service = getattr(spawn_executor, "_fleet_service", None) if spawn_executor is not None else None
+
+    if fleet_service is None:
+        return {"status": "error", "message": "MitosisFleetService not available"}
+
+    try:
+        success = await fleet_service.execute_rescue(match)
+        if success:
+            logger.info("mitosis_child_rescued", child_id=child_id)
+            return {"status": "ok", "child_id": child_id, "message": "Rescue transfer executed"}
+        return {"status": "error", "message": "Rescue failed (max rescues exceeded or transfer error)"}
+    except Exception as exc:
+        logger.exception("mitosis_rescue_failed", child_id=child_id, error=str(exc))
         return {"status": "error", "message": str(exc)}

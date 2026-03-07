@@ -59,6 +59,11 @@ class SnapshotManifest(Identified, Timestamped):
     snapshot_duration_ms: float
     pinata_pin_id: str = ""
 
+    @property
+    def cid(self) -> str:
+        """Alias for ipfs_cid — used in death sequence snapshot capture."""
+        return self.ipfs_cid
+
 
 class RestorationAttempt(Identified, Timestamped):
     """Record of a single restoration attempt."""
@@ -100,6 +105,9 @@ class SnapshotPayload(EOSBaseModel):
 
     instance_id: str
     snapshot_at: datetime = Field(default_factory=utc_now)
-    schema_version: str = "1"
+    schema_version: str = "2"
     nodes: list[dict[str, Any]] = Field(default_factory=list)
     edges: list[dict[str, Any]] = Field(default_factory=list)
+    # Constitutional genome from Memory.export_genome() — survives instance death.
+    # None when Memory is unavailable (e.g. cold startup with no graph yet).
+    constitutional_genome: dict[str, Any] | None = None

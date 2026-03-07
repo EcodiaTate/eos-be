@@ -41,6 +41,7 @@ from systems.evo.types import (
 )
 
 if TYPE_CHECKING:
+    from typing import Any
     from systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
@@ -68,6 +69,19 @@ class ParameterTuner:
         # Adjustment history for this consolidation cycle
         self._cycle_adjustments: list[ParameterAdjustment] = []
         self._total_adjustments: int = 0
+
+        # Event bus — wired post-init via wire_event_bus(); used to push
+        # EVO_PARAMETER_ADJUSTED so subscribing systems don't have to poll.
+        self._event_bus: Any = None
+
+    def wire_event_bus(self, event_bus: Any) -> None:
+        """Wire the Synapse event bus so parameter changes are pushed, not polled.
+
+        See Spec §IX: downstream systems (Atune, Nova, Voxis) call
+        get_current_parameter() each cycle.  With event push they can react
+        immediately — no polling lag.
+        """
+        self._event_bus = event_bus
 
     # ─── Query ────────────────────────────────────────────────────────────────
 
@@ -165,9 +179,13 @@ class ParameterTuner:
         self,
         adjustment: ParameterAdjustment,
     ) -> None:
-        """
-        Apply a single parameter adjustment.
-        Updates the in-memory value and persists to Memory graph.
+        """Apply a single parameter adjustment.
+
+        Updates the in-memory value, persists to Memory graph, and emits
+        EVO_PARAMETER_ADJUSTED on Synapse so downstream systems (Atune,
+        Nova, Voxis) can react immediately rather than waiting for the next
+        polling cycle.  See Spec §IX.
+
         Budget: ≤50ms.
         """
         self._values[adjustment.parameter] = adjustment.new_value
@@ -186,6 +204,8 @@ class ParameterTuner:
 
         if self._memory is not None:
             await self._persist_adjustment(adjustment)
+
+        await self._emit_parameter_adjusted(adjustment)
 
     def begin_cycle(self) -> None:
         """Called at the start of each consolidation cycle. Resets cycle tracking."""
@@ -207,7 +227,7 @@ class ParameterTuner:
             return 0
 
         try:
-            results = await self._memory._neo4j.execute_read(
+            results = await self._memory.execute_read(
                 """
                 MATCH (p:EvoParameter)
                 RETURN p.name AS name, p.current_value AS value
@@ -240,10 +260,36 @@ class ParameterTuner:
 
     # ─── Private ──────────────────────────────────────────────────────────────
 
+    async def _emit_parameter_adjusted(self, adjustment: ParameterAdjustment) -> None:
+        """Emit EVO_PARAMETER_ADJUSTED on Synapse (Spec §IX push notification).
+
+        Best-effort — failure never blocks the learning loop.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_PARAMETER_ADJUSTED,
+                source_system="evo",
+                data={
+                    "parameter": adjustment.parameter,
+                    "old_value": adjustment.old_value,
+                    "new_value": adjustment.new_value,
+                    "delta": round(adjustment.delta, 6),
+                    "hypothesis_id": adjustment.hypothesis_id,
+                    "evidence_score": round(adjustment.evidence_score, 4),
+                    "supporting_count": adjustment.supporting_count,
+                },
+            ))
+        except Exception:
+            self._logger.debug("parameter_adjusted_emit_failed", exc_info=True)
+
     async def _persist_adjustment(self, adjustment: ParameterAdjustment) -> None:
         """Persist the new parameter value to the Memory graph."""
         try:
-            await self._memory._neo4j.execute_write(  # type: ignore[union-attr]
+            await self._memory.execute_write(  # type: ignore[union-attr]
                 """
                 MERGE (p:EvoParameter {name: $name})
                 SET p.current_value = $value,

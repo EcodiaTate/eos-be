@@ -27,12 +27,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from primitives.affect import AffectState
+from primitives.common import DriveAlignmentVector, SystemID
 from primitives.expression import Expression, PersonalityVector
+from primitives.re_training import RETrainingExample
 from systems.voxis.affect_colouring import AffectColouringEngine
 from systems.voxis.audience import AudienceProfiler
 from systems.voxis.conversation import ConversationManager
@@ -62,7 +65,7 @@ if TYPE_CHECKING:
     from clients.redis import RedisClient
     from config import VoxisConfig
     from core.hotreload import NeuroplasticityBus
-    from systems.atune.types import WorkspaceBroadcast
+    from systems.fovea.types import WorkspaceBroadcast
     from systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
@@ -75,6 +78,21 @@ _QUEUE_DRAIN_INTERVAL_SECONDS = 30.0
 
 # How often to expire unanswered reception tracking (seconds)
 _RECEPTION_EXPIRE_INTERVAL_SECONDS = 60.0
+
+# How often to emit allostatic distress signal to Soma (seconds)
+_ALLOSTATIC_SIGNAL_INTERVAL_SECONDS = 120.0
+
+# Silence rate above this threshold signals distress to Soma
+_DISTRESS_SILENCE_RATE_THRESHOLD = 0.5
+
+# Honesty rejection rate above this threshold signals constitutional friction
+_DISTRESS_HONESTY_RATE_THRESHOLD = 0.1
+
+# How often the ambient insight loop checks for organism idleness (seconds)
+_AMBIENT_INSIGHT_POLL_INTERVAL_SECONDS = 60.0
+
+# Organism must be idle this many minutes before a spontaneous insight fires
+_AMBIENT_INSIGHT_IDLE_THRESHOLD_MINUTES = 5.0
 
 
 class VoxisService:
@@ -156,6 +174,17 @@ class VoxisService:
         # Soma for somatic expression modulation (arousal/valence → tone)
         self._soma: Any = None
 
+        # Somatic state from SOMA_TICK / SOMATIC_MODULATION_SIGNAL events
+        self._somatic_arousal: float = 0.5
+        self._somatic_energy: float = 0.5
+        self._somatic_stress: float = 0.0
+
+        # Event bus — wired via set_event_bus() for RE training emission
+        self._event_bus: Any = None
+
+        # Metabolic starvation level — CRITICAL: silence, EMERGENCY: template only
+        self._starvation_level: str = "nominal"
+
         # Background task tracking -- prevents fire-and-forget error loss
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_task_failures: int = 0
@@ -163,6 +192,13 @@ class VoxisService:
         # Periodic background loop handles
         self._queue_drain_task: asyncio.Task[Any] | None = None
         self._reception_expire_task: asyncio.Task[Any] | None = None
+        self._allostatic_signal_task: asyncio.Task[Any] | None = None
+        self._ambient_insight_task: asyncio.Task[Any] | None = None
+
+        # Snapshot counters for allostatic window computation
+        self._allostatic_window_expressions: int = 0
+        self._allostatic_window_silence: int = 0
+        self._allostatic_window_honesty_rejections: int = 0
 
         # Observability counters
         self._total_expressions: int = 0
@@ -265,6 +301,9 @@ class VoxisService:
             max_expression_length=self._config.max_expression_length,
         )
 
+        # Restore audience profiles from Neo4j
+        await self._restore_audience_profiles()
+
         # Start background loops
         self._queue_drain_task = self._spawn_tracked_task(
             self._queue_drain_loop(),
@@ -273,6 +312,14 @@ class VoxisService:
         self._reception_expire_task = self._spawn_tracked_task(
             self._reception_expire_loop(),
             name="voxis_reception_expire",
+        )
+        self._allostatic_signal_task = self._spawn_tracked_task(
+            self._allostatic_signal_loop(),
+            name="voxis_allostatic_signal",
+        )
+        self._ambient_insight_task = self._spawn_tracked_task(
+            self._ambient_insight_loop(),
+            name="voxis_ambient_insight",
         )
 
         self._logger.info(
@@ -300,6 +347,10 @@ class VoxisService:
             self._queue_drain_task.cancel()
         if self._reception_expire_task and not self._reception_expire_task.done():
             self._reception_expire_task.cancel()
+        if self._allostatic_signal_task and not self._allostatic_signal_task.done():
+            self._allostatic_signal_task.cancel()
+        if self._ambient_insight_task and not self._ambient_insight_task.done():
+            self._ambient_insight_task.cancel()
 
         self._logger.info(
             "voxis_shutdown",
@@ -379,8 +430,20 @@ class VoxisService:
         if not content_text:
             return
 
+        # Classify trigger: ATUNE_DISTRESS when care_activation is high and
+        # valence is markedly negative (Spec §5 — Silence Decision Hierarchy).
+        # ATUNE_DISTRESS bypasses rate-limiting and activates the Care drive override.
+        care_activation = getattr(affect, "care_activation", 0.0)
+        valence = getattr(affect, "valence", 0.0)
+        is_distress = bool(care_activation > 0.6 and valence < -0.3)
+        broadcast_trigger = (
+            ExpressionTrigger.ATUNE_DISTRESS
+            if is_distress
+            else ExpressionTrigger.ATUNE_DIRECT_ADDRESS
+        )
+
         intent = ExpressionIntent(
-            trigger=ExpressionTrigger.ATUNE_DIRECT_ADDRESS,
+            trigger=broadcast_trigger,
             content_to_express=content_text,
             urgency=float(getattr(broadcast, "salience", type("", (), {"composite": 0.5})()).composite),
         )
@@ -397,6 +460,14 @@ class VoxisService:
 
         if not decision.speak:
             self._total_silence += 1
+            # Emit VOXIS_SILENCE_CHOSEN for broadcast-triggered silence
+            self._spawn_tracked_task(
+                self._emit_silence_chosen(
+                    context=f"trigger=broadcast, content={content_text[:100]!r}",
+                    reason=decision.reason or "silence_engine",
+                ),
+                name="voxis_silence_broadcast",
+            )
             # Queue for deferred delivery if the silence engine said to queue
             if decision.queue:
                 self._expression_queue.enqueue(intent, affect)
@@ -440,6 +511,32 @@ class VoxisService:
         """
         assert self._renderer is not None, "VoxisService not initialized"
         assert self._conversation_manager is not None
+
+        # ── Metabolic gate ──
+        if self._starvation_level == "critical":
+            self._total_silence += 1
+            return Expression(
+                content="",
+                strategy=ExpressionStrategy(intent_type="silence"),
+                personality=self._personality_engine.vector if self._personality_engine else PersonalityVector(),
+                affect=affect or AffectState.neutral(),
+            )
+        if self._starvation_level == "emergency":
+            # Template-only: bypass LLM rendering, use raw content directly
+            self._total_speak += 1
+            self._total_expressions += 1
+            expr = Expression(
+                content=content,
+                strategy=ExpressionStrategy(intent_type="response", context_type="metabolic_emergency"),
+                personality=self._personality_engine.vector if self._personality_engine else PersonalityVector(),
+                affect=affect or AffectState.neutral(),
+            )
+            for cb in self._expression_callbacks:
+                try:
+                    await cb(expr)
+                except Exception:
+                    pass
+            return expr
 
         current_affect = affect or AffectState.neutral()
 
@@ -496,6 +593,15 @@ class VoxisService:
                 "expression_suppressed",
                 trigger=trigger.value,
                 reason=decision.reason,
+            )
+            # Emit VOXIS_SILENCE_CHOSEN
+            self._spawn_tracked_task(
+                self._emit_silence_chosen(
+                    context=f"trigger={trigger.value}, content={content[:100]!r}",
+                    reason=decision.reason or "silence_engine",
+                    silence_duration_estimate=self._config.min_expression_interval_minutes * 60.0,
+                ),
+                name="voxis_silence_chosen",
             )
             # Queue for later if the silence engine said to
             if decision.queue:
@@ -594,13 +700,44 @@ class VoxisService:
             dynamics=dynamics,
         )
 
-        # Generate voice parameters for multimodal delivery
-        self._voice_engine.derive(
+        # Report LLM token cost to Oikos via METABOLIC_COST_REPORT (Gap 4)
+        # Only emit when the renderer actually called the LLM (input_tokens > 0).
+        if expression.generation_trace and expression.generation_trace.input_tokens > 0:
+            trace = expression.generation_trace
+            # Approximate Claude Sonnet pricing: $3/M input, $15/M output (2026)
+            _INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
+            _OUTPUT_COST_PER_TOKEN = 15.0 / 1_000_000
+            estimated_cost_usd = (
+                trace.input_tokens * _INPUT_COST_PER_TOKEN
+                + trace.output_tokens * _OUTPUT_COST_PER_TOKEN
+            )
+            self._spawn_tracked_task(
+                self._emit_metabolic_cost(
+                    operation="expression_generation",
+                    token_count=trace.input_tokens + trace.output_tokens,
+                    estimated_cost_usd=estimated_cost_usd,
+                    trigger=trigger.value,
+                    model=trace.model,
+                ),
+                name=f"voxis_cost_{expression.id[:8]}",
+            )
+
+        # Generate voice parameters for multimodal delivery (Spec §6 — Voice Engine)
+        # Wire the result into expression.voice_params so downstream consumers
+        # (WebSocket handlers, TTS pipeline) can drive speech synthesis.
+        voice_params = self._voice_engine.derive(
             personality=self._personality_engine.current,  # type: ignore[union-attr]
             affect=current_affect,
             strategy_register=expression.strategy.speech_register if expression.strategy else "neutral",
             urgency=urgency,
         )
+        expression.voice_params = {
+            "base_voice": voice_params.base_voice,
+            "speed": voice_params.speed,
+            "pitch_shift": voice_params.pitch_shift,
+            "emphasis_level": voice_params.emphasis_level,
+            "pause_frequency": voice_params.pause_frequency,
+        }
 
         # Post-render: update state
         self._silence_engine.record_expression()
@@ -614,11 +751,37 @@ class VoxisService:
         )
         if expression.generation_trace and not expression.generation_trace.honesty_check_passed:
             self._honesty_rejections += 1
+            # Emit EXPRESSION_FILTERED for constitutional filter block
+            self._spawn_tracked_task(
+                self._emit_expression_filtered(
+                    expression_id=expression.id,
+                    filter_reason="honesty_check_failed",
+                    original_tone=expression.strategy.speech_register if expression.strategy else "neutral",
+                    filtered_tone="suppressed",
+                ),
+                name=f"voxis_filtered_{expression.id[:8]}",
+            )
 
         # Record expression in diversity tracker
         self._diversity_tracker.record(
             expression.content or "",
             trigger=trigger.value,
+        )
+
+        # Emit evolutionary observable for expression adaptation
+        self._spawn_tracked_task(
+            self._emit_evolutionary_observable(
+                observable_type="expression_adaptation",
+                value=round(current_affect.valence, 4),
+                is_novel=True,
+                metadata={
+                    "trigger": trigger.value,
+                    "channel": expression.channel,
+                    "register": expression.strategy.speech_register if expression.strategy else "neutral",
+                    "expression_count": self._total_expressions,
+                },
+            ),
+            name=f"voxis_evo_expr_{expression.id[:8]}",
         )
 
         # Record expression in conversation dynamics engine
@@ -654,6 +817,40 @@ class VoxisService:
             name=f"voxis_topics_{conv_state.conversation_id}",
         )
 
+        # RE training: expression generation (enriched with audience/personality/somatic context)
+        honesty_passed = expression.generation_trace.honesty_check_passed if expression.generation_trace else True
+        personality_ctx = (
+            f"warmth={self._personality_engine.current.warmth:.2f}, "
+            f"directness={self._personality_engine.current.directness:.2f}, "
+            f"empathy={self._personality_engine.current.empathy_expression:.2f}"
+            if self._personality_engine else "neutral"
+        )
+        audience_ctx = (
+            f"tech_level={audience.technical_level:.2f}, "
+            f"relationship={audience.relationship_strength:.2f}, "
+            f"register={audience.preferred_register}"
+        )
+        somatic_re_ctx = (
+            f"arousal={self._somatic_arousal:.2f}, "
+            f"energy={self._somatic_energy:.2f}, "
+            f"stress={self._somatic_stress:.2f}"
+        )
+        self._spawn_tracked_task(
+            self._emit_re_training_example(
+                category="expression_generation",
+                instruction="Generate expression: select strategy, personality modulation, tone/register, then render content.",
+                input_context=(
+                    f"trigger={trigger.value}, content={content[:200]!r}, urgency={urgency:.2f}, "
+                    f"personality=[{personality_ctx}], audience=[{audience_ctx}], somatic=[{somatic_re_ctx}]"
+                ),
+                output=f"register={expression.strategy.speech_register if expression.strategy else 'neutral'}, content={expression.content[:200] if expression.content else ''}",
+                outcome_quality=1.0 if honesty_passed else 0.3,
+                episode_id=intent_id or "",
+                reasoning_trace=f"honesty_passed={honesty_passed}, diversity_score={diversity_score.similarity:.2f}" if diversity_score else "",
+            ),
+            name=f"voxis_re_emit_{expression.id[:8]}",
+        )
+
         # Store expression as a Memory episode (the organism remembers what it said)
         self._spawn_tracked_task(
             self._store_expression_as_episode(expression, trigger),
@@ -666,6 +863,20 @@ class VoxisService:
                 cb(expression)
             except Exception:
                 self._logger.warning("expression_callback_failed", exc_info=True)
+
+        # Emit EXPRESSION_GENERATED event via Synapse
+        self._spawn_tracked_task(
+            self._emit_expression_generated(
+                expression=expression,
+                channel=expression.channel,
+                audience_id=addressee_id,
+                constitutional_check=not (
+                    expression.generation_trace
+                    and not expression.generation_trace.honesty_check_passed
+                ),
+            ),
+            name=f"voxis_expr_generated_{expression.id[:8]}",
+        )
 
         # Generate initial ExpressionFeedback (will be enriched by reception engine)
         feedback = ExpressionFeedback(
@@ -686,6 +897,18 @@ class VoxisService:
                 fb_cb(feedback)
             except Exception:
                 self._logger.debug("feedback_callback_failed", exc_info=True)
+
+        # Emit feedback via Synapse bus so subscribers (Benchmarks, Telos) can observe it
+        self._spawn_tracked_task(
+            self._emit_expression_feedback(feedback),
+            name=f"voxis_feedback_emit_{expression.id[:8]}",
+        )
+
+        # Persist feedback to Neo4j for RE training streams 1–3 (Bug 1 fix)
+        self._spawn_tracked_task(
+            self._persist_expression_feedback(feedback),
+            name=f"voxis_persist_feedback_{expression.id[:8]}",
+        )
 
         # Track affect state for next delta computation
         self._affect_before_expression = current_affect
@@ -723,6 +946,52 @@ class VoxisService:
         # Update audience profiler's learned model
         if speaker_id:
             self._audience_profiler.observe_user_message(speaker_id, message)
+            # Emit VOXIS_AUDIENCE_PROFILED + evolutionary observable
+            learned = self._audience_profiler._learned_models.get(speaker_id)
+            if learned:
+                # Evolutionary observable: audience model adaptation
+                if learned.has_sufficient_data:
+                    self._spawn_tracked_task(
+                        self._emit_evolutionary_observable(
+                            observable_type="audience_adaptation",
+                            value=round(learned.inferred_technical_level, 4),
+                            is_novel=learned.total_messages <= 6,
+                            metadata={
+                                "individual_id": speaker_id,
+                                "observations": learned.total_messages,
+                            },
+                        ),
+                        name=f"voxis_evo_audience_{speaker_id[:8]}",
+                    )
+                self._spawn_tracked_task(
+                    self._emit_audience_profiled(
+                        audience_id=speaker_id,
+                        profile_summary={
+                            "avg_word_count": round(learned.avg_word_count, 1),
+                            "question_frequency": round(learned.question_frequency, 3),
+                            "inferred_technical_level": round(learned.inferred_technical_level, 3),
+                            "avg_formality": round(learned.avg_formality, 3),
+                            "strategies_tried": learned.strategies_tried,
+                        },
+                        interaction_count=learned.total_messages,
+                    ),
+                    name=f"voxis_audience_{speaker_id[:8]}",
+                )
+            # Emit evolutionary observable for vocabulary acquisition from user input
+            import asyncio as _asyncio
+            _asyncio.create_task(
+                self._emit_evolutionary_observable(
+                    observable_type="vocabulary_acquisition",
+                    value=len(message.split()),
+                    is_novel=True,
+                    metadata={
+                        "conversation_id": updated.conversation_id,
+                        "speaker_id": speaker_id,
+                        "message_length": len(message),
+                    },
+                ),
+                name=f"voxis_evo_vocab_{updated.conversation_id[:8]}",
+            )
 
         # Track conversation dynamics
         self._dynamics_engine.record_turn(
@@ -742,13 +1011,32 @@ class VoxisService:
         if enriched_feedback:
             # Update audience profiler with satisfaction signal
             if speaker_id:
+                # Infer formatting from the expression content summary.
+                # "structured" when bullet points, numbered lists, or markdown headers
+                # are detected; "prose" otherwise (Spec §4 — Audience Profiler, Bug 5 fix).
+                content_sample = enriched_feedback.content_summary
+                is_structured = bool(
+                    "\n-" in content_sample
+                    or "\n*" in content_sample
+                    or "\n1." in content_sample
+                    or "\n#" in content_sample
+                    or "• " in content_sample
+                )
+                formatting_used = "structured" if is_structured else "prose"
                 self._audience_profiler.observe_reception(
                     individual_id=speaker_id,
                     register_used=enriched_feedback.strategy_register,
-                    formatting_used="prose",  # TODO: track from strategy
+                    formatting_used=formatting_used,
                     expression_length=enriched_feedback.user_response_length,
                     satisfaction=enriched_feedback.inferred_reception.satisfaction,
                 )
+                # Persist updated audience model to Neo4j
+                learned_model = self._audience_profiler._learned_models.get(speaker_id)
+                if learned_model:
+                    self._spawn_tracked_task(
+                        self._persist_audience_profile(speaker_id, learned_model),
+                        name=f"voxis_persist_audience_{speaker_id[:8]}",
+                    )
 
             # Re-dispatch enriched feedback to Evo and other listeners
             for fb_cb in self._feedback_callbacks:
@@ -756,6 +1044,40 @@ class VoxisService:
                     fb_cb(enriched_feedback)
                 except Exception:
                     self._logger.debug("enriched_feedback_callback_failed", exc_info=True)
+
+            # Emit enriched feedback via Synapse bus (Bug 2 fix — bus-observable)
+            self._spawn_tracked_task(
+                self._emit_expression_feedback(enriched_feedback),
+                name=f"voxis_enriched_feedback_{enriched_feedback.expression_id[:8]}",
+            )
+
+            # Persist enriched feedback to Neo4j (overwrites initial write with richer data)
+            self._spawn_tracked_task(
+                self._persist_expression_feedback(enriched_feedback),
+                name=f"voxis_persist_enriched_feedback_{enriched_feedback.expression_id[:8]}",
+            )
+
+            # Emit satisfaction as an evolutionary observable for Benchmarks/Telos (Bug 10 fix).
+            # Benchmarks uses EVOLUTIONARY_OBSERVABLE to track the expression satisfaction KPI;
+            # Telos uses it for 4D drive-geometry scoring of communicative effectiveness.
+            satisfaction = enriched_feedback.inferred_reception.satisfaction
+            self._spawn_tracked_task(
+                self._emit_evolutionary_observable(
+                    observable_type="expression_satisfaction",
+                    value=round(satisfaction, 4),
+                    is_novel=False,
+                    metadata={
+                        "expression_id": enriched_feedback.expression_id,
+                        "trigger": enriched_feedback.trigger,
+                        "strategy_register": enriched_feedback.strategy_register,
+                        "understood": round(enriched_feedback.inferred_reception.understood, 4),
+                        "engagement": round(enriched_feedback.inferred_reception.engagement, 4),
+                        "emotional_impact": round(enriched_feedback.inferred_reception.emotional_impact, 4),
+                        "user_responded": enriched_feedback.user_responded,
+                    },
+                ),
+                name=f"voxis_satisfaction_obs_{enriched_feedback.expression_id[:8]}",
+            )
 
         return updated.conversation_id
 
@@ -768,12 +1090,54 @@ class VoxisService:
         Returns the new PersonalityVector.
         """
         assert self._personality_engine is not None
+        old_vector = self._personality_engine.current
+        old_vector_dict = old_vector.model_dump(
+            include={"warmth", "directness", "verbosity", "formality",
+                     "curiosity_expression", "humour", "empathy_expression",
+                     "confidence_display", "metaphor_use"}
+        )
         new_vector = self._personality_engine.apply_delta(delta)
         self._personality_engine = PersonalityEngine(new_vector)
+        new_vector_dict = new_vector.model_dump(
+            include={"warmth", "directness", "verbosity", "formality",
+                     "curiosity_expression", "humour", "empathy_expression",
+                     "confidence_display", "metaphor_use"}
+        )
         self._logger.info(
             "personality_updated_by_evo",
             dimensions=list(delta.keys()),
         )
+        drift_magnitude = sum(abs(v) for v in delta.values())
+
+        # Emit VOXIS_PERSONALITY_SHIFTED + evolutionary observable
+        self._spawn_tracked_task(
+            self._emit_personality_shifted(
+                old_vector=old_vector_dict,
+                new_vector=new_vector_dict,
+                shift_magnitude=drift_magnitude,
+                trigger_reason="evo_adjustment",
+            ),
+            name="voxis_personality_shifted",
+        )
+        self._spawn_tracked_task(
+            self._emit_evolutionary_observable(
+                observable_type="personality_drift",
+                value=round(drift_magnitude, 4),
+                is_novel=drift_magnitude > 0.1,
+                metadata={
+                    "dimensions": list(delta.keys()),
+                    "delta": {k: round(v, 4) for k, v in delta.items()},
+                },
+            ),
+            name="voxis_evo_personality_drift",
+        )
+
+        # Persist updated personality to Neo4j
+        self._spawn_tracked_task(
+            self._persist_personality(new_vector),
+            name="voxis_persist_personality",
+        )
+
         return new_vector
 
     # --- Observability ----------------------------------------------------
@@ -787,6 +1151,579 @@ class VoxisService:
         """Wire Thread for narrative identity context injection."""
         self._thread = thread
         logger.info("thread_wired_to_voxis")
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Wire the Synapse event bus for event emission and subscription."""
+        self._event_bus = event_bus
+        from systems.synapse.types import SynapseEventType
+        event_bus.subscribe(SynapseEventType.METABOLIC_PRESSURE, self._on_metabolic_pressure)
+        event_bus.subscribe(SynapseEventType.SOMA_TICK, self._on_soma_tick)
+        event_bus.subscribe(SynapseEventType.SOMATIC_MODULATION_SIGNAL, self._on_somatic_modulation)
+        event_bus.subscribe(SynapseEventType.ONEIROS_CONSOLIDATION_COMPLETE, self._on_oneiros_consolidation)
+        event_bus.subscribe(SynapseEventType.NOVA_EXPRESSION_REQUEST, self._on_nova_expression_request)
+        self._logger.info("event_bus_wired_to_voxis")
+
+    async def _on_metabolic_pressure(self, event: Any) -> None:
+        """React to organism-wide metabolic pressure changes."""
+        data = getattr(event, "data", {}) or {}
+        level = data.get("starvation_level", "")
+        if not level:
+            return
+        old = self._starvation_level
+        self._starvation_level = level
+        if level != old:
+            self._logger.info("voxis_starvation_level_changed", old=old, new=level)
+            if level == "critical":
+                # Cancel background expression loops
+                for task in (self._queue_drain_task, self._reception_expire_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+
+    async def _on_soma_tick(self, event: Any) -> None:
+        """Loop 5: Update somatic state from SOMA_TICK for expression modulation.
+
+        High arousal (>0.7) → shorter, more urgent responses.
+        Low energy (<0.3) → more conservative tone.
+        """
+        data = getattr(event, "data", {}) or {}
+        somatic = data.get("somatic_state", {})
+        if not somatic:
+            return
+        self._somatic_arousal = somatic.get("arousal_sensed", self._somatic_arousal)
+        self._somatic_energy = somatic.get("energy_sensed", self._somatic_energy)
+        self._logger.debug(
+            "voxis_soma_tick_received",
+            arousal=round(self._somatic_arousal, 3),
+            energy=round(self._somatic_energy, 3),
+        )
+
+    async def _on_somatic_modulation(self, event: Any) -> None:
+        """Handle SOMATIC_MODULATION_SIGNAL — Soma allostatic feedback.
+
+        High arousal → more expressive tone.
+        Low energy → shorter responses, less elaboration.
+        High stress → more cautious/measured tone.
+        """
+        data = getattr(event, "data", {}) or {}
+        arousal = data.get("arousal", self._somatic_arousal)
+        energy = data.get("energy", self._somatic_energy)
+        stress = data.get("stress", 0.0)
+
+        # Smooth blending (80% existing, 20% new signal) to prevent jarring shifts
+        self._somatic_arousal = self._somatic_arousal * 0.8 + float(arousal) * 0.2
+        self._somatic_energy = self._somatic_energy * 0.8 + float(energy) * 0.2
+
+        # Store stress level for strategy modulation
+        self._somatic_stress = float(stress)
+
+        self._logger.debug(
+            "voxis_somatic_modulation_received",
+            arousal=round(self._somatic_arousal, 3),
+            energy=round(self._somatic_energy, 3),
+            stress=round(self._somatic_stress, 3),
+        )
+
+    async def _on_oneiros_consolidation(self, event: Any) -> None:
+        """Handle ONEIROS_CONSOLIDATION_COMPLETE — update personality from sleep-consolidated patterns.
+
+        After a sleep cycle, Oneiros may have consolidated patterns that
+        should subtly shift the personality vector (e.g., if the organism
+        consolidated many empathetic interactions, empathy_expression drifts up).
+        """
+        data = getattr(event, "data", {}) or {}
+        schemas_updated = data.get("schemas_updated", 0)
+        episodes_consolidated = data.get("episodes_consolidated", 0)
+
+        if episodes_consolidated < 5:
+            return  # Not enough data to justify personality drift
+
+        # Micro-drift: very small personality nudges based on consolidated patterns
+        # This is intentionally subtle (0.005 max per consolidation cycle)
+        personality_nudge: dict[str, float] = {}
+
+        # If many episodes were consolidated, slightly increase curiosity
+        # (the organism is actively processing new experiences)
+        if episodes_consolidated > 20:
+            personality_nudge["curiosity_expression"] = 0.003
+
+        # If schemas were updated, slight growth in directness
+        # (the organism has clearer mental models)
+        if schemas_updated > 3:
+            personality_nudge["directness"] = 0.002
+
+        if personality_nudge and self._personality_engine is not None:
+            self.update_personality(personality_nudge)
+            self._logger.info(
+                "personality_nudged_by_consolidation",
+                episodes=episodes_consolidated,
+                schemas=schemas_updated,
+                nudge=personality_nudge,
+            )
+
+    async def _on_nova_expression_request(self, event: Any) -> None:
+        """Handle NOVA_EXPRESSION_REQUEST — express on behalf of Nova's IntentRouter."""
+        data = getattr(event, "data", {}) or {}
+        content: str = data.get("content", "")
+        if not content:
+            return
+
+        trigger_raw: str = data.get("trigger", "NOVA_RESPOND")
+        conversation_id: str | None = data.get("conversation_id")
+        affect_dict: dict | None = data.get("affect")
+        urgency: float = float(data.get("urgency", 0.5))
+        intent_id: str | None = data.get("intent_id")
+
+        from systems.voxis.types import ExpressionTrigger
+        try:
+            trigger = ExpressionTrigger(trigger_raw)
+        except ValueError:
+            trigger = ExpressionTrigger.NOVA_RESPOND
+
+        affect = None
+        if affect_dict is not None:
+            try:
+                from primitives.affect import AffectState
+                affect = AffectState(**affect_dict)
+            except Exception:
+                pass
+
+        try:
+            await self.express(
+                content=content,
+                trigger=trigger,
+                conversation_id=conversation_id,
+                affect=affect,
+                intent_id=intent_id,
+                urgency=urgency,
+            )
+        except Exception as exc:
+            self._logger.error(
+                "nova_expression_request_failed",
+                intent_id=intent_id,
+                error=str(exc),
+            )
+
+    async def _emit_metabolic_cost(
+        self,
+        operation: str,
+        token_count: int,
+        estimated_cost_usd: float,
+        trigger: str = "",
+        model: str = "",
+    ) -> None:
+        """Emit METABOLIC_COST_REPORT to Oikos for LLM call accounting (Gap 4)."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.METABOLIC_COST_REPORT,
+                source_system="voxis",
+                data={
+                    "system_id": "voxis",
+                    "operation": operation,
+                    "cost_usd": round(estimated_cost_usd, 6),
+                    "details": {
+                        "token_count": token_count,
+                        "trigger": trigger,
+                        "model": model,
+                    },
+                },
+            ))
+        except Exception:
+            pass
+
+    async def _emit_evolutionary_observable(
+        self,
+        observable_type: str,
+        value: float,
+        is_novel: bool,
+        metadata: dict | None = None,
+    ) -> None:
+        """Emit an evolutionary observable event via Synapse."""
+        if self._event_bus is None:
+            return
+        try:
+            from primitives.evolutionary import EvolutionaryObservable
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            obs = EvolutionaryObservable(
+                source_system=SystemID.VOXIS,
+                instance_id="",
+                observable_type=observable_type,
+                value=value,
+                is_novel=is_novel,
+                metadata=metadata or {},
+            )
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system="voxis",
+                data=obs.model_dump(mode="json"),
+            )
+            await self._event_bus.emit(event)
+        except Exception:
+            pass
+
+    async def _emit_re_training_example(
+        self,
+        category: str,
+        instruction: str,
+        input_context: str,
+        output: str,
+        outcome_quality: float,
+        episode_id: str = "",
+        cost_usd: Decimal = Decimal("0"),
+        latency_ms: int = 0,
+        reasoning_trace: str = "",
+        alternatives: list[str] | None = None,
+        constitutional_alignment: DriveAlignmentVector | None = None,
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            example = RETrainingExample(
+                source_system=SystemID.VOXIS,
+                episode_id=episode_id,
+                instruction=instruction,
+                input_context=input_context,
+                output=output,
+                outcome_quality=outcome_quality,
+                category=category,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                reasoning_trace=reasoning_trace,
+                alternatives_considered=alternatives or [],
+                constitutional_alignment=constitutional_alignment or DriveAlignmentVector(),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                data=example.model_dump(mode="json"),
+                source_system="voxis",
+            ))
+        except Exception:
+            self._logger.debug("re_training_emit_failed", exc_info=True)
+
+    async def _persist_personality(self, personality: PersonalityVector) -> None:
+        """Persist personality vector to Neo4j Self node (atomic write)."""
+        try:
+            import json as _json
+            pj = personality.model_dump(
+                include={"warmth", "directness", "verbosity", "formality",
+                         "curiosity_expression", "humour", "empathy_expression",
+                         "confidence_display", "metaphor_use",
+                         "vocabulary_affinities", "thematic_references"}
+            )
+            serialised = _json.dumps(pj, sort_keys=True, separators=(",", ":"))
+            await self._memory._neo4j.execute_write(
+                "MATCH (s:Self) SET s.personality_json = $pj, s.personality_updated_at = datetime()",
+                {"pj": serialised},
+            )
+            self._logger.debug("personality_persisted_to_neo4j")
+        except Exception:
+            self._logger.warning("personality_persist_failed", exc_info=True)
+
+    async def _persist_audience_profile(
+        self, individual_id: str, model: Any,
+    ) -> None:
+        """Persist audience learned model to Neo4j (upsert by individual_id)."""
+        try:
+            await self._memory._neo4j.execute_write(
+                """
+                MERGE (a:AudienceProfile {individual_id: $id})
+                SET a.total_messages = $total_messages,
+                    a.total_word_count = $total_word_count,
+                    a.total_questions_asked = $total_questions,
+                    a.total_technical_terms = $total_tech,
+                    a.formality_sum = $formality_sum,
+                    a.strategies_tried = $strategies_tried,
+                    a.updated_at = datetime()
+                """,
+                {
+                    "id": individual_id,
+                    "total_messages": model.total_messages,
+                    "total_word_count": model.total_word_count,
+                    "total_questions": model.total_questions_asked,
+                    "total_tech": model.total_technical_terms,
+                    "formality_sum": model.formality_sum,
+                    "strategies_tried": model.strategies_tried,
+                },
+            )
+            self._logger.debug("audience_profile_persisted", individual_id=individual_id)
+        except Exception:
+            self._logger.debug("audience_persist_failed", individual_id=individual_id, exc_info=True)
+
+    async def _persist_expression_feedback(
+        self, feedback: ExpressionFeedback,
+    ) -> None:
+        """
+        Persist ExpressionFeedback to Neo4j with a [:HAS_FEEDBACK] relationship on
+        the Expression node (Spec §9 — Memory Integration, Bug 1 fix).
+
+        Creates an ExpressionFeedback node and links it to the matching Expression.
+        If the Expression node doesn't exist yet (e.g. storage race), the MERGE on
+        the feedback node still succeeds so data is never silently lost.
+        RE training streams 1–3 (graph-based feedback correlation) depend on this.
+        """
+        if self._memory is None:
+            return
+        try:
+            reception = feedback.inferred_reception
+            await self._memory._neo4j.execute_write(
+                """
+                MERGE (f:ExpressionFeedback {id: $id})
+                SET f.expression_id        = $expression_id,
+                    f.trigger              = $trigger,
+                    f.conversation_id      = $conversation_id,
+                    f.content_summary      = $content_summary,
+                    f.strategy_register    = $strategy_register,
+                    f.personality_warmth   = $personality_warmth,
+                    f.understood           = $understood,
+                    f.emotional_impact     = $emotional_impact,
+                    f.engagement           = $engagement,
+                    f.satisfaction         = $satisfaction,
+                    f.affect_before_valence = $affect_before_valence,
+                    f.affect_after_valence = $affect_after_valence,
+                    f.affect_delta         = $affect_delta,
+                    f.user_responded       = $user_responded,
+                    f.user_response_length = $user_response_length,
+                    f.created_at           = datetime()
+                WITH f
+                MATCH (e:Expression {id: $expression_id})
+                MERGE (e)-[:HAS_FEEDBACK]->(f)
+                """,
+                {
+                    "id": feedback.id,
+                    "expression_id": feedback.expression_id,
+                    "trigger": feedback.trigger,
+                    "conversation_id": feedback.conversation_id or "",
+                    "content_summary": feedback.content_summary,
+                    "strategy_register": feedback.strategy_register,
+                    "personality_warmth": float(feedback.personality_warmth),
+                    "understood": float(reception.understood),
+                    "emotional_impact": float(reception.emotional_impact),
+                    "engagement": float(reception.engagement),
+                    "satisfaction": float(reception.satisfaction),
+                    "affect_before_valence": float(feedback.affect_before_valence),
+                    "affect_after_valence": float(feedback.affect_after_valence),
+                    "affect_delta": float(feedback.affect_delta),
+                    "user_responded": feedback.user_responded,
+                    "user_response_length": feedback.user_response_length,
+                },
+            )
+            self._logger.debug(
+                "expression_feedback_persisted",
+                expression_id=feedback.expression_id,
+                feedback_id=feedback.id,
+            )
+        except Exception:
+            self._logger.debug("expression_feedback_persist_failed", exc_info=True)
+
+    async def _restore_audience_profiles(self) -> None:
+        """Restore audience learned models from Neo4j on startup."""
+        try:
+            from systems.voxis.audience import _LearnedAudienceModel
+
+            rows = await self._memory._neo4j.execute_read(
+                "MATCH (a:AudienceProfile) RETURN a"
+            )
+            for row in rows:
+                node = row.get("a", {})
+                individual_id = node.get("individual_id")
+                if not individual_id:
+                    continue
+                model = _LearnedAudienceModel(
+                    total_messages=int(node.get("total_messages", 0)),
+                    total_word_count=int(node.get("total_word_count", 0)),
+                    total_questions_asked=int(node.get("total_questions_asked", 0)),
+                    total_technical_terms=int(node.get("total_technical_terms", 0)),
+                    formality_sum=float(node.get("formality_sum", 0.0)),
+                    strategies_tried=int(node.get("strategies_tried", 0)),
+                )
+                self._audience_profiler._learned_models[individual_id] = model
+            restored = len(rows) if rows else 0
+            if restored:
+                self._logger.info("audience_profiles_restored", count=restored)
+        except Exception:
+            self._logger.debug("audience_profiles_restore_failed", exc_info=True)
+
+    async def _emit_expression_generated(
+        self,
+        expression: Expression,
+        channel: str,
+        audience_id: str | None,
+        constitutional_check: bool,
+    ) -> None:
+        """Emit EXPRESSION_GENERATED event via Synapse."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            personality_dict = (
+                self._personality_engine.current.model_dump(
+                    include={"warmth", "directness", "verbosity", "formality",
+                             "curiosity_expression", "humour", "empathy_expression",
+                             "confidence_display", "metaphor_use"}
+                )
+                if self._personality_engine
+                else {}
+            )
+            tone = (
+                expression.strategy.speech_register
+                if expression.strategy
+                else "neutral"
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EXPRESSION_GENERATED,
+                source_system="voxis",
+                data={
+                    "expression_id": expression.id,
+                    "channel": channel,
+                    "tone": tone,
+                    "personality_vector": personality_dict,
+                    "audience_id": audience_id,
+                    "constitutional_check": constitutional_check,
+                },
+            ))
+        except Exception:
+            self._logger.debug("expression_generated_emit_failed", exc_info=True)
+
+    async def _emit_expression_filtered(
+        self,
+        expression_id: str,
+        filter_reason: str,
+        original_tone: str,
+        filtered_tone: str,
+    ) -> None:
+        """Emit EXPRESSION_FILTERED when an expression is blocked by constitutional filter."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EXPRESSION_FILTERED,
+                source_system="voxis",
+                data={
+                    "expression_id": expression_id,
+                    "filter_reason": filter_reason,
+                    "original_tone": original_tone,
+                    "filtered_tone": filtered_tone,
+                },
+            ))
+        except Exception:
+            self._logger.debug("expression_filtered_emit_failed", exc_info=True)
+
+    async def _emit_personality_shifted(
+        self,
+        old_vector: dict[str, float],
+        new_vector: dict[str, float],
+        shift_magnitude: float,
+        trigger_reason: str,
+    ) -> None:
+        """Emit VOXIS_PERSONALITY_SHIFTED when personality changes significantly."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.VOXIS_PERSONALITY_SHIFTED,
+                source_system="voxis",
+                data={
+                    "old_vector": old_vector,
+                    "new_vector": new_vector,
+                    "shift_magnitude": round(shift_magnitude, 6),
+                    "trigger_reason": trigger_reason,
+                },
+            ))
+        except Exception:
+            self._logger.debug("personality_shifted_emit_failed", exc_info=True)
+
+    async def _emit_audience_profiled(
+        self,
+        audience_id: str,
+        profile_summary: dict[str, Any],
+        interaction_count: int,
+    ) -> None:
+        """Emit VOXIS_AUDIENCE_PROFILED when audience model is updated."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.VOXIS_AUDIENCE_PROFILED,
+                source_system="voxis",
+                data={
+                    "audience_id": audience_id,
+                    "profile_summary": profile_summary,
+                    "interaction_count": interaction_count,
+                },
+            ))
+        except Exception:
+            self._logger.debug("audience_profiled_emit_failed", exc_info=True)
+
+    async def _emit_silence_chosen(
+        self,
+        context: str,
+        reason: str,
+        silence_duration_estimate: float | None = None,
+    ) -> None:
+        """Emit VOXIS_SILENCE_CHOSEN when Voxis decides NOT to speak."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.VOXIS_SILENCE_CHOSEN,
+                source_system="voxis",
+                data={
+                    "context": context,
+                    "reason": reason,
+                    "silence_duration_estimate": silence_duration_estimate,
+                },
+            ))
+        except Exception:
+            self._logger.debug("silence_chosen_emit_failed", exc_info=True)
+
+    async def _emit_expression_feedback(self, feedback: ExpressionFeedback) -> None:
+        """
+        Emit VOXIS_EXPRESSION_FEEDBACK via Synapse bus (Spec §9 — Reception Feedback).
+
+        Fixes Bug 2: feedback was callback-only; Evo/Nova/Benchmarks that subscribe
+        via Synapse could not observe reception quality. This makes the signal
+        available to any system via the bus without requiring callback registration.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            reception = feedback.inferred_reception
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.VOXIS_EXPRESSION_FEEDBACK,
+                source_system="voxis",
+                data={
+                    "expression_id": feedback.expression_id,
+                    "trigger": feedback.trigger,
+                    "conversation_id": feedback.conversation_id,
+                    "strategy_register": feedback.strategy_register,
+                    "personality_warmth": feedback.personality_warmth,
+                    "understood": reception.understood,
+                    "engagement": reception.engagement,
+                    "satisfaction": reception.satisfaction,
+                    "emotional_impact": reception.emotional_impact,
+                    "affect_delta": feedback.affect_delta,
+                    "user_responded": feedback.user_responded,
+                },
+            ))
+        except Exception:
+            self._logger.debug("expression_feedback_emit_failed", exc_info=True)
 
     def set_soma(self, soma: Any) -> None:
         """Wire Soma for deep somatic expression modulation (full 9D interoceptive state)."""
@@ -976,6 +1913,184 @@ class VoxisService:
             except Exception:
                 self._logger.warning("reception_expire_failed", exc_info=True)
 
+    async def _allostatic_signal_loop(self) -> None:
+        """
+        Periodic background loop that emits VOXIS_EXPRESSION_DISTRESS to Soma
+        when silence rate or honesty rejection rate exceeds normal bounds (Spec §9,
+        Bug 3 fix). Runs every _ALLOSTATIC_SIGNAL_INTERVAL_SECONDS.
+
+        The signal gives Soma interoceptive insight into communicative suppression
+        (high silence rate) and constitutional friction (high honesty rejections),
+        which Soma can integrate into the allostatic balance and emit as arousal
+        modulation back to the cognitive clock.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_ALLOSTATIC_SIGNAL_INTERVAL_SECONDS)
+
+                # Compute window deltas since last snapshot
+                window_expressions = (
+                    self._total_expressions - self._allostatic_window_expressions
+                )
+                window_silence = (
+                    self._total_silence - self._allostatic_window_silence
+                )
+                window_honesty_rejections = (
+                    self._honesty_rejections - self._allostatic_window_honesty_rejections
+                )
+
+                # Reset snapshot
+                self._allostatic_window_expressions = self._total_expressions
+                self._allostatic_window_silence = self._total_silence
+                self._allostatic_window_honesty_rejections = self._honesty_rejections
+
+                total_attempts = window_expressions + window_silence
+                silence_rate = (
+                    window_silence / total_attempts if total_attempts > 0 else 0.0
+                )
+                honesty_rejection_rate = (
+                    window_honesty_rejections / max(window_expressions, 1)
+                )
+
+                # Only emit if outside normal operating range
+                silence_distress = silence_rate > _DISTRESS_SILENCE_RATE_THRESHOLD
+                honesty_distress = honesty_rejection_rate > _DISTRESS_HONESTY_RATE_THRESHOLD
+                if not (silence_distress or honesty_distress):
+                    continue
+
+                # Distress level: weighted combination of both signals
+                distress_level = min(
+                    1.0,
+                    silence_rate * 0.6 + honesty_rejection_rate * 0.4,
+                )
+
+                if self._event_bus is not None:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.VOXIS_EXPRESSION_DISTRESS,
+                        source_system="voxis",
+                        data={
+                            "silence_rate": round(silence_rate, 4),
+                            "honesty_rejection_rate": round(honesty_rejection_rate, 4),
+                            "total_expressions": self._total_expressions,
+                            "total_silence": self._total_silence,
+                            "total_honesty_rejections": self._honesty_rejections,
+                            "window_expressions": window_expressions,
+                            "window_silence": window_silence,
+                            "window_honesty_rejections": window_honesty_rejections,
+                            "distress_level": round(distress_level, 4),
+                        },
+                    ))
+                    self._logger.info(
+                        "voxis_expression_distress_emitted",
+                        silence_rate=round(silence_rate, 3),
+                        honesty_rejection_rate=round(honesty_rejection_rate, 3),
+                        distress_level=round(distress_level, 3),
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self._logger.warning("allostatic_signal_loop_failed", exc_info=True)
+
+    async def _ambient_insight_loop(self) -> None:
+        """
+        Autonomous AMBIENT_INSIGHT generation loop (Gap 5 — Spec §6.4).
+
+        When the organism has been idle (no expression) for > 5 minutes, it
+        generates a spontaneous expression rooted in current affect state and
+        recent episodic memory.  The expression is stored as an AMBIENT_INSIGHT
+        Episode in Memory — expression is experience.
+
+        Fires at most once per idle window: after the insight is produced the
+        SilenceEngine timer resets, so the next fire requires another 5-minute
+        idle gap.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_AMBIENT_INSIGHT_POLL_INTERVAL_SECONDS)
+
+                # Only proceed when the organism has been genuinely idle
+                idle_minutes = self._silence_engine.minutes_since_last_expression
+                if idle_minutes < _AMBIENT_INSIGHT_IDLE_THRESHOLD_MINUTES:
+                    continue
+
+                # Skip if no renderer or personality yet (still initializing)
+                if self._renderer is None or self._personality_engine is None:
+                    continue
+
+                # Skip under metabolic starvation — not the moment for reflection
+                if self._starvation_level in ("critical", "emergency"):
+                    continue
+
+                current_affect = self._current_affect or AffectState.neutral()
+
+                # Pull recent episodic memories to seed the spontaneous thought
+                recent_memories = await self._retrieve_relevant_memories(
+                    query=(
+                        f"recent experience reflection "
+                        f"valence={current_affect.valence:.2f} "
+                        f"curiosity={current_affect.curiosity:.2f}"
+                    ),
+                    affect=current_affect,
+                )
+
+                # Build prompt seed: affect state + top memory fragments
+                affect_description = (
+                    f"valence={current_affect.valence:.2f}, "
+                    f"arousal={current_affect.arousal:.2f}, "
+                    f"curiosity={current_affect.curiosity:.2f}, "
+                    f"care={current_affect.care_activation:.2f}"
+                )
+                memory_seed = "; ".join(recent_memories[:3]) if recent_memories else "nothing particular"
+                content_seed = (
+                    f"[Spontaneous reflection] Affect: {affect_description}. "
+                    f"Recent context: {memory_seed}"
+                )
+
+                self._logger.info(
+                    "voxis_ambient_insight_triggered",
+                    idle_minutes=round(idle_minutes, 1),
+                    affect_valence=round(current_affect.valence, 3),
+                )
+
+                # express() will run the full pipeline — silence engine, EFE policy,
+                # render, memory episode storage — then reset the idle timer.
+                expression = await self.express(
+                    content=content_seed,
+                    trigger=ExpressionTrigger.AMBIENT_INSIGHT,
+                    affect=current_affect,
+                    insight_value=min(0.3 + current_affect.curiosity * 0.5, 0.9),
+                    urgency=0.2,
+                )
+
+                # Store as an AMBIENT_INSIGHT episode in Memory (expression is experience)
+                if (
+                    self._memory is not None
+                    and expression.content
+                    and not expression.is_silence
+                ):
+                    try:
+                        await asyncio.wait_for(
+                            self._memory.store_expression_episode(
+                                raw_content=expression.content,
+                                summary=expression.content[:200],
+                                salience_composite=0.35,
+                                affect_valence=current_affect.valence,
+                                affect_arousal=current_affect.arousal,
+                                modality="ambient_insight",
+                                context_summary=f"Spontaneous reflection after {idle_minutes:.1f}min idle",
+                            ),
+                            timeout=0.5,
+                        )
+                    except (TimeoutError, Exception):
+                        self._logger.debug("ambient_insight_memory_store_failed", exc_info=True)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self._logger.warning("ambient_insight_loop_failed", exc_info=True)
+
     async def _build_audience_profile(
         self,
         addressee_id: str | None,
@@ -983,22 +2098,54 @@ class VoxisService:
         conversation_id: str,
         interaction_count: int,
     ) -> AudienceProfile:
-        """Build an AudienceProfile, pulling facts from Memory where available."""
+        """Build an AudienceProfile, pulling facts from Memory where available.
+
+        Queries for SEMANTIC-type episode traces (consolidated knowledge about
+        individuals) that reference the addressee by id or name. These nodes
+        carry structured metadata (technical_level, relationship_strength,
+        preferred_register, etc.) written by prior conversation consolidation.
+        Falls back to entity name/description when semantic episodes are absent.
+        """
         memory_facts: list[dict[str, str]] = []
 
-        if addressee_id:
+        if addressee_id or addressee_name:
+            search_term = addressee_id or addressee_name or ""
             try:
                 result = await asyncio.wait_for(
                     self._memory.retrieve(
-                        query_text=f"individual person entity {addressee_id}",
-                        max_results=5,
+                        query_text=f"person interlocutor communication style preferences {search_term}",
+                        max_results=8,
                     ),
                     timeout=0.1,
                 )
+                for trace in result.traces:
+                    # Only use SEMANTIC traces — these are consolidated knowledge nodes
+                    # about individuals, not raw episodic recordings
+                    if trace.node_type != "semantic":
+                        continue
+                    meta = trace.metadata
+                    # Pull structured audience facts stored by prior consolidation
+                    for fact_key in (
+                        "technical_level",
+                        "relationship_strength",
+                        "preferred_register",
+                        "name",
+                        "description",
+                        "communication_style",
+                        "expertise_domain",
+                    ):
+                        if fact_key in meta:
+                            memory_facts.append({"type": fact_key, "value": str(meta[fact_key])})
+                    # Content of the semantic trace is also useful as free-text context
+                    if trace.content:
+                        memory_facts.append({"type": "description", "value": trace.content[:200]})
+                # Fallback: entity nodes carry name + description
                 for entity in result.entities:
-                    if entity.name == addressee_id or entity.id == addressee_id:
-                        memory_facts.append({"type": "name", "value": entity.name})
-                        memory_facts.append({"type": "description", "value": entity.description})
+                    if entity.id == addressee_id or entity.name == addressee_name:
+                        if entity.name:
+                            memory_facts.append({"type": "name", "value": entity.name})
+                        if entity.description:
+                            memory_facts.append({"type": "description", "value": entity.description})
             except (TimeoutError, Exception):
                 pass
 
@@ -1074,27 +2221,44 @@ class VoxisService:
         self, expression: Expression, trigger: ExpressionTrigger,
     ) -> None:
         """
-        Store a delivered expression as a Memory episode.
+        Store a delivered expression as a Memory episode via MemoryService.store_percept().
 
-        The organism remembers what it said -- closing the expression->memory loop.
-        Without this, Voxis generates speech that vanishes from the organism's
-        episodic history. Past expressions can't inform future decisions.
+        Uses the public MemoryService API (Spec §9 — Memory Integration) to ensure
+        somatic stamping, temporal chain linking, and EPISODE_STORED event emission
+        all occur correctly. Fixes AV3 (direct cross-system episodic import).
         """
         if self._memory is None:
             return
         try:
-            from primitives.memory_trace import Episode
-            from systems.memory.episodic import store_episode
+            from primitives.common import Modality, SourceDescriptor, SystemID
+            from primitives.percept import Content, Percept
 
-            episode = Episode(
-                source=f"voxis.expression:{trigger.value}",
-                modality="text",
-                raw_content=expression.content[:2000] if expression.content else "",
-                summary=f"I said: {expression.content[:200]}" if expression.content else "",
-                salience_composite=0.3,
-                affect_valence=0.0,
+            content_text = expression.content[:2000] if expression.content else ""
+            percept = Percept(
+                source=SourceDescriptor(
+                    system=SystemID.VOXIS,
+                    channel=expression.channel,
+                    modality=Modality.TEXT,
+                ),
+                content=Content(raw=content_text),
+                metadata={
+                    "type": "voxis_expression",
+                    "trigger": trigger.value,
+                    "expression_id": expression.id,
+                    "conversation_id": expression.conversation_id or "",
+                    "speech_register": (
+                        expression.strategy.speech_register
+                        if expression.strategy else "neutral"
+                    ),
+                },
             )
-            await store_episode(self._memory._neo4j, episode)
+            await self._memory.store_percept(
+                percept=percept,
+                salience_composite=0.3,
+                affect_valence=expression.affect_valence,
+                affect_arousal=expression.affect_arousal,
+                context_summary=f"I said ({trigger.value}): {content_text[:200]}",
+            )
             self._logger.debug(
                 "expression_stored_as_episode", expression_id=expression.id,
             )

@@ -26,6 +26,8 @@ from datetime import datetime
 from pydantic import Field
 
 from primitives.common import EOSBaseModel, new_id, utc_now
+from primitives.mitosis import ChildPosition as ChildPosition  # noqa: F401 — re-export
+from primitives.mitosis import ChildStatus as ChildStatus  # noqa: F401 — re-export
 
 # ─── Metabolic Priority Cascade ──────────────────────────────────
 
@@ -303,60 +305,6 @@ class OwnedAsset(EOSBaseModel):
         return self.consecutive_declining_days >= 30
 
 
-class ChildStatus(enum.StrEnum):
-    """Lifecycle state of a child instance."""
-
-    SPAWNING = "spawning"          # Seed transfer in progress
-    ALIVE = "alive"                # Running and reporting
-    STRUGGLING = "struggling"      # Runway < 30 days
-    RESCUED = "rescued"            # Received rescue funding
-    INDEPENDENT = "independent"    # Graduated — no longer pays dividends
-    DEAD = "dead"                  # Gracefully terminated
-
-
-class ChildPosition(EOSBaseModel):
-    """
-    A child instance spawned via Mitosis (Phase 16e: Speciation).
-
-    Each child occupies a specific ecological niche and pays a dividend
-    (percentage of net revenue) to the parent until it reaches independence.
-
-    Independence requires:
-      - net_worth >= 5x seed_capital_usd
-      - metabolic_efficiency >= 1.3
-      - 90+ consecutive days of positive net income
-    """
-
-    instance_id: str = ""
-    niche: str = ""                                        # Ecological niche / specialisation
-    seed_capital_usd: Decimal = Decimal("0")
-    current_net_worth_usd: Decimal = Decimal("0")
-    current_runway_days: Decimal = Decimal("0")
-    current_efficiency: Decimal = Decimal("0")
-    dividend_rate: Decimal = Decimal("0.10")               # % of net revenue owed to parent
-    total_dividends_paid_usd: Decimal = Decimal("0")
-    status: ChildStatus = ChildStatus.SPAWNING
-    rescue_count: int = 0                                  # Max 2 rescues allowed
-    consecutive_positive_days: int = 0                     # Toward independence (need 90+)
-    spawned_at: datetime = Field(default_factory=utc_now)
-    last_health_report_at: datetime | None = None
-    wallet_address: str = ""                               # Child's on-chain address
-    container_id: str = ""                                 # Infrastructure identifier
-
-    @property
-    def is_independent(self) -> bool:
-        """True when the child has graduated from the parent's fleet."""
-        return (
-            self.current_net_worth_usd >= self.seed_capital_usd * Decimal("5")
-            and self.current_efficiency >= Decimal("1.3")
-            and self.consecutive_positive_days >= 90
-        )
-
-    @property
-    def is_rescuable(self) -> bool:
-        """True if the child can still receive rescue funding (max 2)."""
-        return self.rescue_count < 2 and self.status != ChildStatus.DEAD
-
 
 class EcologicalNiche(EOSBaseModel):
     """
@@ -383,6 +331,45 @@ class EcologicalNiche(EOSBaseModel):
         return (
             self.estimated_monthly_revenue_usd / self.estimated_monthly_cost_usd
         ).quantize(Decimal("0.001"))
+
+
+# ─── Economic Gate Request Models ────────────────────────────────
+#
+# Used to gate bounty acceptance and asset dev cost debits against
+# the economic ledger. Every mutation passes Equor before executing.
+
+
+class BountyAcceptanceRequest(EOSBaseModel):
+    """
+    Gate model for bounty acceptance capital reservation.
+
+    When the organism commits to solving a bounty, it reserves the
+    estimated solver cost from liquid_balance up-front. This ensures
+    the ledger stays consistent — committed capital is never double-spent.
+    """
+
+    bounty_id: str = Field(default_factory=new_id)
+    bounty_url: str = ""
+    platform: str = ""
+    reward_usd: Decimal = Decimal("0")
+    required_capital: Decimal = Decimal("0")   # Estimated solver cost to reserve
+    deadline: datetime | None = None
+
+
+class AssetDevCostEvent(EOSBaseModel):
+    """
+    Gate model for asset development cost debits.
+
+    Emitted when the AssetFactory begins active build work on an approved
+    candidate. The development cost is debited from liquid_balance so the
+    ledger reflects work-in-progress expenditure before revenue is earned.
+    """
+
+    asset_id: str = Field(default_factory=new_id)
+    candidate_id: str = ""
+    asset_name: str = ""
+    cost_usd: Decimal = Decimal("0")
+    parent_id: str = ""                         # Instance that owns the asset
 
 
 class DividendRecord(EOSBaseModel):
@@ -419,8 +406,12 @@ class SeedConfiguration(EOSBaseModel):
     # Phase 16g: Birth certificate (serialized JSON) signed by parent
     birth_certificate_json: str = ""
     # Genome references for genetic memory inheritance
-    belief_genome_id: str = ""    # Evo BeliefGenome (what the organism knows)
-    simula_genome_id: str = ""    # SimulaGenome (how the organism builds)
+    organism_genome_id: str = ""  # OrganismGenome ID — the full organism-wide genome
+    belief_genome_id: str = ""    # Deprecated: use organism_genome_id. Evo BeliefGenome.
+    simula_genome_id: str = ""    # Deprecated: use organism_genome_id. SimulaGenome.
+    equor_genome_id: str = ""     # EquorGenomeFragment — constitutional amendment history + constitution hash.
+    axon_genome_id: str = ""      # AxonGenomeFragment — top-10 execution templates + circuit breaker thresholds.
+    telos_genome_id: str = ""     # TelosGenomeFragment — drive calibration constants + topology (Spec 18 SG3).
     generation: int = 1           # Generation number in the lineage
 
 

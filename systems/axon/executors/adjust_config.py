@@ -1,0 +1,131 @@
+"""
+EcodiaOS — Adjust Config Executor
+
+Adjusts system configuration parameters at runtime via Synapse events.
+Used by Evo/Simula for parameter tuning without direct cross-system imports.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import structlog
+
+from systems.axon.executor import Executor
+from systems.axon.types import ExecutionContext, ExecutionResult, RateLimit, ValidationResult
+from systems.synapse.types import SynapseEvent, SynapseEventType
+
+if TYPE_CHECKING:
+    pass
+
+logger = structlog.get_logger()
+
+
+class AdjustConfigExecutor(Executor):
+    action_type = "adjust_config"
+    description = "Adjust system configuration parameters at runtime"
+    required_autonomy = 2
+    reversible = True
+    max_duration_ms = 10_000
+    rate_limit = RateLimit.per_minute(20)
+
+    def __init__(self, event_bus: Any = None) -> None:
+        self._event_bus = event_bus
+        # Track previous values for rollback
+        self._last_adjustments: dict[str, dict[str, Any]] = {}
+
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
+        target_system = params.get("target_system")
+        if not target_system or not isinstance(target_system, str):
+            return ValidationResult.fail("'target_system' is required")
+        config_key = params.get("config_key")
+        if not config_key or not isinstance(config_key, str):
+            return ValidationResult.fail("'config_key' is required")
+        if "new_value" not in params:
+            return ValidationResult.fail("'new_value' is required")
+        return ValidationResult.ok()
+
+    async def execute(self, params: dict[str, Any], context: ExecutionContext) -> ExecutionResult:
+        target_system = params["target_system"]
+        config_key = params["config_key"]
+        new_value = params["new_value"]
+        reason = params.get("reason", "")
+
+        try:
+            # Emit config adjustment event via Synapse for the target system to pick up
+            if self._event_bus is not None:
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.ACTION_EXECUTED,
+                    source_system="axon",
+                    data={
+                        "action_type": self.action_type,
+                        "target_system": target_system,
+                        "config_key": config_key,
+                        "new_value": new_value,
+                        "reason": reason,
+                        "execution_id": context.execution_id,
+                    },
+                ))
+
+            # Store for potential rollback
+            self._last_adjustments[context.execution_id] = {
+                "target_system": target_system,
+                "config_key": config_key,
+                "new_value": new_value,
+            }
+
+            await self._emit_re_trace(context, params, success=True)
+
+            return ExecutionResult(
+                success=True,
+                data={
+                    "target_system": target_system,
+                    "config_key": config_key,
+                    "new_value": new_value,
+                },
+                side_effects=[
+                    f"Config adjusted: {target_system}.{config_key} = {new_value}"
+                ],
+            )
+        except Exception as exc:
+            if self._event_bus is not None:
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.ACTION_FAILED,
+                        source_system="axon",
+                        data={
+                            "action_type": self.action_type,
+                            "error": str(exc),
+                            "execution_id": context.execution_id,
+                        },
+                    ))
+                except Exception:
+                    pass
+            return ExecutionResult(success=False, error=str(exc))
+
+    async def _emit_re_trace(
+        self, context: ExecutionContext, params: dict[str, Any], success: bool
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            from primitives.common import DriveAlignmentVector, SystemID, utc_now
+            from primitives.re_training import RETrainingExample
+
+            trace = RETrainingExample(
+                source_system=SystemID.AXON,
+                instruction=f"Adjust config {params.get('target_system', '')}.{params.get('config_key', '')}",
+                input_context=f"new_value={params.get('new_value', '')}, reason={params.get('reason', '')}",
+                output=f"success={success}",
+                outcome_quality=1.0 if success else 0.5,
+                category="config_adjustment",
+                constitutional_alignment=DriveAlignmentVector(),
+                timestamp=utc_now(),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                source_system="axon",
+                data=trace.model_dump(mode="json"),
+            ))
+        except Exception:
+            pass

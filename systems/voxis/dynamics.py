@@ -277,7 +277,7 @@ class ConversationDynamicsEngine:
             return ConversationDynamics()
 
         user_turns = [t for t in turns if t.role == "user"]
-        [t for t in turns if t.role == "assistant"]
+        assistant_turns = [t for t in turns if t.role == "assistant"]
 
         # ── Emotional trajectory ─────────────────────────────────
         valences = [t.affect_valence for t in turns]
@@ -369,3 +369,22 @@ class ConversationDynamicsEngine:
                 1 for d in self._dynamics_cache.values() if d.repair_mode
             ),
         }
+
+
+# ─── Module-Level Helper ──────────────────────────────────────────
+
+
+def apply_dynamics_to_strategy(
+    strategy: StrategyParams,
+    dynamics: ConversationDynamics,
+) -> StrategyParams:
+    """
+    Stateless helper: apply conversation dynamics to a strategy without
+    instantiating a ConversationDynamicsEngine.
+
+    Called by ContentRenderer to avoid allocating a throwaway engine
+    per render (AV2 fix). The shared engine instance on VoxisService
+    should be used for state-accumulating methods (record_turn, get_dynamics).
+    """
+    engine = ConversationDynamicsEngine.__new__(ConversationDynamicsEngine)
+    return engine.apply_dynamics(strategy, dynamics)

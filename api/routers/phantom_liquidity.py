@@ -381,14 +381,11 @@ async def deploy_position(request: Request, body: DeployRequest) -> dict[str, An
     if wallet is None:
         raise HTTPException(status_code=503, detail="Wallet client not initialised")
 
-    from systems.phantom_liquidity.pool_selector import (
-        _STATIC_POOLS as STATIC_POOL_REGISTRY,  # noqa: PLC2701
-    )
     from systems.phantom_liquidity.pool_selector import PoolSelector
     from systems.phantom_liquidity.types import PhantomLiquidityPool, PoolHealth
 
     candidate = next(
-        (c for c in STATIC_POOL_REGISTRY if c.pool_address.lower() == body.pool_address.lower()),
+        (c for c in svc.get_candidates() if c.pool_address.lower() == body.pool_address.lower()),
         None,
     )
     if candidate is None:
@@ -578,7 +575,7 @@ async def get_defillama_pools(
     except Exception as exc:
         logger.warning("defillama_fetch_failed", error=str(exc))
 
-        from systems.phantom_liquidity.pool_selector import _STATIC_POOLS as _SP  # noqa: PLC2701
+        from systems.phantom_liquidity.pool_selector import PoolSelector as _PS
 
         fallback = [
             {
@@ -594,7 +591,7 @@ async def get_defillama_pools(
                 "chain": "Base",
                 "project": "uniswap-v3",
             }
-            for c in _SP
+            for c in _PS.get_static_pools()
         ]
 
         return {

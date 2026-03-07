@@ -6,12 +6,27 @@ The emotional context that modulates all processing.
 
 from __future__ import annotations
 
+import enum
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from pydantic import Field
 
 from primitives.common import EOSBaseModel, utc_now
+
+
+class InteroceptiveDimension(enum.StrEnum):
+    """The nine dimensions of felt internal state (canonical — shared across systems)."""
+
+    ENERGY = "energy"                       # Metabolic budget (token/compute availability)
+    AROUSAL = "arousal"                     # Activation level (cycle speed, parallelism)
+    VALENCE = "valence"                     # Net allostatic trend (improving vs deteriorating)
+    CONFIDENCE = "confidence"               # Generative model fit (prediction accuracy)
+    COHERENCE = "coherence"                 # Inter-system integration quality
+    SOCIAL_CHARGE = "social_charge"         # Relational engagement quality
+    CURIOSITY_DRIVE = "curiosity_drive"     # Epistemic appetite
+    INTEGRITY = "integrity"                 # Ethical/constitutional alignment + system health
+    TEMPORAL_PRESSURE = "temporal_pressure"  # Urgency / time horizon compression
 
 
 class AffectState(EOSBaseModel):

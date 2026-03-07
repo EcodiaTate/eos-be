@@ -51,8 +51,8 @@ def _register_monitor_prs(
     from primitives.common import AutonomyLevel, Verdict
     from primitives.constitutional import ConstitutionalCheck
     from primitives.intent import Action, ActionSequence, GoalDescriptor, Intent
-    from systems.atune.types import InputChannel
     from systems.axon.types import ExecutionRequest
+    from systems.fovea.types import InputChannel
 
     async def _poll_monitor_prs() -> str | None:
         intent = Intent(
@@ -89,7 +89,7 @@ def _register_defi_yield_deployment(
     scheduler: PerceptionScheduler,
     oikos: OikosService,
 ) -> None:
-    from systems.atune.types import InputChannel
+    from systems.fovea.types import InputChannel
 
     async def _deploy_idle_capital() -> str | None:
         outcome = await oikos.deploy_idle_capital()
@@ -115,7 +115,7 @@ def _register_defi_yield_accrual(
     scheduler: PerceptionScheduler,
     oikos: OikosService,
 ) -> None:
-    from systems.atune.types import InputChannel
+    from systems.fovea.types import InputChannel
 
     async def _record_accrued_yield() -> str | None:
         accrued = await oikos.record_accrued_yield()
@@ -139,7 +139,7 @@ def _register_foraging_cycle(
     scheduler: PerceptionScheduler,
     oikos: OikosService,
 ) -> None:
-    from systems.atune.types import InputChannel
+    from systems.fovea.types import InputChannel
 
     async def _run_foraging() -> str | None:
         result = await oikos.run_foraging_cycle()
@@ -165,7 +165,7 @@ def _register_consolidation_cycle(
     scheduler: PerceptionScheduler,
     oikos: OikosService,
 ) -> None:
-    from systems.atune.types import InputChannel
+    from systems.fovea.types import InputChannel
 
     async def _run_consolidation() -> str | None:
         result = await oikos.run_consolidation_cycle()

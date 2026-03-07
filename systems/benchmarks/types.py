@@ -12,6 +12,7 @@ from datetime import datetime
 from pydantic import Field
 
 from primitives.common import EOSBaseModel, utc_now
+from primitives.evolutionary import BedauPackardStats
 
 class BenchmarkSnapshot(EOSBaseModel):
     """A single benchmark run result, stored in TimescaleDB."""
@@ -40,6 +41,21 @@ class BenchmarkSnapshot(EOSBaseModel):
 
     compression_ratio: float | None = None
     """Logos intelligence ratio I = K(reality_modeled) / K(model). >1 means compressive."""
+
+    # ── Evolutionary layer ───────────────────────────────────────────
+    bedau_packard: BedauPackardStats | None = None
+    """Population-level Bedau-Packard evolutionary activity stats. None until first computation."""
+
+    evolutionary_fitness: dict[str, Any] = Field(default_factory=dict)
+    """Aggregated fitness observables from Evo (Loop 6). Keys: hypotheses_evaluated, integrated, schemas_induced, consolidation_count."""
+
+    constitutional_phenotype_divergence: float | None = None
+    """
+    Variance of drive-weight vectors across the fleet, derived from TELOS_POPULATION_SNAPSHOT.
+    Computed as mean of per-drive variances across all fleet instances (coherence, care, growth, honesty).
+    Rising trend alongside Bedau-Packard A(t) = adaptive speciation, not just random drift.
+    None until first TELOS_POPULATION_SNAPSHOT is received with ≥2 instances.
+    """
 
     # ── Diagnostic metadata ───────────────────────────────────────────
     errors: dict[str, str] = Field(default_factory=dict)

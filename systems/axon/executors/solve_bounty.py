@@ -40,14 +40,13 @@ from systems.axon.types import (
     RateLimit,
     ValidationResult,
 )
-from systems.simula.evolution_types import (
-    ChangeCategory,
-    ChangeSpec,
-    EvolutionProposal,
-    ProposalStatus,
-)
-
 if TYPE_CHECKING:
+    from systems.simula.evolution_types import (
+        ChangeCategory,
+        ChangeSpec,
+        EvolutionProposal,
+        ProposalStatus,
+    )
     from clients.llm import LLMProvider
     from systems.identity.connectors.github_app import GitHubAppConnector
     from systems.simula.service import SimulaService
@@ -198,6 +197,14 @@ class SolveBountyExecutor(Executor):
             reward_usd=reward_usd,
             difficulty=difficulty,
             execution_id=context.execution_id,
+        )
+
+        # Lazy import of Simula types to avoid cross-system import at module level
+        from systems.simula.evolution_types import (
+            ChangeCategory,
+            ChangeSpec,
+            EvolutionProposal,
+            ProposalStatus,
         )
 
         # -- Guard: SimulaService must be wired --------------------------------

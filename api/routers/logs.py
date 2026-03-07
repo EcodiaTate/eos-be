@@ -228,6 +228,37 @@ async def get_health_snapshot(request: Request) -> dict[str, Any]:
             sev = inc.severity.value
             thymos_summary["by_severity"][sev] = thymos_summary["by_severity"].get(sev, 0) + 1
 
+    # Soma allostatic state
+    soma_summary: dict[str, Any] = {"available": False}
+    if hasattr(request.app.state, "soma"):
+        try:
+            soma = request.app.state.soma
+            soma_state = soma.get_current_state()
+            if soma_state is not None:
+                soma_summary = {
+                    "available": True,
+                    "arousal": round(getattr(soma_state, "arousal", 0.0), 4),
+                    "valence": round(getattr(soma_state, "valence", 0.0), 4),
+                    "allostatic_load": round(getattr(soma_state, "allostatic_load", 0.0), 4),
+                }
+        except Exception:
+            pass
+
+    # Fovea attention profile
+    fovea_summary: dict[str, Any] = {"available": False}
+    if hasattr(request.app.state, "fovea"):
+        try:
+            fovea = request.app.state.fovea
+            profile = fovea.get_current_attention_profile()
+            fovea_summary = {
+                "available": True,
+                "ignition_threshold": profile.current_ignition_threshold,
+                "habituated_patterns": profile.habituated_pattern_count,
+                "highest_recent_error": profile.highest_recent_error_summary,
+            }
+        except Exception:
+            pass
+
     return {
         "timestamp": datetime.now(UTC).isoformat(),
         "error_count": len(errors),
@@ -239,6 +270,8 @@ async def get_health_snapshot(request: Request) -> dict[str, Any]:
         "latency_by_system": latency,
         "recent_errors": errors[:10],
         "thymos": thymos_summary,
+        "soma": soma_summary,
+        "fovea": fovea_summary,
     }
 
 

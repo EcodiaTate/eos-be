@@ -34,7 +34,8 @@ import structlog
 
 from clients.llm import LLMProvider, Message
 from clients.optimized_llm import OptimizedLLMProvider
-from primitives.common import utc_now
+from primitives.common import new_id, utc_now
+from primitives.experimental import ExperimentDesign, ExperimentResult
 from systems.evo.types import (
     VELOCITY_LIMITS,
     EvidenceDirection,
@@ -95,6 +96,11 @@ class HypothesisEngine:
         # In-memory hypothesis registry (also persisted to Memory graph)
         self._active: dict[str, Hypothesis] = {}
 
+        # Experiment tracking: hypothesis_id → ExperimentDesign
+        self._experiments: dict[str, ExperimentDesign] = {}
+        # Completed experiment results: hypothesis_id → ExperimentResult
+        self._experiment_results: dict[str, ExperimentResult] = {}
+
         # Metrics
         self._total_proposed: int = 0
         self._total_supported: int = 0
@@ -104,6 +110,58 @@ class HypothesisEngine:
     def get_hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
         """Look up a hypothesis by ID. Returns None if not found or archived."""
         return self._active.get(hypothesis_id)
+
+    def _record_experiment_result(
+        self,
+        hypothesis: Hypothesis,
+        outcome: str,
+    ) -> None:
+        """Record an ExperimentResult when a hypothesis reaches a terminal evidence state."""
+        experiment = self._experiments.get(hypothesis.id)
+        experiment_id = experiment.id if experiment else new_id()
+        self._experiment_results[hypothesis.id] = ExperimentResult(
+            experiment_id=experiment_id,
+            hypothesis_id=hypothesis.id,
+            outcome=outcome,  # type: ignore[arg-type]
+            metrics={
+                "evidence_score": hypothesis.evidence_score,
+                "supporting_count": float(len(hypothesis.supporting_episodes)),
+                "contradicting_count": float(len(hypothesis.contradicting_episodes)),
+            },
+            confidence=max(0.0, min(1.0, hypothesis.evidence_score / 10.0)),
+        )
+
+    def get_experiment_results(self) -> dict[str, ExperimentResult]:
+        """Return all completed experiment results."""
+        return dict(self._experiment_results)
+
+    def _compute_novelty_scores(self, new_hypotheses: list[Hypothesis]) -> None:
+        """
+        Compute novelty_score for each new hypothesis as
+        1.0 - max_similarity against all confirmed (SUPPORTED/INTEGRATED) hypotheses.
+        Uses word-set Jaccard as a cheap proxy for embedding similarity.
+        """
+        confirmed = [
+            h for h in self._active.values()
+            if h.status in (HypothesisStatus.SUPPORTED, HypothesisStatus.INTEGRATED)
+        ]
+        if not confirmed:
+            for h in new_hypotheses:
+                h.novelty_score = 1.0
+            return
+
+        confirmed_word_sets = [
+            set(h.statement.lower().split()) for h in confirmed
+        ]
+        for h in new_hypotheses:
+            words = set(h.statement.lower().split())
+            max_sim = 0.0
+            for cws in confirmed_word_sets:
+                intersection = len(words & cws)
+                union = len(words | cws)
+                if union > 0:
+                    max_sim = max(max_sim, intersection / union)
+            h.novelty_score = round(1.0 - max_sim, 3)
 
     # ─── Generation ───────────────────────────────────────────────────────────
 
@@ -123,12 +181,24 @@ class HypothesisEngine:
             return []
 
         if len(self._active) >= _MAX_ACTIVE:
-            self._logger.warning(
-                "hypothesis_capacity_reached",
+            # Eviction policy (Spec §IV gap fix): rather than silently rejecting
+            # new hypotheses, evict the lowest-fitness PROPOSED/TESTING hypothesis.
+            # Fitness = evidence_score penalised by staleness (days since last evidence).
+            evicted = self._evict_lowest_fitness()
+            if evicted is None:
+                # All active hypotheses are SUPPORTED/INTEGRATED — nothing to evict.
+                self._logger.warning(
+                    "hypothesis_capacity_reached_no_eviction",
+                    active=len(self._active),
+                    max=_MAX_ACTIVE,
+                )
+                return []
+            self._logger.info(
+                "hypothesis_evicted_for_capacity",
+                evicted_id=evicted.id,
+                evicted_score=round(evicted.evidence_score, 3),
                 active=len(self._active),
-                max=_MAX_ACTIVE,
             )
-            return []
 
         prompt = _build_generation_prompt(
             instance_name=self._instance_name,
@@ -184,6 +254,9 @@ class HypothesisEngine:
             except (KeyError, ValueError) as exc:
                 self._logger.warning("hypothesis_parse_failed", error=str(exc))
                 continue
+
+        # Compute novelty scores: 1.0 - max similarity to confirmed hypotheses
+        self._compute_novelty_scores(hypotheses)
 
         # Persist to Memory if available
         if self._memory is not None:
@@ -284,13 +357,25 @@ class HypothesisEngine:
             episode_threshold = self._meta_learning.get_effective_min_episodes()
 
         if hypothesis.status in (HypothesisStatus.PROPOSED, HypothesisStatus.TESTING):
+            old_status = hypothesis.status
             hypothesis.status = HypothesisStatus.TESTING
+
+            # Create ExperimentDesign on first transition to TESTING
+            if old_status == HypothesisStatus.PROPOSED and hypothesis.id not in self._experiments:
+                self._experiments[hypothesis.id] = ExperimentDesign(
+                    hypothesis_id=hypothesis.id,
+                    experiment_type="before_after",
+                    description=f"Test: {hypothesis.statement[:200]}",
+                    success_criteria=hypothesis.formal_test or "evidence_score > threshold",
+                )
+
             if (
                 hypothesis.evidence_score > score_threshold
                 and len(hypothesis.supporting_episodes) >= episode_threshold
             ):
                 hypothesis.status = HypothesisStatus.SUPPORTED
                 self._total_supported += 1
+                self._record_experiment_result(hypothesis, "confirmed")
                 self._logger.info(
                     "hypothesis_supported",
                     hypothesis_id=hypothesis.id,
@@ -300,6 +385,7 @@ class HypothesisEngine:
             elif hypothesis.evidence_score < -2.0:
                 hypothesis.status = HypothesisStatus.REFUTED
                 self._total_refuted += 1
+                self._record_experiment_result(hypothesis, "refuted")
                 self._logger.info(
                     "hypothesis_refuted",
                     hypothesis_id=hypothesis.id,
@@ -421,8 +507,18 @@ class HypothesisEngine:
         callers must check for None before unpacking.
         """
         if len(self._active) >= _MAX_ACTIVE:
-            self._logger.warning("hypothesis_capacity_reached_repair", active=len(self._active))
-            return None  # type: ignore[return-value]
+            evicted = self._evict_lowest_fitness()
+            if evicted is None:
+                self._logger.warning(
+                    "hypothesis_capacity_reached_repair_no_eviction",
+                    active=len(self._active),
+                )
+                return None  # type: ignore[return-value]
+            self._logger.info(
+                "hypothesis_evicted_for_repair_capacity",
+                evicted_id=evicted.id,
+                evicted_score=round(evicted.evidence_score, 3),
+            )
 
         # Dedup on structured fields — exact match on normalised endpoint+fix_type pair.
         # Using repair_endpoint/repair_fix_type avoids false matches from statement text.
@@ -536,12 +632,48 @@ class HypothesisEngine:
         """Return short statements of all active hypotheses (deduplication prompt)."""
         return [h.statement[:100] for h in self._active.values()]
 
+    def _evict_lowest_fitness(self) -> Hypothesis | None:
+        """Evict the lowest-fitness evictable hypothesis to free capacity.
+
+        Eviction fitness = evidence_score − staleness_penalty, where
+        staleness_penalty = days_since_last_evidence × 0.1 (max 2.0).
+
+        Only PROPOSED and TESTING hypotheses are eviction candidates —
+        SUPPORTED/INTEGRATED ones have already met evidence thresholds.
+
+        Spec §IV gap fix: replaces silent rejection at capacity with LRU eviction.
+        Returns the evicted hypothesis (already removed from _active), or None if
+        no evictable candidates exist.
+        """
+        import time
+
+        now = time.time()
+        candidates = [
+            h for h in self._active.values()
+            if h.status in (HypothesisStatus.PROPOSED, HypothesisStatus.TESTING)
+        ]
+        if not candidates:
+            return None
+
+        def _fitness(h: Hypothesis) -> float:
+            try:
+                last_evidence_ts = h.last_evidence_at.timestamp()
+            except Exception:
+                last_evidence_ts = h.created_at.timestamp() if hasattr(h, "created_at") else now
+            days_stale = (now - last_evidence_ts) / 86400.0
+            staleness_penalty = min(2.0, days_stale * 0.1)
+            return h.evidence_score - staleness_penalty
+
+        worst = min(candidates, key=_fitness)
+        del self._active[worst.id]
+        return worst
+
     async def _persist_hypothesis(self, hypothesis: Hypothesis) -> None:
         """Store hypothesis as a governance record in Memory."""
         if self._memory is None:
             return
         try:
-            await self._memory._neo4j.execute_write(
+            await self._memory.execute_write(
                 """
                 MERGE (h:Hypothesis {hypothesis_id: $hypothesis_id})
                 SET h.type = $type,
@@ -757,7 +889,7 @@ class StructuralHypothesisGenerator:
 
         # --- Latent relationships: high betweenness bridging nodes ---
         try:
-            bridging = await self._memory._neo4j.execute_read(
+            bridging = await self._memory.execute_read(
                 """
                 MATCH (a)-[r1]-(bridge)-[r2]-(b)
                 WHERE NOT (a)--(b)
@@ -803,7 +935,7 @@ class StructuralHypothesisGenerator:
 
         # --- Dense clusters without named schema ---
         try:
-            clusters = await self._memory._neo4j.execute_read(
+            clusters = await self._memory.execute_read(
                 """
                 MATCH (a)-[r]-(b)
                 WHERE NOT a:Schema AND NOT b:Schema
@@ -847,7 +979,7 @@ class StructuralHypothesisGenerator:
 
         # --- Temporal sequence intermediates: A→B→C common, A→C rare ---
         try:
-            sequences = await self._memory._neo4j.execute_read(
+            sequences = await self._memory.execute_read(
                 """
                 MATCH (a)-[:FOLLOWED_BY]->(b)-[:FOLLOWED_BY]->(c)
                 WITH a.name AS step_a, b.name AS step_b, c.name AS step_c,

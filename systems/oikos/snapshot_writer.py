@@ -4,6 +4,10 @@ EcodiaOS — Oikos Snapshot Writer (Revenue Timeseries Persistence)
 Persists EconomicState snapshots to a Redis-backed ring buffer every 5 minutes
 so the dashboard can render net worth, burn rate, and runway trends over time.
 
+Also writes each snapshot to TimescaleDB (table: oikos_economic_state, hypertable
+on recorded_at) for long-term time-series queries. TimescaleDB writes are
+non-fatal — a failure logs and continues.
+
 Architecture:
   - SnapshotWriter subscribes to a periodic asyncio task
   - Every SNAPSHOT_INTERVAL_SECONDS, it reads oikos.snapshot() and appends to Redis
@@ -23,6 +27,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
+    import asyncpg
+
     from clients.redis import RedisClient
     from systems.oikos.service import OikosService
 
@@ -35,10 +41,12 @@ REDIS_KEY: str = "ecodiaos:oikos:snapshot_ring"
 
 class SnapshotWriter:
     """
-    Background task that persists OikosService snapshots to a Redis ring buffer.
+    Background task that persists OikosService snapshots to a Redis ring buffer
+    and to TimescaleDB for long-term time-series queries.
 
     Usage:
         writer = SnapshotWriter(oikos=oikos_service, redis=redis_client)
+        writer.set_timescale(pool)    # optional — enables TimescaleDB writes
         await writer.start()          # begin background loop
         await writer.stop()           # graceful shutdown
         history = await writer.get_history(days=7)
@@ -47,9 +55,15 @@ class SnapshotWriter:
     def __init__(self, oikos: OikosService, redis: RedisClient) -> None:
         self._oikos = oikos
         self._redis = redis
+        self._timescale: asyncpg.Pool | None = None
         self._task: asyncio.Task[None] | None = None
         self._running = False
         self._logger = logger.bind(component="snapshot_writer")
+
+    def set_timescale(self, pool: asyncpg.Pool) -> None:
+        """Inject an asyncpg connection pool for TimescaleDB writes."""
+        self._timescale = pool
+        self._logger.info("timescale_pool_wired")
 
     async def start(self) -> None:
         """Start the background snapshot loop."""
@@ -109,6 +123,48 @@ class SnapshotWriter:
             )
         except Exception as exc:
             self._logger.warning("snapshot_redis_write_failed", error=str(exc))
+
+        # TimescaleDB persistence — non-fatal
+        await self._write_timescale(state, now)
+
+    async def _write_timescale(self, state: Any, now: datetime) -> None:
+        """
+        Write the current EconomicState snapshot to TimescaleDB.
+
+        Table: oikos_economic_state (hypertable on recorded_at)
+        Schema:
+          recorded_at TIMESTAMPTZ, instance_id TEXT, balance_usdc NUMERIC,
+          burn_rate NUMERIC, metabolic_efficiency NUMERIC, runway_days NUMERIC
+
+        Non-fatal: any error is logged and swallowed.
+        """
+        if self._timescale is None:
+            return
+
+        try:
+            instance_id: str = getattr(self._oikos, "_instance_id", "unknown")
+            async with self._timescale.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO oikos_economic_state
+                        (recorded_at, instance_id, balance_usdc, burn_rate,
+                         metabolic_efficiency, runway_days)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    now,
+                    instance_id,
+                    float(state.liquid_balance),
+                    float(state.current_burn_rate.usd_per_day),
+                    float(state.metabolic_efficiency),
+                    float(state.runway_days),
+                )
+            self._logger.debug(
+                "timescale_snapshot_written",
+                instance_id=instance_id,
+                balance_usdc=str(state.liquid_balance),
+            )
+        except Exception as exc:
+            self._logger.warning("timescale_snapshot_write_failed", error=str(exc))
 
     async def get_history(self, days: int = 7) -> list[dict[str, Any]]:
         """

@@ -19,11 +19,15 @@ exposure is needed.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from primitives.common import SystemID
+from primitives.genome import OrganGenomeSegment
 from systems.oneiros.types import (
     EmergenceReport,
     LucidDreamingReport,
@@ -126,7 +130,7 @@ class EmergenceStage:
             await logos.run_batch_compression(force=True, max_items=50)
             finalized = True
             # 2. Measure intelligence ratio improvement
-            ratio_after = logos.world_model.measure_intelligence_ratio()
+            ratio_after = logos.get_intelligence_ratio()
 
         improvement = ratio_after - ratio_before
 
@@ -235,22 +239,74 @@ class EmergenceStage:
     ) -> bool:
         """Prepare genome update for potential Mitosis instance spawning.
 
-        The genome captures the current world model state as a serializable
-        snapshot that a new instance can bootstrap from.
+        Extracts consolidated beliefs, schemas, and hypotheses from the world
+        model into an OrganGenomeSegment and emits ONEIROS_GENOME_READY so
+        Mitosis can incorporate it into child genomes.
         """
         if logos is None:
             return False
 
-        # Genome update is only worth preparing if there was meaningful improvement
         if improvement <= 0.001:
             return False
 
-        # The genome is effectively the world model's compressed state.
-        # Logos already maintains this — we just flag that it's ready for export.
+        schemas = logos.get_generative_schemas()
+        causal = logos.get_causal_structure()
+        wm = logos.world_model
+
+        # Extract heritable state from the world model
+        payload: dict[str, Any] = {
+            "intelligence_ratio": logos.get_intelligence_ratio(),
+            "complexity": logos.get_current_complexity(),
+            "schema_count": len(schemas),
+            "invariant_count": len(wm.empirical_invariants),
+            "causal_link_count": causal.link_count if hasattr(causal, "link_count") else 0,
+            "schemas": {
+                sid: {
+                    "domain": getattr(s, "domain", "general"),
+                    "pattern": getattr(s, "pattern", {}),
+                }
+                for sid, s in list(schemas.items())[:50]
+            },
+            "invariants": [
+                {
+                    "id": getattr(inv, "id", ""),
+                    "statement": getattr(inv, "statement", ""),
+                    "confidence": getattr(inv, "confidence", 0.0),
+                    "domain": getattr(inv, "domain", "general"),
+                }
+                for inv in list(wm.empirical_invariants)[:50]
+            ],
+            "improvement_history": self._improvement_history[-20:],
+        }
+
+        payload_json = json.dumps(payload, sort_keys=True, default=str)
+        payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+
+        segment = OrganGenomeSegment(
+            system_id=SystemID.ONEIROS,
+            payload=payload,
+            payload_hash=payload_hash,
+            size_bytes=len(payload_json.encode()),
+        )
+
+        # Emit ONEIROS_GENOME_READY via Synapse (fire-and-forget)
+        if self._event_bus is not None:
+            event = SynapseEvent(
+                event_type=SynapseEventType.ONEIROS_GENOME_READY,
+                source_system=_SOURCE,
+                data=segment.model_dump(mode="json"),
+            )
+            try:
+                await self._event_bus.emit(event)
+            except Exception as exc:
+                self._logger.debug("genome_event_emit_failed", error=str(exc))
+
         self._logger.debug(
             "genome_update_prepared",
             improvement=round(improvement, 4),
-            complexity=round(logos.world_model.current_complexity, 1),
+            complexity=round(logos.get_current_complexity(), 1),
+            schema_count=len(schemas),
+            payload_size_bytes=segment.size_bytes,
         )
         return True
 

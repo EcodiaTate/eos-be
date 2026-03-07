@@ -26,12 +26,20 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from systems.atune.types import SystemLoad
-from systems.synapse.types import ClockState, CycleResult, SomaticCycleState
+from primitives.affect import InteroceptiveDimension
+from systems.synapse.types import (
+    ClockState,
+    CycleResult,
+    SomaticCycleState,
+    SynapseEvent,
+    SynapseEventType,
+    SystemLoad,
+)
 
 if TYPE_CHECKING:
     from config import SynapseConfig
-    from systems.atune.service import AtuneService
+    from systems.fovea.gateway import AtuneService
+    from systems.synapse.event_bus import EventBus
 
 logger = structlog.get_logger("systems.synapse.clock")
 
@@ -78,6 +86,7 @@ class CognitiveClock:
 
         # System references (wired later by SynapseService)
         self._soma = None  # Soma service (step 0 of theta cycle)
+        self._event_bus: EventBus | None = None  # Wired for THETA_CYCLE_START/OVERRUN
 
         # Soma degradation tracking (spec §15.4 / §XVI)
         # If Soma exceeds _SOMA_WARN_MS, log a warning.
@@ -200,15 +209,40 @@ class CognitiveClock:
             errors=self._error_count,
         )
 
+    async def force_stop(self, reason: str = "") -> None:
+        """Forceful stop called by VitalityCoordinator during death sequence.
+
+        Unlike stop(), this is designed to be called from OUTSIDE the clock's
+        own control flow. The clock cannot prevent or delay this.
+        """
+        self._logger.critical(
+            "clock_force_stopped",
+            reason=reason,
+            total_cycles=self._cycle_count,
+        )
+        await self.stop()
+
     def pause(self) -> None:
         """Pause the clock (e.g., during safe mode). Cycle loop sleeps."""
         self._paused = True
         self._logger.info("clock_paused", cycle=self._cycle_count)
+        if self._event_bus is not None:
+            asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.CLOCK_PAUSED,
+                source_system="synapse",
+                data={"cycle": self._cycle_count, "reason": "external_pause"},
+            )))
 
     def resume(self) -> None:
         """Resume after pause."""
         self._paused = False
         self._logger.info("clock_resumed", cycle=self._cycle_count)
+        if self._event_bus is not None:
+            asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.CLOCK_RESUMED,
+                source_system="synapse",
+                data={"cycle": self._cycle_count},
+            )))
 
     def set_coherence_drag(self, drag: float) -> None:
         """
@@ -248,6 +282,10 @@ class CognitiveClock:
     def set_soma(self, soma: Any) -> None:
         """Wire Soma service (step 0 of theta cycle)."""
         self._soma = soma
+
+    def set_event_bus(self, event_bus: EventBus) -> None:
+        """Wire event bus for THETA_CYCLE_START / THETA_CYCLE_OVERRUN emission (Spec 09 §18)."""
+        self._event_bus = event_bus
 
     # ─── State ───────────────────────────────────────────────────────
 
@@ -299,6 +337,20 @@ class CognitiveClock:
             t0 = time.monotonic()
 
             try:
+                # Emit THETA_CYCLE_START before any work so consumers can
+                # time the full cycle. Fire-and-forget; never block the clock.
+                if self._event_bus is not None:
+                    with contextlib.suppress(Exception):
+                        asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.THETA_CYCLE_START,
+                            source_system="synapse:clock",
+                            data={
+                                "cycle_number": self._cycle_count + 1,
+                                "period_ms": round(self._current_period_ms, 2),
+                                "arousal": round(self._current_arousal, 4),
+                            },
+                        )))
+
                 # 0. RUN SOMA FIRST (step 0 of theta cycle)
                 # Soma produces the AllostaticSignal that all downstream
                 # systems read.  Degrades gracefully per spec §15.4/§XVI:
@@ -335,7 +387,6 @@ class CognitiveClock:
                         # Snapshot signal immediately after Soma ran
                         signal = self._soma.get_current_signal()
                         sensed = signal.state.sensed
-                        from systems.soma.types import InteroceptiveDimension
                         somatic_state = SomaticCycleState(
                             urgency=signal.urgency,
                             dominant_error=signal.dominant_error.value
@@ -376,7 +427,6 @@ class CognitiveClock:
                                 # Build somatic state from the successful probe
                                 signal = self._soma.get_current_signal()
                                 sensed = signal.state.sensed
-                                from systems.soma.types import InteroceptiveDimension
                                 somatic_state = SomaticCycleState(
                                     urgency=signal.urgency,
                                     dominant_error=signal.dominant_error.value
@@ -426,6 +476,19 @@ class CognitiveClock:
                             elapsed_ms=round(elapsed_ms, 2),
                             budget_ms=round(self._current_period_ms, 2),
                         )
+                    # Emit THETA_CYCLE_OVERRUN as a bus event (Spec 09 §18 P8)
+                    if self._event_bus is not None:
+                        with contextlib.suppress(Exception):
+                            asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                                event_type=SynapseEventType.THETA_CYCLE_OVERRUN,
+                                source_system="synapse:clock",
+                                data={
+                                    "cycle_number": self._cycle_count,
+                                    "elapsed_ms": round(elapsed_ms, 2),
+                                    "budget_ms": round(self._current_period_ms, 2),
+                                    "overrun_count": self._overrun_count,
+                                },
+                            )))
 
                 # 6. Build cycle result
                 result = CycleResult(
@@ -493,7 +556,6 @@ class CognitiveClock:
         if self._soma is not None:
             with contextlib.suppress(Exception):
                 signal = self._soma.get_current_signal()
-                from systems.soma.types import InteroceptiveDimension
                 if signal.state is not None:
                     raw_arousal = signal.state.sensed.get(
                         InteroceptiveDimension.AROUSAL, 0.1

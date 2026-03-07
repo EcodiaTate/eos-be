@@ -119,7 +119,7 @@ class SelfModelManager:
         """
         cutoff = (utc_now() - timedelta(days=_OUTCOME_HORIZON_DAYS)).isoformat()
         try:
-            results = await self._memory._neo4j.execute_read(  # type: ignore[union-attr]
+            results = await self._memory.execute_read(  # type: ignore[union-attr]
                 """
                 MATCH (cf:Counterfactual)
                 WHERE cf.resolved = true
@@ -178,7 +178,7 @@ class SelfModelManager:
         """Retrieve recent action outcome episodes from Memory."""
         cutoff = (utc_now() - timedelta(days=_OUTCOME_HORIZON_DAYS)).isoformat()
         try:
-            results = await self._memory._neo4j.execute_read(  # type: ignore[union-attr]
+            results = await self._memory.execute_read(  # type: ignore[union-attr]
                 """
                 MATCH (e:Episode)
                 WHERE e.source STARTS WITH 'axon:'
@@ -249,7 +249,7 @@ class SelfModelManager:
     async def _persist_stats(self, stats: SelfModelStats) -> None:
         """Write self-model stats (including regret) to the Self node in Memory."""
         try:
-            await self._memory._neo4j.execute_write(  # type: ignore[union-attr]
+            await self._memory.execute_write(  # type: ignore[union-attr]
                 """
                 MATCH (s:Self)
                 SET s.evo_success_rate = $success_rate,

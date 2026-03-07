@@ -107,6 +107,20 @@ class LogosWorldModel(Protocol):
         """
         ...
 
+    async def get_dimension_accuracy(
+        self, context_type: str, dimension: str, lookback_window: int = 100
+    ) -> float:
+        """
+        Return [0, 1] historical prediction accuracy for a specific error dimension
+        and context type over the last *lookback_window* predictions.
+
+        Enables per-dimension precision weighting: content errors may be 70% accurate
+        while causal errors are only 30% accurate in the same context.
+
+        Returns 0.5 (neutral) if no per-dimension history is available for this context.
+        """
+        ...
+
     async def get_compression_score(self) -> float:
         """
         Return the current world model compression score [0, 1].
@@ -171,6 +185,11 @@ class StubWorldModel:
 
     async def get_historical_accuracy(
         self, context_type: str, lookback_window: int = 100
+    ) -> float:
+        return 0.5
+
+    async def get_dimension_accuracy(
+        self, context_type: str, dimension: str, lookback_window: int = 100
     ) -> float:
         return 0.5
 
@@ -282,6 +301,19 @@ class LogosWorldModelAdapter:
         self, context_type: str, lookback_window: int = 100
     ) -> float:
         """Delegate to the real Logos world model accuracy tracker."""
+        return self._wm.get_historical_accuracy(context_type)
+
+    async def get_dimension_accuracy(
+        self, context_type: str, dimension: str, lookback_window: int = 100
+    ) -> float:
+        """
+        Return per-dimension accuracy from Logos if it tracks it, else fall back
+        to the global accuracy for this context type.
+        """
+        # Logos may expose per-dimension accuracy; fall back to global if not.
+        fn = getattr(self._wm, "get_dimension_accuracy", None)
+        if callable(fn):
+            return fn(context_type, dimension)
         return self._wm.get_historical_accuracy(context_type)
 
     async def get_context_stability_age(self, context_type: str) -> int:

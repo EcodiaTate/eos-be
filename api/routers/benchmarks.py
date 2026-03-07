@@ -30,6 +30,8 @@ _VALID_METRICS = frozenset({
     "economic_ratio",
     "learning_rate",
     "mutation_success_rate",
+    "effective_intelligence_ratio",
+    "compression_ratio",
 })
 
 
@@ -87,7 +89,8 @@ async def benchmarks_trend(
     Return time-series data for a single KPI.
 
     metric — one of: decision_quality, llm_dependency, economic_ratio,
-             learning_rate, mutation_success_rate
+             learning_rate, mutation_success_rate, effective_intelligence_ratio,
+             compression_ratio
     """
     if metric not in _VALID_METRICS:
         raise HTTPException(

@@ -40,7 +40,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import json
+import random
 import subprocess
+from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +76,14 @@ if TYPE_CHECKING:
     from systems.simula.learning.grpo import GRPOEngine
 
 logger = structlog.get_logger()
+
+
+def _escape_prompt_injection(text: str) -> str:
+    """Sanitise user-controlled or stored data before injecting into LLM prompts."""
+    if not text:
+        return ""
+    # JSON-escape to break out of string literals in JSON
+    return json.dumps(text)[1:-1]  # Remove outer quotes
 
 # ─── Tool Definitions ────────────────────────────────────────────────────────
 
@@ -492,6 +503,8 @@ class SimulaCodeAgent:
         thinking_provider: ExtendedThinkingProvider | None = None,
         thinking_budget_tokens: int = 16384,
         embedding_client: EmbeddingClient | None = None,
+        # #60: default sourced from SimulaConfig.kv_compression_ratio (0.3).
+        # SimulaService always passes this explicitly from config.
         kv_compression_ratio: float = 0.3,
         kv_compression_enabled: bool = True,
         # Stage 2C: Static analysis post-generation gate
@@ -525,13 +538,21 @@ class SimulaCodeAgent:
         self._files_written: list[str] = []
         self._total_tokens_used: int = 0
         self._reasoning_tokens_used: int = 0
+        self._system_prompt_tokens: int = 0
         self._used_extended_thinking: bool = False
         # Optimization: detect optimized provider for budget checks + metrics tagging
         self._optimized = isinstance(llm, OptimizedLLMProvider)
         # Embedding cache for semantic find_similar (lazy-built)
         self._code_index: dict[str, list[float]] | None = None
         self._code_index_lock = asyncio.Lock()
-        # KVzip context compression — prunes old tool results to reduce token usage
+        # KVzip context compression — prunes old tool results to stay within context.
+        # kv_compression_ratio controls the LILO (Last-In-Last-Out) prune fraction:
+        #   0.0 = disabled (no pruning, maximum context but risks overflow)
+        #   0.3 = prune 30% of oldest tool results each time the window is compressed
+        #         (default: safe balance between recency and context depth)
+        #   1.0 = maximum pruning (keeps only the most recent tool results)
+        # The compressor is triggered after turn 3 when tool results start accumulating.
+        # It prunes *tool result messages* only, never the system prompt or user messages.
         self._compressor = ContextCompressor(
             prune_ratio=kv_compression_ratio,
             enabled=kv_compression_enabled,
@@ -541,10 +562,19 @@ class SimulaCodeAgent:
         self._static_fix_max_iterations = static_analysis_max_fix_iterations
         # Stage 3C: LILO library prompt (set by SimulaService before each generate call)
         self._lilo_prompt: str = ""
+        # Z3 counterexample feedback: injected by SimulaService when formal verification
+        # finds invalid invariants so the code agent can fix the implementation (Spec §9)
+        self._z3_counterexample_prompt: str = ""
         # Repair Memory: lessons from past repair outcomes (set by SimulaService)
         self._repair_memory_prompt: str = ""
         # Stage 4A: Proof library prompt (set by SimulaService before each generate call)
         self._proof_library_prompt: str = ""
+        # Token budget tracking for injected prompt sections (chars // 4 ≈ tokens).
+        # Exposed so SimulaService can log budget consumption and detect overflow before
+        # the LLM call.  Reset in generate() alongside _system_prompt_tokens.
+        self._lilo_prompt_tokens: int = 0
+        self._repair_memory_tokens: int = 0
+        self._proof_library_tokens: int = 0
         # Stage 4B: GRPO fine-tuned model ID (set by SimulaService for A/B routing)
         self._grpo_model_id: str = ""
         # Stage 4B: GRPO engine reference (set by SimulaService for local model routing)
@@ -555,6 +585,9 @@ class SimulaCodeAgent:
         self._neo4j = neo4j
         # Populated per-proposal when source=="arxiv"; injected into system prompt
         self._arxiv_paper_abstract: str = ""
+        # Organism health context: injected by SimulaService before each repair call.
+        # Contains log-derived signals, Soma arousal, Fovea attention profile.
+        self._organism_context: str = ""
 
     def _should_use_extended_thinking(self, proposal: EvolutionProposal) -> bool:
         """
@@ -722,6 +755,10 @@ class SimulaCodeAgent:
         self._files_written = []
         self._total_tokens_used = 0
         self._reasoning_tokens_used = 0
+        self._system_prompt_tokens = 0
+        self._lilo_prompt_tokens = 0
+        self._repair_memory_tokens = 0
+        self._proof_library_tokens = 0
         self._arxiv_paper_abstract = ""
 
         # Fetch paper abstract from memory graph for arXiv proposals so the
@@ -747,6 +784,10 @@ class SimulaCodeAgent:
         self._used_extended_thinking = use_thinking
 
         system_prompt = self._build_system_prompt(proposal)
+        # #68: Estimate system prompt token budget (1 token ≈ 4 chars, conservative).
+        # This is measured once so downstream callers can see how much of the
+        # context window the static instructions consume before any turns.
+        self._system_prompt_tokens = len(system_prompt) // 4
 
         # Stage 2D: When AgentCoder pipeline is active, disable test writing
         if skip_test_writing:
@@ -799,6 +840,8 @@ class SimulaCodeAgent:
                     success=False,
                     files_written=[],
                     error="LLM budget exhausted (RED tier) — code agent skipped.",
+                    total_tokens=self._total_tokens_used,
+                    system_prompt_tokens=self._system_prompt_tokens,
                 )
 
         while turns < self._max_turns:
@@ -898,6 +941,8 @@ class SimulaCodeAgent:
                 files_written=self._files_written,
                 summary=last_text[:500] if last_text else "Max turns exceeded",
                 error="Max turns exceeded without completion signal",
+                total_tokens=self._total_tokens_used,
+                system_prompt_tokens=self._system_prompt_tokens,
                 kv_compression_ratio=cm.compression_ratio,
                 kv_messages_compressed=cm.messages_compressed,
                 kv_original_tokens=cm.original_tokens,
@@ -924,8 +969,12 @@ class SimulaCodeAgent:
                         f"in your written files. Fix them:\n\n{feedback_text}"
                     ),
                 })
-                # Run one more tool-use turn to fix
-                for _fix_turn in range(self._static_fix_max_iterations):
+                # Run up to 3 fix iterations with exponential backoff.
+                # Cap is enforced by min(config, 3) — avoids runaway retries.
+                _max_fix = min(self._static_fix_max_iterations, 3)
+                for _fix_turn in range(_max_fix):
+                    if _fix_turn > 0:
+                        await asyncio.sleep(2 ** _fix_turn + random.uniform(0, 1))
                     static_fix_iterations += 1
                     try:
                         response = await active_llm.generate_with_tools(  # type: ignore[union-attr]
@@ -962,17 +1011,27 @@ class SimulaCodeAgent:
 
                 # Re-run static analysis to see if fixes worked
                 sa_result = await self._static_bridge.run_all(self._files_written)  # type: ignore[attr-defined]
-                self._logger.info(
-                    "static_analysis_post_fix",
-                    errors_remaining=sa_result.error_count,
-                    fix_iterations=static_fix_iterations,
-                )
+                if sa_result.error_count > 0:
+                    self._logger.warning(
+                        "static_analysis_fix_iterations_exhausted",
+                        errors_remaining=sa_result.error_count,
+                        fix_iterations=static_fix_iterations,
+                        max_iterations=self._static_fix_max_iterations,
+                    )
+                else:
+                    self._logger.info(
+                        "static_analysis_post_fix",
+                        errors_remaining=sa_result.error_count,
+                        fix_iterations=static_fix_iterations,
+                    )
 
         cm = self._compressor.metrics
         change_result = CodeChangeResult(
             success=len(self._files_written) > 0,
             files_written=self._files_written,
             summary=last_text[:1000] if last_text else "Change implemented",
+            total_tokens=self._total_tokens_used,
+            system_prompt_tokens=self._system_prompt_tokens,
             used_extended_thinking=self._used_extended_thinking,
             reasoning_tokens=self._reasoning_tokens_used,
             kv_compression_ratio=cm.compression_ratio,
@@ -1033,9 +1092,9 @@ class SimulaCodeAgent:
 
     async def _tool_read_file(self, tc: ToolCall) -> ToolResult:
         rel_path = tc.input.get("path", "")
-        target = (self._root / rel_path).resolve()
-        if not str(target).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied: path outside codebase root", True)
+        target, err = self._validate_path(rel_path)
+        if target is None:
+            return ToolResult(tc.id, err, True)
         try:
             content = target.read_text(encoding="utf-8")
             return ToolResult(tc.id, content)
@@ -1050,29 +1109,26 @@ class SimulaCodeAgent:
         forbidden_check = self._check_forbidden_path(rel_path)
         if forbidden_check:
             return ToolResult(tc.id, forbidden_check, True)
-        target = (self._root / rel_path).resolve()
-        if not str(target).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied: path outside codebase root", True)
+        target, err = self._validate_path(rel_path)
+        if target is None:
+            return ToolResult(tc.id, err, True)
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-            self._files_written.append(rel_path)
+            if rel_path not in self._files_written:
+                self._files_written.append(rel_path)
             return ToolResult(tc.id, f"Written: {rel_path} ({len(content)} bytes)")
         except Exception as exc:
             return ToolResult(tc.id, f"Write error: {exc}", True)
 
     async def _tool_list_directory(self, tc: ToolCall) -> ToolResult:
         rel_path = tc.input.get("path", "")
-        target = (self._root / rel_path).resolve() if rel_path else self._root
-        log.debug(
-            "list_directory_debug",
-            rel_path=rel_path,
-            target=str(target),
-            root=str(self._root),
-            exists=target.exists(),
-        )
-        if not str(target).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied", True)
+        if rel_path:
+            target, err = self._validate_path(rel_path)
+            if target is None:
+                return ToolResult(tc.id, err, True)
+        else:
+            target = self._root
         try:
             if not target.exists():
                 return ToolResult(tc.id, f"Directory not found: {rel_path}", True)
@@ -1087,10 +1143,17 @@ class SimulaCodeAgent:
 
     async def _tool_search_code(self, tc: ToolCall) -> ToolResult:
         pattern = tc.input.get("pattern", "")
+        pat_err = self._validate_search_pattern(pattern)
+        if pat_err:
+            return ToolResult(tc.id, pat_err, True)
         directory = tc.input.get("directory", "ecodiaos/")
-        search_root = (self._root / directory).resolve()
-        if not str(search_root).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied", True)
+        search_root, dir_err = self._validate_path(directory or "ecodiaos/")
+        if search_root is None:
+            return ToolResult(tc.id, dir_err, True)
+        # #71: bound both line count and per-line length to prevent context overflow
+        _SEARCH_MAX_LINES = 50
+        _SEARCH_LINE_MAX_CHARS = 200
+        _SEARCH_TIMEOUT = 15.0
         results: list[str] = []
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1098,21 +1161,27 @@ class SimulaCodeAgent:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_SEARCH_TIMEOUT)
             output = stdout.decode("utf-8", errors="replace")
-            for line in output.splitlines()[:50]:
-                results.append(line.replace(str(self._root) + "/", "").replace(str(self._root) + "\\", ""))
+            all_lines = output.splitlines()
+            for line in all_lines[:_SEARCH_MAX_LINES]:
+                line = line.replace(str(self._root) + "/", "").replace(str(self._root) + "\\", "")
+                if len(line) > _SEARCH_LINE_MAX_CHARS:
+                    line = line[:_SEARCH_LINE_MAX_CHARS] + " [...]"
+                results.append(line)
+            if len(all_lines) > _SEARCH_MAX_LINES:
+                results.append(f"[... {len(all_lines) - _SEARCH_MAX_LINES} more matches omitted ...]")
             return ToolResult(tc.id, "\n".join(results) if results else "No matches found")
         except TimeoutError:
-            return ToolResult(tc.id, "Search timed out", True)
+            return ToolResult(tc.id, f"Search timed out after {_SEARCH_TIMEOUT:.0f}s", True)
         except Exception as exc:
             return ToolResult(tc.id, f"Search error: {exc}", True)
 
     async def _tool_run_tests(self, tc: ToolCall) -> ToolResult:
         test_path = tc.input.get("test_path", "")
-        target = (self._root / test_path).resolve()
-        if not str(target).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied", True)
+        target, err = self._validate_path(test_path)
+        if target is None:
+            return ToolResult(tc.id, err, True)
         if not target.exists():
             return ToolResult(tc.id, f"Test path not found: {test_path}")
         try:
@@ -1138,9 +1207,9 @@ class SimulaCodeAgent:
     async def _tool_run_linter(self, tc: ToolCall) -> ToolResult:
         import sys as _sys
         path = tc.input.get("path", "")
-        target = (self._root / path).resolve()
-        if not str(target).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied", True)
+        target, err = self._validate_path(path)
+        if target is None:
+            return ToolResult(tc.id, err, True)
         # Prefer the venv-local ruff so we don't pick up a mismatched binary
         # from PATH (e.g. a Windows ruff.exe when running under WSL).
         _venv_ruff = Path(_sys.executable).parent / "ruff"
@@ -1151,6 +1220,9 @@ class SimulaCodeAgent:
             _ruff = str(_venv_ruff_exe)
         else:
             _ruff = "ruff"  # fall back to PATH
+        # #52: explicit timeout constant; #69: cap output to avoid context overflow
+        _LINTER_TIMEOUT = 20.0
+        _LINTER_MAX_CHARS = 4000
         try:
             proc = await asyncio.create_subprocess_exec(
                 _ruff, "check", str(target),
@@ -1158,15 +1230,20 @@ class SimulaCodeAgent:
                 stderr=subprocess.STDOUT,
                 cwd=str(self._root),
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_LINTER_TIMEOUT)
             output = stdout.decode("utf-8", errors="replace")
             passed = proc.returncode == 0
+            if len(output) > _LINTER_MAX_CHARS:
+                output = (
+                    output[:_LINTER_MAX_CHARS]
+                    + f"\n[... {len(output) - _LINTER_MAX_CHARS} chars truncated ...]"
+                )
             return ToolResult(
                 tc.id,
                 f"{'CLEAN' if passed else 'ISSUES FOUND'}\n{output}" if output else "CLEAN",
             )
         except TimeoutError:
-            return ToolResult(tc.id, "Linter timed out", True)
+            return ToolResult(tc.id, f"Linter timed out after {_LINTER_TIMEOUT:.0f}s", True)
         except Exception as exc:
             return ToolResult(tc.id, f"Linter error: {exc}", True)
 
@@ -1178,28 +1255,40 @@ class SimulaCodeAgent:
         find_text = tc.input.get("find", "")
         replace_text = tc.input.get("replace", "")
 
+        if not find_text:
+            return ToolResult(tc.id, "find parameter must not be empty", True)
+
         forbidden_check = self._check_forbidden_path(rel_path)
         if forbidden_check:
             return ToolResult(tc.id, forbidden_check, True)
 
-        target = (self._root / rel_path).resolve()
-        if not str(target).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied: path outside codebase root", True)
+        target, err = self._validate_path(rel_path)
+        if target is None:
+            return ToolResult(tc.id, err, True)
         if not target.exists():
             return ToolResult(tc.id, f"File not found: {rel_path}", True)
 
         try:
             content = target.read_text(encoding="utf-8")
 
-            if find_text not in content:
+            # #64: Normalise line endings before matching so that CRLF files and
+            # LF find_text (or vice versa) don't cause spurious "not found" errors.
+            # We work on the normalised form and rewrite with the file's original
+            # line ending style so on-disk content is not inadvertently changed.
+            original_has_crlf = "\r\n" in content
+            content_norm = content.replace("\r\n", "\n")
+            find_norm = find_text.replace("\r\n", "\n")
+
+            if find_norm not in content_norm:
                 return ToolResult(
                     tc.id,
                     f"Find text not found in {rel_path}. "
-                    "Ensure the 'find' parameter is an exact match of existing content.",
+                    "Ensure the 'find' parameter matches existing content "
+                    "(whitespace-normalised comparison was also attempted).",
                     True,
                 )
 
-            occurrences = content.count(find_text)
+            occurrences = content_norm.count(find_norm)
             if occurrences > 1:
                 return ToolResult(
                     tc.id,
@@ -1208,15 +1297,20 @@ class SimulaCodeAgent:
                     True,
                 )
 
-            new_content = content.replace(find_text, replace_text, 1)
+            replace_norm = replace_text.replace("\r\n", "\n")
+            new_content_norm = content_norm.replace(find_norm, replace_norm, 1)
+            # Restore the file's original line ending style
+            if original_has_crlf:
+                new_content = new_content_norm.replace("\n", "\r\n")
+            else:
+                new_content = new_content_norm
             target.write_text(new_content, encoding="utf-8")
 
             if rel_path not in self._files_written:
                 self._files_written.append(rel_path)
 
-            # Build a readable diff summary
-            find_lines = find_text.count("\n") + 1
-            replace_lines = replace_text.count("\n") + 1
+            find_lines = find_norm.count("\n") + 1
+            replace_lines = replace_norm.count("\n") + 1
             return ToolResult(
                 tc.id,
                 f"Edited {rel_path}: replaced {find_lines} line(s) with {replace_lines} line(s)",
@@ -1228,9 +1322,9 @@ class SimulaCodeAgent:
         """Run mypy type checker on a path."""
         import sys as _sys
         path = tc.input.get("path", "")
-        target = (self._root / path).resolve()
-        if not str(target).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied", True)
+        target, err = self._validate_path(path)
+        if target is None:
+            return ToolResult(tc.id, err, True)
         _bin_dir = Path(_sys.executable).parent
         _mypy = str(next(
             (p for p in [_bin_dir / "mypy", _bin_dir / "mypy.exe"] if p.exists()),
@@ -1243,18 +1337,26 @@ class SimulaCodeAgent:
                 stderr=subprocess.STDOUT,
                 cwd=str(self._root),
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            # #52: explicit timeout constant; #70: cap to first 4000 chars (errors appear at top)
+            _TC_TIMEOUT = 45.0
+            _TC_MAX_CHARS = 4000
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_TC_TIMEOUT)
             output = stdout.decode("utf-8", errors="replace")
             passed = proc.returncode == 0
             if passed:
                 return ToolResult(tc.id, "TYPE CHECK PASSED — no issues found")
+            if len(output) > _TC_MAX_CHARS:
+                output = (
+                    output[:_TC_MAX_CHARS]
+                    + f"\n[... {len(output) - _TC_MAX_CHARS} chars truncated ...]"
+                )
             return ToolResult(
                 tc.id,
-                f"TYPE CHECK ISSUES:\n{output[-2000:]}",
+                f"TYPE CHECK ISSUES:\n{output}",
                 is_error=True,
             )
         except TimeoutError:
-            return ToolResult(tc.id, "Type check timed out after 30s", True)
+            return ToolResult(tc.id, f"Type check timed out after {_TC_TIMEOUT:.0f}s", True)
         except FileNotFoundError:
             return ToolResult(tc.id, "mypy not found — type checking unavailable")
         except Exception as exc:
@@ -1263,9 +1365,9 @@ class SimulaCodeAgent:
     async def _tool_dependency_graph(self, tc: ToolCall) -> ToolResult:
         """Show what a module imports and what imports it."""
         module_path = tc.input.get("module_path", "")
-        target = (self._root / module_path).resolve()
-        if not str(target).startswith(str(self._root)):
-            return ToolResult(tc.id, "Access denied", True)
+        target, err = self._validate_path(module_path)
+        if target is None:
+            return ToolResult(tc.id, err, True)
         if not target.exists():
             return ToolResult(tc.id, f"File not found: {module_path}", True)
 
@@ -1426,11 +1528,19 @@ class SimulaCodeAgent:
             return []
 
         # Embed the query — use query-optimized encoding for Voyage
+        # 5s timeout: a hung embedding call must not stall the code agent
         try:
             if isinstance(self._embedding, VoyageEmbeddingClient):
-                query_vec = await self._embedding.embed_query(description)
+                query_vec = await asyncio.wait_for(
+                    self._embedding.embed_query(description), timeout=5.0
+                )
             else:
-                query_vec = await self._embedding.embed(description)
+                query_vec = await asyncio.wait_for(
+                    self._embedding.embed(description), timeout=5.0
+                )
+        except (asyncio.TimeoutError, TimeoutError):
+            self._logger.warning("semantic_search_embed_timeout")
+            return []
         except Exception as exc:
             self._logger.warning("semantic_search_embed_failed", error=str(exc))
             return []
@@ -1531,6 +1641,50 @@ class SimulaCodeAgent:
         return ToolResult(tc.id, "\n\n".join(results) if results else "No files found at matched paths")
 
     # ─── Helpers ─────────────────────────────────────────────────────────────
+
+    def _validate_path(self, rel_path: str) -> tuple[Path, str] | tuple[None, str]:
+        """
+        Validate a tool-supplied path and resolve it within the codebase root.
+
+        Catches:
+          - Empty paths
+          - Null bytes (used in some path-injection attacks)
+          - Path traversal after resolution (e.g. ../../etc/passwd)
+
+        Returns (resolved_path, "") on success or (None, error_message) on failure.
+        This is the single gate used by all tools that accept a path (#48).
+        """
+        if not rel_path or not rel_path.strip():
+            return None, "Path must not be empty"
+        if "\x00" in rel_path:
+            return None, "Path contains null byte — rejected"
+        try:
+            target = (self._root / rel_path).resolve()
+        except Exception as exc:
+            return None, f"Invalid path: {exc}"
+        root_str = str(self._root)
+        target_str = str(target)
+        # Ensure resolved path is strictly inside (or equal to) the codebase root.
+        # Use os.sep-aware prefix check to avoid false matches like /root vs /rootdir.
+        if target_str != root_str and not target_str.startswith(root_str + "/") and not target_str.startswith(root_str + "\\"):
+            return None, "Access denied: path outside codebase root"
+        return target, ""
+
+    def _validate_search_pattern(self, pattern: str) -> str | None:
+        """
+        Validate a search pattern for the search_code tool (#48).
+
+        Rejects empty patterns and patterns that are excessively long (which
+        could cause catastrophic backtracking in grep or be used to probe
+        the filesystem via timed side-channels).
+
+        Returns error message or None if valid.
+        """
+        if not pattern or not pattern.strip():
+            return "Search pattern must not be empty"
+        if len(pattern) > 500:
+            return "Search pattern too long (max 500 chars)"
+        return None
 
     def _check_forbidden_path(self, rel_path: str) -> str | None:
         """Check if a path is forbidden. Returns error message or None."""
@@ -1860,16 +2014,45 @@ class SimulaCodeAgent:
                 f"```\n{self._arxiv_paper_abstract}\n```"
             )
 
-        # Repair Memory: Append lessons from past repairs
-        if self._repair_memory_prompt:
-            prompt += f"\n\n{self._repair_memory_prompt}"
+        # Repair Memory: Append lessons from past repairs (escaped to prevent injection)
+        # Budget: cap at 4 000 tokens (~16 000 chars) to avoid crowding the context window.
+        _SECTION_TOKEN_BUDGET = 4_000
+        _SECTION_CHAR_BUDGET = _SECTION_TOKEN_BUDGET * 4
+        repair_memory_text = _escape_prompt_injection(self._repair_memory_prompt)
+        if len(repair_memory_text) > _SECTION_CHAR_BUDGET:
+            repair_memory_text = repair_memory_text[:_SECTION_CHAR_BUDGET] + "\n...[truncated]"
+        self._repair_memory_tokens = len(repair_memory_text) // 4
+        if repair_memory_text:
+            prompt += f"\n\n{repair_memory_text}"
 
-        # Stage 3C: Append LILO library abstractions if available
-        if self._lilo_prompt:
-            prompt += f"\n\n{self._lilo_prompt}"
+        # Stage 3C: Append LILO library abstractions if available (escaped)
+        # Budget: cap at 4 000 tokens to leave room for counterfactual context.
+        lilo_text = _escape_prompt_injection(self._lilo_prompt)
+        if len(lilo_text) > _SECTION_CHAR_BUDGET:
+            lilo_text = lilo_text[:_SECTION_CHAR_BUDGET] + "\n...[truncated]"
+        self._lilo_prompt_tokens = len(lilo_text) // 4
+        if lilo_text:
+            prompt += f"\n\n{lilo_text}"
 
-        # Stage 4A: Append proof library context if available
-        if self._proof_library_prompt:
-            prompt += self._proof_library_prompt
+        # Stage 4A: Append proof library context if available (escaped)
+        # Budget: cap at 4 000 tokens; proofs are dense but LILO has higher priority.
+        proof_text = _escape_prompt_injection(self._proof_library_prompt)
+        if len(proof_text) > _SECTION_CHAR_BUDGET:
+            proof_text = proof_text[:_SECTION_CHAR_BUDGET] + "\n...[truncated]"
+        self._proof_library_tokens = len(proof_text) // 4
+        if proof_text:
+            prompt += proof_text
+
+        # Organism health: inject current system health state so the agent
+        # understands whether the organism is under pressure (cascades, high arousal,
+        # high Fovea salience) and can prioritise accordingly. (escaped)
+        if self._organism_context:
+            prompt += f"\n\n{_escape_prompt_injection(self._organism_context)}"
+
+        # Z3 counterexample feedback (Spec §9): when formal verification found invalid
+        # invariants in the written code, inject the counterexamples so the agent
+        # understands which boundary conditions it violated and can fix them.
+        if self._z3_counterexample_prompt:
+            prompt += f"\n\n{_escape_prompt_injection(self._z3_counterexample_prompt)}"
 
         return prompt

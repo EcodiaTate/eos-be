@@ -111,6 +111,26 @@ class EntropicDecayEngine:
         self._access_decay_rate = access_decay_rate
         self._contradiction_multiplier = contradiction_decay_multiplier
 
+        # P6: Contradiction counts (incremented by record_contradiction)
+        self._contradiction_counts: dict[str, int] = {}
+
+    def record_contradiction(self, item_id: str) -> None:
+        """Record a contradiction against an item (P6).
+
+        Called when HYPOTHESIS_REJECTED indicates an item's underlying
+        hypothesis was refuted, or when conflicting schemas are detected.
+        """
+        self._contradiction_counts[item_id] = self._contradiction_counts.get(item_id, 0) + 1
+        logger.debug(
+            "contradiction_recorded",
+            item_id=item_id,
+            count=self._contradiction_counts[item_id],
+        )
+
+    def get_contradiction_count(self, item_id: str) -> int:
+        """Get the recorded contradiction count for an item."""
+        return self._contradiction_counts.get(item_id, 0)
+
     async def run_decay_cycle(
         self,
         memory_store: MemoryStoreProtocol,
@@ -133,6 +153,8 @@ class EntropicDecayEngine:
         distilled: list[str] = []
         reinforced: list[str] = []
         total_bits_freed = 0.0
+        # P7: record item_type per eviction so service decrements the correct tier
+        evicted_item_types: dict[str, str] = {}
 
         for item in all_items:
             # Skip anchor memories -- permanent
@@ -146,6 +168,7 @@ class EntropicDecayEngine:
                     # Explains less than it costs -> evict
                     await memory_store.evict(item.id)
                     evicted.append(item.id)
+                    evicted_item_types[item.id] = item.item_type  # P7
                     total_bits_freed += score.description_length
                     logger.debug(
                         "decay_evicted",
@@ -190,6 +213,7 @@ class EntropicDecayEngine:
             reinforced=reinforced,
             total_items_scanned=len(all_items),
             total_bits_freed=total_bits_freed,
+            evicted_item_types=evicted_item_types,
         )
 
         logger.info(
@@ -245,10 +269,12 @@ class EntropicDecayEngine:
         access_decay = math.exp(-self._access_decay_rate * age_hours)
 
         # 2) Contradiction decay: multiplicative penalty
+        # P6: Use both item's native count AND locally recorded contradictions
+        total_contradictions = item.contradiction_count + self.get_contradiction_count(item.id)
         contradiction_factor = 1.0
-        if item.contradiction_count > 0:
+        if total_contradictions > 0:
             contradiction_factor = 1.0 / (
-                1.0 + self._contradiction_multiplier * item.contradiction_count
+                1.0 + self._contradiction_multiplier * total_contradictions
             )
 
         # Adjust the decay_rate upward for stale/contradicted items

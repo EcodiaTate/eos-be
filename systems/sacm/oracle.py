@@ -29,8 +29,9 @@ Concurrency model:
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydantic import Field
@@ -162,6 +163,9 @@ class ComputeMarketOracle:
         )
     """
 
+    # How often the recovery loop re-checks UNREACHABLE providers (seconds)
+    _RECOVERY_INTERVAL_S: float = 300.0  # 5 minutes
+
     def __init__(
         self,
         stale_threshold_minutes: float = 10.0,
@@ -180,6 +184,7 @@ class ComputeMarketOracle:
         self._stale_threshold = timedelta(minutes=stale_threshold_minutes)
         self._max_failures = max_consecutive_failures
         self._last_refresh_epoch: float = 0.0
+        self._recovery_task: asyncio.Task[None] | None = None
         self._log = logger.bind(component="sacm.oracle")
 
     # ── Provider Registry ─────────────────────────────────────────
@@ -202,6 +207,99 @@ class ComputeMarketOracle:
     @property
     def registered_providers(self) -> list[str]:
         return list(self._providers.keys())
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """
+        Start the background UNREACHABLE-recovery loop.
+
+        Call once after the oracle is fully configured and the event loop
+        is running (typically in SACMService.initialize()).
+        """
+        if self._recovery_task is not None:
+            return
+        self._recovery_task = asyncio.create_task(
+            self._recovery_loop(),
+            name="sacm_oracle_recovery",
+        )
+        self._log.info("oracle_recovery_loop_started")
+
+    async def stop(self) -> None:
+        """Stop the background recovery loop."""
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            import contextlib
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._recovery_task
+            self._recovery_task = None
+        self._log.info("oracle_recovery_loop_stopped")
+
+    # ── UNREACHABLE Recovery Loop ──────────────────────────────────
+
+    async def _recovery_loop(self) -> None:
+        """
+        Background task: every 5 minutes, re-health-check all providers
+        currently marked UNREACHABLE.
+
+        On a successful health() call the provider is restored to AVAILABLE
+        and its consecutive_failures counter is reset so the next
+        refresh_all() will include it again.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._RECOVERY_INTERVAL_S)
+                await self._recover_unreachable_providers()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self._log.exception("oracle_recovery_loop_error")
+
+    async def _recover_unreachable_providers(self) -> None:
+        """Re-health-check all UNREACHABLE providers and restore healthy ones."""
+        unreachable = [
+            pid
+            for pid, health in self._health.items()
+            if health.status == SubstrateProviderStatus.UNREACHABLE
+            and pid in self._providers
+        ]
+        if not unreachable:
+            return
+
+        self._log.info(
+            "oracle_recovery_check",
+            unreachable_count=len(unreachable),
+            provider_ids=unreachable,
+        )
+
+        for provider_id in unreachable:
+            provider = self._providers.get(provider_id)
+            if provider is None:
+                continue
+            try:
+                status = await provider.health()
+                if status == SubstrateProviderStatus.AVAILABLE:
+                    health = self._health[provider_id]
+                    health.status = SubstrateProviderStatus.AVAILABLE
+                    health.consecutive_failures = 0
+                    health.last_successful_fetch = utc_now().timestamp()
+                    self._log.info(
+                        "provider_restored",
+                        provider_id=provider_id,
+                    )
+                    # Immediately fetch fresh offers so the restored provider
+                    # is available to the optimizer without waiting for the
+                    # next scheduled refresh_all().
+                    asyncio.create_task(
+                        self.refresh_provider(provider_id),
+                        name=f"sacm_oracle_restore_{provider_id}",
+                    )
+            except Exception as exc:
+                self._log.debug(
+                    "provider_recovery_check_failed",
+                    provider_id=provider_id,
+                    error=str(exc),
+                )
 
     # ── Refresh ───────────────────────────────────────────────────
 

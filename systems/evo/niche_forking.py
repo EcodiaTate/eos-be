@@ -546,9 +546,11 @@ class NicheForkingEngine:
         if self._event_bus is not None:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
+            # Use NICHE_FORK_PROPOSAL (not EVOLUTION_CANDIDATE) — fork proposals
+            # request cognitive organogenesis, not structural code changes.
             await self._event_bus.emit(
                 SynapseEvent(
-                    event_type=SynapseEventType.EVOLUTION_CANDIDATE,
+                    event_type=SynapseEventType.NICHE_FORK_PROPOSAL,
                     source_system="evo.niche_forking",
                     data={
                         "proposal_id": proposal.id,

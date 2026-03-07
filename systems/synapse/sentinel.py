@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from systems.thymos.types import Incident, IncidentClass, IncidentSeverity
+from primitives.incident import IncidentClass, IncidentSeverity
 
 if TYPE_CHECKING:
     from systems.synapse.event_bus import EventBus
@@ -188,30 +188,32 @@ class ErrorSentinel:
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
-            incident = Incident(
-                incident_class=resolved_class,
-                severity=resolved_severity,
-                fingerprint=fingerprint,
-                source_system=self._system_id,
-                error_type=error_type,
-                error_message=error_message,
-                stack_trace="".join(
+            # Build a structured incident dict — Incident is a thymos-internal
+            # model with repair-lifecycle fields; sentinel emits the primitives
+            # only (Spec 09 §AV9: no cross-system type import from Thymos).
+            incident_data: dict[str, Any] = {
+                "incident_class": resolved_class.value,
+                "severity": resolved_severity.value,
+                "fingerprint": fingerprint,
+                "source_system": self._system_id,
+                "error_type": error_type,
+                "error_message": error_message,
+                "stack_trace": "".join(
                     traceback.format_exception(
                         type(error), error, error.__traceback__
                     )
                 )[-5000:],
-                context=full_context,
-                affected_systems=affected_systems or [self._system_id],
-                blast_radius=blast_radius,
-                user_visible=user_visible,
-            )
+                "context": full_context,
+                "affected_systems": affected_systems or [self._system_id],
+                "blast_radius": blast_radius,
+                "user_visible": user_visible,
+            }
 
             await self._event_bus.emit(
                 SynapseEvent(
                     event_type=SynapseEventType.SYSTEM_FAILED,
-                    source=self._system_id,
-                    timestamp=time.time(),
-                    data={"incident": incident.model_dump()},
+                    source_system=self._system_id,
+                    data={"incident": incident_data},
                 )
             )
 

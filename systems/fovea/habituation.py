@@ -15,9 +15,10 @@ is immediate and amplified.
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -84,7 +85,13 @@ class HabituationEngine:
     is amplified. This is a prediction error about a prediction error.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        instance_id: str = "",
+        neo4j_driver: Any = None,
+        persist_batch_size: int = 10,
+    ) -> None:
         # error_signature -> list of recent magnitudes
         self._error_history: dict[str, deque[float]] = {}
         # error_signature -> habituation level [0.0, _MAX_HABITUATION]
@@ -95,6 +102,13 @@ class HabituationEngine:
         self._habituated_count: int = 0
         self._dishabituated_count: int = 0
         self._habituation_complete_count: int = 0
+
+        # Neo4j persistence (batched writes)
+        self._instance_id = instance_id
+        self._neo4j_driver = neo4j_driver
+        self._persist_batch_size = persist_batch_size
+        self._changes_since_persist: int = 0
+
         self._logger = logger.bind(component="habituation")
 
     @property
@@ -259,6 +273,66 @@ class HabituationEngine:
     @property
     def habituation_complete_count(self) -> int:
         return self._habituation_complete_count
+
+    # ------------------------------------------------------------------
+    # Neo4j persistence (batched)
+    # ------------------------------------------------------------------
+
+    def set_neo4j_driver(self, driver: Any, instance_id: str = "") -> None:
+        """Wire Neo4j driver post-construction."""
+        self._neo4j_driver = driver
+        if instance_id:
+            self._instance_id = instance_id
+
+    async def restore_state(self) -> bool:
+        """Restore habituation levels from Neo4j on startup. Returns True if restored."""
+        if self._neo4j_driver is None:
+            return False
+        try:
+            async with self._neo4j_driver.session() as session:
+                result = await session.run(
+                    "MATCH (fh:FoveaHabituation {instance_id: $id}) RETURN fh.levels AS l",
+                    id=self._instance_id,
+                )
+                record = await result.single()
+                if record and record["l"]:
+                    restored = json.loads(record["l"])
+                    if isinstance(restored, dict) and restored:
+                        self._habituation_levels = restored
+                        self._logger.info(
+                            "habituation_restored_from_neo4j",
+                            instance_id=self._instance_id,
+                            entry_count=len(restored),
+                        )
+                        return True
+        except Exception:
+            self._logger.warning("habituation_restore_failed", exc_info=True)
+        return False
+
+    async def persist_state(self, force: bool = False) -> None:
+        """Persist habituation levels to Neo4j. Batched: only writes every N changes."""
+        self._changes_since_persist += 1
+        if not force and self._changes_since_persist < self._persist_batch_size:
+            return
+        if self._neo4j_driver is None:
+            return
+        self._changes_since_persist = 0
+        try:
+            async with self._neo4j_driver.session() as session:
+                await session.run(
+                    "MERGE (fh:FoveaHabituation {instance_id: $id}) "
+                    "SET fh.levels = $levels_json, fh.updated_at = datetime()",
+                    id=self._instance_id,
+                    levels_json=json.dumps(self._habituation_levels),
+                )
+                self._logger.debug("habituation_persisted", instance_id=self._instance_id)
+        except Exception:
+            self._logger.warning("habituation_persist_failed", exc_info=True)
+
+    async def snapshot_for_sleep(self) -> dict[str, float]:
+        """Force-persist and return habituation state for Oneiros consolidation."""
+        await self.persist_state(force=True)
+        return dict(self._habituation_levels)
 
     def prune_stale(self, max_entries: int = 1000) -> int:
         """Remove oldest entries if the tracker exceeds *max_entries*."""

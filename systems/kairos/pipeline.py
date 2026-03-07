@@ -33,6 +33,7 @@ Integrations: Logos (world model), Nexus (federation sharing of Tier 3),
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -45,6 +46,7 @@ from systems.kairos.counter_invariant import CounterInvariantDetector
 from systems.kairos.hierarchy import CausalHierarchy
 from systems.kairos.intelligence_ledger import IntelligenceContributionLedger
 from systems.kairos.invariant_distiller import InvariantDistiller
+from systems.kairos.mechanism_extractor import MechanismExtractor
 from systems.kairos.types import (
     CausalCandidatePayload,
     CausalDirection,
@@ -212,6 +214,7 @@ class KairosPipeline:
         self._correlation_miner = CorrelationMiner(self._config)
         self._direction_tester = CausalDirectionTester(self._config)
         self._confounder_analyzer = ConfounderAnalyzer(self._config)
+        self._mechanism_extractor = MechanismExtractor()  # Stage 4
         self._invariance_tester = ContextInvarianceTester(self._config)
         self._hierarchy = CausalHierarchy(self._config)
         self._evo_pipeline = KairosEvoPipeline()
@@ -233,6 +236,9 @@ class KairosPipeline:
         self._oneiros: Any = None  # Loop 5: Oneiros REM seed injection
         self._memory: Any = None  # Memory system for observation queries
         self._neo4j: Any = None  # Neo4j client for persistence
+
+        # Background pipeline task
+        self._pipeline_task: asyncio.Task[None] | None = None
 
         # Health monitoring
         self._health_status = KairosHealthStatus()
@@ -281,6 +287,7 @@ class KairosPipeline:
     def set_memory(self, memory: Any) -> None:
         """Wire the Memory system for observation queries."""
         self._memory = memory
+        self._mechanism_extractor.set_memory(memory)
         logger.info("kairos_memory_wired")
 
     def set_neo4j(self, neo4j: Any) -> None:
@@ -706,8 +713,16 @@ class KairosPipeline:
             else:
                 clean_directions.append(direction_result)
 
+        # ── Stage 4: Mechanism Extraction ────────────────────────
+        # Populate CausalRule.mechanism for each clean direction before
+        # context-invariance testing so Stage 5 can record mechanism scope.
+        mechanisms: dict[str, str] = {}
+        for direction_result in clean_directions:
+            mechanisms[direction_result.id] = (
+                await self._mechanism_extractor.extract(direction_result)
+            )
+
         # ── Stage 5: Context Invariance Testing ──────────────────
-        # (Stage 4 — Mechanism Extraction — deferred to future phase)
         invariants_created = 0
         new_invariants: list[CausalInvariant] = []
         for direction_result in clean_directions:
@@ -716,6 +731,7 @@ class KairosPipeline:
                 effect_variable=direction_result.effect,
                 direction_confidence=direction_result.confidence,
                 domain="",
+                mechanism=mechanisms.get(direction_result.id, ""),
                 observation_count=direction_result.candidate.context_count,
                 source_candidate_id=direction_result.candidate.id,
             )
@@ -1959,6 +1975,65 @@ class KairosPipeline:
             return result
 
         return {}
+
+    # --- Background Pipeline Loop ---
+
+    def start_pipeline_loop(self) -> None:
+        """
+        Start the periodic pipeline execution loop.
+
+        Called from the core registry after Kairos is fully wired.
+        Runs `run_pipeline()` every `mining_interval_s` seconds (default 300s),
+        feeding it whatever observations have been buffered since the last run.
+        Also runs an immediate short-delay cycle on startup so that the first
+        pipeline events are visible within seconds, not minutes.
+        """
+        if self._pipeline_task is not None and not self._pipeline_task.done():
+            return
+        self._pipeline_task = asyncio.create_task(
+            self._pipeline_loop(), name="kairos_pipeline_loop"
+        )
+        logger.info("kairos_pipeline_loop_started", interval_s=self._config.mining_interval_s)
+
+    async def _pipeline_loop(self) -> None:
+        """
+        Periodic pipeline execution: run every mining_interval_s.
+
+        On first run (after a 15s warm-up), immediately executes the pipeline
+        so that KAIROS_HEALTH_DEGRADED and evolutionary observables are visible
+        at startup. Subsequent runs follow the configured interval.
+
+        Observations are fetched from Memory if available; the pipeline also
+        processes any candidates pre-seeded by Fovea/Evo event handlers.
+        """
+        # Short warm-up so all systems are wired before first pipeline run
+        await asyncio.sleep(15.0)
+
+        while True:
+            try:
+                # Fetch recent observations from Memory if wired
+                observations: dict[str, list[dict[str, Any]]] = {}
+                if self._memory is not None and hasattr(self._memory, "get_all_observations_with_context"):
+                    try:
+                        raw = await self._memory.get_all_observations_with_context(limit=500)
+                        for ep, _, _ in (raw or []):
+                            ctx = getattr(ep, "context_id", "default") or "default"
+                            obs = getattr(ep, "observations", []) or []
+                            if obs:
+                                observations.setdefault(ctx, []).extend(obs)
+                    except Exception:
+                        logger.debug("kairos_loop_memory_fetch_failed", exc_info=True)
+
+                await self.run_pipeline(observations_by_context=observations)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("kairos_pipeline_loop_error")
+
+            try:
+                await asyncio.sleep(self._config.mining_interval_s)
+            except asyncio.CancelledError:
+                break
 
     # --- Health (ManagedSystemProtocol) ---
 

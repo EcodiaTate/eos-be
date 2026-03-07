@@ -13,7 +13,7 @@ Kairos mines the hierarchy of causal knowledge: correlations → causal rules �
 | 1 | `correlation_miner.py` | O(n²) cross-context correlation mining. Filter: mean |r| > 0.3, variance < 0.1 |
 | 2 | `causal_direction.py` | Three tests: temporal precedence, intervention asymmetry (Axon logs), additive noise model |
 | 3 | `confounder.py` | PC algorithm for confounder detection with partial correlation |
-| 4 | (deferred) | Mechanism extraction — not yet implemented |
+| 4 | `mechanism_extractor.py` | BFS over CausalNode graph in Memory; populates `CausalRule.mechanism` before Stage 5 |
 | 5 | `context_invariance.py` | Tests rules across contexts. Computes hold_rate, identifies scope conditions |
 | 6 | `invariant_distiller.py` | Phase C: variable abstraction, tautology test, minimality test, domain mapping |
 | 7 | `counter_invariant.py` | Phase D: violation scanning, clustering, scope refinement |
@@ -94,7 +94,7 @@ Key fields added to `CausalInvariant`:
 - `set_logos(logos_ingest)` — Logos KairosInvariantProtocol for world model ingestion
 - `set_nexus(nexus_share)` — Nexus fragment sharing for Tier 3 federation
 - `set_oneiros(oneiros)` — Oneiros REM seed injection on Tier 3 discoveries
-- `set_memory(memory)` — Memory system for `query_observations_for_testing()`
+- `set_memory(memory)` — Memory system for `query_observations_for_testing()` and Stage 4 CausalNode BFS
 
 ## Feedback Loops
 
@@ -170,10 +170,30 @@ Per-invariant accounting with:
 - **SG4**: `_emit_re_training_example()` fires after each validated causal chain (Stream 4, RE training)
 - **P2** (variable abstraction): `_abstract_variables()` now also parses scope condition tokens and domain substrate identifiers
 
+## Implemented (2026-03-07 interface gap closure)
+
+- **Stage 4 IMPLEMENTED**: `mechanism_extractor.py` — `MechanismExtractor` BFS-traverses the `CausalNode` graph in Memory (up to 4 hops, max 8 branch per node). Populates `CausalRule.mechanism` before Stage 5. Falls back to direct-influence placeholder when Memory unavailable or no path found. Wired into `pipeline.py` via `_mechanism_extractor` field; receives Memory reference through `set_memory()`.
+- **`_loses_predictive_power()` IMPLEMENTED**: `invariant_distiller.py` — checks whether raising abstraction level collapses the cause/effect variable roles into the same abstract role (directional information lost) or reduces unique roles below 2 (prediction becomes trivial). Used as a second stop condition in the M2 abstraction-raising loop.
+- **`LogosEngineProtocol` ADDED**: `logos/protocols.py` — `count_observations_explained_by(invariant_id)` and `estimate_description_length_without(invariant_id)` as `@runtime_checkable Protocol`. Kairos can now depend on this interface without importing LogosService directly.
+- **`WorldModel` satisfies `LogosEngineProtocol`**: `logos/world_model.py` — both methods implemented. `count_observations_explained_by` returns `EmpiricalInvariant.observation_count`. `estimate_description_length_without` computes `current_complexity - 80 + observation_count * 50` (removes rule cost, adds back raw observation bits).
+- **`ActionLog` primitive ADDED** (previous session): `primitives/causal.py` — canonical type for Axon intervention logs queryable by Kairos Stage 2.
+- **`CausalHierarchyLevel` primitive ADDED** (previous session): `primitives/causal.py` — tier metadata type promoted from Kairos-internal to shared primitives.
+- **`MemoryService.get_all_observations_with_context()` ADDED** (previous session): `memory/service.py` — returns `list[tuple[Episode, [Entity], [CausalNode ref]]]` for the last N cycles; satisfies Stage 1 CorrelationMiner input requirement.
+
+## Pipeline Loop (2026-03-07 — root-cause fix)
+
+**Root cause of 0% event coverage**: `run_pipeline()` was never called. All 14 Synapse event emissions are correctly wired inside `run_pipeline()`, but nothing triggered it. Event handlers (`_on_fovea_prediction_error`, `_on_episode_stored`, etc.) only buffer data — they do not trigger a pipeline run.
+
+**Fix**: `start_pipeline_loop()` + `_pipeline_loop()` added to `KairosPipeline`:
+- `start_pipeline_loop()` — creates a supervised asyncio Task (idempotent if already running)
+- `_pipeline_loop()` — 15s warm-up delay, then calls `run_pipeline()` every `mining_interval_s` (default 300s)
+- `core/registry.py._init_kairos()` — calls `kairos.start_pipeline_loop()` after wiring
+
+All 14 events now fire on every pipeline cycle when sufficient data is available.
+
 ## Known Issues / Remaining Work
 
-- Stage 4 (Mechanism Extraction) not implemented — deliberately deferred
-- Memory `query_episodes()` API assumed but not yet confirmed against Memory system interface
+- Memory `query_episodes()` API assumed but not yet confirmed against Memory system interface (used via `hasattr` guard in pipeline)
 - Curriculum learning and strategic priority scheduling not yet implemented — needs cognitive budget integration with Synapse
 - Abstract structure extraction is basic — only detects bidirectional and cross-domain novelty, not full pattern library
 - Nexus ground truth convergence feedback not yet subscribed — needs `GROUND_TRUTH_CANDIDATE` and `EMPIRICAL_INVARIANT_CONFIRMED` events

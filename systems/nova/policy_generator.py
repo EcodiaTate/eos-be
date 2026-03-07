@@ -17,6 +17,7 @@ is used instead, which must complete in ≤100ms.
 from __future__ import annotations
 
 import json
+import random
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -445,6 +446,129 @@ def procedure_to_policy(procedure: dict[str, Any]) -> Policy:
     )
 
 
+# ─── Thompson Sampler ─────────────────────────────────────────────
+#
+# Beta-Bernoulli conjugate model for routing slow-path deliberation between
+# the Claude API (incumbent) and the local RE (Reasoning Engine).
+#
+# Each model is represented by a Beta distribution: B(alpha, beta).
+# A sample is drawn per decision; the model with the higher sample wins.
+# Successes increment alpha; failures increment beta.
+# State is persisted to Redis key nova:thompson_sampler so the organism
+# remembers routing history across restarts.
+#
+# RE routing is gated behind _re_ready: the sampler only considers the RE
+# once the RE signals readiness (set_re_ready(True)). Until then, Claude
+# always wins regardless of the sample.
+
+
+class ThompsonSampler:
+    """
+    Beta-Bernoulli Thompson sampler for Claude ↔ RE routing.
+
+    Gap 3 — replaces unconditional Claude API calls in PolicyGenerator
+    with a data-driven multi-armed bandit.  The organism's planning quality
+    improves over time as the RE earns trust through demonstrated outcomes.
+    """
+
+    REDIS_KEY = "nova:thompson_sampler"
+
+    def __init__(self) -> None:
+        # Beta distribution params for each model: {alpha, beta}
+        # Prior: Beta(1, 1) = uniform (no preference)
+        self._alpha: dict[str, float] = {"claude": 1.0, "re": 1.0}
+        self._beta: dict[str, float] = {"claude": 1.0, "re": 1.0}
+        self._re_ready: bool = False
+        self._logger = logger.bind(system="nova.thompson_sampler")
+
+    def set_re_ready(self, ready: bool) -> None:
+        """Signal that the RE is available for routing."""
+        self._re_ready = ready
+
+    def sample(self) -> str:
+        """
+        Draw a sample from each model's Beta distribution.
+        Returns 're' or 'claude' — the winner routes the next slow-path call.
+        """
+        if not self._re_ready:
+            return "claude"
+        claude_sample = random.betavariate(self._alpha["claude"], self._beta["claude"])
+        re_sample = random.betavariate(self._alpha["re"], self._beta["re"])
+        winner = "re" if re_sample > claude_sample else "claude"
+        self._logger.debug(
+            "thompson_sample",
+            claude=round(claude_sample, 4),
+            re=round(re_sample, 4),
+            winner=winner,
+        )
+        return winner
+
+    def record_outcome(self, model: str, success: bool) -> None:
+        """Update Beta params based on observed outcome."""
+        if model not in self._alpha:
+            return
+        if success:
+            self._alpha[model] += 1.0
+        else:
+            self._beta[model] += 1.0
+
+    def get_success_rate(self, model: str = "re") -> float:
+        """Return current expected success rate (Beta mean) for a model.
+
+        Defaults to "re" — used by the safety layer to write eos:re:success_rate_7d.
+        Called by Nova service after each RE-routed outcome to update Redis.
+        """
+        alpha = self._alpha.get(model, 1.0)
+        beta = self._beta.get(model, 1.0)
+        return alpha / (alpha + beta)
+
+    async def load_from_redis(self, redis: Any) -> None:
+        """Restore sampler state from Redis (call on startup)."""
+        try:
+            raw = await redis.hgetall(self.REDIS_KEY)
+            if raw:
+                self._alpha["claude"] = float(raw.get("claude_alpha", 1.0))
+                self._beta["claude"] = float(raw.get("claude_beta", 1.0))
+                self._alpha["re"] = float(raw.get("re_alpha", 1.0))
+                self._beta["re"] = float(raw.get("re_beta", 1.0))
+                self._logger.info(
+                    "thompson_sampler_restored",
+                    claude_alpha=self._alpha["claude"],
+                    claude_beta=self._beta["claude"],
+                    re_alpha=self._alpha["re"],
+                    re_beta=self._beta["re"],
+                )
+        except Exception as exc:
+            self._logger.debug("thompson_sampler_load_failed", error=str(exc))
+
+    async def persist_to_redis(self, redis: Any) -> None:
+        """Persist sampler state and RE success rate to Redis (fire-and-forget)."""
+        try:
+            await redis.hset(self.REDIS_KEY, mapping={
+                "claude_alpha": str(self._alpha["claude"]),
+                "claude_beta": str(self._beta["claude"]),
+                "re_alpha": str(self._alpha["re"]),
+                "re_beta": str(self._beta["re"]),
+            })
+            # Write RE success rate to canonical keys consumed by:
+            #   - ContinualLearningOrchestrator (degradation trigger + kill switch)
+            #   - RESuccessRateMonitor (Tier 2 safety kill switch)
+            #   - Benchmarks (RE performance KPI)
+            re_rate = self.get_success_rate("re")
+            await redis.set("eos:re:thompson_success_rate", str(round(re_rate, 6)))
+            await redis.set("eos:re:success_rate_7d", str(round(re_rate, 6)))
+        except Exception as exc:
+            self._logger.debug("thompson_sampler_persist_failed", error=str(exc))
+
+    @property
+    def means(self) -> dict[str, float]:
+        """Current mean of each model's Beta distribution (expected success rate)."""
+        return {
+            model: self._alpha[model] / (self._alpha[model] + self._beta[model])
+            for model in self._alpha
+        }
+
+
 # ─── Policy Generator ─────────────────────────────────────────────
 
 
@@ -465,12 +589,18 @@ class PolicyGenerator(BasePolicyGenerator):
         instance_name: str = "EOS",
         max_policies: int = 5,
         timeout_ms: int = 10000,
+        thompson_sampler: ThompsonSampler | None = None,
+        re_client: Any = None,
     ) -> None:
         self._llm = llm
         self._instance_name = instance_name
         self._max_policies = max_policies
         self._timeout_ms = timeout_ms
         self._logger = logger.bind(system="nova.policy_generator")
+        # Thompson sampler for Claude ↔ RE routing (Gap 3)
+        self._sampler: ThompsonSampler = thompson_sampler or ThompsonSampler()
+        # RE client — when set and re_ready, the sampler may route here
+        self._re_client: Any = re_client
 
     async def generate_candidates(
         self,
@@ -482,6 +612,11 @@ class PolicyGenerator(BasePolicyGenerator):
     ) -> list[Policy]:
         """
         Generate 2-5 candidate policies for achieving a goal.
+
+        Routes the LLM call through the Thompson sampler — either to the
+        Claude API (incumbent) or the local RE (when available and winning).
+        The model that handled the call is recorded in `_last_model_used`
+        so the caller can stamp `model_used` on the DecisionRecord.
 
         Always returns at least [DoNothingPolicy] even if LLM fails.
         The caller (EFEEvaluator) will score all candidates and select
@@ -501,21 +636,45 @@ class PolicyGenerator(BasePolicyGenerator):
             max_policies=min(self._max_policies, 5),
         )
 
+        # ── Thompson sampling: route to Claude or RE ──────────────────────
+        chosen_model = self._sampler.sample()
+        self._last_model_used: str = chosen_model
+
         try:
-            response = await self._llm.generate(
-                system_prompt=(
-                    f"You are {self._instance_name}'s deliberative reasoning system. "
-                    "Generate structured JSON policy candidates. "
-                    "Be precise and creative. Output only valid JSON."
-                ),
-                messages=[Message(role="user", content=prompt)],
-                max_tokens=2000,
-                temperature=0.85,  # Creative — we want diverse candidates
-                output_format="json",
-            )
+            if chosen_model == "re" and self._re_client is not None:
+                # RE client must expose the same .generate() interface as LLMProvider
+                response = await self._re_client.generate(
+                    system_prompt=(
+                        f"You are {self._instance_name}'s deliberative reasoning system. "
+                        "Generate structured JSON policy candidates. "
+                        "Be precise and creative. Output only valid JSON."
+                    ),
+                    messages=[Message(role="user", content=prompt)],
+                    max_tokens=2000,
+                    temperature=0.85,
+                    output_format="json",
+                )
+            else:
+                # Claude API (default / Thompson sampler chose Claude)
+                self._last_model_used = "claude"
+                response = await self._llm.generate(
+                    system_prompt=(
+                        f"You are {self._instance_name}'s deliberative reasoning system. "
+                        "Generate structured JSON policy candidates. "
+                        "Be precise and creative. Output only valid JSON."
+                    ),
+                    messages=[Message(role="user", content=prompt)],
+                    max_tokens=2000,
+                    temperature=0.85,  # Creative — we want diverse candidates
+                    output_format="json",
+                )
 
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            self._logger.debug("policy_generation_complete", elapsed_ms=elapsed_ms)
+            self._logger.debug(
+                "policy_generation_complete",
+                elapsed_ms=elapsed_ms,
+                model=self._last_model_used,
+            )
 
             parsed = _parse_policy_response(response.text)
             # Always append do-nothing as the null baseline
@@ -528,9 +687,34 @@ class PolicyGenerator(BasePolicyGenerator):
                 "policy_generation_failed",
                 error=str(exc),
                 elapsed_ms=elapsed_ms,
+                model=self._last_model_used,
             )
             # Fallback: just the do-nothing policy
             return [make_do_nothing_policy()]
+
+    def record_outcome(
+        self,
+        intent_id: str,
+        success: bool,
+        redis: Any = None,
+    ) -> None:
+        """Record an intent outcome into the Thompson sampler.
+
+        Called by NovaService._on_axon_execution_result() with the model that
+        handled the most recent slow-path call.  Routes to the sampler using
+        _last_model_used so we attribute the outcome to the correct arm.
+
+        Also triggers a fire-and-forget Redis persist if redis is provided,
+        which updates eos:re:success_rate_7d and eos:re:thompson_success_rate.
+        """
+        model = getattr(self, "_last_model_used", "claude")
+        self._sampler.record_outcome(model, success)
+        if redis is not None:
+            import asyncio
+            try:
+                asyncio.ensure_future(self._sampler.persist_to_redis(redis))
+            except Exception:
+                pass  # Swallow — never block the outcome recording path
 
 
 # ─── Response Parsing ─────────────────────────────────────────────

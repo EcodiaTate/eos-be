@@ -415,6 +415,33 @@ class HealthMonitor:
         # Wait for all to complete (each has its own timeout)
         await asyncio.gather(*tasks.values(), return_exceptions=True)
 
+    async def _emit_health_changed(
+        self,
+        system_id: str,
+        old_status: SystemStatus,
+        new_status: SystemStatus,
+    ) -> None:
+        """
+        Emit SYSTEM_HEALTH_CHANGED for any status transition (Spec 09 §18 M8).
+
+        Previously only SYSTEM_FAILED and SYSTEM_RECOVERED were emitted, leaving
+        intermediate transitions (STARTING→HEALTHY, HEALTHY→DEGRADED, HEALTHY→OVERLOADED)
+        invisible to the bus.  Every transition is now visible so Thymos, Fovea,
+        and Alive can react proportionally without polling.
+        """
+        if old_status == new_status:
+            return
+        with contextlib.suppress(Exception):
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.SYSTEM_HEALTH_CHANGED,
+                data={
+                    "system_id": system_id,
+                    "old_status": old_status.value,
+                    "new_status": new_status.value,
+                },
+                source_system="synapse:health",
+            ))
+
     async def _check_system(self, system_id: str, system: Any) -> None:
         """Check a single system's health."""
         record = self._records[system_id]
@@ -434,29 +461,49 @@ class HealthMonitor:
             )
 
             if status == "healthy":
-                was_failed = record.status == SystemStatus.FAILED
+                old_status = record.status
+                was_failed = old_status == SystemStatus.FAILED
                 # Detect overloaded: latency > 2x the EMA (if we have history)
                 if record.latency_ema_ms > 0 and latency_ms > record.latency_ema_ms * 2:
                     record.record_overloaded(latency_ms)
                 else:
                     record.record_success(latency_ms)
 
-                # Recovery detection
+                # Emit transition event for any status change
+                await self._emit_health_changed(system_id, old_status, record.status)
+
+                # Recovery detection (FAILED → HEALTHY requires 3 successes)
                 if was_failed and record.status == SystemStatus.HEALTHY:
                     await self._handle_recovery(system_id)
             else:
                 # System reported non-healthy status
+                old_status = record.status
                 record.record_failure()
+                # Transition to DEGRADED on first miss (not yet FAILED)
+                if (
+                    old_status == SystemStatus.HEALTHY
+                    and record.consecutive_misses < self._config.health_failure_threshold
+                ):
+                    record.status = SystemStatus.DEGRADED
+                    await self._emit_health_changed(system_id, old_status, record.status)
                 if record.consecutive_misses >= self._config.health_failure_threshold:
                     await self._handle_failure(system_id)
 
         except TimeoutError as exc:
+            old_status = record.status
             record.record_failure()
             self._logger.warning(
                 "health_check_timeout",
                 system_id=system_id,
                 consecutive_misses=record.consecutive_misses,
             )
+            # Transition to DEGRADED on first miss (not yet FAILED)
+            if (
+                old_status == SystemStatus.HEALTHY
+                and record.consecutive_misses < self._config.health_failure_threshold
+            ):
+                record.status = SystemStatus.DEGRADED
+                await self._emit_health_changed(system_id, old_status, record.status)
             # Report degradation on first timeout (before threshold)
             sentinel = self._system_sentinels.get(system_id)
             if sentinel is not None:
@@ -471,6 +518,7 @@ class HealthMonitor:
                 await self._handle_failure(system_id)
 
         except Exception as exc:
+            old_status = record.status
             record.record_failure()
             self._logger.warning(
                 "health_check_error",
@@ -478,6 +526,13 @@ class HealthMonitor:
                 error=str(exc),
                 consecutive_misses=record.consecutive_misses,
             )
+            # Transition to DEGRADED on first miss (not yet FAILED)
+            if (
+                old_status == SystemStatus.HEALTHY
+                and record.consecutive_misses < self._config.health_failure_threshold
+            ):
+                record.status = SystemStatus.DEGRADED
+                await self._emit_health_changed(system_id, old_status, record.status)
             # Report the exception via sentinel
             sentinel = self._system_sentinels.get(system_id)
             if sentinel is not None:
@@ -493,6 +548,7 @@ class HealthMonitor:
         if record.status == SystemStatus.FAILED:
             return  # Already handling this failure
 
+        old_status = record.status
         record.status = SystemStatus.FAILED
         self._total_failures_detected += 1
 
@@ -502,6 +558,8 @@ class HealthMonitor:
             consecutive_misses=record.consecutive_misses,
             is_critical=record.is_critical,
         )
+
+        await self._emit_health_changed(system_id, old_status, SystemStatus.FAILED)
 
         await self._event_bus.emit(SynapseEvent(
             event_type=SynapseEventType.SYSTEM_FAILED,
@@ -544,6 +602,8 @@ class HealthMonitor:
             system_id=system_id,
         )
 
+        # SYSTEM_HEALTH_CHANGED for FAILED → HEALTHY already emitted by _check_system;
+        # _handle_recovery is called after record.status == HEALTHY is confirmed.
         await self._event_bus.emit(SynapseEvent(
             event_type=SynapseEventType.SYSTEM_RECOVERED,
             data={"system_id": system_id},

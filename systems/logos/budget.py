@@ -94,6 +94,49 @@ class CognitiveBudgetManager:
             "urgency": self._state.compression_urgency,
         }
 
+    def record_compression_operation(
+        self,
+        *,
+        cost_ku: float,
+        gain_ku: float,
+        tier: MemoryTier = MemoryTier.WORLD_MODEL,
+    ) -> None:
+        """HIGH-3: Update utilization after one compression operation.
+
+        After each compression:
+          - increment current_utilization by compression_cost_ku
+            (the work of computing and storing the new compressed form)
+          - decrement current_utilization by compression_gain_ku
+            (the budget freed by evicting/replacing the source material)
+
+        Net effect is (cost - gain): positive when compression is costly,
+        negative when a highly compressive cycle frees more than it costs.
+        """
+        current = self._state.current_utilization.get(tier.value, 0.0)
+        updated = max(0.0, current + cost_ku - gain_ku)
+        self._state.current_utilization[tier.value] = updated
+        logger.debug(
+            "compression_operation_recorded",
+            tier=tier.value,
+            cost_ku=cost_ku,
+            gain_ku=gain_ku,
+            utilization_before=current,
+            utilization_after=updated,
+            total_pressure=self._state.total_pressure,
+        )
+
+    @property
+    def current_utilization_state(self) -> dict[str, float]:
+        """Synapse-readable snapshot of per-tier utilization (HIGH-3).
+
+        Returned by the COGNITIVE_PRESSURE payload so every subscriber has
+        live utilization data without a direct reference to the budget manager.
+        """
+        return {
+            tier.value: self._state.current_utilization.get(tier.value, 0.0)
+            for tier in MemoryTier
+        }
+
     def snapshot(self) -> dict[str, float]:
         """Full budget snapshot for telemetry."""
         return {

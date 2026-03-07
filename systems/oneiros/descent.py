@@ -13,7 +13,7 @@ Steps:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -38,8 +38,10 @@ class DescentStage:
     def __init__(
         self,
         event_bus: EventBus | None = None,
+        neo4j: Any | None = None,
     ) -> None:
         self._event_bus = event_bus
+        self._neo4j = neo4j
         self._input_suspended = False
         self._logger = logger.bind(stage="descent")
 
@@ -71,8 +73,8 @@ class DescentStage:
         cognitive_pressure = 0.0
 
         if logos is not None:
-            intelligence_ratio = logos.world_model.measure_intelligence_ratio()
-            world_model_complexity = logos.world_model.current_complexity
+            intelligence_ratio = logos.get_intelligence_ratio()
+            world_model_complexity = logos.get_current_complexity()
             cognitive_pressure = logos.budget.state.total_pressure
 
         checkpoint = SleepCheckpoint(
@@ -84,10 +86,13 @@ class DescentStage:
             cognitive_pressure_at_sleep=cognitive_pressure,
         )
 
-        # 2. Suspend input channels
+        # 2. Tag recent episodes as uncompressed for the Memory Ladder
+        tagged = await self._tag_uncompressed_episodes()
+
+        # 3. Suspend input channels
         await self._suspend_input_channels()
 
-        # 3. Broadcast SLEEP_INITIATED
+        # 4. Broadcast SLEEP_INITIATED
         await self._broadcast_sleep_initiated(checkpoint, target_duration_s)
 
         self._logger.info(
@@ -99,16 +104,53 @@ class DescentStage:
 
         return checkpoint
 
+    async def _tag_uncompressed_episodes(self) -> int:
+        """Tag recent Neo4j episodes with `uncompressed: true` label.
+
+        The Memory Ladder uses this label to select episodes for processing
+        during Slow Wave. After consolidation, episodes are re-labelled.
+        """
+        if self._neo4j is None:
+            return 0
+
+        try:
+            query = """
+                MATCH (e:Episode)
+                WHERE NOT e:Compressed
+                  AND e.event_time > datetime() - duration({hours: 24})
+                SET e.uncompressed = true
+                RETURN count(e) AS tagged
+            """
+            result = await self._neo4j.execute_write(query)
+            tagged = result[0]["tagged"] if result else 0
+            self._logger.debug("episodes_tagged_uncompressed", count=tagged)
+            return tagged
+        except Exception as exc:
+            self._logger.debug("episode_tagging_failed", error=str(exc))
+            return 0
+
     async def _suspend_input_channels(self) -> None:
         """
         Suspend real-time input processing.
 
-        In the current architecture this is a logical flag — the cognitive
-        clock and Atune check this flag to skip perception cycles.
-        Full channel suspension is handled by the SleepCycleEngine at a higher level.
+        Broadcasts `SLEEP_INITIATED` (already done in execute()) which all
+        subscribing systems interpret as a directive to pause new-input
+        processing.  The flag `input_suspended` is also exposed so that the
+        cognitive loop's `on_cycle()` can short-circuit perception while the
+        engine runs the sleep pipeline.
         """
         self._input_suspended = True
         self._logger.debug("input_channels_suspended")
+
+    def resume_input_channels(self) -> None:
+        """
+        Re-enable real-time input processing after wake.
+
+        Called by SleepCycleEngine during EMERGENCE so that on_cycle() stops
+        short-circuiting and normal perception resumes.
+        """
+        self._input_suspended = False
+        self._logger.debug("input_channels_resumed")
 
     @property
     def input_suspended(self) -> bool:

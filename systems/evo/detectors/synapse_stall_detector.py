@@ -5,7 +5,15 @@ from typing import Any, Dict, Optional
 
 from primitives.common import EOSBaseModel
 from systems.evo.detectors import PatternDetector
-from systems.axon.types import DetectionResult
+
+
+class DetectionResult(EOSBaseModel):
+    """Local detection result type — avoids importing from systems.axon."""
+
+    detected: bool
+    severity: float
+    pattern_type: str
+    details: dict
 
 logger = structlog.get_logger("synapse_stall_detector")
 

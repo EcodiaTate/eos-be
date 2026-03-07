@@ -112,10 +112,16 @@ class DafnyBridge:
         verify_timeout_s: float = 30.0,
         max_rounds: int = 8,
         temp_dir: Path | None = None,
+        total_timeout_s: float | None = None,
     ) -> None:
         self._dafny_path = dafny_path
         self._verify_timeout_s = verify_timeout_s
         self._max_rounds = max_rounds
+        # Wall-clock budget for the entire Clover loop (all rounds combined).
+        # Default: max_rounds × (verify_timeout_s + 15s LLM headroom), capped at 600s.
+        self._total_timeout_s = total_timeout_s or min(
+            max_rounds * (verify_timeout_s + 15.0), 600.0
+        )
         self._temp_dir = temp_dir
         self._log = logger
 
@@ -230,6 +236,25 @@ class DafnyBridge:
         messages: list[Message] = [Message(role="user", content=prompt)]
 
         for round_num in range(1, self._max_rounds + 1):
+            # Wall-clock budget check: abort before starting a round that can't fit.
+            elapsed = time.monotonic() - start
+            if elapsed >= self._total_timeout_s:
+                self._log.warning(
+                    "clover_loop_wall_clock_exceeded",
+                    elapsed_s=round(elapsed, 1),
+                    budget_s=self._total_timeout_s,
+                    round=round_num,
+                    function=function_name,
+                )
+                result.status = DafnyVerificationStatus.FAILED
+                result.rounds_attempted = round_num - 1
+                result.error_summary = (
+                    f"Clover loop exceeded wall-clock budget "
+                    f"{self._total_timeout_s}s after {round_num - 1} rounds."
+                )
+                result.verification_time_ms = int(elapsed * 1000)
+                return result
+
             self._log.info(
                 "clover_round_start",
                 round=round_num,

@@ -13,16 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 if TYPE_CHECKING:
-    from systems.atune.service import AtuneService
     from systems.axon.service import AxonService
     from systems.equor.service import EquorService
     from systems.evo.service import EvoService
     from systems.federation.service import FederationService
+    from systems.fovea.gateway import AtuneService
     from systems.nova.service import NovaService
     from systems.oneiros.service import OneirosService
     from systems.synapse.service import SynapseService
@@ -42,6 +42,9 @@ async def inner_life_loop(
     evo: EvoService,
     oneiros: OneirosService,
     axon: AxonService,
+    soma: Any | None = None,
+    fovea: Any | None = None,
+    log_analyzer: Any | None = None,
     voxis: VoxisService,
     federation: FederationService,
     equor: EquorService,
@@ -56,7 +59,7 @@ async def inner_life_loop(
     like any other percept — competing for broadcast and driving
     the cognitive cycle even when no external input arrives.
     """
-    from systems.atune.types import WorkspaceContribution
+    from systems.fovea.types import WorkspaceContribution
 
     cycle = 0
     while True:
@@ -369,6 +372,78 @@ async def inner_life_loop(
                         phase="thread_identity",
                         error=str(exc),
                         cycle=cycle,
+                    )
+
+            # ── Soma allostatic state reflection (every 6th cycle = ~30s, offset 3) ──
+            if cycle % 6 == 3 and soma is not None:
+                try:
+                    soma_state = soma.get_current_state()
+                    if soma_state is not None:
+                        urgency = getattr(soma_state, "allostatic_load", 0.0)
+                        arousal = getattr(soma_state, "arousal", 0.0)
+                        valence = getattr(soma_state, "valence", 0.0)
+                        priority = 0.3 + urgency * 0.25
+                        content = (
+                            f"My body signals: arousal={arousal:.2f}, valence={valence:.2f}, "
+                            f"allostatic_load={urgency:.2f}"
+                        )
+                        if urgency > 0.7:
+                            content += " — I am under significant internal pressure."
+                        atune.contribute(
+                            WorkspaceContribution(
+                                system="soma",
+                                content=content,
+                                priority=priority,
+                                reason="soma_self_observation",
+                            )
+                        )
+                except Exception as exc:
+                    _il_logger.warning(
+                        "inner_life_phase_error", phase="soma_state", error=str(exc), cycle=cycle
+                    )
+
+            # ── Fovea attention profile reflection (every 8th cycle = ~40s, offset 7) ──
+            if cycle % 8 == 7 and fovea is not None:
+                try:
+                    profile = fovea.get_current_attention_profile()
+                    if profile.highest_recent_error_summary:
+                        atune.contribute(
+                            WorkspaceContribution(
+                                system="fovea",
+                                content=(
+                                    "Attending to: "
+                                    f"{profile.highest_recent_error_summary}. "
+                                    f"thr={profile.current_ignition_threshold:.3f}, "
+                                    f"hab={profile.habituated_pattern_count}"
+                                ),
+                                priority=0.35,
+                                reason="fovea_self_observation",
+                            )
+                        )
+                except Exception as exc:
+                    _il_logger.warning(
+                        "inner_life_phase_error",
+                        phase="fovea_attention", error=str(exc), cycle=cycle
+                    )
+
+            # ── Log health reflection (every 12th cycle = ~60s, offset 10) ──
+            if cycle % 12 == 10 and log_analyzer is not None:
+                try:
+                    signals = await log_analyzer.compute_interoceptive_signals(minutes=5)
+                    critical = [s for s in signals if s.get("severity") in ("critical", "high")]
+                    if critical:
+                        signal_summaries = "; ".join(s.get("interpretation", "") for s in critical)
+                        atune.contribute(
+                            WorkspaceContribution(
+                                system="interoception",
+                                content=f"Organism health alert: {signal_summaries}",
+                                priority=0.55,
+                                reason="health_self_observation",
+                            )
+                        )
+                except Exception as exc:
+                    _il_logger.warning(
+                        "inner_life_phase_error", phase="log_health", error=str(exc), cycle=cycle
                     )
 
             _il_logger.debug("inner_life_tick", cycle=cycle)

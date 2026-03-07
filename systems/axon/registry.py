@@ -150,6 +150,8 @@ _ALIAS_MAP: dict[str, str] = {
     "fast_path_arb": "defi_yield",
     "reflex_arc": "defi_yield",
     "executor.reflex_arc": "defi_yield",
+    # PR monitoring — scheduled_tasks.py uses "axon.monitor_prs" prefix
+    "axon.monitor_prs": "monitor_prs",
 }
 
 
@@ -158,9 +160,11 @@ def _normalise(action_type: str) -> str:
     normalised = _ALIAS_MAP.get(action_type)
     if normalised:
         return normalised
-    # Strip "executor." prefix if present
+    # Strip "executor." or "axon." prefix if present
     if action_type.startswith("executor."):
         return action_type[len("executor."):]
+    if action_type.startswith("axon."):
+        return action_type[len("axon."):]
     return action_type
 
 

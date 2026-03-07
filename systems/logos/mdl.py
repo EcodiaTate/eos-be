@@ -8,6 +8,8 @@ Logos uses practical estimators that produce consistent pressure.
 
 from __future__ import annotations
 
+import json
+import math
 from typing import TYPE_CHECKING, Any, Protocol
 from datetime import datetime
 
@@ -102,6 +104,34 @@ class MDLEstimator:
     def set_world_model(self, world_model: WorldModel) -> None:
         self._world_model = world_model
 
+    @staticmethod
+    def compute_raw_complexity(content: dict[str, Any]) -> float:
+        """
+        MDL raw complexity approximation (Spec 21 §HIGH-2).
+
+        formula: byte_length(JSON(content)) × log2(unique_token_count)
+
+        byte_length captures structural size; log2(unique_tokens) captures
+        vocabulary richness — together they approximate Kolmogorov complexity
+        without being uncomputable.  Returns at least 1.0.
+        """
+        try:
+            serialized = json.dumps(content, default=str, separators=(",", ":"))
+        except Exception:
+            serialized = str(content)
+
+        byte_len = len(serialized.encode("utf-8"))
+
+        # Unique tokens: split on common delimiters to approximate vocabulary
+        tokens: set[str] = set()
+        for part in serialized.replace("{", " ").replace("}", " ").replace(
+            "[", " "
+        ).replace("]", " ").replace(",", " ").replace(":", " ").split():
+            tokens.add(part)
+
+        unique_count = max(len(tokens), 1)
+        return max(float(byte_len) * math.log2(unique_count), 1.0)
+
     async def score_episode(self, episode: EpisodeProtocol) -> MDLScore:
         """
         An episode's MDL score is primarily its SURPRISE relative to the world model.
@@ -114,7 +144,15 @@ class MDLEstimator:
         and our model of reality, not the raw experience.
         """
         prediction_error = 1.0  # Default: fully novel if no world model
-        raw_complexity = max(episode.raw_complexity, 1.0)
+
+        # Use the spec-defined formula when the caller hasn't pre-computed it
+        declared = episode.raw_complexity
+        if declared > 0:
+            raw_complexity = max(declared, 1.0)
+        else:
+            raw_complexity = self.compute_raw_complexity(
+                {**episode.context, **episode.content}
+            )
 
         if self._world_model is not None:
             prediction = await self._world_model.predict(episode.context)

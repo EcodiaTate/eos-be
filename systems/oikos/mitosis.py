@@ -199,7 +199,11 @@ class MitosisEngine:
 
     # ─── Reproductive Fitness Check ────────────────────────────
 
-    def evaluate_fitness(self, state: EconomicState) -> ReproductiveFitness:
+    def evaluate_fitness(
+        self,
+        state: EconomicState,
+        max_children_override: int | None = None,
+    ) -> ReproductiveFitness:
         """
         Check all preconditions for reproduction. ALL must pass.
 
@@ -207,8 +211,14 @@ class MitosisEngine:
           1. Parent runway >= min_parent_runway_days (180)
           2. Parent metabolic_efficiency >= min_parent_efficiency (1.5)
           3. Parent is metabolically positive (net_income_7d > 0)
-          4. Active children < max_children
+          4. Active children < max_children (dynamic: max(5, floor(net_worth/1000)))
           5. Net worth > min_seed_capital (can actually afford to seed)
+
+        Parameters
+        ----------
+        max_children_override
+            If provided, overrides the configured max_children with a dynamic
+            cap (e.g. from ``MitosisFleetService.compute_dynamic_max_children``).
         """
         reasons: list[str] = []
         cfg = self._config
@@ -216,7 +226,7 @@ class MitosisEngine:
         min_runway = Decimal(str(cfg.mitosis_min_parent_runway_days))
         min_efficiency = Decimal(str(cfg.mitosis_min_parent_efficiency))
         min_seed = Decimal(str(cfg.mitosis_min_seed_capital))
-        max_children = cfg.mitosis_max_children
+        max_children = max_children_override if max_children_override is not None else cfg.mitosis_max_children
 
         # Count active (non-dead, non-independent) children
         active_children = sum(

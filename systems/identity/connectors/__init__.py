@@ -7,6 +7,7 @@ Instagram (Graph API), and Canva (Connect API).
 
 from systems.identity.connectors.canva import CanvaConnector
 from systems.identity.connectors.github_app import GitHubAppConnector
+from systems.identity.connectors.google import GoogleConnector
 from systems.identity.connectors.instagram_graph import InstagramConnector
 from systems.identity.connectors.linkedin import LinkedInConnector
 from systems.identity.connectors.x import XConnector
@@ -14,6 +15,7 @@ from systems.identity.connectors.x import XConnector
 __all__ = [
     "CanvaConnector",
     "GitHubAppConnector",
+    "GoogleConnector",
     "InstagramConnector",
     "LinkedInConnector",
     "XConnector",

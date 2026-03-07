@@ -31,6 +31,29 @@ from systems.axon.types import AuditRecord, AxonOutcome, ExecutionContext
 if TYPE_CHECKING:
     from systems.memory.service import MemoryService
 
+# RE training stream 1 + 2 require GovernanceRecord nodes to be linked to their
+# originating Intent (and Episode) so Stream 1 Cypher can join the full
+# context → reasoning → action → outcome tuple.
+_GOVERNANCE_LINK_CYPHER = """
+MATCH (g:GovernanceRecord {id: $governance_id})
+OPTIONAL MATCH (i:Intent {id: $intent_id})
+FOREACH (_ IN CASE WHEN i IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (g)-[:REVIEWED]->(i)
+)
+WITH g
+OPTIONAL MATCH (e:Episode)-[:GENERATED]->(:Intent {id: $intent_id})
+FOREACH (_ IN CASE WHEN e IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (g)-[:REVIEWED]->(e)
+)
+"""
+
+# Stream 2: link a rollback record to the success record that recovered it.
+_ROLLBACK_OF_CYPHER = """
+MATCH (rollback:GovernanceRecord {id: $rollback_id})
+MATCH (success:GovernanceRecord {id: $success_id})
+MERGE (rollback)-[:ROLLBACK_OF]->(success)
+"""
+
 logger = structlog.get_logger()
 
 
@@ -47,13 +70,24 @@ class AuditLogger:
     Records are written to Memory as GovernanceRecord nodes. If Memory is
     unavailable, the record is emitted to the structured log (structlog)
     as a fallback — it will not be silently dropped.
+
+    RE Stream 2 — rollback → success pairing:
+    When a rollback record is written, its governance_id is cached keyed by
+    intent_id. If a later success record arrives for the same intent_id, a
+    [:ROLLBACK_OF] relationship is written from the failure record to the
+    success record. The cache is bounded to 64 entries (FIFO eviction) to
+    avoid unbounded growth from intents that are never retried.
     """
+
+    _ROLLBACK_CACHE_MAX = 64
 
     def __init__(self, memory: MemoryService | None = None) -> None:
         self._memory = memory
         self._logger = logger.bind(system="axon.audit")
         self._records_written: int = 0
         self._records_failed: int = 0
+        # intent_id → governance_id of the most recent ROLLED_BACK record
+        self._pending_rollbacks: dict[str, str] = {}
 
     async def log(
         self,
@@ -111,6 +145,8 @@ class AuditLogger:
             try:
                 await self._store_governance_record(record)
                 self._records_written += 1
+                # RE Stream 2: wire rollback → success pairs
+                await self._update_rollback_pairs(record)
             except Exception as exc:
                 self._records_failed += 1
                 self._logger.error(
@@ -123,10 +159,12 @@ class AuditLogger:
 
     async def _store_governance_record(self, record: AuditRecord) -> None:
         """
-        Store the audit record as a GovernanceRecord node in Neo4j.
+        Store the audit record as a GovernanceRecord node in Neo4j and wire
+        [:REVIEWED] relationships to the originating Intent and Episode.
 
         Neo4j schema:
           (:GovernanceRecord {
+            id: str,               ← ULID; used as stable join key
             type: "action_audit",
             execution_id: str,
             intent_id: str,
@@ -139,11 +177,13 @@ class AuditLogger:
             autonomy_level: int,
             timestamp: datetime
           })
+          (g:GovernanceRecord)-[:REVIEWED]->(i:Intent {id: intent_id})
+          (g:GovernanceRecord)-[:REVIEWED]->(e:Episode) WHERE (e)-[:GENERATED]->(i)
 
-        The Memory service exposes store_governance_record() which handles
-        the Cypher write.
+        The [:REVIEWED] relationships are what the RE Stream 1 Cypher joins on.
         """
         record_data = {
+            "id": record.id,  # stable ULID for relationship anchoring
             "type": "action_audit",
             "execution_id": record.execution_id,
             "intent_id": record.intent_id,
@@ -163,6 +203,14 @@ class AuditLogger:
 
         if hasattr(self._memory, "store_governance_record"):
             await self._memory.store_governance_record(record_data)  # type: ignore[union-attr]
+            # Wire [:REVIEWED] → Intent and Episode so RE Stream 1 can join.
+            # Uses optional MATCH so missing nodes are silently skipped —
+            # the GovernanceRecord is always written even if the Intent/Episode
+            # nodes don't exist yet (e.g. fast-fail before Memory write).
+            await self._link_governance_to_episode(
+                governance_id=record.id,
+                intent_id=record.intent_id,
+            )
         else:
             # Fallback: log the full record as JSON
             self._logger.info(
@@ -170,11 +218,114 @@ class AuditLogger:
                 record=json.dumps(record_data),
             )
 
+    async def _link_governance_to_episode(
+        self,
+        governance_id: str,
+        intent_id: str,
+    ) -> None:
+        """
+        Create [:REVIEWED] relationships from the GovernanceRecord to its
+        originating Intent node and (via GENERATED) the Episode that produced it.
+
+        Both MATCHes are OPTIONAL — silently a no-op when nodes don't exist.
+        This is safe to call concurrently with Memory writes.
+        """
+        if not hasattr(self._memory, "_neo4j") or self._memory._neo4j is None:  # type: ignore[union-attr]
+            return
+        try:
+            await self._memory._neo4j.execute_write(  # type: ignore[union-attr]
+                _GOVERNANCE_LINK_CYPHER,
+                {
+                    "governance_id": governance_id,
+                    "intent_id": intent_id,
+                },
+            )
+        except Exception as exc:
+            # Non-fatal — the GovernanceRecord node was already written;
+            # the link is a training-data enhancement, not a hard requirement.
+            self._logger.warning(
+                "governance_episode_link_failed",
+                governance_id=governance_id,
+                intent_id=intent_id,
+                error=str(exc),
+            )
+
+    async def _update_rollback_pairs(self, record: AuditRecord) -> None:
+        """
+        Maintain RE Stream 2 rollback → success linkage.
+
+        - If result == "rolled_back": cache this record's id keyed by intent_id.
+        - If result == "success" and there's a cached rollback for this intent_id:
+          write [:ROLLBACK_OF] from the failure record to this success record,
+          then evict the cache entry.
+
+        Cache is FIFO-bounded to _ROLLBACK_CACHE_MAX entries.
+        """
+        intent_id = record.intent_id
+        result = record.result
+
+        if result == "rolled_back":
+            # Cache this failure record for future success linkage
+            if len(self._pending_rollbacks) >= self._ROLLBACK_CACHE_MAX:
+                # FIFO eviction: remove the oldest entry
+                oldest_key = next(iter(self._pending_rollbacks))
+                del self._pending_rollbacks[oldest_key]
+            self._pending_rollbacks[intent_id] = record.id
+            self._logger.debug(
+                "rollback_cached",
+                intent_id=intent_id,
+                governance_id=record.id,
+            )
+
+        elif result == "success" and intent_id in self._pending_rollbacks:
+            rollback_id = self._pending_rollbacks.pop(intent_id)
+            await self._write_rollback_of_relationship(
+                rollback_id=rollback_id,
+                success_id=record.id,
+                intent_id=intent_id,
+            )
+
+    async def _write_rollback_of_relationship(
+        self,
+        rollback_id: str,
+        success_id: str,
+        intent_id: str,
+    ) -> None:
+        """
+        Write (failure:GovernanceRecord)-[:ROLLBACK_OF]->(success:GovernanceRecord)
+        to Neo4j. Both nodes must already exist (written in the same session).
+        """
+        if not hasattr(self._memory, "_neo4j") or self._memory._neo4j is None:  # type: ignore[union-attr]
+            return
+        try:
+            await self._memory._neo4j.execute_write(  # type: ignore[union-attr]
+                _ROLLBACK_OF_CYPHER,
+                {
+                    "rollback_id": rollback_id,
+                    "success_id": success_id,
+                },
+            )
+            self._logger.info(
+                "rollback_of_linked",
+                rollback_governance_id=rollback_id,
+                success_governance_id=success_id,
+                intent_id=intent_id,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "rollback_of_link_failed",
+                rollback_id=rollback_id,
+                success_id=success_id,
+                intent_id=intent_id,
+                error=str(exc),
+            )
+
     @property
     def stats(self) -> dict[str, Any]:
         return {
             "records_written": self._records_written,
             "records_failed": self._records_failed,
+            "pending_rollbacks": len(self._pending_rollbacks),
         }
 
 

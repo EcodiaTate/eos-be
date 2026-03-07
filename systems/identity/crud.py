@@ -1,9 +1,9 @@
 """
 EcodiaOS — Identity CRUD
 
-Async asyncpg queries for SealedEnvelope persistence.
+Async asyncpg queries for SealedEnvelope and ConnectorCredentials persistence.
 
-Table schema (created by ensure_table()):
+Table schemas (created by ensure_table()):
 
     CREATE TABLE IF NOT EXISTS sealed_envelopes (
         id                TEXT PRIMARY KEY,
@@ -13,7 +13,24 @@ Table schema (created by ensure_table()):
         key_version       INTEGER NOT NULL DEFAULT 1,
         created_at        TIMESTAMPTZ NOT NULL,
         last_accessed_at  TIMESTAMPTZ,
-        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        deleted_at        TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS connector_credentials (
+        id                      TEXT PRIMARY KEY,
+        connector_id            TEXT NOT NULL UNIQUE,
+        platform_id             TEXT NOT NULL,
+        status                  TEXT NOT NULL DEFAULT 'unconfigured',
+        token_envelope_id       TEXT NOT NULL DEFAULT '',
+        totp_envelope_id        TEXT NOT NULL DEFAULT '',
+        cookie_envelope_id      TEXT NOT NULL DEFAULT '',
+        last_refresh_at         TIMESTAMPTZ,
+        refresh_failure_count   INTEGER NOT NULL DEFAULT 0,
+        metadata                JSONB NOT NULL DEFAULT '{}',
+        created_at              TIMESTAMPTZ NOT NULL,
+        updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        deleted_at              TIMESTAMPTZ
     );
 
 All functions accept an asyncpg.Connection so callers can participate
@@ -22,11 +39,13 @@ in an outer transaction if needed.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 from datetime import datetime
 
 import structlog
 
+from systems.identity.connector import ConnectorCredentials, ConnectorStatus
 from systems.identity.vault import SealedEnvelope
 
 if TYPE_CHECKING:
@@ -43,20 +62,40 @@ CREATE TABLE IF NOT EXISTS sealed_envelopes (
     key_version       INTEGER NOT NULL DEFAULT 1,
     created_at        TIMESTAMPTZ NOT NULL,
     last_accessed_at  TIMESTAMPTZ,
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at        TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_sealed_envelopes_platform_id
     ON sealed_envelopes (platform_id);
+CREATE TABLE IF NOT EXISTS connector_credentials (
+    id                      TEXT PRIMARY KEY,
+    connector_id            TEXT NOT NULL,
+    platform_id             TEXT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'unconfigured',
+    token_envelope_id       TEXT NOT NULL DEFAULT '',
+    totp_envelope_id        TEXT NOT NULL DEFAULT '',
+    cookie_envelope_id      TEXT NOT NULL DEFAULT '',
+    last_refresh_at         TIMESTAMPTZ,
+    refresh_failure_count   INTEGER NOT NULL DEFAULT 0,
+    metadata                JSONB NOT NULL DEFAULT '{}',
+    created_at              TIMESTAMPTZ NOT NULL,
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at              TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_credentials_connector_id
+    ON connector_credentials (connector_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_connector_credentials_platform_id
+    ON connector_credentials (platform_id) WHERE deleted_at IS NULL;
 """
 
 
 async def ensure_table(conn: asyncpg.Connection) -> None:  # type: ignore[type-arg]
-    """Create sealed_envelopes table and index if not present."""
+    """Create sealed_envelopes and connector_credentials tables if not present."""
     for stmt in _CREATE_TABLE_SQL.split(";"):
         s = stmt.strip()
         if s:
             await conn.execute(s)
-    logger.debug("sealed_envelopes_table_ensured")
+    logger.debug("identity_tables_ensured")
 
 
 # ─── Insert ──────────────────────────────────────────────────────────────────
@@ -108,12 +147,12 @@ async def get_envelopes_by_platform(
     conn: asyncpg.Connection,  # type: ignore[type-arg]
     platform_id: str,
 ) -> list[SealedEnvelope]:
-    """Return all envelopes for a platform, ordered by created_at ascending."""
+    """Return all non-deleted envelopes for a platform, ordered by created_at ascending."""
     rows = await conn.fetch(
         """
         SELECT id, platform_id, purpose, ciphertext, key_version, created_at, last_accessed_at
         FROM sealed_envelopes
-        WHERE platform_id = $1
+        WHERE platform_id = $1 AND deleted_at IS NULL
         ORDER BY created_at ASC
         """,
         platform_id,
@@ -124,11 +163,12 @@ async def get_envelopes_by_platform(
 async def get_all_envelopes(
     conn: asyncpg.Connection,  # type: ignore[type-arg]
 ) -> list[SealedEnvelope]:
-    """Return all envelopes across all platforms, ordered by platform_id then created_at."""
+    """Return all non-deleted envelopes across all platforms, ordered by platform_id then created_at."""
     rows = await conn.fetch(
         """
         SELECT id, platform_id, purpose, ciphertext, key_version, created_at, last_accessed_at
         FROM sealed_envelopes
+        WHERE deleted_at IS NULL
         ORDER BY platform_id ASC, created_at ASC
         """,
     )
@@ -154,7 +194,7 @@ async def get_envelope_by_platform_and_purpose(
     purpose: str,
 ) -> SealedEnvelope | None:
     """
-    Fetch the most recent envelope for a platform + purpose pair.
+    Fetch the most recent non-deleted envelope for a platform + purpose pair.
 
     Returns None if no match.
     """
@@ -162,7 +202,7 @@ async def get_envelope_by_platform_and_purpose(
         """
         SELECT id, platform_id, purpose, ciphertext, key_version, created_at, last_accessed_at
         FROM sealed_envelopes
-        WHERE platform_id = $1 AND purpose = $2
+        WHERE platform_id = $1 AND purpose = $2 AND deleted_at IS NULL
         ORDER BY created_at DESC
         LIMIT 1
         """,
@@ -242,19 +282,18 @@ async def delete_envelope_by_id(
     envelope_id: str,
 ) -> bool:
     """
-    Hard-delete a SealedEnvelope by ID.
+    Soft-delete a SealedEnvelope by ID (sets deleted_at = NOW()).
 
-    Envelopes are intentionally hard-deleted — ciphertext encrypted under a
-    rotated key is unrecoverable and should be purged rather than soft-deleted.
-    Returns True if a row was deleted.
+    Soft-delete preserves the audit trail in Neo4j and complies with the
+    EcodiaOS soft-delete rule. Returns True if a row was marked deleted.
     """
     result = await conn.execute(
-        "DELETE FROM sealed_envelopes WHERE id = $1",
+        "UPDATE sealed_envelopes SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL",
         envelope_id,
     )
     deleted = result.endswith("1")
     if deleted:
-        logger.info("envelope_deleted", envelope_id=envelope_id)
+        logger.info("envelope_soft_deleted", envelope_id=envelope_id)
     else:
         logger.warning("envelope_delete_not_found", envelope_id=envelope_id)
     return deleted
@@ -265,19 +304,19 @@ async def delete_envelopes_by_platform(
     platform_id: str,
 ) -> int:
     """
-    Delete all envelopes for a platform (e.g. on connector decommission).
+    Soft-delete all envelopes for a platform (e.g. on connector decommission).
 
-    Returns the count of deleted rows.
+    Returns the count of rows marked deleted.
     """
     result = await conn.execute(
-        "DELETE FROM sealed_envelopes WHERE platform_id = $1",
+        "UPDATE sealed_envelopes SET deleted_at = NOW() WHERE platform_id = $1 AND deleted_at IS NULL",
         platform_id,
     )
     try:
         count = int(result.split()[-1])
     except (ValueError, IndexError):
         count = 0
-    logger.info("envelopes_deleted_for_platform", platform_id=platform_id, count=count)
+    logger.info("envelopes_soft_deleted_for_platform", platform_id=platform_id, count=count)
     return count
 
 
@@ -294,4 +333,139 @@ def _row_to_envelope(row: asyncpg.Record) -> SealedEnvelope:  # type: ignore[typ
         key_version=row["key_version"],
         created_at=row["created_at"],
         last_accessed_at=last_accessed,
+    )
+
+
+# ─── ConnectorCredentials CRUD ───────────────────────────────────────────────
+
+
+async def get_all_credentials(
+    conn: asyncpg.Connection,  # type: ignore[type-arg]
+) -> list[ConnectorCredentials]:
+    """
+    Return all non-deleted ConnectorCredentials, ordered by platform_id then created_at.
+
+    Called at boot to restore all connector token state from the database.
+    Without this, connector state (status, envelope IDs, failure counts) is lost
+    on process restart.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT id, connector_id, platform_id, status, token_envelope_id, totp_envelope_id,
+               cookie_envelope_id, last_refresh_at, refresh_failure_count, metadata, created_at
+        FROM connector_credentials
+        WHERE deleted_at IS NULL
+        ORDER BY platform_id ASC, created_at ASC
+        """,
+    )
+    return [_row_to_credentials(r) for r in rows]
+
+
+async def get_credentials_by_connector_id(
+    conn: asyncpg.Connection,  # type: ignore[type-arg]
+    connector_id: str,
+) -> ConnectorCredentials | None:
+    """Fetch a single non-deleted ConnectorCredentials by connector_id."""
+    row = await conn.fetchrow(
+        """
+        SELECT id, connector_id, platform_id, status, token_envelope_id, totp_envelope_id,
+               cookie_envelope_id, last_refresh_at, refresh_failure_count, metadata, created_at
+        FROM connector_credentials
+        WHERE connector_id = $1 AND deleted_at IS NULL
+        """,
+        connector_id,
+    )
+    return _row_to_credentials(row) if row else None
+
+
+async def upsert_credential(
+    conn: asyncpg.Connection,  # type: ignore[type-arg]
+    cred: ConnectorCredentials,
+) -> ConnectorCredentials:
+    """
+    Insert or update a ConnectorCredentials record atomically.
+
+    Uses connector_id as the natural key. On conflict, updates all mutable
+    fields. The deleted_at column is reset to NULL so a previously soft-deleted
+    credential is effectively restored.
+    """
+    metadata_json = json.dumps(cred.metadata, sort_keys=True)
+    await conn.execute(
+        """
+        INSERT INTO connector_credentials
+            (id, connector_id, platform_id, status, token_envelope_id, totp_envelope_id,
+             cookie_envelope_id, last_refresh_at, refresh_failure_count, metadata, created_at,
+             updated_at, deleted_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, NOW(), NULL)
+        ON CONFLICT (connector_id) DO UPDATE
+            SET status                = EXCLUDED.status,
+                token_envelope_id     = EXCLUDED.token_envelope_id,
+                totp_envelope_id      = EXCLUDED.totp_envelope_id,
+                cookie_envelope_id    = EXCLUDED.cookie_envelope_id,
+                last_refresh_at       = EXCLUDED.last_refresh_at,
+                refresh_failure_count = EXCLUDED.refresh_failure_count,
+                metadata              = EXCLUDED.metadata,
+                updated_at            = NOW(),
+                deleted_at            = NULL
+        """,
+        cred.id,
+        cred.connector_id,
+        cred.platform_id,
+        cred.status.value,
+        cred.token_envelope_id,
+        cred.totp_envelope_id,
+        cred.cookie_envelope_id,
+        cred.last_refresh_at,
+        cred.refresh_failure_count,
+        metadata_json,
+        cred.created_at,
+    )
+    logger.debug(
+        "connector_credentials_upserted",
+        connector_id=cred.connector_id,
+        platform_id=cred.platform_id,
+    )
+    return cred
+
+
+async def delete_credential(
+    conn: asyncpg.Connection,  # type: ignore[type-arg]
+    connector_id: str,
+) -> bool:
+    """
+    Soft-delete ConnectorCredentials by connector_id (sets deleted_at = NOW()).
+
+    Returns True if a row was marked deleted.
+    """
+    result = await conn.execute(
+        """
+        UPDATE connector_credentials
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE connector_id = $1 AND deleted_at IS NULL
+        """,
+        connector_id,
+    )
+    deleted = result.endswith("1")
+    if deleted:
+        logger.info("connector_credentials_soft_deleted", connector_id=connector_id)
+    else:
+        logger.warning("connector_credentials_delete_not_found", connector_id=connector_id)
+    return deleted
+
+
+def _row_to_credentials(row: asyncpg.Record) -> ConnectorCredentials:  # type: ignore[type-arg]
+    raw_meta = row["metadata"]
+    metadata: dict[str, str] = json.loads(raw_meta) if isinstance(raw_meta, str) else dict(raw_meta or {})
+    return ConnectorCredentials(
+        id=row["id"],
+        connector_id=row["connector_id"],
+        platform_id=row["platform_id"],
+        status=ConnectorStatus(row["status"]),
+        token_envelope_id=row["token_envelope_id"] or "",
+        totp_envelope_id=row["totp_envelope_id"] or "",
+        cookie_envelope_id=row["cookie_envelope_id"] or "",
+        last_refresh_at=row["last_refresh_at"],
+        refresh_failure_count=row["refresh_failure_count"],
+        metadata=metadata,
+        created_at=row["created_at"],
     )

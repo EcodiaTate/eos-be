@@ -81,6 +81,20 @@ synapse:
   coherence_update_interval: 50
   rhythm_enabled: true
 
+# ── Fovea (prediction-error attention) ────────────────────────────────────────
+fovea:
+  habituation_increment: 0.05
+  max_habituation_cap: 0.9
+  learning_rate: 0.01
+  false_alarm_decay: 0.005
+  error_weights:
+    content: 0.20
+    temporal: 0.10
+    magnitude: 0.15
+    source: 0.15
+    category: 0.30
+    causal: 0.10
+
 # ── Atune (attention / salience) ──────────────────────────────────────────────
 atune:
   ignition_threshold: 0.3

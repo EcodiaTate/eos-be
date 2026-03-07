@@ -1,0 +1,137 @@
+"""
+EcodiaOS — Send Email Executor
+
+Sends email notifications via configured SMTP or API-based email provider.
+Emits ACTION_EXECUTED / ACTION_FAILED events and RE training traces.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import TYPE_CHECKING, Any
+
+import structlog
+
+from systems.axon.executor import Executor
+from systems.axon.types import ExecutionContext, ExecutionResult, RateLimit, ValidationResult
+from systems.synapse.types import SynapseEvent, SynapseEventType
+
+if TYPE_CHECKING:
+    pass
+
+logger = structlog.get_logger()
+
+
+class SendEmailExecutor(Executor):
+    action_type = "send_email"
+    description = "Send an email notification via configured provider"
+    required_autonomy = 2
+    reversible = False
+    max_duration_ms = 30_000
+    rate_limit = RateLimit.per_minute(10)
+
+    def __init__(self, email_client: Any = None, event_bus: Any = None) -> None:
+        self._email_client = email_client
+        self._event_bus = event_bus
+
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
+        to = params.get("to")
+        if not to or not isinstance(to, str):
+            return ValidationResult.fail("'to' is required and must be a string")
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", to):
+            return ValidationResult.fail(f"Invalid email address: {to}")
+        subject = params.get("subject")
+        if not subject or not isinstance(subject, str):
+            return ValidationResult.fail("'subject' is required and must be a string")
+        body = params.get("body")
+        if not body or not isinstance(body, str):
+            return ValidationResult.fail("'body' is required and must be a string")
+        return ValidationResult.ok()
+
+    async def execute(self, params: dict[str, Any], context: ExecutionContext) -> ExecutionResult:
+        to = params["to"]
+        subject = params["subject"]
+        body = params["body"]
+        from_addr = params.get("from", "noreply@ecodiaos.org")
+
+        try:
+            if self._email_client is None:
+                logger.warning("send_email_no_client", to=to, subject=subject)
+                return ExecutionResult(
+                    success=False,
+                    error="No email client configured",
+                )
+
+            result = await self._email_client.send(
+                to=to,
+                from_addr=from_addr,
+                subject=subject,
+                body=body,
+            )
+
+            await self._emit_event(
+                SynapseEventType.ACTION_EXECUTED,
+                {
+                    "action_type": self.action_type,
+                    "to": to,
+                    "subject": subject,
+                    "execution_id": context.execution_id,
+                },
+            )
+
+            await self._emit_re_trace(context, params, success=True)
+
+            return ExecutionResult(
+                success=True,
+                data={"message_id": result.get("message_id", ""), "to": to},
+                side_effects=[f"Email sent to {to}: {subject}"],
+            )
+        except Exception as exc:
+            await self._emit_event(
+                SynapseEventType.ACTION_FAILED,
+                {
+                    "action_type": self.action_type,
+                    "error": str(exc),
+                    "execution_id": context.execution_id,
+                },
+            )
+            return ExecutionResult(success=False, error=str(exc))
+
+    async def _emit_event(self, event_type: SynapseEventType, data: dict[str, Any]) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=event_type,
+                source_system="axon",
+                data=data,
+            ))
+        except Exception:
+            pass
+
+    async def _emit_re_trace(
+        self, context: ExecutionContext, params: dict[str, Any], success: bool
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            from primitives.common import DriveAlignmentVector, SystemID, utc_now
+            from primitives.re_training import RETrainingExample
+
+            trace = RETrainingExample(
+                source_system=SystemID.AXON,
+                instruction=f"Send email to {params.get('to', 'unknown')}",
+                input_context=f"subject={params.get('subject', '')!r}",
+                output=f"success={success}",
+                outcome_quality=1.0 if success else 0.0,
+                category="email_delivery",
+                constitutional_alignment=DriveAlignmentVector(),
+                timestamp=utc_now(),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                source_system="axon",
+                data=trace.model_dump(mode="json"),
+            ))
+        except Exception:
+            pass

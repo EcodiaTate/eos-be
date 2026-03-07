@@ -53,6 +53,10 @@ class IdentityManager:
         self._certificate_fingerprint: str = ""
         self._local_identity: InstanceIdentityCard | None = None
         self._logger = logger.bind(component="identity_manager")
+        # Drive weights for constitutional hash — defaults until Equor provides actuals
+        self._drive_weights: dict[str, float] = {
+            "coherence": 1.0, "care": 1.0, "growth": 1.0, "honesty": 1.0,
+        }
 
     # ─── Initialization ─────────────────────────────────────────────
 
@@ -117,10 +121,8 @@ class IdentityManager:
                 self._public_key_pem
             )
 
-        # Compute constitutional hash (hash of the drives for compatibility)
-        constitutional_hash = hashlib.sha256(
-            b"coherence:1.0|care:1.0|growth:1.0|honesty:1.0"
-        ).hexdigest()[:16]
+        # Compute constitutional hash from actual drive weights
+        constitutional_hash = self._compute_constitutional_hash()
 
         # Build local identity card
         self._local_identity = InstanceIdentityCard(
@@ -142,6 +144,48 @@ class IdentityManager:
             instance_id=instance_id,
             fingerprint=self._certificate_fingerprint[:16] + "...",
         )
+
+    # ─── Constitutional Hash ────────────────────────────────────────
+
+    def _compute_constitutional_hash(self) -> str:
+        """Deterministic hash from current drive weights. Same weights = same hash."""
+        w = self._drive_weights
+        raw = (
+            f"coherence:{w['coherence']:.6f}|"
+            f"care:{w['care']:.6f}|"
+            f"growth:{w['growth']:.6f}|"
+            f"honesty:{w['honesty']:.6f}"
+        )
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def update_drive_weights(
+        self,
+        coherence: float,
+        care: float,
+        growth: float,
+        honesty: float,
+    ) -> None:
+        """Update drive weights and recompute constitutional hash.
+
+        Called when Equor updates its drive weights. Constitutional divergence
+        between instances (different hashes) is a speciation signal.
+        """
+        self._drive_weights = {
+            "coherence": coherence,
+            "care": care,
+            "growth": growth,
+            "honesty": honesty,
+        }
+        new_hash = self._compute_constitutional_hash()
+        if self._local_identity is not None:
+            old_hash = self._local_identity.constitutional_hash
+            self._local_identity.constitutional_hash = new_hash
+            if old_hash != new_hash:
+                self._logger.info(
+                    "constitutional_hash_recomputed",
+                    old_hash=old_hash,
+                    new_hash=new_hash,
+                )
 
     # ─── Local Identity ─────────────────────────────────────────────
 

@@ -25,18 +25,23 @@ Interface contracts (from spec):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections import deque
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from primitives.common import DriveAlignmentVector, SystemID
+from primitives.re_training import RETrainingExample
 from systems.axon.audit import AuditLogger
 from systems.axon.credentials import CredentialStore
 from systems.axon.executor import Executor
 from systems.axon.executors import build_default_registry
 from systems.axon.introspection import AxonIntrospector
 from systems.axon.pipeline import ExecutionPipeline
+from systems.axon.performance_monitor import ActionPerformanceMonitor
 from systems.axon.reactive import AxonReactiveAdapter
 from systems.axon.safety import BudgetTracker, CircuitBreaker, RateLimiter
 from systems.axon.shield import TransactionShield
@@ -46,7 +51,6 @@ if TYPE_CHECKING:
     from config import AxonConfig, MEVConfig
     from core.hotreload import NeuroplasticityBus
     from primitives.fast_path import FastPathIntent, FastPathOutcome
-    from systems.atune.block_competition import BlockCompetitionMonitor
     from systems.axon.fast_path import FastPathExecutor
     from systems.axon.mev_analyzer import MEVAnalyzer
     from systems.axon.registry import ExecutorRegistry
@@ -123,7 +127,7 @@ class AxonService:
         self._audit: AuditLogger | None = None
         self._shield: TransactionShield | None = None
         self._mev_analyzer: MEVAnalyzer | None = None
-        self._block_competition_monitor: BlockCompetitionMonitor | None = None
+        self._block_competition_monitor: Any = None  # BlockCompetitionMonitor — injected via set_block_competition_monitor()
         self._fast_path: FastPathExecutor | None = None
 
         # Metrics
@@ -146,8 +150,14 @@ class AxonService:
         # Introspection — learns from execution patterns to improve performance
         self._introspector = AxonIntrospector()
 
+        # Performance monitor — tracks rolling success rate for Loop 2 closure
+        self._performance_monitor = ActionPerformanceMonitor()
+
         # Reactive adapter — subscribes to Synapse events and adapts safety systems
         self._reactive: AxonReactiveAdapter | None = None
+
+        # ── Metabolic gating ──────────────────────────────────────────────
+        self._starvation_level: str = "nominal"
 
         # NeuroplasticityBus registration — done in initialize() when bus is available
 
@@ -170,7 +180,12 @@ class AxonService:
             failure_threshold=5,
             recovery_timeout_s=300,
             half_open_max_calls=1,
+            redis_client=self._redis,
+            event_bus=self._event_bus,
         )
+        # Restore persisted circuit breaker states so tripped executors
+        # do not silently reset to CLOSED after a process restart (Spec §5.3).
+        await self._circuit_breaker.load_all_states()
 
         # Credential store
         self._credential_store = CredentialStore()
@@ -180,9 +195,6 @@ class AxonService:
 
         # MEV Analyzer (Prompt #12: Predator Detection)
         if self._mev_config is not None and self._mev_config.enabled:
-            from systems.atune.block_competition import (
-                BlockCompetitionMonitor as _BlockCompMonitor,
-            )
             from systems.axon.mev_analyzer import MEVAnalyzer as _MEVAnalyzer
 
             rpc_url = self._mev_config.rpc_url
@@ -195,20 +207,23 @@ class AxonService:
             # Connect MEV analyzer (initialises Web3 provider)
             await self._mev_analyzer.connect()
 
-            # Block competition monitor (feeds live data to MEV analyzer)
-            self._block_competition_monitor = _BlockCompMonitor(
-                rpc_url=rpc_url,
-                poll_interval_s=self._mev_config.block_competition_poll_interval_s,
-            )
-            self._block_competition_monitor.add_listener(
-                self._mev_analyzer.update_competition
-            )
-            await self._block_competition_monitor.start()
+            # Block competition monitor is injected via set_block_competition_monitor()
+            # after initialize() — avoids cross-system import from systems.fovea.
+            # Wiring layer (main.py / core/wiring.py) constructs and injects it.
+            if self._block_competition_monitor is not None:
+                self._block_competition_monitor.add_listener(
+                    self._mev_analyzer.update_competition
+                )
+                await self._block_competition_monitor.start()
 
             self._logger.info(
                 "mev_analyzer_initialized",
                 rpc_available=self._mev_analyzer.has_rpc,
-                block_monitor=self._block_competition_monitor.stats["running"],
+                block_monitor=(
+                    self._block_competition_monitor.stats["running"]
+                    if self._block_competition_monitor is not None
+                    else False
+                ),
             )
 
         # Transaction shield (Layer 1: Economic Immune System)
@@ -261,6 +276,25 @@ class AxonService:
             executors=len(self._registry),
             executor_types=self._registry.list_types(),
         )
+
+        # ── Child boot: apply inherited template genome if present ──
+        # On child instances, ECODIAOS_AXON_GENOME_PAYLOAD carries the
+        # parent's AxonGenomeFragment JSON. Apply it now so inherited templates
+        # are available from the first cognitive cycle.
+        import os as _os
+        _axon_genome_payload = _os.environ.get("ECODIAOS_AXON_GENOME_PAYLOAD", "")
+        if _axon_genome_payload:
+            try:
+                import json as _json
+                from primitives.genome_inheritance import AxonGenomeFragment as _AxonGF
+                _fragment = _AxonGF.model_validate(_json.loads(_axon_genome_payload))
+                await self._initialize_from_parent_templates(_fragment)
+            except Exception as _exc:
+                self._logger.warning(
+                    "axon_genome_payload_parse_failed",
+                    error=str(_exc),
+                    note="Child will start without inherited templates",
+                )
 
         # Register with the NeuroplasticityBus for hot-reload of Executor subclasses.
         if self._bus is not None:
@@ -439,6 +473,47 @@ class AxonService:
 
         return outcome
 
+    async def _emit_re_training_example(
+        self,
+        category: str,
+        instruction: str,
+        input_context: str,
+        output: str,
+        outcome_quality: float,
+        episode_id: str = "",
+        cost_usd: Decimal = Decimal("0"),
+        latency_ms: int = 0,
+        reasoning_trace: str = "",
+        alternatives: list[str] | None = None,
+        constitutional_alignment: DriveAlignmentVector | None = None,
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            example = RETrainingExample(
+                source_system=SystemID.AXON,
+                episode_id=episode_id,
+                instruction=instruction,
+                input_context=input_context,
+                output=output,
+                outcome_quality=outcome_quality,
+                category=category,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                reasoning_trace=reasoning_trace,
+                alternatives_considered=alternatives or [],
+                constitutional_alignment=constitutional_alignment or DriveAlignmentVector(),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                data=example.model_dump(mode="json"),
+                source_system="axon",
+            ))
+        except Exception:
+            self._logger.debug("re_training_emit_failed", exc_info=True)
+
     def set_event_bus(self, event_bus: EventBus) -> None:
         """
         Wire the Synapse event bus so Axon can emit financial events.
@@ -453,14 +528,195 @@ class AxonService:
         # Register reactive adapter to listen for organism state changes
         if self._reactive is not None:
             self._reactive.register_on_synapse(event_bus)
-        # Register wake handler to drain deferred intents
+        # Register lifecycle event handlers
         if hasattr(event_bus, "subscribe"):
             from systems.synapse.types import SynapseEventType
             event_bus.subscribe(
                 SynapseEventType.WAKE_ONSET,
                 self._on_wake_drain_queue,
             )
+            event_bus.subscribe(
+                SynapseEventType.METABOLIC_PRESSURE,
+                self._on_metabolic_pressure,
+            )
+            event_bus.subscribe(
+                SynapseEventType.GENOME_EXTRACT_REQUEST,
+                self._on_genome_extract_request,
+            )
+            event_bus.subscribe(
+                SynapseEventType.METABOLIC_EMERGENCY,
+                self._on_metabolic_emergency,
+            )
+            event_bus.subscribe(
+                SynapseEventType.ORGANISM_SLEEP,
+                self._on_organism_sleep,
+            )
         self._logger.info("event_bus_wired", system="axon")
+
+    async def _on_metabolic_pressure(self, event: Any) -> None:
+        """React to organism-wide metabolic pressure changes."""
+        data = getattr(event, "data", {}) or {}
+        level = data.get("starvation_level", "")
+        if not level:
+            return
+        old = self._starvation_level
+        self._starvation_level = level
+        if level != old:
+            self._logger.info("axon_starvation_level_changed", old=old, new=level)
+
+    async def _on_genome_extract_request(self, event: Any) -> None:
+        """
+        Respond to GENOME_EXTRACT_REQUEST from Mitosis.
+
+        Returns motor patterns, executor configs, and circuit breaker thresholds
+        as the Axon segment of the organism's genome.
+        """
+        data = getattr(event, "data", {}) or {}
+        request_id = data.get("request_id", "")
+
+        # Build Axon genome segment
+        executor_configs: list[dict[str, Any]] = []
+        if self._registry is not None:
+            for action_type in self._registry.list_types():
+                executor = self._registry.get(action_type)
+                if executor is not None:
+                    executor_configs.append({
+                        "action_type": executor.action_type,
+                        "required_autonomy": executor.required_autonomy,
+                        "reversible": executor.reversible,
+                        "max_duration_ms": executor.max_duration_ms,
+                        "rate_limit": {
+                            "max_calls": executor.rate_limit.max_calls,
+                            "window_seconds": executor.rate_limit.window_seconds,
+                        },
+                    })
+
+        genome_segment = {
+            "system": "axon",
+            "request_id": request_id,
+            "executor_configs": executor_configs,
+            "circuit_breaker": {
+                "failure_threshold": self._circuit_breaker.failure_threshold
+                if self._circuit_breaker else 5,
+                "recovery_timeout_s": self._circuit_breaker.recovery_timeout_s
+                if self._circuit_breaker else 300,
+                "half_open_max_calls": self._circuit_breaker.half_open_max_calls
+                if self._circuit_breaker else 1,
+            },
+            "budget": {
+                "max_actions_per_cycle": self._budget.budget.max_actions_per_cycle
+                if self._budget else 5,
+                "max_concurrent_executions": self._budget.budget.max_concurrent_executions
+                if self._budget else 3,
+            },
+            "motor_patterns": {
+                "total_executions": self._total_executions,
+                "success_rate": (
+                    self._successful_executions / max(1, self._total_executions)
+                ),
+            },
+        }
+
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.GENOME_EXTRACT_RESPONSE,
+                    source_system="axon",
+                    data=genome_segment,
+                ))
+            except Exception as exc:
+                self._logger.debug("genome_extract_response_failed", error=str(exc))
+
+        self._logger.info(
+            "genome_extract_responded",
+            request_id=request_id,
+            executor_count=len(executor_configs),
+        )
+
+    async def _on_metabolic_emergency(self, event: Any) -> None:
+        """
+        Respond to METABOLIC_EMERGENCY by pausing non-critical repairs.
+
+        Sets starvation level to emergency so the execute() gate blocks
+        low-urgency intents. Only survival-priority actions proceed.
+        """
+        data = getattr(event, "data", {}) or {}
+        severity = data.get("severity", data.get("level", "emergency"))
+
+        old_level = self._starvation_level
+        self._starvation_level = "emergency" if severity != "critical" else "critical"
+
+        if old_level != self._starvation_level:
+            self._logger.warning(
+                "metabolic_emergency_received",
+                old_level=old_level,
+                new_level=self._starvation_level,
+                severity=severity,
+            )
+
+        # Force-open circuit breakers for non-essential executors to reduce load
+        if self._circuit_breaker is not None:
+            non_essential = [
+                "social_post", "bounty_hunt", "deploy_asset", "phantom_liquidity",
+            ]
+            for action_type in non_essential:
+                self._circuit_breaker.force_open(action_type)
+            # Metabolic emergency forces multiple circuit breaks — this IS motor
+            # degradation: several executor types are now unreachable.
+            if self._event_bus is not None:
+                asyncio.create_task(
+                    self._emit_motor_degradation(),
+                    name="axon_motor_degradation_metabolic_emergency",
+                )
+
+    async def _on_organism_sleep(self, event: Any) -> None:
+        """
+        Respond to ORGANISM_SLEEP by completing in-flight actions then idling.
+
+        The reactive adapter handles sleep queueing via SLEEP_INITIATED.
+        This handler ensures any direct sleep signals also trigger idle mode.
+        """
+        self._logger.info("organism_sleep_received")
+
+        # Mark the reactive adapter as sleeping (defence-in-depth)
+        if self._reactive is not None and not self._reactive.is_sleeping:
+            self._reactive._is_sleeping = True
+            self._reactive._record_adaptation("organism_sleep_direct")
+
+        # No need to cancel in-flight actions — the pipeline handles timeouts.
+        # We just prevent new executions via the Oneiros gate and reactive adapter.
+
+    async def _emit_evolutionary_observable(
+        self,
+        observable_type: str,
+        value: float,
+        is_novel: bool,
+        metadata: dict | None = None,
+    ) -> None:
+        """Emit an evolutionary observable event via Synapse."""
+        if self._event_bus is None:
+            return
+        try:
+            from primitives.evolutionary import EvolutionaryObservable
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            obs = EvolutionaryObservable(
+                source_system=SystemID.AXON,
+                instance_id=self._instance_id or "",
+                observable_type=observable_type,
+                value=value,
+                is_novel=is_novel,
+                metadata=metadata or {},
+            )
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system="axon",
+                data=obs.model_dump(mode="json"),
+            )
+            await self._event_bus.emit(event)
+        except Exception:
+            pass
 
     def set_fovea(self, fovea: Any) -> None:
         """
@@ -475,6 +731,25 @@ class AxonService:
         self._fovea = fovea
         self._logger.info("fovea_wired", system="axon")
 
+    def set_block_competition_monitor(self, monitor: Any) -> None:
+        """
+        Inject the BlockCompetitionMonitor (from systems.fovea.block_competition).
+
+        Must be called by the wiring layer (main.py / core/wiring.py) after
+        AxonService.initialize() when MEV config is enabled. Injecting rather
+        than importing keeps Axon free of direct Fovea imports (architecture
+        contract: no cross-system imports).
+
+        If initialize() has already run and the MEV analyzer is live, this
+        method wires the monitor immediately and starts polling.
+        """
+        self._block_competition_monitor = monitor
+        if self._mev_analyzer is not None and monitor is not None:
+            monitor.add_listener(self._mev_analyzer.update_competition)
+            import asyncio
+            asyncio.ensure_future(monitor.start())
+        self._logger.info("block_competition_monitor_wired", system="axon")
+
     def set_oneiros(self, oneiros: Any) -> None:
         """
         Wire Oneiros sleep safety.
@@ -486,6 +761,243 @@ class AxonService:
         """
         self._oneiros = oneiros
         self._logger.info("oneiros_wired", system="axon")
+
+    async def export_axon_genome(self, generation: int = 1) -> Any:
+        """
+        Export Axon's heritable execution intelligence as an AxonGenomeFragment.
+
+        Extracts the top-10 action templates by success_rate from the
+        introspector's per-executor stats. Each template captures the
+        action pattern, confidence, and cost statistics so the child
+        can warm-start with validated execution strategies.
+
+        Returns an AxonGenomeFragment, or None if insufficient execution history.
+
+        Called by SpawnChildExecutor at spawn time (Step 0b).
+        """
+        from primitives.genome_inheritance import AxonGenomeFragment, AxonTemplateSnapshot
+
+        try:
+            templates: list[AxonTemplateSnapshot] = []
+
+            # Pull per-executor stats from the introspector
+            if self._introspector is not None and hasattr(self._introspector, "get_stats"):
+                stats = self._introspector.get_stats()
+                executor_stats: dict[str, Any] = stats.get("per_executor", {})
+            else:
+                # Fall back to computing from recent outcomes
+                executor_stats = self._compute_executor_stats_for_genome()
+
+            # Build template snapshots from executor stats, ranked by success_rate
+            raw_templates = []
+            for action_type, data in executor_stats.items():
+                if action_type == "__aggregate__":
+                    continue
+                success_rate = float(data.get("success_rate", 0.0))
+                total = int(data.get("total_observed", data.get("total", 0)))
+                if total < 5:
+                    # Skip executors with too few observations — not yet reliable
+                    continue
+                mean_cost = float(data.get("mean_cost_usd", data.get("mean_ms", 0.0)) or 0.0)
+                variance_cost = float(data.get("variance_cost_usd", 0.0))
+                raw_templates.append(
+                    AxonTemplateSnapshot(
+                        action_pattern=action_type,
+                        cached_approvals=data.get("cached_approvals", []),
+                        expected_cost_mean=mean_cost,
+                        expected_cost_variance=variance_cost,
+                        success_rate=success_rate,
+                    )
+                )
+
+            # Top 10 by success_rate
+            raw_templates.sort(key=lambda t: t.success_rate, reverse=True)
+            templates = raw_templates[:10]
+
+            if not templates:
+                self._logger.debug("export_axon_genome_empty", reason="no_qualified_templates")
+                return None
+
+            # Build confidence dict: max(0.5, success_rate) so inherited templates
+            # are always above the floor (never misleadingly zero)
+            template_confidence = {
+                t.action_pattern: max(0.5, t.success_rate)
+                for t in templates
+            }
+
+            # Extract circuit breaker thresholds from current config
+            cb_thresholds: dict[str, int] = {}
+            if self._circuit_breaker is not None:
+                # Global threshold as default for all action types
+                cb_thresholds["__default__"] = self._circuit_breaker.failure_threshold
+                for action_type, state in self._circuit_breaker._states.items():
+                    cb_thresholds[action_type] = self._circuit_breaker.failure_threshold
+
+            fragment = AxonGenomeFragment(
+                instance_id=self._instance_id,
+                generation=generation,
+                templates=templates,
+                circuit_breaker_thresholds=cb_thresholds,
+                template_confidence=template_confidence,
+            )
+
+            self._logger.info(
+                "axon_genome_exported",
+                template_count=len(templates),
+                top_pattern=templates[0].action_pattern if templates else "",
+                generation=generation,
+            )
+
+            return fragment
+
+        except Exception as exc:
+            self._logger.error("axon_genome_export_failed", error=str(exc))
+            return None
+
+    def _compute_executor_stats_for_genome(self) -> dict[str, Any]:
+        """
+        Compute per-executor stats from recent_outcomes for genome export.
+
+        Used as fallback when the introspector doesn't expose get_stats().
+        """
+        from collections import defaultdict
+
+        per_executor: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"success": 0, "failure": 0, "total": 0, "total_ms": 0}
+        )
+        for outcome in self._recent_outcomes:
+            for step in outcome.step_outcomes:
+                action_type = step.action_type
+                per_executor[action_type]["total"] += 1
+                per_executor[action_type]["total_ms"] += step.duration_ms
+                if step.result.success:
+                    per_executor[action_type]["success"] += 1
+                else:
+                    per_executor[action_type]["failure"] += 1
+
+        result: dict[str, Any] = {}
+        for action_type, counts in per_executor.items():
+            total = counts["total"]
+            result[action_type] = {
+                "success_rate": counts["success"] / total if total > 0 else 0.0,
+                "total_observed": total,
+                "mean_ms": counts["total_ms"] / total if total > 0 else 0.0,
+            }
+        return result
+
+    async def _initialize_from_parent_templates(self, parent_genome: Any) -> None:
+        """
+        Seed the child's fast-path template library from an inherited AxonGenomeFragment.
+
+        Inserts each inherited template into the service's execution knowledge with
+        a lower confidence threshold than self-learned templates:
+          - Inherited:   execute with confidence ≥ 0.6
+          - Self-learned: execute with confidence ≥ 0.8
+
+        This warm-start collapses the cold-start period where a fresh child has no
+        execution history and falls back to conservative defaults.
+
+        After seeding, emits AXON_TEMPLATES_INHERITED so Evo can track the ratio
+        of inherited vs. self-discovered execution strategies — a speciation metric.
+
+        Call this from initialize() when ECODIAOS_AXON_GENOME_PAYLOAD env var is set,
+        or wire the caller to call it explicitly after boot.
+        """
+        try:
+            from primitives.genome_inheritance import AxonGenomeFragment
+
+            if not isinstance(parent_genome, AxonGenomeFragment):
+                self._logger.warning(
+                    "axon_genome_seed_type_error",
+                    got=type(parent_genome).__name__,
+                )
+                return
+
+            if not parent_genome.templates:
+                self._logger.debug("axon_genome_seed_skip", reason="no_templates_in_fragment")
+                return
+
+            # Apply circuit breaker thresholds from parent so the child starts with
+            # calibrated protection levels, not bare defaults
+            if self._circuit_breaker is not None and parent_genome.circuit_breaker_thresholds:
+                default_threshold = parent_genome.circuit_breaker_thresholds.get(
+                    "__default__", self._circuit_breaker.failure_threshold
+                )
+                if default_threshold != self._circuit_breaker.failure_threshold:
+                    self._circuit_breaker.failure_threshold = default_threshold
+                    self._logger.debug(
+                        "axon_genome_cb_threshold_inherited",
+                        threshold=default_threshold,
+                    )
+
+            # Seed the introspector's inherited execution knowledge
+            # so fast-path confidence checks honour the lower threshold (0.6)
+            inherited_action_patterns: list[str] = []
+            for template in parent_genome.templates:
+                confidence = parent_genome.template_confidence.get(
+                    template.action_pattern, max(0.5, template.success_rate)
+                )
+                inherited_action_patterns.append(template.action_pattern)
+
+                # Store on introspector as pre-seeded stats so the child's first
+                # executions of these patterns start with realistic priors
+                if self._introspector is not None and hasattr(
+                    self._introspector, "seed_inherited_template"
+                ):
+                    self._introspector.seed_inherited_template(
+                        action_type=template.action_pattern,
+                        success_rate=template.success_rate,
+                        confidence=confidence,
+                        inherited_from_parent=True,
+                    )
+
+                self._logger.debug(
+                    "axon_template_inherited",
+                    action_pattern=template.action_pattern,
+                    success_rate=template.success_rate,
+                    confidence=confidence,
+                    inherited=True,
+                )
+
+            # Emit AXON_TEMPLATES_INHERITED so Evo can track cold-start improvement
+            if self._event_bus is not None:
+                try:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                    mean_confidence = (
+                        sum(
+                            parent_genome.template_confidence.get(p, 0.0)
+                            for p in inherited_action_patterns
+                        )
+                        / len(inherited_action_patterns)
+                        if inherited_action_patterns
+                        else 0.0
+                    )
+
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.AXON_TEMPLATES_INHERITED,
+                        source_system="axon",
+                        data={
+                            "template_count": len(parent_genome.templates),
+                            "action_patterns": inherited_action_patterns,
+                            "generation": parent_genome.generation,
+                            "inherited_confidence_mean": round(mean_confidence, 4),
+                            "source_genome_id": parent_genome.genome_id,
+                        },
+                    ))
+                except Exception as exc:
+                    self._logger.debug("axon_templates_event_failed", error=str(exc))
+
+            self._logger.info(
+                "axon_templates_inherited",
+                template_count=len(parent_genome.templates),
+                action_patterns=inherited_action_patterns,
+                generation=parent_genome.generation,
+                source_genome_id=parent_genome.genome_id,
+            )
+
+        except Exception as exc:
+            self._logger.error("axon_genome_seed_failed", error=str(exc))
 
     async def _on_wake_drain_queue(self, event: Any) -> None:
         """Re-execute intents that were deferred during sleep."""
@@ -548,6 +1060,34 @@ class AxonService:
                 "AxonService.initialize() must be called before execute()"
             )
 
+        # ── Metabolic starvation gate ─────────────────────────────
+        # CRITICAL: halt all execution
+        # EMERGENCY: only survival-priority intents
+        if self._starvation_level == "critical":
+            from primitives.common import new_id
+            from systems.axon.types import ExecutionStatus
+            return AxonOutcome(
+                intent_id=request.intent.id,
+                execution_id=new_id(),
+                success=False,
+                status=ExecutionStatus.REJECTED,
+                failure_reason="metabolic_critical_halt",
+                error="Metabolic starvation (critical) — all execution halted.",
+            )
+        if self._starvation_level == "emergency":
+            urgency = getattr(request.intent, "urgency", 0.0)
+            if urgency < 0.8:
+                from primitives.common import new_id
+                from systems.axon.types import ExecutionStatus
+                return AxonOutcome(
+                    intent_id=request.intent.id,
+                    execution_id=new_id(),
+                    success=False,
+                    status=ExecutionStatus.REJECTED,
+                    failure_reason="metabolic_emergency_low_urgency",
+                    error="Metabolic emergency — only survival-priority intents executed.",
+                )
+
         # ── Oneiros sleep safety gate ─────────────────────────────
         # When the organism is sleeping, defer non-emergency execution.
         # This prevents the motor cortex from acting during consolidation.
@@ -602,13 +1142,14 @@ class AxonService:
         fovea_prediction_id: str | None = None
         if self._fovea is not None:
             try:
-                from systems.fovea.types import InternalErrorType
                 action_types = [
                     step.executor for step in request.intent.plan.steps
                 ]
+                # Pass InternalErrorType as a string literal — avoids a direct
+                # cross-system import from systems.fovea.types (AV3 fix).
                 fovea_prediction_id = self._fovea.predict_self(
                     action_type=",".join(action_types) or "unknown",
-                    internal_error_type=InternalErrorType.COMPETENCY,
+                    internal_error_type="COMPETENCY",
                     predicted_state={
                         "intent_id": request.intent.id,
                         "expected_success": True,
@@ -629,6 +1170,11 @@ class AxonService:
             "action_types": [step.executor for step in request.intent.plan.steps],
             "step_count": len(request.intent.plan.steps),
         }
+
+        # ── Bus: notify Nova/Thymos/Fovea of incoming execution ──────
+        # Fire-and-forget — never blocks or delays execution.
+        # Replaces any need for direct cross-system imports of Axon types.
+        await self._emit_execution_request(request, execution_id="")
 
         try:
             outcome = await self._pipeline.execute(request)
@@ -677,6 +1223,11 @@ class AxonService:
             except Exception as exc:
                 self._logger.debug("fovea_resolve_self_error", error=str(exc))
 
+        # ── Bus: broadcast full result to Nova/Thymos/Fovea ──────────
+        # AXON_EXECUTION_RESULT is richer than ACTION_EXECUTED/ACTION_FAILED
+        # and removes the last need for cross-system type imports.
+        await self._emit_execution_result(outcome)
+
         if outcome.success:
             self._successful_executions += 1
             # Emit WALLET_TRANSFER_CONFIRMED so Memory encodes it at salience=1.0
@@ -684,6 +1235,21 @@ class AxonService:
                 await self._emit_financial_events(outcome)
         else:
             self._failed_executions += 1
+
+        # Emit evolutionary observable for executor reliability shift
+        total = self._successful_executions + self._failed_executions
+        reliability = self._successful_executions / total if total > 0 else 0.0
+        await self._emit_evolutionary_observable(
+            observable_type="executor_reliability_shift",
+            value=round(reliability, 4),
+            is_novel=False,
+            metadata={
+                "intent_id": outcome.intent_id,
+                "success": outcome.success,
+                "total_executions": self._total_executions,
+                "action_types": [s.action_type for s in outcome.step_outcomes],
+            },
+        )
 
         # Emit ACTION_COMPLETED so Evo can update hypothesis confidence
         if self._event_bus is not None:
@@ -699,11 +1265,133 @@ class AxonService:
         if self._budget is not None:
             self._introspector.record_cycle_utilization(self._budget.utilisation)
 
+        # ── RE training: execution decision ──
+        value_gained = 0.0
+        for step in outcome.step_outcomes:
+            if step.result.success and "economic_delta_usd" in step.result.data:
+                with contextlib.suppress(ValueError, TypeError):
+                    value_gained += float(step.result.data["economic_delta_usd"])
+        await self._emit_re_training_example(
+            category="execution",
+            instruction="Execute approved intent: route to executors, manage timeouts/retries, track outcomes.",
+            input_context=f"intent_id={request.intent.id}, goal={request.intent.goal.description[:200]!r}, steps={len(request.intent.plan.steps)}",
+            output=f"success={outcome.success}, duration_ms={outcome.duration_ms}, failure={outcome.failure_reason or 'none'}, value_gained={value_gained:.4f}",
+            outcome_quality=1.0 if outcome.success else 0.0,
+            episode_id=outcome.episode_id or "",
+            latency_ms=outcome.duration_ms or 0,
+        )
+
         # ── Self-healing: auto-evict persistently failing executors ──
         await self._check_self_healing(outcome)
 
+        # ── Loop 2: track motor performance and emit degradation if needed ──
+        executor_types = [s.action_type for s in outcome.step_outcomes] if outcome.step_outcomes else []
+        if not executor_types and outcome.failure_reason == "circuit_open":
+            # Circuit-open short-circuit produces no step_outcomes — derive executor
+            # types from the intent's plan so that OPEN events count toward the
+            # rolling degradation window. This allows MOTOR_DEGRADATION_DETECTED to
+            # fire when a circuit stays open, which is exactly the signal Nova needs.
+            executor_types = [
+                step.executor
+                for step in request.intent.plan.steps
+                if step.executor
+            ]
+        should_alert = self._performance_monitor.record(
+            success=outcome.success,
+            error=outcome.error or outcome.failure_reason or "",
+            executor_type=executor_types[0] if executor_types else "",
+        )
+        if should_alert and self._event_bus is not None:
+            await self._emit_motor_degradation()
+
         self._recent_outcomes.append(outcome)
         return outcome
+
+    async def _emit_execution_request(
+        self,
+        request: ExecutionRequest,
+        execution_id: str,
+    ) -> None:
+        """
+        Emit AXON_EXECUTION_REQUEST so Nova, Thymos, and Fovea can observe
+        the upcoming action without requiring direct imports from Axon.
+
+        Emitted after the Equor gate passes, before pipeline execution.
+        Fires-and-forgets — never blocks execution.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            intent = request.intent
+            action_types = [step.executor for step in intent.plan.steps]
+            risky = any(
+                at in ("wallet_transfer", "defi_yield", "phantom_liquidity", "spawn_child")
+                for at in action_types
+            )
+            autonomy_level = (
+                intent.autonomy_level_granted.value
+                if hasattr(intent.autonomy_level_granted, "value")
+                else str(intent.autonomy_level_granted)
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.AXON_EXECUTION_REQUEST,
+                source_system="axon",
+                data={
+                    "intent_id": intent.id,
+                    "execution_id": execution_id,
+                    "goal": intent.goal.description[:200],
+                    "action_types": action_types,
+                    "step_count": len(intent.plan.steps),
+                    "estimated_budget_usd": float(
+                        getattr(intent, "estimated_cost_usd", 0.0) or 0.0
+                    ),
+                    "risky": risky,
+                    "autonomy_level": autonomy_level,
+                },
+            ))
+        except Exception:
+            self._logger.debug("axon_execution_request_emit_failed", exc_info=True)
+
+    async def _emit_execution_result(self, outcome: AxonOutcome) -> None:
+        """
+        Emit AXON_EXECUTION_RESULT after pipeline completion.
+
+        Richer than ACTION_EXECUTED/ACTION_FAILED — carries the full
+        result shape so Nova can update Thompson scores and Fovea can
+        resolve competency prediction errors without importing Axon types.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            action_types = [s.action_type for s in outcome.step_outcomes]
+            economic_delta = 0.0
+            for step in outcome.step_outcomes:
+                if step.result.success and "economic_delta_usd" in step.result.data:
+                    try:
+                        economic_delta += float(step.result.data["economic_delta_usd"])
+                    except (ValueError, TypeError):
+                        pass
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.AXON_EXECUTION_RESULT,
+                source_system="axon",
+                data={
+                    "intent_id": outcome.intent_id,
+                    "execution_id": outcome.execution_id,
+                    "success": outcome.success,
+                    "failure_reason": outcome.failure_reason,
+                    "duration_ms": outcome.duration_ms,
+                    "step_count": len(outcome.step_outcomes),
+                    "action_types": action_types,
+                    "economic_delta_usd": economic_delta,
+                },
+            ))
+        except Exception:
+            self._logger.debug("axon_execution_result_emit_failed", exc_info=True)
 
     async def _emit_financial_events(self, outcome: AxonOutcome) -> None:
         """Emit WALLET_TRANSFER_CONFIRMED for any successful wallet_transfer steps."""
@@ -730,6 +1418,25 @@ class AxonService:
                     self._logger.error(
                         "wallet_transfer_event_emit_failed", error=str(exc)
                     )
+
+    async def _emit_motor_degradation(self) -> None:
+        """Emit MOTOR_DEGRADATION_DETECTED when rolling success rate drops below threshold."""
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        data = self._performance_monitor.build_event_data()
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.MOTOR_DEGRADATION_DETECTED,
+                source_system="axon",
+                data=data,
+            ))
+            self._logger.warning(
+                "motor_degradation_event_emitted",
+                success_rate=data["success_rate"],
+                affected_executors=data["affected_executors"],
+            )
+        except Exception as exc:
+            self._logger.warning("motor_degradation_event_emit_failed", error=str(exc))
 
     async def _emit_action_completed(self, outcome: AxonOutcome) -> None:
         """Emit ACTION_COMPLETED after every execution so Evo can update hypothesis confidence."""
@@ -931,6 +1638,18 @@ class AxonService:
                         "self_healing_event_emit_failed", error=str(exc)
                     )
 
+            # Emit evolutionary observable for circuit breaker trip
+            await self._emit_evolutionary_observable(
+                observable_type="circuit_breaker_trip",
+                value=profile.get("success_rate", 0),
+                is_novel=False,
+                metadata={
+                    "action_type": action_type,
+                    "consecutive_failures": consecutive,
+                    "evicted": True,
+                },
+            )
+
     def register_executor(self, executor: Any) -> None:
         """
         Register a custom executor at runtime.
@@ -944,6 +1663,20 @@ class AxonService:
         self._logger.info(
             "executor_registered_runtime",
             action_type=executor.action_type,
+        )
+        # Emit evolutionary observable for new executor discovery
+        import asyncio as _asyncio
+        _asyncio.create_task(
+            self._emit_evolutionary_observable(
+                observable_type="new_executor_discovered",
+                value=1.0,
+                is_novel=True,
+                metadata={
+                    "action_type": executor.action_type,
+                    "executor_class": type(executor).__name__,
+                },
+            ),
+            name=f"axon_evo_new_executor_{executor.action_type}",
         )
 
     def get_executor(self, action_type: str) -> Any | None:

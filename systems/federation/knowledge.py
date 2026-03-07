@@ -39,6 +39,12 @@ if TYPE_CHECKING:
     from systems.federation.reputation_staking import ReputationStakingManager
     from systems.memory.service import MemoryService
 
+# Lazy import — exchange collectors live in the same federation package.
+# We defer to avoid circular imports at module load time.
+def _get_exchange_collectors() -> tuple[Any, Any]:
+    from systems.federation.exchange import collect_hypotheses, collect_procedures  # noqa: PLC0415
+    return collect_hypotheses, collect_procedures
+
 logger = structlog.get_logger("systems.federation.knowledge")
 
 
@@ -60,11 +66,15 @@ class KnowledgeExchangeManager:
         privacy_filter: PrivacyFilter | None = None,
         max_items_per_request: int = 100,
         staking_manager: ReputationStakingManager | None = None,
+        evo: Any = None,
+        instance_id: str = "",
     ) -> None:
         self._memory = memory
         self._privacy_filter = privacy_filter or PrivacyFilter()
         self._max_items_per_request = max_items_per_request
         self._staking_manager: ReputationStakingManager | None = staking_manager
+        self._evo: Any = evo          # Wired post-init for procedure/hypothesis retrieval
+        self._instance_id: str = instance_id
         self._logger = logger.bind(component="knowledge_exchange")
 
         # Counters
@@ -406,16 +416,75 @@ class KnowledgeExchangeManager:
     async def _retrieve_procedures(
         self, domain: str, max_results: int
     ) -> list[KnowledgeItem]:
-        """Retrieve learned procedures from Evo."""
-        # Procedures would come from Evo's procedure store
-        # For now, return empty — will be wired when Evo exposes procedures
-        return []
+        """
+        Retrieve learned procedures from Evo via the IIEP collector.
+
+        Delegates to ``collect_procedures()`` in exchange.py — single source of
+        truth for procedure serialisation.  Returns ``[]`` if Evo is not wired.
+
+        References: Spec 11b §5.1 (PROCEDURES knowledge type), §VIII Fix #11
+        """
+        if self._evo is None:
+            return []
+        try:
+            collect_hypotheses, collect_procedures = _get_exchange_collectors()
+            payloads = await collect_procedures(
+                self._evo,
+                self._instance_id,
+                min_confidence=0.0,
+                max_items=max_results,
+            )
+            items: list[KnowledgeItem] = []
+            for p in payloads:
+                # domain filter — skip if domain provided and doesn't match
+                if domain and p.domain and domain.lower() not in p.domain.lower():
+                    continue
+                items.append(KnowledgeItem(
+                    item_id=new_id(),
+                    knowledge_type=KnowledgeType.PROCEDURES,
+                    privacy_level=PrivacyLevel.COMMUNITY_ONLY,
+                    content=p.content,
+                ))
+            return items
+        except Exception as exc:
+            self._logger.warning("procedure_retrieval_failed", error=str(exc))
+            return []
 
     async def _retrieve_hypotheses(
         self, domain: str, max_results: int
     ) -> list[KnowledgeItem]:
-        """Retrieve active hypotheses from Evo."""
-        return []
+        """
+        Retrieve active hypotheses from Evo via the IIEP collector.
+
+        Delegates to ``collect_hypotheses()`` in exchange.py — single source of
+        truth for hypothesis serialisation.  Returns ``[]`` if Evo is not wired.
+
+        References: Spec 11b §5.1 (HYPOTHESES knowledge type), §VIII Fix #11
+        """
+        if self._evo is None:
+            return []
+        try:
+            collect_hypotheses, _collect_procedures = _get_exchange_collectors()
+            payloads = await collect_hypotheses(
+                self._evo,
+                self._instance_id,
+                min_confidence=0.0,
+                max_items=max_results,
+            )
+            items: list[KnowledgeItem] = []
+            for p in payloads:
+                if domain and p.domain and domain.lower() not in p.domain.lower():
+                    continue
+                items.append(KnowledgeItem(
+                    item_id=new_id(),
+                    knowledge_type=KnowledgeType.HYPOTHESES,
+                    privacy_level=PrivacyLevel.COMMUNITY_ONLY,
+                    content=p.content,
+                ))
+            return items
+        except Exception as exc:
+            self._logger.warning("hypothesis_retrieval_failed", error=str(exc))
+            return []
 
     async def _retrieve_patterns(
         self, domain: str, max_results: int

@@ -29,7 +29,11 @@ Interface:
   get_developmental_stage() — current maturation stage
   create_somatic_marker()   — create marker from current state
   somatic_rerank()          — boost memory candidates by somatic similarity
-  update_dynamics_matrix()  — Evo updates cross-dimension coupling
+  update_dynamics_matrix()         — Evo updates cross-dimension coupling (raw)
+  update_dynamics_matrix_payload() — typed hot-reload with Neo4j audit (GAP 1)
+  export_somatic_genome()          — export calibrated state for Mitosis (GAP 6)
+  seed_child_from_genome()         — apply parent genome with noise to child (GAP 6)
+  set_neo4j()                      — wire Neo4j driver for marker writes (GAP 5)
   update_emotion_regions()  — Evo refines emotion boundaries
   shutdown()                — graceful teardown
   health()                  — self-health report for Synapse
@@ -72,7 +76,7 @@ from systems.soma.phase_space_reconstructor import (
 from systems.soma.predictor import InteroceptivePredictor
 from systems.soma.renormalization import RenormalizationEngine, RGFlowReport
 from systems.soma.signal_buffer import SignalBuffer
-from systems.soma.somatic_memory import SomaticMemoryIntegration
+from systems.soma.somatic_memory import SomaticMarkerWriter, SomaticMemoryIntegration
 from systems.soma.state_vector import StateVectorConstructor
 from systems.soma.temporal_depth import (
     TemporalDepthManager,
@@ -90,6 +94,7 @@ from systems.soma.types import (
     CounterfactualTrace,
     DerivativeSnapshot,
     DevelopmentalStage,
+    DynamicsMatrixPayload,
     InteroceptiveDimension,
     InteroceptivePercept,
     InteroceptiveState,
@@ -181,6 +186,12 @@ class SomaService:
         # Cross-modal synesthesia — exteroceptive pressure (per-dimension)
         # Injected by ExteroceptionService, applied as deltas to sensed state
         self._exteroceptive_pressure: ExteroceptivePressure | None = None
+
+        # Metabolic starvation level — treated as allostatic error signal.
+        # Soma never gates itself (SURVIVAL priority) but makes the organism
+        # *feel* economic deprivation as increased temporal_pressure / reduced energy.
+        self._starvation_level: str = "nominal"
+        self._starvation_stress: float = 0.0  # [0,1] scalar mapped from level
 
         # State
         self._synapse_ref: Any = None  # Cached for hot-swap forwarding
@@ -299,14 +310,67 @@ class SomaService:
         self._medium_path_task: asyncio.Task[None] | None = None
         self._deep_path_task: asyncio.Task[None] | None = None
 
+        # ── Interconnectedness: cross-system references ──
+        self._oneiros_ref: Any = None
+        self._benchmarks_ref: Any = None
+        self._skia_ref: Any = None
+        self._identity_ref: Any = None
+        self._organism_public_key: Any = None
+        self._memory_ref: Any = None
+
+        # Rolling urgency history for allostatic report (1h window at ~6.7 cycles/s)
+        self._urgency_history: deque[float] = deque(maxlen=24000)
+        self._allostatic_report_interval: int = config.allostatic_report_interval if hasattr(config, "allostatic_report_interval") else 50
+
+        # Phase space tracking for Memory trace writes
+        self._prev_attractor_count: int = 0
+        self._prev_bifurcation_count: int = 0
+        self._prev_dominant_emotion: str | None = None
+
+        # GAP 5: Somatic marker write protocol — Neo4j persistence
+        self._marker_writer = SomaticMarkerWriter()
+        # Tracks the last episode_id for which a marker was written;
+        # set by the EPISODE_ENCODED event handler.
+        self._pending_episode_id: str | None = None
+        # Urgency threshold at which we write a standalone adjustment marker
+        self._marker_urgency_threshold: float = 0.7
+
+        # PHILOSOPHICAL: Constitutional drift accumulator for INTEGRITY dimension.
+        # Equor publishes CONSTITUTIONAL_DRIFT_DETECTED; Soma translates it into
+        # an allostatic error on INTEGRITY so the organism *feels* drift as bodily
+        # stress — not just cognitive dissonance.
+        self._constitutional_drift_signal: float = 0.0   # [0, 1] — decays each cycle
+        self._drift_decay_per_cycle: float = 0.98        # 2% decay per cycle (~30s half-life)
+        self._drift_integrity_weight: float = 0.4        # max INTEGRITY suppression
+
         # Fisher manifold input cache — skip update if delta < threshold (Task 2)
         self._fisher_last_flat: np.ndarray | None = None
         self._fisher_cache_delta_threshold: float = 0.01
         self._fisher_cache_max_age_s: float = 5.0  # never serve stale beyond 5s
         self._fisher_last_updated_ts: float = 0.0
 
-    async def initialize(self) -> None:
-        """Initialize sub-systems and register with NeuroplasticityBus."""
+    async def initialize(self, genome_segment: dict[str, Any] | None = None) -> None:
+        """Initialize sub-systems and register with NeuroplasticityBus.
+
+        Phase-space initialization:
+          - No parent genome (first boot): all 9 dimensions start at
+            setpoint=0.5, variance=0.1. This is the organism's blank slate.
+          - With genome segment: load parent's Soma setpoints so the child
+            begins life with inherited interoceptive calibration.
+        """
+        # Phase-space initialization — deterministic given same genome segment
+        if genome_segment is not None and "setpoints" in genome_segment:
+            parent_setpoints = genome_segment["setpoints"]
+            for dim in ALL_DIMENSIONS:
+                dim_key = dim.value
+                if dim_key in parent_setpoints:
+                    self._controller.setpoints[dim] = float(parent_setpoints[dim_key])
+            logger.info("soma_genome_seeded", dimensions=len(parent_setpoints))
+        elif self._cycle_count == 0:
+            # First boot with no parent — uniform default (0.5, variance=0.1)
+            for dim in ALL_DIMENSIONS:
+                self._controller.setpoints[dim] = 0.5
+
         self._temporal_depth.set_stage(self._developmental.stage)
         self._counterfactual.set_dynamics(self._predictor.dynamics_matrix)
 
@@ -470,6 +534,35 @@ class SomaService:
         if self._manifold_enabled:
             event_bus.subscribe_all(self._on_synapse_event)
 
+        # Metabolic starvation → allostatic error signal
+        from systems.synapse.types import SynapseEventType
+        event_bus.subscribe(SynapseEventType.METABOLIC_PRESSURE, self._on_metabolic_pressure)
+
+        # Revenue → ATP regeneration (positive energy injection)
+        event_bus.subscribe(SynapseEventType.REVENUE_INJECTED, self._on_revenue_injected)
+
+        # Evo hypothesis outcomes → EmotionDetector region refinement
+        # Confirmed hypotheses reinforce emotion region patterns;
+        # refuted hypotheses revert the linked region to its hardcoded default.
+        event_bus.subscribe(SynapseEventType.EVO_HYPOTHESIS_CONFIRMED, self._on_hypothesis_confirmed)
+        event_bus.subscribe(SynapseEventType.EVO_HYPOTHESIS_REFUTED, self._on_hypothesis_refuted)
+
+        # GAP 5: Episode encoding → write somatic marker linked to Episode node
+        event_bus.subscribe(SynapseEventType.EPISODE_STORED, self._on_episode_stored)
+
+        # PHILOSOPHICAL: Constitutional drift → INTEGRITY allostatic error
+        event_bus.subscribe(SynapseEventType.CONSTITUTIONAL_DRIFT_DETECTED, self._on_constitutional_drift)
+
+        # INV-017 / immune response: Equor drift signal raises INTEGRITY dimension.
+        # When source="equor_drift", treat integrity_error as direct INTEGRITY pressure.
+        # This is separate from the generic SOMATIC_MODULATION_SIGNAL consumer so Equor's
+        # constitutional signals go through the INTEGRITY pathway, not just metabolic stress.
+        event_bus.subscribe(SynapseEventType.SOMATIC_MODULATION_SIGNAL, self._on_equor_drift_modulation)
+
+        # Degradation pressure → somatic urgency (Skia §8.2)
+        if hasattr(SynapseEventType, "DEGRADATION_TICK"):
+            event_bus.subscribe(SynapseEventType.DEGRADATION_TICK, self._on_degradation_tick)
+
     def set_atune(self, atune: Any) -> None:
         self._interoceptor.set_atune(atune)
         self._loop_executor.set_atune(atune)
@@ -521,6 +614,7 @@ class SomaService:
 
     def set_oneiros(self, oneiros: Any) -> None:
         """Wire Oneiros for sleep pressure loop and autonomic sleep requests."""
+        self._oneiros_ref = oneiros
         self._loop_executor.set_oneiros(oneiros)
         self._autonomic_protocol.set_oneiros(oneiros)
 
@@ -537,8 +631,100 @@ class SomaService:
         self._loop_executor.set_voxis(voxis)
 
     def set_memory(self, memory: Any) -> None:
-        """Wire Memory for salience decay loop."""
+        """Wire Memory for salience decay loop and MemoryTrace discovery writes."""
         self._loop_executor.set_memory(memory)
+        self._memory_ref = memory
+
+    def set_benchmarks(self, benchmarks: Any) -> None:
+        """Wire Benchmarks for KPI telemetry emission."""
+        self._benchmarks_ref = benchmarks
+
+    def set_skia(self, skia: Any) -> None:
+        """Wire Skia for state persistence and recovery."""
+        self._skia_ref = skia
+        # Register snapshot/restore providers with Skia
+        try:
+            if hasattr(skia, "register_state_provider"):
+                skia.register_state_provider(
+                    system_id="soma",
+                    provider=self._skia_snapshot,
+                    restore_callback=self._skia_restore,
+                )
+        except Exception:
+            pass
+
+    def set_identity(self, identity: Any) -> None:
+        """Wire Identity for cryptographic signing of outbound events."""
+        self._identity_ref = identity
+        try:
+            if hasattr(identity, "public_key_pem"):
+                self._organism_public_key = identity.public_key_pem
+            elif hasattr(identity, "_public_key_pem"):
+                self._organism_public_key = identity._public_key_pem
+        except Exception:
+            pass
+
+    def set_neo4j(self, driver: Any) -> None:
+        """Wire Neo4j driver into the somatic marker writer (GAP 5).
+
+        Called from the application bootstrap after the driver is ready.
+        The marker writer is non-fatal — if the driver is absent, markers
+        are silently skipped rather than breaking the allostatic cycle.
+        """
+        self._marker_writer.set_driver(driver)
+
+    # ─── Genome Interface (Mitosis / child spawning) ──────────────
+
+    async def get_genome_segment(self) -> Any:
+        """Extract Soma's heritable interoceptive calibration for Mitosis.
+
+        Returns an OrganGenomeSegment containing setpoints, phase-space config,
+        stage thresholds, and allostatic baselines. Called by Mitosis when
+        assembling the parent genome for a child instance.
+
+        Spec §16 XIV (genome inheritance): child starts at REFLEXIVE stage
+        but receives parent's calibrated setpoints as a head start.
+        """
+        from systems.soma.genome import SomaGenomeExtractor
+        extractor = SomaGenomeExtractor(self)
+        return await extractor.extract_genome_segment()
+
+    async def seed_from_genome(self, segment: Any) -> bool:
+        """Apply a genome segment to this Soma instance.
+
+        Used during child instance initialization when a parent genome is
+        provided. Applies setpoints without advancing the developmental stage
+        (child always starts at REFLEXIVE regardless of parent's stage).
+        """
+        from systems.soma.genome import SomaGenomeExtractor
+        extractor = SomaGenomeExtractor(self)
+        return await extractor.seed_from_genome_segment(segment)
+
+    async def export_somatic_genome(self) -> Any:
+        """Export full calibrated state as a heritable genome segment (GAP 6).
+
+        Returns an OrganGenomeSegment (version=2) that includes setpoints,
+        phase-space config, allostatic baselines, and the live dynamics matrix.
+        Called by Mitosis when assembling the parent genome for a child instance.
+
+        Children receive this segment via seed_child_from_genome(), which applies
+        ±5% noise on setpoints and ±2% noise on dynamics weights before writing.
+        """
+        from systems.soma.genome import SomaGenomeExtractor
+        extractor = SomaGenomeExtractor(self)
+        return await extractor.export_somatic_genome()
+
+    async def seed_child_from_genome(self, segment: Any) -> bool:
+        """Apply parent genome to a child Soma instance with heritable noise (GAP 6).
+
+        Setpoints: ±5% uniform noise per dimension.
+        Dynamics weights: ±2% uniform noise per weight (zero weights stay zero).
+        Developmental stage: always starts at REFLEXIVE (ignored from genome).
+        Phase-space config and allostatic baselines: inherited exactly.
+        """
+        from systems.soma.genome import SomaGenomeExtractor
+        extractor = SomaGenomeExtractor(self)
+        return await extractor.seed_child_from_genome(segment)
 
     # ─── NeuroplasticityBus Callbacks ─────────────────────────────
 
@@ -583,6 +769,222 @@ class SomaService:
         self._signal_buffer.ingest_synapse_event(event)
         # Feed micro-level transition tracking for causal emergence
         self._emergence_engine.observe_micro(event.event_type.value)
+
+    async def _on_metabolic_pressure(self, event: Any) -> None:
+        """Translate metabolic starvation into allostatic error signal.
+
+        Soma never gates itself (SURVIVAL priority=0) but makes the organism
+        feel economic deprivation as increased stress. The starvation_stress
+        scalar is blended into the exteroceptive pressure path during the
+        next theta cycle via _apply_exteroceptive_pressure.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("starvation_level", "")
+        if not level:
+            return
+        old = self._starvation_level
+        self._starvation_level = level
+        # Map starvation level → [0, 1] stress scalar
+        _STRESS_MAP = {
+            "nominal": 0.0,
+            "cautious": 0.15,
+            "austerity": 0.4,
+            "emergency": 0.7,
+            "critical": 1.0,
+        }
+        self._starvation_stress = _STRESS_MAP.get(level, 0.0)
+        # Blend into external stress so temporal_pressure rises organically
+        self.inject_external_stress(max(self._external_stress, self._starvation_stress))
+        if level != old:
+            logger.info("soma_starvation_signal", old=old, new=level, stress=self._starvation_stress)
+
+    async def _on_revenue_injected(self, event: Any) -> None:
+        """Translate Oikos revenue into positive energy regeneration.
+
+        Revenue makes the organism feel nourished: energy rises, temporal
+        pressure eases. The delta is capped at 0.1 per event to prevent
+        a single large payment from snapping the organism to full energy.
+        """
+        data = getattr(event, "data", {}) or {}
+        revenue_usd = float(data.get("amount_usd", data.get("revenue_usd", 0.0)))
+        if revenue_usd <= 0.0:
+            return
+        energy_delta = min(0.1, revenue_usd / 100.0)
+        # Inject as reduced external stress (revenue counteracts starvation)
+        new_stress = max(0.0, self._external_stress - energy_delta)
+        self.inject_external_stress(new_stress)
+        logger.info(
+            "soma_revenue_energy",
+            revenue_usd=round(revenue_usd, 4),
+            energy_delta=round(energy_delta, 4),
+            new_stress=round(new_stress, 4),
+        )
+
+    async def _on_degradation_tick(self, event: Any) -> None:
+        """Skia §8.2 DEGRADATION_TICK — translate cumulative entropy pressure into
+        interoceptive urgency so the organism somatically feels its own decay.
+
+        pressure > 0.5 → +0.1 stress (moderate maintenance urgency)
+        pressure > 0.8 → +0.3 stress (critical — organism must act or die)
+        The delta is injected via inject_external_stress(), which blends into
+        TEMPORAL_PRESSURE on the next theta cycle and ultimately raises urgency.
+        """
+        data = getattr(event, "data", {}) or {}
+        pressure = float(data.get("cumulative_pressure", 0.0))
+        if pressure <= 0.0:
+            return
+
+        if pressure > 0.8:
+            stress_delta = 0.3
+        elif pressure > 0.5:
+            stress_delta = 0.1
+        else:
+            return  # below threshold — no somatic response needed
+
+        new_stress = min(1.0, self._external_stress + stress_delta)
+        self.inject_external_stress(new_stress)
+        logger.info(
+            "soma_degradation_pressure_applied",
+            pressure=round(pressure, 4),
+            stress_delta=stress_delta,
+            new_stress=round(new_stress, 4),
+        )
+
+        async def _on_hypothesis_confirmed(self, event: Any) -> None:
+        """Evo hypothesis confirmed — reinforce linked emotion region pattern.
+
+        Spec §08 §12.2: Evo refines emotion region boundaries during learning.
+        EmotionDetector.on_hypothesis_confirmed() applies updated_pattern when
+        provided, or keeps the current pattern if the event carries no update.
+        """
+        data = getattr(event, "data", {}) or {}
+        hypothesis_id = data.get("hypothesis_id", "")
+        updated_pattern: dict[str, str] | None = data.get("updated_pattern")
+        if hypothesis_id:
+            self._emotion_detector.on_hypothesis_confirmed(hypothesis_id, updated_pattern)
+            logger.debug("soma_emotion_hypothesis_confirmed", hypothesis_id=hypothesis_id)
+
+    async def _on_hypothesis_refuted(self, event: Any) -> None:
+        """Evo hypothesis refuted — revert linked emotion region to hardcoded default.
+
+        Spec §08 §12.2: Refuted hypotheses restore the default seed region pattern
+        so the detector falls back to known-good behaviour.
+        """
+        data = getattr(event, "data", {}) or {}
+        hypothesis_id = data.get("hypothesis_id", "")
+        if hypothesis_id:
+            self._emotion_detector.on_hypothesis_refuted(hypothesis_id)
+            logger.debug("soma_emotion_hypothesis_refuted", hypothesis_id=hypothesis_id)
+
+    async def _on_episode_stored(self, event: Any) -> None:
+        """GAP 5: Memory stored an episode → write a somatic marker linked to it.
+
+        Triggered by EPISODE_STORED from Memory. Captures the current interoceptive
+        state and writes a (:SomaticMarker)-[:MARKS]->(:Episode) pair off the
+        critical path (fire-and-forget via the calling create_task context).
+
+        Only writes if:
+          - a current state exists (Soma has run at least once)
+          - urgency is above _marker_urgency_threshold (avoid flooding low-salience episodes)
+          - current signal urgency is below 0.85 (urgency_critical writes its own marker)
+        """
+        if self._current_state is None or self._current_signal is None:
+            return
+
+        data = getattr(event, "data", {}) or {}
+        episode_id = data.get("episode_id", "")
+        if not episode_id:
+            return
+
+        urgency = self._current_signal.urgency
+        # Only stamp episodes when organism has meaningful allostatic state
+        if urgency < self._marker_urgency_threshold:
+            return
+
+        nearest_attractor = self._phase_space.get_nearest_attractor_label(
+            self._current_state.sensed,
+        )
+        marker = self._somatic_memory.create_marker(self._current_state, nearest_attractor)
+        asyncio.create_task(
+            self._marker_writer.write_marker_for_episode(
+                marker=marker,
+                episode_id=episode_id,
+                signal=self._current_signal,
+            ),
+            name="soma_marker_episode",
+        )
+
+    async def _on_constitutional_drift(self, event: Any) -> None:
+        """PHILOSOPHICAL: Equor signals constitutional drift → raise INTEGRITY error.
+
+        When the organism's behavior diverges from its constitutional values,
+        Equor publishes CONSTITUTIONAL_DRIFT_DETECTED. Soma translates this into
+        an interoceptive signal by accumulating drift into _constitutional_drift_signal,
+        which is then applied as INTEGRITY suppression during the next cycle.
+
+        The signal decays 2% per cycle (~30s half-life at 150ms theta), so a single
+        drift event has transient effect. Sustained drift causes sustained INTEGRITY
+        error — the organism feels its own misalignment.
+        """
+        data = getattr(event, "data", {}) or {}
+        alignment_gap = float(data.get("alignment_gap", 0.0))
+        severity = str(data.get("severity", "low")).lower()
+
+        # Map severity to drift intensity (additive accumulation)
+        _SEVERITY_WEIGHTS = {
+            "low": 0.1,
+            "medium": 0.25,
+            "high": 0.5,
+            "critical": 0.8,
+        }
+        weight = _SEVERITY_WEIGHTS.get(severity, 0.1)
+        drift_delta = alignment_gap * weight
+        self._constitutional_drift_signal = min(
+            1.0, self._constitutional_drift_signal + drift_delta,
+        )
+        logger.info(
+            "soma_constitutional_drift",
+            alignment_gap=round(alignment_gap, 4),
+            severity=severity,
+            drift_signal=round(self._constitutional_drift_signal, 4),
+        )
+
+    async def _on_equor_drift_modulation(self, event: Any) -> None:
+        """INV-017 / immune response: when Equor emits SOMATIC_MODULATION_SIGNAL
+        with source='equor_drift', raise the INTEGRITY allostatic dimension.
+
+        The INTEGRITY dimension tracks the organism's felt sense of internal
+        coherence and constitutional alignment. Constitutional drift is one of
+        the clearest integrity threats: the organism is acting against its own
+        values. Soma raises INTEGRITY error proportional to integrity_error ×
+        0.5, capped at the current allostatic ceiling (1.0).
+
+        This is additive with the drift accumulator from _on_constitutional_drift
+        — both channels feed the INTEGRITY signal from different angles:
+          - CONSTITUTIONAL_DRIFT_DETECTED: long-term drift pattern
+          - SOMATIC_MODULATION_SIGNAL (equor_drift): per-cycle acute signal
+        """
+        data = getattr(event, "data", {}) or {}
+        source = str(data.get("source", "")).lower()
+        if source != "equor_drift":
+            return  # Not an equor-drift signal — handled by other consumers
+
+        integrity_error = float(data.get("integrity_error", 0.0))
+        if integrity_error <= 0.0:
+            return
+
+        # Raise constitutional drift accumulator by integrity_error × 0.5,
+        # capped at 1.0 (allostatic ceiling). The accumulator decays each cycle.
+        integrity_raise = min(1.0, integrity_error * 0.5)
+        self._constitutional_drift_signal = min(
+            1.0, self._constitutional_drift_signal + integrity_raise,
+        )
+        logger.info(
+            "soma_equor_drift_integrity_raised",
+            integrity_error=round(integrity_error, 4),
+            integrity_raise=round(integrity_raise, 4),
+            drift_signal=round(self._constitutional_drift_signal, 4),
+        )
 
     # ─── Core Cycle ──────────────────────────────────────────────
 
@@ -634,6 +1036,21 @@ class SomaService:
             self._refresh_financial_snapshot_if_due()
             self._temporal_depth.tick_financial()
             sensed = self._temporal_depth.apply_affect_bias_to_sensed(sensed)
+
+            # 1d. Constitutional drift decay + INTEGRITY suppression (PHILOSOPHICAL)
+            # Decay accumulated drift signal 2% per cycle (~30s half-life at 150ms theta).
+            # Then apply as a downward nudge on the INTEGRITY dimension, making the
+            # organism feel its own misalignment with its constitutional values.
+            if self._constitutional_drift_signal > 0.0:
+                self._constitutional_drift_signal *= self._drift_decay_per_cycle
+                if self._constitutional_drift_signal < 0.001:
+                    self._constitutional_drift_signal = 0.0
+                else:
+                    integrity_suppression = self._constitutional_drift_signal * self._drift_integrity_weight
+                    current_integrity = sensed.get(InteroceptiveDimension.INTEGRITY, 0.5)
+                    suppressed_integrity = max(0.0, current_integrity - integrity_suppression)
+                    sensed = dict(sensed)
+                    sensed[InteroceptiveDimension.INTEGRITY] = suppressed_integrity
 
             # 2. Buffer
             self._predictor.push_state(sensed)
@@ -747,7 +1164,7 @@ class SomaService:
             # ── Vulnerability / Fisher manifold (staggered) ───────────
             # Phase A — Manifold fast path (every cycle — cheap signal aggregation)
             if self._manifold_enabled:
-                await self._run_manifold_fast_path()
+                self._run_manifold_fast_path()
 
             # Phase B — Fisher manifold: every 10 cycles (Task 3)
             # The manifold update + Ledoit-Wolf estimation is the primary slow path.
@@ -826,6 +1243,78 @@ class SomaService:
                 signal_ms=round(_t_signal_ms, 3),
                 total_ms=round(elapsed_ms, 3),
                 cycle=self._cycle_count,
+            )
+
+        # ── Interconnectedness: off-critical-path fire-and-forget hooks ──
+
+        # Track urgency history for allostatic report
+        self._urgency_history.append(self._current_signal.urgency)
+
+        # Vitality signal — every cycle, fire-and-forget to VitalityCoordinator
+        if self._event_bus_ref is not None:
+            asyncio.create_task(
+                self._emit_vitality_signal(), name="soma_vitality_signal",
+            )
+
+        # Allostatic signal — every cycle, bus-broadcast of primary Soma output.
+        # Enables federated subscribers and systems without a direct Soma ref.
+        if self._event_bus_ref is not None:
+            asyncio.create_task(
+                self._emit_allostatic_signal(), name="soma_allostatic_signal",
+            )
+
+        # Urgency critical — when urgency > 0.85, emit high-priority alert (Spec 16 §XVIII).
+        if self._event_bus_ref is not None and self._current_signal is not None and self._current_signal.urgency > 0.85:
+            asyncio.create_task(
+                self._maybe_emit_urgency_critical(), name="soma_urgency_critical",
+            )
+
+        # GAP 5: Urgency-triggered standalone marker (no episode association).
+        # Fires when urgency spikes above the marker threshold — captures the
+        # organism's state at the moment it decided to act, not just at encoding.
+        if (
+            self._current_state is not None
+            and self._current_signal is not None
+            and self._current_signal.urgency >= self._marker_urgency_threshold
+        ):
+            nearest_attractor = self._phase_space.get_nearest_attractor_label(
+                self._current_state.sensed,
+            )
+            _marker = self._somatic_memory.create_marker(self._current_state, nearest_attractor)
+            asyncio.create_task(
+                self._marker_writer.write_marker_for_adjustment(
+                    marker=_marker,
+                    signal=self._current_signal,
+                    adjustment_type="urgency_threshold_crossed",
+                ),
+                name="soma_marker_adjustment",
+            )
+
+        # Allostatic report — every N cycles, fire-and-forget to Benchmarks
+        if self._event_bus_ref is not None and self._cycle_count % self._allostatic_report_interval == 0:
+            asyncio.create_task(
+                self._emit_allostatic_report(), name="soma_allostatic_report",
+            )
+
+        # Fix 2: Benchmarks KPI emission (every 50 cycles)
+        if self._benchmarks_ref is not None and self._cycle_count % 50 == 0:
+            asyncio.create_task(
+                self._emit_benchmarks_kpis(), name="soma_benchmarks_kpi",
+            )
+
+        # Fix 4: Memory trace writes (attractor/bifurcation/emotion discoveries)
+        self._check_memory_traces()
+
+        # Fix 5: Telos drive vector emission (every 10 cycles)
+        if self._event_bus_ref is not None and self._cycle_count % 10 == 0:
+            asyncio.create_task(
+                self._emit_drive_vector(), name="soma_drive_vector",
+            )
+
+        # Loop 5: Emit SOMATIC_MODULATION_SIGNAL when thresholds crossed
+        if self._event_bus_ref is not None:
+            asyncio.create_task(
+                self._maybe_emit_somatic_modulation(), name="soma_modulation_signal",
             )
 
         # Task 1+2: Suppress soma_cycle_slow during warmup or heavy external operations
@@ -996,9 +1485,72 @@ class SomaService:
     # ─── Evo Integration ─────────────────────────────────────────
 
     def update_dynamics_matrix(self, new_dynamics: list[list[float]]) -> None:
-        """Evo updates the 9x9 cross-dimension coupling matrix."""
+        """Evo updates the 9x9 cross-dimension coupling matrix (raw list form).
+
+        Atomically swaps the predictor's dynamics matrix and syncs the
+        counterfactual engine. No Neo4j audit — use update_dynamics_matrix_payload()
+        when provenance tracking is required (e.g. from Simula/NeuroplasticityBus).
+        """
         self._predictor.update_dynamics(new_dynamics)
         self._counterfactual.set_dynamics(self._predictor.dynamics_matrix)
+
+    def update_dynamics_matrix_payload(self, payload: DynamicsMatrixPayload) -> None:
+        """GAP 1: Hot-reload the dynamics matrix from a typed payload (Simula/Evo).
+
+        Atomically swaps the predictor's 9×9 cross-dimension coupling matrix,
+        syncs the counterfactual engine, and writes an immutable Neo4j audit node
+        so every matrix mutation is traceable back to its source.
+
+        This is the preferred call path when Simula or Evo updates coupling weights
+        via NeuroplasticityBus — it carries provenance (source, mutation_id, reason,
+        confidence) for downstream causal analysis.
+        """
+        self._predictor.update_dynamics(payload.matrix)
+        self._counterfactual.set_dynamics(self._predictor.dynamics_matrix)
+        logger.info(
+            "soma_dynamics_matrix_updated",
+            mutation_id=payload.mutation_id,
+            source=payload.source,
+            confidence=round(payload.confidence, 4),
+            reason=payload.reason,
+        )
+        # Write immutable audit node off the critical path (fire-and-forget)
+        asyncio.create_task(
+            self._persist_dynamics_mutation(payload),
+            name="soma_dynamics_audit",
+        )
+
+    async def _persist_dynamics_mutation(self, payload: DynamicsMatrixPayload) -> None:
+        """Write a (:DynamicsMatrixMutation) Neo4j node for provenance (GAP 1)."""
+        driver = getattr(self._marker_writer, "_driver", None)
+        if driver is None:
+            return
+        try:
+            from primitives.common import utc_now
+            query = """
+            CREATE (dm:DynamicsMatrixMutation {
+                mutation_id:   $mutation_id,
+                source:        $source,
+                reason:        $reason,
+                confidence:    $confidence,
+                cycle_number:  $cycle_number,
+                event_time:    $event_time,
+                ingestion_time: $event_time
+            })
+            RETURN dm.mutation_id AS mutation_id
+            """
+            params = {
+                "mutation_id": payload.mutation_id,
+                "source": payload.source,
+                "reason": payload.reason,
+                "confidence": round(payload.confidence, 6),
+                "cycle_number": self._cycle_count,
+                "event_time": payload.timestamp.isoformat(),
+            }
+            async with driver.session() as session:
+                await session.run(query, **params)
+        except Exception as exc:
+            logger.debug("soma_dynamics_audit_failed", error=str(exc))
 
     def update_emotion_regions(self, updated_regions: dict[str, dict[str, Any]]) -> None:
         """Evo refines emotion region boundaries."""
@@ -1018,11 +1570,31 @@ class SomaService:
         """
         Generate a counterfactual interoceptive trajectory.
         Only available at REFLECTIVE stage and above.
+
+        If Oneiros is in a sleep cycle, falls back to simplified linear
+        trajectory extrapolation from the last 5 states.
         """
         if not self._developmental.counterfactual_enabled():
             return CounterfactualTrace(
                 decision_id=decision_id,
                 lesson="Counterfactual not available at current developmental stage",
+            )
+
+        # Check if Oneiros is in sleep cycle — if so, use simplified fallback
+        oneiros_sleeping = False
+        if self._oneiros_ref is not None:
+            try:
+                if hasattr(self._oneiros_ref, "is_sleeping"):
+                    oneiros_sleeping = bool(self._oneiros_ref.is_sleeping)
+                elif hasattr(self._oneiros_ref, "_is_sleeping"):
+                    oneiros_sleeping = bool(self._oneiros_ref._is_sleeping)
+            except Exception:
+                pass
+
+        if oneiros_sleeping:
+            return self._linear_counterfactual_fallback(
+                decision_id, actual_trajectory, alternative_description,
+                alternative_initial_impact, num_steps,
             )
 
         return self._counterfactual.generate_counterfactual(
@@ -1032,6 +1604,70 @@ class SomaService:
             alternative_initial_impact=alternative_initial_impact,
             setpoints=self._controller.setpoints,
             num_steps=num_steps,
+        )
+
+    def _linear_counterfactual_fallback(
+        self,
+        decision_id: str,
+        actual_trajectory: list[dict[InteroceptiveDimension, float]],
+        alternative_description: str,
+        alternative_initial_impact: dict[InteroceptiveDimension, float],
+        num_steps: int,
+    ) -> CounterfactualTrace:
+        """Simplified linear trajectory extrapolation when Oneiros is sleeping.
+
+        Uses the last 5 states to compute a linear trend per dimension,
+        then projects forward with the alternative's initial impact applied.
+        """
+        if len(actual_trajectory) < 2:
+            return CounterfactualTrace(
+                decision_id=decision_id,
+                counterfactual_policy_description=alternative_description,
+                lesson="Insufficient data for linear counterfactual fallback",
+            )
+
+        # Use last 5 states (or fewer if unavailable)
+        recent = actual_trajectory[-5:]
+        n = len(recent)
+
+        # Compute linear slope per dimension
+        slopes: dict[InteroceptiveDimension, float] = {}
+        for dim in ALL_DIMENSIONS:
+            vals = [s.get(dim, 0.5) for s in recent]
+            if n > 1:
+                slopes[dim] = (vals[-1] - vals[0]) / (n - 1)
+            else:
+                slopes[dim] = 0.0
+
+        # Apply alternative impact to last state
+        start = dict(recent[-1])
+        for dim, delta in alternative_initial_impact.items():
+            if dim in start:
+                lo, hi = (-1.0, 1.0) if dim == InteroceptiveDimension.VALENCE else (0.0, 1.0)
+                start[dim] = max(lo, min(hi, start[dim] + delta))
+
+        # Project forward linearly
+        cf_trajectory = [start]
+        for step in range(1, num_steps):
+            state: dict[InteroceptiveDimension, float] = {}
+            for dim in ALL_DIMENSIONS:
+                lo, hi = (-1.0, 1.0) if dim == InteroceptiveDimension.VALENCE else (0.0, 1.0)
+                state[dim] = max(lo, min(hi, start.get(dim, 0.5) + slopes[dim] * step))
+            cf_trajectory.append(state)
+
+        setpoints = self._controller.setpoints
+        regret, gratitude = self._counterfactual._compute_regret_gratitude(
+            actual_trajectory[-num_steps:], cf_trajectory, setpoints,
+        )
+
+        return CounterfactualTrace(
+            decision_id=decision_id,
+            chosen_trajectory=actual_trajectory[-num_steps:],
+            counterfactual_trajectory=cf_trajectory,
+            counterfactual_policy_description=alternative_description,
+            regret=regret,
+            gratitude=gratitude,
+            lesson=f"Linear fallback (Oneiros sleeping): regret={regret:.2f}, gratitude={gratitude:.2f}",
         )
 
     # ─── Context Management ──────────────────────────────────────
@@ -1142,7 +1778,7 @@ class SomaService:
 
     # ─── Phase A: Manifold Fast Path ─────────────────────────────
 
-    async def _run_manifold_fast_path(self) -> None:
+    def _run_manifold_fast_path(self) -> None:
         """Per-cycle manifold analysis: signals → state vector → derivatives → percept.
 
         Runs inside the try block of run_cycle so failures degrade gracefully
@@ -1178,7 +1814,8 @@ class SomaService:
             )
             self._current_percept = percept
 
-            # Broadcast percept through Synapse EventBus
+            # Broadcast percept through Synapse EventBus — fire-and-forget to
+            # avoid blocking the soma cycle budget with a Redis await.
             if percept is not None and self._event_bus_ref is not None:
                 from systems.synapse.types import (
                     SynapseEvent as SynEvent,
@@ -1187,10 +1824,7 @@ class SomaService:
                     SynapseEventType,
                 )
 
-                event = SynEvent(
-                    event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
-                    source_system="soma",
-                    data={
+                percept_data = {
                         "percept_id": percept.percept_id,
                         "urgency": percept.urgency,
                         "sensation_type": percept.sensation_type.value,
@@ -1198,9 +1832,16 @@ class SomaService:
                         "epicenter_system": percept.epicenter_system,
                         "affected_systems": percept.affected_systems,
                         "recommended_action": percept.recommended_action.value,
-                    },
+                }
+                event = SynEvent(
+                    event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
+                    source_system="soma",
+                    data=self._sign_event_data(percept_data),
                 )
-                await self._event_bus_ref.emit(event)
+                asyncio.create_task(
+                    self._event_bus_ref.emit(event),
+                    name="soma_interoceptive_percept",
+                )
 
     # ─── Phase B: Fisher Fast Path (inline, staggered every 10 cycles) ──
 
@@ -1386,7 +2027,7 @@ class SomaService:
         event = SynEvent(
             event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
             source_system="soma",
-            data=percept_data,
+            data=self._sign_event_data(percept_data),
         )
         asyncio.create_task(self._event_bus_ref.emit(event), name="soma_fisher_broadcast")
 
@@ -1459,10 +2100,7 @@ class SomaService:
                 SynapseEventType,
             )
 
-            event = SynEvent(
-                event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
-                source_system="soma",
-                data={
+            emergence_data = {
                     "percept_id": f"emergence_{emergence.emergence_trend}_{self._cycle_count}",
                     "urgency": 0.8 if emergence.emergence_trend == "critical" else 0.5,
                     "sensation_type": SensationType.COHERENCE_DECLINE.value,
@@ -1474,7 +2112,11 @@ class SomaService:
                     "epicenter_system": "emergence",
                     "affected_systems": [],
                     "recommended_action": InteroceptiveAction.ATTEND_INWARD.value,
-                },
+            }
+            event = SynEvent(
+                event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
+                source_system="soma",
+                data=self._sign_event_data(emergence_data),
             )
             asyncio.create_task(self._event_bus_ref.emit(event), name="soma_emergence_broadcast")
 
@@ -1488,10 +2130,7 @@ class SomaService:
                 SynapseEventType,
             )
 
-            event = SynEvent(
-                event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
-                source_system="soma",
-                data={
+            rg_data = {
                     "percept_id": f"rg_anomaly_{self._cycle_count}",
                     "urgency": 0.6,
                     "sensation_type": SensationType.SCALE_ANOMALY.value,
@@ -1502,7 +2141,11 @@ class SomaService:
                     "epicenter_system": "renormalization",
                     "affected_systems": [],
                     "recommended_action": InteroceptiveAction.ATTEND_INWARD.value,
-                },
+            }
+            event = SynEvent(
+                event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
+                source_system="soma",
+                data=self._sign_event_data(rg_data),
             )
             asyncio.create_task(self._event_bus_ref.emit(event), name="soma_rg_broadcast")
 
@@ -1522,10 +2165,7 @@ class SomaService:
                 if causal.unexpected_influences
                 else causal.reversed_influences[0]
             )
-            event = SynEvent(
-                event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
-                source_system="soma",
-                data={
+            causal_data = {
                     "percept_id": f"causal_anomaly_{self._cycle_count}",
                     "urgency": min(0.9, 0.3 + anomaly_count * 0.1),
                     "sensation_type": SensationType.CAUSAL_DISRUPTION.value,
@@ -1536,7 +2176,11 @@ class SomaService:
                     "epicenter_system": top_anomaly.source_system,
                     "affected_systems": [top_anomaly.target_system],
                     "recommended_action": InteroceptiveAction.ATTEND_INWARD.value,
-                },
+            }
+            event = SynEvent(
+                event_type=SynapseEventType.INTEROCEPTIVE_PERCEPT,
+                source_system="soma",
+                data=self._sign_event_data(causal_data),
             )
             asyncio.create_task(self._event_bus_ref.emit(event), name="soma_causal_broadcast")
 
@@ -1861,3 +2505,607 @@ class SomaService:
     def loop_executor(self) -> LoopExecutor:
         """Direct access to loop executor for Evo learning reads."""
         return self._loop_executor
+
+    # ─── Interconnectedness: Benchmarks KPI Emission (Fix 2) ──────
+
+    async def _emit_benchmarks_kpis(self) -> None:
+        """Emit 7 KPIs to Benchmarks every 50 cycles (fire-and-forget)."""
+        try:
+            benchmarks = self._benchmarks_ref
+            now = time.time()
+
+            # soma_cycle_duration_ms_p99
+            if self._cycle_durations:
+                sorted_durations = sorted(self._cycle_durations)
+                p99_idx = int(len(sorted_durations) * 0.99)
+                p99 = sorted_durations[min(p99_idx, len(sorted_durations) - 1)]
+                await benchmarks.record_kpi(system="soma", metric="soma_cycle_duration_ms_p99", value=p99)
+
+            # soma_cycle_duration_ms_mean
+            if self._cycle_durations:
+                mean_dur = sum(self._cycle_durations) / len(self._cycle_durations)
+                await benchmarks.record_kpi(system="soma", metric="soma_cycle_duration_ms_mean", value=mean_dur)
+
+            # soma_phase_space_attractors
+            await benchmarks.record_kpi(
+                system="soma", metric="soma_phase_space_attractors",
+                value=float(self._phase_space.attractor_count),
+            )
+
+            # soma_dominant_error
+            dominant = self._current_signal.dominant_error.value
+            # Encode as hash for numeric storage
+            await benchmarks.record_kpi(
+                system="soma", metric="soma_dominant_error",
+                value=float(hash(dominant) % 1000),
+            )
+
+            # soma_max_error_magnitude
+            await benchmarks.record_kpi(
+                system="soma", metric="soma_max_error_magnitude",
+                value=self._current_signal.dominant_error_magnitude,
+            )
+
+            # soma_current_urgency
+            await benchmarks.record_kpi(
+                system="soma", metric="soma_current_urgency",
+                value=self._current_signal.urgency,
+            )
+
+            # soma_current_emotion
+            emotion_val = 0.0
+            if self._current_emotions:
+                emotion_val = self._current_emotions[0].intensity
+            await benchmarks.record_kpi(
+                system="soma", metric="soma_current_emotion",
+                value=emotion_val,
+            )
+
+        except Exception as exc:
+            logger.debug("soma_benchmarks_kpi_error", error=str(exc))
+
+    # ─── Interconnectedness: Skia State Persistence (Fix 3) ───────
+
+    def _skia_snapshot(self) -> dict[str, Any]:
+        """Capture Soma's full state for Skia persistence."""
+        snapshot: dict[str, Any] = {
+            "cycle_count": self._cycle_count,
+            "developmental_stage": self._developmental.stage.value,
+            "emotion_regions": dict(self._emotion_regions),
+        }
+
+        # Trajectory ring buffer
+        try:
+            trajectory = self._predictor.raw_trajectory
+            snapshot["trajectory"] = [
+                {dim.value: val for dim, val in state.items()}
+                for state in trajectory
+            ]
+        except Exception:
+            snapshot["trajectory"] = []
+
+        # Phase space attractors
+        try:
+            attractors = []
+            for a in self._phase_space._attractors:
+                attractors.append({
+                    "label": a.label,
+                    "center": {dim.value: val for dim, val in a.center.items()},
+                    "basin_radius": a.basin_radius,
+                    "stability": a.stability,
+                    "valence": a.valence,
+                    "visits": a.visits,
+                    "dwell_cycles": getattr(a, "dwell_cycles", 0),
+                })
+            snapshot["attractors"] = attractors
+        except Exception:
+            snapshot["attractors"] = []
+
+        # Dynamics matrix
+        try:
+            dm = self._predictor.dynamics_matrix
+            if dm is not None:
+                snapshot["dynamics_matrix"] = dm.tolist() if hasattr(dm, "tolist") else list(dm)
+        except Exception:
+            pass
+
+        return snapshot
+
+    def _skia_restore(self, snapshot: dict[str, Any]) -> None:
+        """Restore Soma state from a Skia snapshot."""
+        try:
+            # Restore trajectory buffer
+            trajectory_data = snapshot.get("trajectory", [])
+            for state_dict in trajectory_data:
+                state = {
+                    InteroceptiveDimension(k): v
+                    for k, v in state_dict.items()
+                }
+                self._predictor.push_state(state)
+
+            # Restore attractors
+            attractors_data = snapshot.get("attractors", [])
+            from systems.soma.types import Attractor
+            restored_attractors = []
+            for a_data in attractors_data:
+                center = {
+                    InteroceptiveDimension(k): v
+                    for k, v in a_data.get("center", {}).items()
+                }
+                restored_attractors.append(Attractor(
+                    label=a_data.get("label", "restored"),
+                    center=center,
+                    basin_radius=a_data.get("basin_radius", 0.15),
+                    stability=a_data.get("stability", 0.5),
+                    valence=a_data.get("valence", 0.0),
+                    visits=a_data.get("visits", 0),
+                ))
+            if restored_attractors:
+                self._phase_space._attractors = restored_attractors
+
+            # Restore emotion regions
+            emotion_regions = snapshot.get("emotion_regions")
+            if emotion_regions:
+                self._emotion_regions.update(emotion_regions)
+
+            # Restore developmental stage
+            stage_val = snapshot.get("developmental_stage")
+            if stage_val:
+                self._developmental._stage = DevelopmentalStage(stage_val)
+
+            # Restore dynamics matrix
+            dynamics = snapshot.get("dynamics_matrix")
+            if dynamics is not None:
+                self._predictor.update_dynamics([list(row) for row in dynamics])
+                self._counterfactual.set_dynamics(self._predictor.dynamics_matrix)
+
+            # Restore cycle count
+            cycle = snapshot.get("cycle_count", 0)
+            if cycle > self._cycle_count:
+                self._cycle_count = cycle
+
+            logger.info(
+                "soma_skia_restored",
+                cycle_count=self._cycle_count,
+                attractors=len(restored_attractors),
+                trajectory_len=len(trajectory_data),
+            )
+        except Exception as exc:
+            logger.error("soma_skia_restore_error", error=str(exc))
+
+    # ─── Interconnectedness: Memory Trace Writes (Fix 4) ──────────
+
+    def _check_memory_traces(self) -> None:
+        """Check for attractor/bifurcation/emotion discoveries and write Memory traces."""
+        if self._memory_ref is None:
+            return
+
+        # New attractor discovered
+        current_attractor_count = self._phase_space.attractor_count
+        if current_attractor_count > self._prev_attractor_count:
+            marker = self.create_somatic_marker()
+            new_attractors = self._phase_space._attractors[self._prev_attractor_count:]
+            for attractor in new_attractors:
+                asyncio.create_task(
+                    self._write_memory_trace(
+                        discovery_type="attractor",
+                        details={
+                            "label": attractor.label,
+                            "center": {d.value: v for d, v in attractor.center.items()},
+                            "basin_radius": attractor.basin_radius,
+                        },
+                        somatic_marker=marker,
+                    ),
+                    name="soma_memory_attractor",
+                )
+            self._prev_attractor_count = current_attractor_count
+
+        # Bifurcation crossed
+        current_bifurcation_count = self._phase_space.bifurcation_count
+        if current_bifurcation_count > self._prev_bifurcation_count:
+            asyncio.create_task(
+                self._write_memory_trace(
+                    discovery_type="bifurcation",
+                    details={
+                        "bifurcation_count": current_bifurcation_count,
+                        "phase_position": self._phase_space.snapshot_dict(),
+                    },
+                ),
+                name="soma_memory_bifurcation",
+            )
+            self._prev_bifurcation_count = current_bifurcation_count
+
+        # Dominant emotion shift
+        current_emotion = (
+            self._current_emotions[0].name if self._current_emotions else None
+        )
+        if current_emotion is not None and current_emotion != self._prev_dominant_emotion:
+            asyncio.create_task(
+                self._write_memory_trace(
+                    discovery_type="emotion_shift",
+                    details={
+                        "from_emotion": self._prev_dominant_emotion,
+                        "to_emotion": current_emotion,
+                        "intensity": self._current_emotions[0].intensity,
+                    },
+                ),
+                name="soma_memory_emotion",
+            )
+            self._prev_dominant_emotion = current_emotion
+
+    async def _write_memory_trace(
+        self,
+        discovery_type: str,
+        details: dict[str, Any],
+        somatic_marker: SomaticMarker | None = None,
+    ) -> None:
+        """Write a discovery trace to Memory (fire-and-forget)."""
+        try:
+            from primitives.common import utc_now as _utc_now
+
+            trace_data = {
+                "system": "soma",
+                "discovery_type": discovery_type,
+                "timestamp": _utc_now().isoformat(),
+                "cycle_count": self._cycle_count,
+                "details": details,
+            }
+            if somatic_marker is not None:
+                trace_data["somatic_marker"] = {
+                    "prediction_error": somatic_marker.prediction_error_at_encoding,
+                    "allostatic_context": somatic_marker.allostatic_context,
+                    "snapshot": {
+                        d.value: v
+                        for d, v in somatic_marker.interoceptive_snapshot.items()
+                    },
+                }
+
+            # Memory doesn't have write_trace — use store_percept with a synthetic percept
+            from primitives.common import Modality, SourceDescriptor, SystemID
+            from primitives.percept import Content, Percept
+
+            percept = Percept(
+                source=SourceDescriptor(
+                    system=SystemID.SOMA,
+                    channel="interoception",
+                    modality=Modality.INTERNAL,
+                ),
+                content=Content(raw=f"soma:{discovery_type}", parsed=trace_data),
+                metadata=trace_data,
+            )
+            await self._memory_ref.store_percept(
+                percept=percept,
+                salience_composite=0.6 if discovery_type == "attractor" else 0.4,
+            )
+        except Exception as exc:
+            logger.debug("soma_memory_trace_error", error=str(exc), discovery_type=discovery_type)
+
+    # ─── Interconnectedness: Telos Drive Vector (Fix 5) ───────────
+
+    async def _emit_drive_vector(self) -> None:
+        """Map 9D sensed state to 4D drive vector and emit via Synapse."""
+        try:
+            if self._current_state is None:
+                return
+
+            sensed = self._current_state.sensed
+            from systems.soma.types import InteroceptiveDimension as ID
+
+            coherence_drive = sensed.get(ID.COHERENCE, 0.5)
+            care_drive = (
+                sensed.get(ID.SOCIAL_CHARGE, 0.3) + max(0.0, sensed.get(ID.VALENCE, 0.0))
+            ) / 2.0
+            growth_drive = sensed.get(ID.CURIOSITY_DRIVE, 0.5)
+            honesty_drive = sensed.get(ID.INTEGRITY, 0.8)
+
+            # Clamp all to [0, 1]
+            coherence_drive = max(0.0, min(1.0, coherence_drive))
+            care_drive = max(0.0, min(1.0, care_drive))
+            growth_drive = max(0.0, min(1.0, growth_drive))
+            honesty_drive = max(0.0, min(1.0, honesty_drive))
+
+            from systems.synapse.types import (
+                SynapseEvent as SynEvent,
+                SynapseEventType,
+            )
+
+            payload = {
+                "coherence_drive": coherence_drive,
+                "care_drive": care_drive,
+                "growth_drive": growth_drive,
+                "honesty_drive": honesty_drive,
+                "cycle": self._cycle_count,
+            }
+
+            if self._event_bus_ref is None:
+                return
+            event = SynEvent(
+                event_type=SynapseEventType.SOMATIC_DRIVE_VECTOR,
+                source_system="soma",
+                data=self._sign_event_data(payload),
+            )
+            await self._event_bus_ref.emit(event)
+        except Exception as exc:
+            logger.debug("soma_drive_vector_error", error=str(exc))
+
+    # ─── Loop 5: Somatic Modulation Signal ──────────────────────
+
+    async def _maybe_emit_somatic_modulation(self) -> None:
+        """Emit SOMATIC_MODULATION_SIGNAL when thresholds are crossed.
+
+        Thresholds: urgency > 0.7, energy < 0.2, coherence_stress > 0.5.
+        """
+        try:
+            signal = self._current_signal
+            if signal is None:
+                return
+
+            from systems.soma.types import InteroceptiveDimension as ID
+
+            urgency = signal.urgency
+            energy = signal.state.sensed.get(ID.ENERGY, 0.5)
+            coherence = signal.state.sensed.get(ID.COHERENCE, 0.5)
+            coherence_stress = 1.0 - coherence  # stress = inverse of coherence
+
+            crossed: list[str] = []
+            if urgency > 0.7:
+                crossed.append("urgency")
+            if energy < 0.2:
+                crossed.append("energy_low")
+            if coherence_stress > 0.5:
+                crossed.append("coherence_stress")
+
+            if not crossed:
+                return
+            if self._event_bus_ref is None:
+                return
+
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            from systems.soma.types import InteroceptiveDimension as ID2
+
+            arousal = signal.state.sensed.get(ID2.AROUSAL, 0.5)
+            dev_stage = self._developmental.stage.value
+
+            await self._event_bus_ref.emit(SynapseEvent(
+                event_type=SynapseEventType.SOMATIC_MODULATION_SIGNAL,
+                source_system="soma",
+                data={
+                    "urgency": round(urgency, 3),
+                    "energy": round(energy, 3),
+                    "arousal": round(arousal, 3),
+                    "coherence": round(1.0 - coherence_stress, 3),
+                    "coherence_stress": round(coherence_stress, 3),
+                    "developmental_stage": dev_stage,
+                    "thresholds_crossed": crossed,
+                    "cycle": self._cycle_count,
+                },
+            ))
+        except Exception as exc:
+            logger.debug("soma_modulation_signal_error", error=str(exc))
+
+    # ─── Vitality Signal Emission ────────────────────────────────
+
+    async def _emit_vitality_signal(self) -> None:
+        """Emit SOMA_VITALITY_SIGNAL every cycle for VitalityCoordinator.
+
+        Lightweight fire-and-forget — VitalityCoordinator uses this to assess
+        somatic collapse threshold (allostatic error sustained > 0.8 for 48h).
+        """
+        try:
+            signal = self._current_signal
+            state = self._current_state
+            if signal is None or state is None:
+                return
+
+            # Mean absolute error across 9 dimensions at moment horizon
+            moment_errors = state.errors.get("moment", {})
+            allostatic_error = 0.0
+            if moment_errors:
+                allostatic_error = sum(abs(v) for v in moment_errors.values()) / len(moment_errors)
+
+            coherence = state.sensed.get(InteroceptiveDimension.COHERENCE, 0.5)
+
+            if self._event_bus_ref is None:
+                return
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus_ref.emit(SynapseEvent(
+                event_type=SynapseEventType.SOMA_VITALITY_SIGNAL,
+                source_system="soma",
+                data={
+                    "urgency_scalar": round(signal.urgency, 4),
+                    "allostatic_error": round(allostatic_error, 4),
+                    "coherence_stress": round(1.0 - coherence, 4),
+                    "cycle": self._cycle_count,
+                },
+            ))
+        except Exception as exc:
+            logger.debug("soma_vitality_signal_error", error=str(exc))
+
+    async def _emit_allostatic_report(self) -> None:
+        """Emit SOMA_ALLOSTATIC_REPORT every N cycles for Benchmarks.
+
+        Summarises allostatic efficiency over the rolling window:
+        mean urgency, urgency frequency, setpoint deviation, developmental stage.
+        """
+        try:
+            signal = self._current_signal
+            state = self._current_state
+            if signal is None or state is None:
+                return
+
+            # Mean urgency over rolling window
+            urgency_vals = list(self._urgency_history)
+            mean_urgency = sum(urgency_vals) / len(urgency_vals) if urgency_vals else 0.0
+
+            # % of cycles with urgency > 0.5
+            urgency_frequency = (
+                sum(1 for u in urgency_vals if u > 0.5) / len(urgency_vals)
+                if urgency_vals
+                else 0.0
+            )
+
+            # Mean absolute error from setpoints across 9 dimensions
+            setpoints = self._controller.setpoints
+            sensed = state.sensed
+            deviations = [abs(sensed.get(d, 0.5) - setpoints.get(d, 0.5)) for d in ALL_DIMENSIONS]
+            setpoint_deviation = sum(deviations) / len(deviations) if deviations else 0.0
+
+            if self._event_bus_ref is None:
+                return
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            # allostatic_efficiency = how well the system is maintaining homeostasis.
+            # 1.0 = perfect (zero deviation, zero urgency pressure); 0.0 = total failure.
+            allostatic_efficiency = round(
+                (1.0 - setpoint_deviation) * (1.0 - urgency_frequency), 4
+            )
+
+            await self._event_bus_ref.emit(SynapseEvent(
+                event_type=SynapseEventType.SOMA_ALLOSTATIC_REPORT,
+                source_system="soma",
+                data={
+                    "mean_urgency": round(mean_urgency, 4),
+                    "urgency_frequency": round(urgency_frequency, 4),
+                    "setpoint_deviation": round(setpoint_deviation, 4),
+                    "allostatic_efficiency": allostatic_efficiency,
+                    "developmental_stage": self._developmental.stage.value,
+                    "cycle": self._cycle_count,
+                },
+            ))
+
+            # Bedau-Packard evolutionary observables — allostatic efficiency and
+            # urgency frequency are both eligible fitness dimensions (Spec 08 gap fix).
+            from primitives.common import SystemID
+            from primitives.evolutionary import EvolutionaryObservable
+
+            for obs in [
+                EvolutionaryObservable(
+                    source_system=SystemID.SOMA,
+                    observable_type="allostatic_efficiency",
+                    value=allostatic_efficiency,
+                    is_novel=False,
+                    metadata={"cycle": self._cycle_count},
+                ),
+                EvolutionaryObservable(
+                    source_system=SystemID.SOMA,
+                    observable_type="urgency_frequency",
+                    value=round(urgency_frequency, 4),
+                    is_novel=False,
+                    metadata={"cycle": self._cycle_count},
+                ),
+            ]:
+                await self._event_bus_ref.emit(SynapseEvent(
+                    event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                    source_system="soma",
+                    data=obs.model_dump(mode="json"),
+                ))
+        except Exception as exc:
+            logger.debug("soma_allostatic_report_error", error=str(exc))
+
+    async def _emit_allostatic_signal(self) -> None:
+        """Emit ALLOSTATIC_SIGNAL every theta cycle (Spec 08 §15.1, Spec 16 §XVIII).
+
+        Bus-broadcast of Soma's primary output. Decouples downstream subscribers
+        from requiring a direct Soma reference — essential for federated instances.
+        """
+        try:
+            signal = self._current_signal
+            state = self._current_state
+            if signal is None or state is None:
+                return
+
+            sensed = state.sensed
+            if self._event_bus_ref is None:
+                return
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus_ref.emit(SynapseEvent(
+                event_type=SynapseEventType.ALLOSTATIC_SIGNAL,
+                source_system="soma",
+                data={
+                    "urgency": round(signal.urgency, 4),
+                    "dominant_error": signal.dominant_error.value if signal.dominant_error else None,
+                    "precision_weights": {
+                        d.value: round(w, 4)
+                        for d, w in (signal.precision_weights or {}).items()
+                    },
+                    "nearest_attractor": signal.nearest_attractor,
+                    "trajectory_heading": signal.trajectory_heading,
+                    "cycle_number": self._cycle_count,
+                    "energy": round(sensed.get(InteroceptiveDimension.ENERGY, 0.5), 4),
+                    "arousal": round(sensed.get(InteroceptiveDimension.AROUSAL, 0.5), 4),
+                    "valence": round(sensed.get(InteroceptiveDimension.VALENCE, 0.5), 4),
+                    "coherence": round(sensed.get(InteroceptiveDimension.COHERENCE, 0.5), 4),
+                },
+            ))
+        except Exception as exc:
+            logger.debug("soma_allostatic_signal_error", error=str(exc))
+
+    async def _maybe_emit_urgency_critical(self) -> None:
+        """Emit SOMA_URGENCY_CRITICAL when urgency > 0.85 (Spec 16 §XVIII).
+
+        High-priority alert for systems that need faster response than waiting
+        for the next ALLOSTATIC_SIGNAL subscription. Includes a recommended
+        action derived from the dominant allostatic error dimension.
+        """
+        try:
+            signal = self._current_signal
+            if signal is None:
+                return
+
+            dominant = signal.dominant_error.value if signal.dominant_error else "unknown"
+            # Map dominant error dimension to a recommended action
+            _action_map = {
+                "energy": "reduce_compute_parallelism",
+                "arousal": "enter_recovery_context",
+                "valence": "inject_dopaminergic_targets",
+                "coherence": "request_coherence_repair",
+                "social_charge": "reduce_social_processing",
+                "curiosity_drive": "defer_exploration",
+                "integrity": "run_thymos_scan",
+                "temporal_pressure": "prioritise_immediate_goals",
+                "confidence": "seek_confirmation_loop",
+            }
+            recommended_action = _action_map.get(dominant, "activate_autonomic_protocol")
+
+            if self._event_bus_ref is None:
+                return
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus_ref.emit(SynapseEvent(
+                event_type=SynapseEventType.SOMA_URGENCY_CRITICAL,
+                source_system="soma",
+                data={
+                    "urgency": round(signal.urgency, 4),
+                    "dominant_error": dominant,
+                    "recommended_action": recommended_action,
+                    "cycle": self._cycle_count,
+                    "salience": 1.0,
+                },
+            ))
+        except Exception as exc:
+            logger.debug("soma_urgency_critical_error", error=str(exc))
+
+    # ─── Interconnectedness: Identity Signing (Fix 6) ─────────────
+
+    def _sign_event_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Augment event data with organism identity and optional signature."""
+        if self._identity_ref is not None:
+            try:
+                instance_id = getattr(self._identity_ref, "instance_id", None)
+                if instance_id:
+                    data["source_organism_id"] = instance_id
+
+                if hasattr(self._identity_ref, "sign"):
+                    import json as _json
+                    payload_bytes = _json.dumps(data, sort_keys=True, default=str).encode()
+                    sig = self._identity_ref.sign(payload_bytes)
+                    if isinstance(sig, bytes):
+                        import base64
+                        data["signature"] = base64.b64encode(sig).decode()
+                    else:
+                        data["signature"] = str(sig)
+            except Exception:
+                pass  # Signing is best-effort — never block event emission
+        return data

@@ -20,6 +20,7 @@ import structlog
 
 from systems.phantom_liquidity.types import (
     PhantomLiquidityPool,
+    PoolHealth,
     PoolSelectionCandidate,
 )
 
@@ -184,7 +185,7 @@ class PoolSelector:
         existing_addresses = {
             p.pool_address.lower()
             for p in existing_pools
-            if p.health not in ("withdrawn", "failed")
+            if p.health not in (PoolHealth.WITHDRAWN, PoolHealth.FAILED)
         }
 
         candidates = [
@@ -214,6 +215,11 @@ class PoolSelector:
         )
 
         return selected
+
+    @staticmethod
+    def get_static_pools() -> list[PoolSelectionCandidate]:
+        """Return the full static pool candidate list (Phase 1 curated set)."""
+        return list(_STATIC_POOLS)
 
     @staticmethod
     def compute_tick_range(

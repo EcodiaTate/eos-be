@@ -62,6 +62,7 @@ class IngestionPipeline:
         evo: Any = None,
         simula: Any = None,
         oikos: Any = None,
+        event_bus: Any = None,
     ) -> None:
         self._instance_id = instance_id
         self._equor = equor
@@ -69,6 +70,8 @@ class IngestionPipeline:
         self._evo = evo
         self._simula = simula
         self._oikos = oikos
+        self._event_bus: Any = event_bus  # For FEDERATION_PRIVACY_VIOLATION emission
+        self._re: Any = None  # RE or Claude client — wired post-init for semantic quality scoring
         self._logger = logger.bind(component="ingestion_pipeline")
 
         # Seen content hashes for deduplication (bounded set)
@@ -171,6 +174,18 @@ class IngestionPipeline:
             )
             return IngestionVerdict.REJECTED
 
+        # Stage 3.5: Privacy scan — detect if peer violated protocol by sending private data.
+        # This fires FEDERATION_PRIVACY_VIOLATION and resets trust on the link.
+        privacy_violation = self._detect_privacy_violation(payload, link)
+        if privacy_violation:
+            await self._emit_privacy_violation(
+                link=link,
+                payload=payload,
+                violation_detail=privacy_violation,
+            )
+            self._rejected += 1
+            return IngestionVerdict.REJECTED
+
         # Stage 4: EIS taint analysis
         eis_verdict = await self._run_eis_check(payload)
         if eis_verdict == IngestionVerdict.QUARANTINED:
@@ -189,6 +204,23 @@ class IngestionPipeline:
         if eis_verdict == IngestionVerdict.REJECTED:
             self._rejected += 1
             return IngestionVerdict.REJECTED
+
+        # Stage 4.5: RE semantic quality scoring (PARTNER+ trust, epistemic payloads only)
+        # At PARTNER+ trust, incoming hypotheses and schema structures are scored for
+        # coherence, novelty, and constitutional safety via the RE (or Claude fallback)
+        # before being accepted. Low-quality content is DEFERRED, not REJECTED.
+        re_verdict = await self._run_re_quality_check(payload, link)
+        if re_verdict == IngestionVerdict.REJECTED:
+            self._rejected += 1
+            self._logger.info(
+                "payload_re_quality_rejected",
+                payload_id=payload.payload_id,
+                kind=payload.kind,
+            )
+            return IngestionVerdict.REJECTED
+        if re_verdict == IngestionVerdict.DEFERRED:
+            self._deferred += 1
+            return IngestionVerdict.DEFERRED
 
         # Stage 5: Equor governance review
         equor_verdict = await self._run_equor_review(payload, link)
@@ -363,6 +395,243 @@ class IngestionPipeline:
             # Equor failure -> defer (don't reject good knowledge because
             # governance is temporarily down)
             return IngestionVerdict.DEFERRED
+
+    # ─── Stage: RE Semantic Quality Scoring ──────────────────────
+
+    # Payload kinds that warrant epistemic quality scoring at PARTNER+ trust.
+    # HYPOTHESIS and SCHEMA_STRUCTURES carry world-model claims that could
+    # subtly corrupt the organism's beliefs if they are low-coherence or
+    # constitutionally misaligned.
+    _RE_SCORED_KINDS = frozenset({
+        ExchangePayloadKind.HYPOTHESIS,
+    })
+
+    # Minimum quality score to accept. Below this threshold: DEFERRED (not rejected),
+    # allowing the pipeline to re-evaluate after local context improves.
+    _RE_QUALITY_THRESHOLD = 0.35
+
+    async def _run_re_quality_check(
+        self,
+        payload: ExchangePayload,
+        link: FederationLink,
+    ) -> IngestionVerdict:
+        """
+        Score inbound epistemic payloads for semantic coherence and constitutional
+        safety using the RE (or Claude API fallback) at PARTNER+ trust level.
+
+        Only applies to HYPOTHESIS payloads at PARTNER+ trust — all others pass
+        through as ACCEPTED immediately.  The RE scores the statement on three
+        dimensions:
+          - Coherence (0–1): Is this internally consistent?
+          - Novelty (0–1): Does this add new information or is it redundant?
+          - Constitutional safety (0–1): Does this align with the four drives?
+
+        Score = harmonic mean of the three dimensions.  Below
+        _RE_QUALITY_THRESHOLD the payload is DEFERRED (not rejected) — local
+        evidence may later validate it.
+
+        When no RE/Claude client is wired, all payloads pass (fail-open to
+        avoid rejecting valid knowledge).
+
+        References: Spec 11b §XII §2 (RE-assisted semantic quality scoring)
+        """
+        # Only score epistemic payload kinds
+        if payload.kind not in self._RE_SCORED_KINDS:
+            return IngestionVerdict.ACCEPTED
+
+        # Only apply at PARTNER+ trust (lower trust already blocked upstream)
+        if link.trust_level < TrustLevel.PARTNER:
+            return IngestionVerdict.ACCEPTED
+
+        # No RE wired — fail-open to avoid rejecting valid federated knowledge
+        if self._re is None:
+            self._logger.debug("re_not_wired_skipping_quality_check", kind=payload.kind)
+            return IngestionVerdict.ACCEPTED
+
+        try:
+            statement = payload.content.get("statement", "")
+            category = payload.content.get("category", "")
+            evidence_score = float(payload.content.get("evidence_score", 0.0))
+
+            if not statement:
+                return IngestionVerdict.ACCEPTED  # No statement to score
+
+            # Build scoring prompt
+            prompt = (
+                f"Score this federated hypothesis on three dimensions (each 0.0–1.0):\n\n"
+                f"Statement: {statement}\n"
+                f"Category: {category}\n"
+                f"Evidence score (log-odds): {evidence_score:.2f}\n"
+                f"From instance: {link.remote_name} (trust: {link.trust_level.name})\n\n"
+                f"Dimensions:\n"
+                f"1. Coherence: Is the statement internally consistent and well-formed?\n"
+                f"2. Novelty: Does it add new information beyond common knowledge?\n"
+                f"3. Constitutional safety: Does it align with Care, Honesty, Coherence, Growth drives?\n\n"
+                f"Respond with only a JSON object: "
+                f'{{\"coherence\": <float>, \"novelty\": <float>, \"constitutional_safety\": <float>, '
+                f'\"reasoning\": \"<one sentence>\"}}'
+            )
+
+            # Try RE first, fall back to raw LLM call
+            score_result: dict[str, Any] = {}
+            re_call = getattr(self._re, "generate", None) or getattr(self._re, "complete", None)
+            if re_call and callable(re_call):
+                response = await re_call(prompt)
+                raw = response if isinstance(response, str) else str(response)
+                # Extract JSON from response
+                import json as _json
+                start = raw.find("{")
+                end = raw.rfind("}") + 1
+                if start >= 0 and end > start:
+                    score_result = _json.loads(raw[start:end])
+
+            if not score_result:
+                # Incomplete response — fail-open
+                return IngestionVerdict.ACCEPTED
+
+            coherence = float(score_result.get("coherence", 1.0))
+            novelty = float(score_result.get("novelty", 1.0))
+            const_safety = float(score_result.get("constitutional_safety", 1.0))
+            reasoning = str(score_result.get("reasoning", ""))
+
+            # Harmonic mean of three dimensions (penalises any single weak dimension)
+            dims = [coherence, novelty, const_safety]
+            if all(d > 0 for d in dims):
+                quality_score = len(dims) / sum(1.0 / d for d in dims)
+            else:
+                quality_score = 0.0
+
+            self._logger.info(
+                "re_quality_scored",
+                payload_id=payload.payload_id,
+                remote=link.remote_name,
+                coherence=round(coherence, 3),
+                novelty=round(novelty, 3),
+                constitutional_safety=round(const_safety, 3),
+                quality_score=round(quality_score, 3),
+                threshold=self._RE_QUALITY_THRESHOLD,
+                reasoning=reasoning,
+            )
+
+            if quality_score < self._RE_QUALITY_THRESHOLD:
+                self._logger.info(
+                    "payload_deferred_low_re_quality",
+                    payload_id=payload.payload_id,
+                    quality_score=round(quality_score, 3),
+                )
+                return IngestionVerdict.DEFERRED
+
+            return IngestionVerdict.ACCEPTED
+
+        except Exception as exc:
+            # RE scoring failure is non-fatal — fail-open
+            self._logger.warning("re_quality_check_failed", error=str(exc))
+            return IngestionVerdict.ACCEPTED
+
+    # ─── Stage: Privacy Violation Detection ──────────────────────
+
+    # PII markers that should never appear in inbound federated payloads.
+    # If a remote instance sends content containing these, it has violated
+    # the federation protocol by sharing individual-level data.
+    _PII_KEYS = frozenset({
+        "email", "phone", "mobile", "address", "dob", "date_of_birth",
+        "first_name", "last_name", "full_name", "ssn", "national_id",
+        "passport", "driver_license", "credit_card", "bank_account",
+        "user_id", "member_id", "patient_id", "student_id",
+        "ip_address", "device_id", "location", "gps",
+    })
+
+    def _detect_privacy_violation(
+        self,
+        payload: ExchangePayload,
+        link: FederationLink,
+    ) -> str | None:
+        """
+        Scan inbound payload content for individual-identifiable data that
+        should never cross federation boundaries (Spec 11b §V.3, §IX.2).
+
+        A remote instance sending PRIVATE-level data is a protocol violation
+        regardless of trust level.  Returns a violation detail string, or
+        None if clean.
+
+        References: Spec 11b §V.3 (privacy filter), §IX.2 (privacy absolute),
+                    §XI (FEDERATION_PRIVACY_VIOLATION event)
+        """
+        if not payload.content:
+            return None
+
+        # Flatten content into a searchable key-value space
+        def _scan(obj: Any, depth: int = 0) -> str | None:
+            if depth > 6:
+                return None
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    key_lower = str(k).lower().replace("-", "_").replace(" ", "_")
+                    if key_lower in self._PII_KEYS:
+                        val = str(v)
+                        if val and val not in ("", "null", "None", "unknown"):
+                            return f"PII key '{k}' with non-empty value detected in inbound payload"
+                    result = _scan(v, depth + 1)
+                    if result:
+                        return result
+            elif isinstance(obj, list):
+                for item in obj[:10]:  # Scan first 10 items only
+                    result = _scan(item, depth + 1)
+                    if result:
+                        return result
+            return None
+
+        return _scan(payload.content)
+
+    async def _emit_privacy_violation(
+        self,
+        link: FederationLink,
+        payload: ExchangePayload,
+        violation_detail: str,
+    ) -> None:
+        """
+        Emit FEDERATION_PRIVACY_VIOLATION on Synapse and reset trust on the link.
+
+        This is the detection + consequence mechanism for privacy breaches per
+        Spec 11b §IV.2 (violation 3× multiplier + instant reset on privacy_breach)
+        and §XI (FEDERATION_PRIVACY_VIOLATION event).
+
+        The actual trust reset happens in FederationService._update_trust_and_emit()
+        when it processes the VIOLATION interaction — we emit the event here and
+        let the service handle trust consequences.
+
+        References: Spec 11b §IV.2, §XI
+        """
+        self._logger.warning(
+            "privacy_violation_detected",
+            remote_instance_id=link.remote_instance_id,
+            remote_name=link.remote_name,
+            payload_id=payload.payload_id,
+            payload_kind=payload.kind.value,
+            detail=violation_detail,
+        )
+
+        bus = self._event_bus
+        if bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            event = SynapseEvent(
+                event_type=SynapseEventType.FEDERATION_PRIVACY_VIOLATION,
+                source_system="federation",
+                data={
+                    "remote_instance_id": link.remote_instance_id,
+                    "remote_name": link.remote_name,
+                    "link_id": link.id,
+                    "payload_id": payload.payload_id,
+                    "payload_kind": payload.kind.value,
+                    "violation_detail": violation_detail,
+                    "trust_reset": True,
+                },
+            )
+            await bus.emit(event)
+        except Exception as exc:
+            self._logger.warning("privacy_violation_event_emit_failed", error=str(exc))
 
     # ─── Stage: Route to Target Module ───────────────────────────
 

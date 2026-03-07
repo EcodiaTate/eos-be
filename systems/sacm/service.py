@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from primitives.common import EOSBaseModel, Identified, Timestamped
-from systems.sacm.optimizer import optimize_placement
+from systems.sacm.optimizer import PlacementPlan, ScoredPlacement, optimize_placement
 from systems.sacm.remote_executor import (
     PlacementDecision,
     RemoteExecutionManager,
@@ -249,28 +249,97 @@ class WorkloadHistoryRecord(EOSBaseModel):
 
 class SACMWorkloadHistoryStore:
     """
-    In-memory store for completed workload history.
+    Redis-backed workload history store with in-memory fallback.
 
-    Holds the last `max_records` records, ordered newest-first on retrieval.
+    Records are persisted to a Redis sorted set (scored by submitted_at)
+    for continuity across restarts. Falls back to pure in-memory when
+    Redis is unavailable.
     """
 
-    def __init__(self, max_records: int = 500) -> None:
+    _REDIS_KEY = "sacm:workload_history"
+
+    def __init__(self, max_records: int = 500, redis_client: Any = None) -> None:
         self._max_records = max_records
         self._records: list[WorkloadHistoryRecord] = []
+        self._redis: Any = redis_client  # RedisClient instance, wired after init
         self._log = structlog.get_logger("systems.sacm.history").bind(
             component="sacm.history"
         )
+
+    def set_redis(self, redis_client: Any) -> None:
+        """Wire Redis for persistent workload history."""
+        self._redis = redis_client
+        self._log.info("redis_wired_to_sacm_history")
+
+    async def load_from_redis(self) -> int:
+        """
+        Reload history from Redis on startup.
+
+        Returns the number of records loaded.
+        """
+        if self._redis is None:
+            return 0
+
+        try:
+            import orjson
+
+            client = self._redis.client
+            raw_records = await client.zrange(
+                self._redis._key(self._REDIS_KEY),
+                0, self._max_records - 1,
+                desc=True,
+            )
+            loaded = 0
+            for raw in reversed(raw_records):
+                data = orjson.loads(raw) if isinstance(raw, (str, bytes)) else raw
+                self._records.append(WorkloadHistoryRecord(**data))
+                loaded += 1
+
+            self._log.info("history_loaded_from_redis", count=loaded)
+            return loaded
+        except Exception as exc:
+            self._log.warning("redis_history_load_failed", error=str(exc))
+            return 0
 
     def record(self, rec: WorkloadHistoryRecord) -> None:
         self._records.append(rec)
         if len(self._records) > self._max_records:
             self._records = self._records[-self._max_records :]
+
+        # Persist to Redis (fire-and-forget)
+        if self._redis is not None:
+            asyncio.create_task(
+                self._persist_to_redis(rec),
+                name=f"sacm_history_persist_{rec.id[:8]}",
+            )
+
         self._log.info(
             "workload_history_recorded",
             workload_id=rec.id,
             status=rec.status,
             provider_id=rec.provider_id,
         )
+
+    async def _persist_to_redis(self, rec: WorkloadHistoryRecord) -> None:
+        """Write a single record to the Redis sorted set."""
+        try:
+            import orjson
+
+            client = self._redis.client
+            key = self._redis._key(self._REDIS_KEY)
+            data = orjson.dumps(rec.model_dump(mode="json")).decode()
+            await client.zadd(key, {data: rec.submitted_at})
+
+            # Trim to max_records (keep highest scores = newest)
+            count = await client.zcard(key)
+            if count > self._max_records:
+                await client.zremrangebyrank(key, 0, count - self._max_records - 1)
+        except Exception as exc:
+            self._log.warning(
+                "redis_history_persist_failed",
+                workload_id=rec.id,
+                error=str(exc),
+            )
 
     def query(
         self,
@@ -401,6 +470,47 @@ class SACMClient:
             "metrics": self._metrics.snapshot,
         }
 
+    async def shutdown(self, drain_timeout_s: float = 30.0) -> None:
+        """
+        Graceful shutdown: emit SACM_DRAINING then wait up to drain_timeout_s
+        for all in-flight workloads to complete before returning.
+
+        Callers (main.py / SACMService) should call this before terminating
+        the process so results are not silently lost.
+        """
+        if not self._pending:
+            return
+
+        await self._emit_synapse("sacm_draining", {
+            "pending_count": len(self._pending),
+            "drain_timeout_s": drain_timeout_s,
+        })
+
+        self._log.info(
+            "sacm_drain_started",
+            pending_workloads=len(self._pending),
+            drain_timeout_s=drain_timeout_s,
+        )
+
+        try:
+            await asyncio.wait_for(
+                self._drain_pending(),
+                timeout=drain_timeout_s,
+            )
+            self._log.info("sacm_drain_complete", remaining=len(self._pending))
+        except asyncio.TimeoutError:
+            self._log.warning(
+                "sacm_drain_timeout",
+                remaining_pending=len(self._pending),
+                timeout_s=drain_timeout_s,
+            )
+
+    async def _drain_pending(self) -> None:
+        """Wait for all pending futures to resolve (complete or fail)."""
+        if not self._pending:
+            return
+        await asyncio.gather(*self._pending.values(), return_exceptions=True)
+
     async def submit(self, workload: WorkloadDescriptor) -> SubmissionTicket:
         """
         Submit a workload for asynchronous remote execution.
@@ -461,7 +571,7 @@ class SACMClient:
         future: asyncio.Future[RemoteExecutionResult] = loop.create_future()
         self._pending[wid] = future
 
-        asyncio.create_task(self._execute_and_resolve(workload, decision, future))
+        asyncio.create_task(self._execute_and_resolve(workload, decision, future, plan))
 
         # 5. Emit Synapse event for the submission
         await self._emit_synapse("compute_request_submitted", {
@@ -522,13 +632,35 @@ class SACMClient:
         """Access the metrics emitter for health checks."""
         return self._metrics
 
+    @staticmethod
+    def _scored_placement_to_decision(sp: ScoredPlacement) -> PlacementDecision:
+        """Build a PlacementDecision from a ScoredPlacement."""
+        return PlacementDecision(
+            provider_id=sp.offer.provider_id,
+            provider_public_key=(
+                sp.offer.public_key if hasattr(sp.offer, "public_key") else b"\x00" * 32
+            ),
+            provider_endpoint=(
+                sp.offer.endpoint if hasattr(sp.offer, "endpoint") else ""
+            ),
+            estimated_cost_usd=sp.raw_cost_usd,
+            offer_id=sp.offer.id,
+        )
+
     async def _execute_and_resolve(
         self,
         workload: WorkloadDescriptor,
         decision: PlacementDecision,
         future: asyncio.Future[RemoteExecutionResult],
+        plan: PlacementPlan | None = None,
     ) -> None:
-        """Background task: execute via RemoteExecutionManager, resolve the future."""
+        """
+        Background task: execute via RemoteExecutionManager, resolve the future.
+
+        Retry logic: if the primary provider fails (not accepted), iterate
+        through the remaining ranked placements from the optimizer plan (up to
+        max_retries from the execution config) before declaring failure.
+        """
         wid = workload.workload_id
         meta = self._submit_meta.pop(wid, None)
         offload_class_str, priority_str, estimated_cost, submitted_at = (
@@ -536,6 +668,47 @@ class SACMClient:
         )
         try:
             result = await self._execution_manager.execute(workload, decision)
+
+            # ── Secondary provider retry ──────────────────────────────
+            # If primary failed and we have a ranked plan with fallback placements,
+            # iterate provider_ranking[1:] up to max_retries before giving up.
+            if not result.accepted and plan is not None:
+                feasible = plan.feasible_placements()
+                max_retries = getattr(
+                    getattr(self._execution_manager, "_config", None),
+                    "max_retries",
+                    1,
+                )
+                retry_count = 0
+                for fallback_sp in feasible[1:]:
+                    if retry_count >= max_retries:
+                        break
+                    retry_count += 1
+                    fallback_decision = self._scored_placement_to_decision(fallback_sp)
+                    self._log.info(
+                        "retrying_on_secondary_provider",
+                        workload_id=wid,
+                        attempt=retry_count,
+                        primary_provider=decision.provider_id,
+                        fallback_provider=fallback_decision.provider_id,
+                        primary_error=result.error,
+                    )
+                    await self._emit_synapse("compute_request_submitted", {
+                        "workload_id": wid,
+                        "source": "sacm_client_retry",
+                        "priority": workload.priority.name,
+                        "offload_class": workload.offload_class.value,
+                        "estimated_cost_usd": round(fallback_decision.estimated_cost_usd, 6),
+                        "provider_id": fallback_decision.provider_id,
+                        "retry_attempt": retry_count,
+                    })
+                    retry_result = await self._execution_manager.execute(
+                        workload, fallback_decision
+                    )
+                    if retry_result.accepted:
+                        result = retry_result
+                        decision = fallback_decision
+                        break
 
             # Calculate e2e latency
             submit_time = self._submit_times.pop(wid, None)

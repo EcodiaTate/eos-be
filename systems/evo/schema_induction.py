@@ -164,7 +164,7 @@ class SchemaInductionEngine:
         if self._memory is None:
             return result
 
-        neo4j = self._memory._neo4j
+        neo4j = self._memory
 
         # ── Strategy 1: Graph Motif Mining ─────────────────────────────
         entity_candidates = await self._mine_entity_type_motifs(neo4j)
@@ -859,7 +859,7 @@ class SchemaAlgebra:
 
         # Persist composition relationship
         if self._memory is not None:
-            neo4j = self._memory._neo4j
+            neo4j = self._memory
             await self._persist_composition_relationship(
                 neo4j, composed, [schema_a.id, schema_b.id], "COMPOSED_OF"
             )
@@ -929,7 +929,7 @@ class SchemaAlgebra:
         )
 
         if self._memory is not None:
-            neo4j = self._memory._neo4j
+            neo4j = self._memory
             await self._persist_composition_relationship(
                 neo4j, child, [parent.id], "SPECIALIZES"
             )
@@ -1008,7 +1008,7 @@ class SchemaAlgebra:
 
         # Persist abstraction relationships
         if self._memory is not None:
-            neo4j = self._memory._neo4j
+            neo4j = self._memory
             for s in schemas:
                 await self._persist_composition_relationship(
                     neo4j, abstract, [s.id], "ABSTRACTS"
@@ -1107,7 +1107,7 @@ class SchemaAlgebra:
         self._schema_fitness[schema_name] = fitness
 
         if self._memory is not None:
-            neo4j = self._memory._neo4j
+            neo4j = self._memory
             try:
                 await neo4j.execute_write(
                     """
@@ -1140,7 +1140,7 @@ class SchemaAlgebra:
             pruned += 1
 
             if self._memory is not None:
-                neo4j = self._memory._neo4j
+                neo4j = self._memory
                 try:
                     await neo4j.execute_write(
                         """

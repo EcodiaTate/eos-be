@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         WorldModelFragmentShare,
         WorldModelFragmentShareResponse,
     )
+    from primitives.common import EOSBaseModel
 
 # ─── Logos: World Model Access ───────────────────────────────────
 
@@ -108,6 +109,20 @@ class FoveaAttentionProtocol(Protocol):
         """
         ...
 
+    def receive_divergence_signal(
+        self,
+        divergence_pressure: float,
+        frontier_domains: list[str],
+    ) -> None:
+        """
+        Receive a divergence pressure signal from Nexus.
+
+        Fovea can use this to bias attention toward frontier domains
+        where the federation lacks coverage, amplifying prediction errors
+        in those domains to drive exploration.
+        """
+        ...
+
 
 # ─── Federation: Fragment Transport ──────────────────────────────
 
@@ -155,6 +170,26 @@ class FederationFragmentProtocol(Protocol):
         """
         Request a remote instance's divergence profile.
         Returns None if the link is inactive or the request fails.
+        """
+        ...
+
+    async def get_remote_logos(
+        self, instance_id: str
+    ) -> LogosWorldModelProtocol | None:
+        """
+        Request a read-only proxy to a remote instance's Logos world model.
+
+        Used by InvariantBridge to exchange causal invariants across
+        speciation boundaries. Returns None if the instance is unreachable.
+        """
+        ...
+
+    def get_link_health(self, link_id: str) -> dict[str, Any] | None:
+        """
+        Return health status for a federation link.
+
+        Returns a dict with at minimum: {active: bool, consecutive_failures: int,
+        last_success_at: datetime | None}. Returns None if link_id is unknown.
         """
         ...
 
@@ -283,5 +318,101 @@ class EquorProtectionProtocol(Protocol):
         The evidence dict should include promotion metrics:
         triangulation_confidence, source_diversity, source_count,
         survived_adversarial, survived_competition.
+        """
+        ...
+
+
+# ─── Kairos: Causal Invariant Source ──────────────────────────
+
+
+@runtime_checkable
+class KairosCausalSourceProtocol(Protocol):
+    """
+    Protocol for Nexus to query Kairos for Tier 3 causal invariants.
+
+    Kairos pushes Tier 3 invariants to Nexus, but Nexus also needs to
+    pull updated structures — e.g. after a sleep cycle, Nexus should
+    query Kairos for any new Tier 3 discoveries that emerged during
+    consolidation.
+    """
+
+    def get_tier3_invariants(self) -> list[dict[str, Any]]:
+        """
+        Return all Tier 3 (substrate-independent) causal invariants.
+
+        Each dict must include at minimum: id, abstract_form,
+        invariance_hold_rate, applicable_domains, description_length_bits.
+        """
+        ...
+
+    def get_invariants_since(self, since_timestamp: str) -> list[dict[str, Any]]:
+        """
+        Return invariants discovered or promoted since a timestamp.
+
+        Enables Nexus to sync only new discoveries rather than
+        re-processing the full invariant set.
+        """
+        ...
+
+
+# ─── Telos: Fragment Quality Gate ─────────────────────────────
+
+
+@runtime_checkable
+class TelosFragmentGateProtocol(Protocol):
+    """
+    Protocol for Nexus to score fragments via Telos topology.
+
+    Replaces the untyped `Any` Telos dependency with a formal protocol.
+    """
+
+    def score_fragment(self, fragment_data: dict[str, Any]) -> float:
+        """
+        Score a fragment's alignment with the organism's drive topology.
+
+        Returns [0.0, 1.0] — fragments below 0.3 are rejected from sharing.
+        """
+        ...
+
+
+# ─── Logos: Write-Back Protocol ───────────────────────────────
+
+
+@runtime_checkable
+class LogosWriteBackProtocol(Protocol):
+    """
+    Protocol for Nexus to write convergence feedback into Logos.
+
+    Replaces the untyped `Any` logos_adapter dependency with a formal protocol.
+    """
+
+    def update_schema_triangulation_confidence(
+        self,
+        schema_id: str,
+        new_confidence: float,
+    ) -> bool:
+        """
+        Update a schema's epistemic confidence from triangulation results.
+        Returns True if the schema was found and updated.
+        """
+        ...
+
+    def ingest_empirical_invariant_from_nexus(
+        self,
+        abstract_structure: dict[str, Any],
+        observations_explained: int,
+        triangulation_confidence: float,
+    ) -> None:
+        """
+        Promote a Level 4 EMPIRICAL_INVARIANT into the Logos world model.
+        """
+        ...
+
+    def get_federation_confidence(self, schema_id: str) -> float | None:
+        """
+        Return the current federation-derived confidence for a schema.
+
+        Enables Logos to query Nexus for on-demand epistemic status
+        without waiting for the next sleep cycle.
         """
         ...

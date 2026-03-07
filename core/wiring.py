@@ -110,6 +110,10 @@ def wire_core_systems(
     atune.subscribe(voxis)  # Loop 6: workspace broadcasts → spontaneous expression
     equor.set_evo(evo)      # Loop 8: constitutional vetoes → learning episodes
     equor.set_axon(axon)    # HITL: approved intents → Axon
+    # Prompt 4.1: Memory's Neo4j client → Equor for inherited_constitutional_wisdom
+    # write-back to Memory.Self on child boot (non-fatal if memory has no _neo4j).
+    if hasattr(equor, "set_memory_neo4j") and hasattr(memory, "_neo4j"):
+        equor.set_memory_neo4j(memory._neo4j)
 
     # Arbitrage Reflex Arc
     axon.set_template_library(equor.template_library)
@@ -131,12 +135,11 @@ def wire_thread(
     evo: Any,
     nova: Any,
 ) -> None:
-    """Wire Thread (Narrative Identity) cross-references."""
-    thread.set_voxis(voxis)
-    thread.set_equor(equor)
-    thread.set_atune(atune)
-    thread.set_evo(evo)
-    thread.set_nova(nova)
+    """Wire Thread (Narrative Identity) cross-references.
+
+    Thread implements all cross-system communication via Synapse event subscriptions.
+    Only Voxis needs the back-reference to Thread.
+    """
     voxis.set_thread(thread)
 
 
@@ -158,6 +161,7 @@ def wire_synapse_phase(
     sacm_client: Any,
     axon: Any,
     nova: Any,
+    voxis: Any,
     llm_client: Any,
     config: Any,
 ) -> None:
@@ -205,6 +209,9 @@ def wire_synapse_phase(
     # Metabolic cost tracking
     llm_client.set_metabolic_callback(synapse.metabolism.log_usage)
     logger.info("metabolic_tracking_wired", system="llm_client→synapse.metabolism")
+
+    # Voxis → Synapse event bus (RE training emission + event subscriptions)
+    voxis.set_event_bus(synapse.event_bus)
 
     # Logos → Synapse
     logos.set_synapse(synapse)
@@ -340,7 +347,8 @@ def wire_soma_phase(
     oneiros.set_soma(soma)
     thymos.set_soma(soma)
     voxis.set_soma(soma)
-    sacm_accounting.wire_soma(soma)
+    # SACM uses Synapse events only (SACM_COMPUTE_STRESS → Soma subscribes)
+    # sacm_accounting does not take direct Soma references
 
 
 def wire_intelligence_loops(
@@ -375,11 +383,9 @@ def wire_intelligence_loops(
     # Loop 4: Oneiros → Axon (sleep safety gate)
     axon.set_oneiros(oneiros)
 
-    # Loop 6: Fovea → Thread (behavioral prediction errors)
-    thread.set_fovea(fovea)
-
-    # Loop 7: Oneiros → Thread (sleep narratives)
-    thread.set_oneiros(oneiros)
+    # Loop 6: Fovea → Thread — via FOVEA_INTERNAL_PREDICTION_ERROR Synapse subscription
+    # Loop 7: Oneiros → Thread — via ONEIROS_CONSOLIDATION_COMPLETE / LUCID_DREAM_RESULT Synapse subscriptions
+    # (No set_* calls needed; Thread uses bus-mediated integration only)
 
     logger.info(
         "intelligence_loops_wired",
@@ -435,6 +441,103 @@ def wire_oikos_phase(
     sacm_prewarm_engine.wire_oikos(oikos)
 
 
+def wire_mitosis_phase(
+    *,
+    oikos: Any,
+    axon: Any,
+    evo: Any,
+    simula: Any,
+    equor: Any = None,
+    telos: Any = None,
+    adapter_sharer: Any = None,
+    get_adapter_path_fn: Any = None,
+) -> None:
+    """
+    Wire Mitosis callbacks and genome services after Oikos is ready (Spec 26).
+
+    1. Injects evo + simula + equor + axon + telos into SpawnChildExecutor for genome export
+       at spawn time.
+    2. Calls wire_oikos_callbacks() with check_decommission so that blacklisted
+       children are automatically decommissioned after 7 days with zero net income.
+    3. Optionally wires AdapterSharer into MitosisFleetService for cross-instance
+       LoRA adapter merging (Share 2025 framework). Pass adapter_sharer + an optional
+       get_adapter_path_fn callable that returns the current slow adapter path.
+
+    Must be called AFTER wire_oikos_phase() — requires oikos.fleet to be populated.
+    """
+    spawn_executor: Any = None
+    try:
+        spawn_executor = axon.get_executor("spawn_child")
+        if spawn_executor is not None:
+            # Inject genome exporters (Spec 26 SG4 / Oikos v2.1; Prompt 4.1 equor; Spec 6 §24 axon;
+            # Spec 18 SG3 telos)
+            if evo is not None:
+                spawn_executor._evo = evo  # type: ignore[attr-defined]
+            if simula is not None:
+                spawn_executor._simula = simula  # type: ignore[attr-defined]
+            if equor is not None:
+                spawn_executor._equor = equor  # type: ignore[attr-defined]
+            if telos is not None:
+                spawn_executor._telos = telos  # type: ignore[attr-defined]
+            # Axon self-reference: SpawnChildExecutor calls export_axon_genome() on the
+            # parent instance (same service) to snapshot its top-10 execution templates
+            spawn_executor._axon = axon  # type: ignore[attr-defined]
+            logger.info(
+                "spawn_child_genome_exporters_wired",
+                equor_wired=equor is not None,
+                telos_wired=telos is not None,
+                axon_wired=True,
+            )
+        else:
+            logger.warning("spawn_child_executor_not_found", note="Genome exporters not wired")
+    except Exception as exc:
+        logger.warning("wire_mitosis_genome_exporters_failed", error=str(exc))
+
+    try:
+        fleet_service = getattr(spawn_executor, "_fleet_service", None)
+        fleet_manager = getattr(oikos, "fleet", None)
+        if fleet_service is not None and fleet_manager is not None:
+            fleet_service.wire_oikos_callbacks(
+                get_children=lambda: oikos.get_children(),
+                get_state=lambda: oikos.get_state(),
+                run_fleet_evaluation=lambda state: fleet_manager.get_metrics(state),
+                check_decommission=lambda state: fleet_manager.check_decommission_candidates(
+                    state
+                ),
+            )
+            logger.info("mitosis_oikos_callbacks_wired", check_decommission=True)
+        else:
+            logger.warning(
+                "mitosis_oikos_callbacks_not_wired",
+                fleet_service_present=fleet_service is not None,
+                fleet_manager_present=fleet_manager is not None,
+            )
+    except Exception as exc:
+        logger.warning("wire_mitosis_oikos_callbacks_failed", error=str(exc))
+
+    # Wire AdapterSharer into fleet_service for cross-instance LoRA merging
+    if adapter_sharer is not None:
+        try:
+            fleet_service = getattr(
+                getattr(axon, "get_executor", lambda _: None)("spawn_child"),
+                "_fleet_service",
+                None,
+            )
+            if fleet_service is not None:
+                fleet_service.set_adapter_sharer(
+                    adapter_sharer,
+                    get_adapter_path_fn=get_adapter_path_fn,
+                )
+                logger.info(
+                    "mitosis_adapter_sharer_wired",
+                    adapter_path_fn_provided=get_adapter_path_fn is not None,
+                )
+            else:
+                logger.warning("mitosis_adapter_sharer_fleet_service_not_found")
+        except Exception as exc:
+            logger.warning("wire_mitosis_adapter_sharer_failed", error=str(exc))
+
+
 def wire_federation_phase(
     *,
     federation: Any,
@@ -446,6 +549,7 @@ def wire_federation_phase(
 ) -> None:
     """Wire Federation cross-references."""
     federation.set_atune(atune)
+    federation.set_event_bus(synapse.event_bus)
     thymos.set_federation(federation)
     sacm_compute_manager.set_federation(federation)
     if config.federation.enabled:

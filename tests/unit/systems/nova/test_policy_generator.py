@@ -15,7 +15,7 @@ import pytest
 from clients.llm import LLMProvider, LLMResponse
 from primitives.affect import AffectState
 from primitives.common import new_id
-from systems.atune.types import SalienceVector, WorkspaceBroadcast
+from systems.fovea.types import SalienceVector, WorkspaceBroadcast
 from systems.nova.policy_generator import (
     DO_NOTHING_EFE,
     PolicyGenerator,

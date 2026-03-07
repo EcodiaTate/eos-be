@@ -57,6 +57,8 @@ The high-all-four corner is not just ethically desirable — it is the globally 
 ### Emitted
 | Event | Trigger | Payload |
 |-------|---------|---------|
+| `TELOS_GENOME_EXTRACTED` | `export_telos_genome()` called at spawn | `genome_id`, `instance_id`, `generation`, `drive_count`, `topology` |
+| `GENOME_INHERITED` | Child boot after jitter applied | `child_instance_id`, `parent_genome_id`, `generation`, `topology`, `drive_mutations` (per-drive before/after deltas), `mutation_magnitude` |
 | `TELOS_ASSESSMENT_SIGNAL` | After each cycle | care gaps, coherence violations, honesty concerns, growth frontier |
 | `TELOS_VITALITY_SIGNAL` | Each cycle | effective_I, alignment_gap_severity, growth_stagnation_flag → VitalityCoordinator |
 | `EFFECTIVE_I_COMPUTED` | Every 60s | `EffectiveIntelligenceReport` |
@@ -68,7 +70,7 @@ The high-all-four corner is not just ethically desirable — it is the globally 
 | `CONSTITUTIONAL_TOPOLOGY_INTACT` | Every 24h | `{all_four_drives: verified, timestamp}` |
 | Evolutionary observable `intelligence_measurement` | Each cycle | per-instance effective_I → Benchmarks population tracking |
 
-### Consumed (10 subscriptions)
+### Consumed (11 subscriptions)
 | Event | Source | Purpose |
 |-------|--------|---------|
 | `TELOS_COMPUTE_CYCLE` | Synapse scheduler | Main measurement cycle |
@@ -81,6 +83,7 @@ The high-all-four corner is not just ethically desirable — it is the globally 
 | `COMMITMENT_VIOLATED` | Thread | Coherence/honesty signal |
 | `WELFARE_OUTCOME_RECORDED` | Axon | Care calibration |
 | `INCIDENT_RESOLVED` | Thymos | Honesty confabulation signal |
+| `SELF_COHERENCE_ALARM` | Identity | §8.6 homeostatic drive regulation — when self-model coherence < 0.5, emits `SOMATIC_MODULATION_SIGNAL` with `signal=drive_mean_reversion` to nudge drive weights toward historical mean. Severity: "low" (coherence 0.3–0.5), "medium" (< 0.3). Not a punishment — homeostatic. |
 
 ---
 
@@ -131,5 +134,15 @@ Telos is the system most directly responsible for whether EOS qualifies as a liv
 5. **Welfare domain keywords** (`care.py:164-180`) are hardcoded; should be learned from Evo.
 6. ~~**Genome extraction** uses `SystemID.API` as placeholder~~ — RESOLVED: `genome.py` now uses `SystemID.TELOS`.
 7. **Growth engine stubs** — `_compute_frontier_expansion` and `_compute_exploration_entropy` return stub values.
-8. **Population-level drive evolution** — Mitosis inherits topology but no demonstrated selection on drive calibration parameters across generations. `TelosGenomeExtractor` covers extraction/seeding but calibration constants have no bounded mutation range.
+8. ~~**Population-level drive evolution**~~ — **RESOLVED (07 Mar 2026, SG3)**: `TeloDriveCalibration` + `TelosGenomeFragment` primitives added to `primitives/genome_inheritance.py`. `TelosService` implements `export_telos_genome()`, `to_genome_fragment()`, `from_genome_fragment()`, `_initialize_from_parent_genome()` (bounded Gaussian jitter ±15% resonance / ±10% dissipation / ±20% coupling), and `_apply_inherited_telos_genome_if_child()` (reads `ECODIAOS_TELOS_GENOME_PAYLOAD` on non-genesis boot). `TELOS_GENOME_EXTRACTED` emitted at export; `GENOME_INHERITED` emitted post-mutation with per-drive deltas for Evo hypothesis tracking. `SpawnChildExecutor` wired in Step 0b.
 9. **RE integration** — Telos does not route decisions through RE yet. High-value training data: drive topology audit traces with causal analysis of alignment gaps. Phase D work.
+
+## Event Emission Fixes (2026-03-07)
+
+- **`CONSTITUTIONAL_TOPOLOGY_INTACT`**: Fixed first-run skip — `_check_constitutional_topology()` now runs immediately on the first call (`_last_constitutional_check == 0.0`) without waiting 24h. Subsequent calls still obey `constitutional_check_interval_s = 86400.0`.
+- **`CARE_COVERAGE_GAP`**: Added fallback trigger — fires if `len(care_report.uncovered_welfare_domains) > 0` even when `nominal_I == 0` (MDL gap workaround). Previously dead when nominal_I was zero.
+- **`TELOS_POPULATION_SNAPSHOT`**: Lowered `_MIN_INSTANCES_FOR_SNAPSHOT` from 2 → 1 in `population.py`. A solo genesis instance now emits population snapshots.
+- **`COHERENCE_COST_ELEVATED`**: Already correctly fires when coherence engine detects incoherences (independent of nominal_I). No change needed.
+- **`TELOS_OBJECTIVE_THREATENED`**: Already correctly fires when Redis reports metabolic efficiency < 1.0 with 3+ consecutive declining readings. Runtime-dependent, no change needed.
+- **`TELOS_AUTONOMY_STAGNATING`**: Already correctly fires when `AUTONOMY_INSUFFICIENT` event rate exceeds 3/day. Runtime-dependent, no change needed.
+- **`ALIGNMENT_GAP_WARNING`**: Has 3 fire paths — primary (nominal_I threshold, broken by MDL gap), constitutional binder violation (working), Simula proposal violation (working).

@@ -17,6 +17,7 @@ The divergence emerges from experience, not configuration.
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
@@ -95,6 +96,10 @@ class AttentionWeightLearner:
         self,
         learning_rate: float = 0.01,
         false_alarm_decay: float = 0.005,
+        *,
+        instance_id: str = "",
+        neo4j_driver: Any = None,
+        persist_batch_size: int = 10,
     ) -> None:
         self._weights: dict[str, float] = dict(DEFAULT_ERROR_WEIGHTS)
         self._learning_rate = learning_rate
@@ -120,6 +125,12 @@ class AttentionWeightLearner:
         self._decays: int = 0
         self._false_alarms: int = 0
 
+        # Neo4j persistence (batched writes)
+        self._instance_id = instance_id
+        self._neo4j_driver = neo4j_driver
+        self._persist_batch_size = persist_batch_size
+        self._changes_since_persist: int = 0
+
         self._logger = logger.bind(component="weight_learner")
 
     def set_habituation_engine(self, engine: HabituationEngine) -> None:
@@ -134,6 +145,11 @@ class AttentionWeightLearner:
     def weights(self) -> dict[str, float]:
         """Current learned weight vector (read-only copy)."""
         return dict(self._weights)
+
+    @property
+    def recent_errors(self) -> deque[_TrackedError]:
+        """Read-only access to recent tracked errors for telemetry and queries."""
+        return self._recent_errors
 
     @property
     def reinforcements(self) -> int:
@@ -245,6 +261,9 @@ class AttentionWeightLearner:
             error_salience=round(best.salience, 4),
         )
 
+        # Schedule batched persistence (caller should await if async context)
+        self._changes_since_persist += 1
+
         return weight_deltas
 
     def flush_stale_errors(self) -> list[ErrorType]:
@@ -299,6 +318,42 @@ class AttentionWeightLearner:
         """
         error.error_weights = dict(self._weights)
 
+    def adjust_weight(self, error_type_key: str, delta: float) -> float:
+        """
+        Adjust a single error type weight by delta, clamped to [floor, ceiling].
+        Normalises weights after adjustment. Returns new weight value.
+        """
+        old = self._weights.get(error_type_key, 0.0)
+        self._weights[error_type_key] = max(
+            _WEIGHT_FLOOR, min(_WEIGHT_CEILING, old + delta)
+        )
+        self._normalise_weights()
+        self._changes_since_persist += 1
+        return self._weights[error_type_key]
+
+    @property
+    def learning_rate(self) -> float:
+        return self._learning_rate
+
+    @property
+    def false_alarm_decay_rate(self) -> float:
+        return self._false_alarm_decay
+
+    def get_raw_weights(self) -> dict[str, float]:
+        """Return the raw internal weights dict (for genome extraction / telemetry)."""
+        return dict(self._weights)
+
+    def set_raw_weights(self, weights: dict[str, float]) -> None:
+        """Replace internal weights (for genome seeding). Normalises after set."""
+        self._weights = dict(weights)
+        self._normalise_weights()
+
+    def set_learning_rate(self, rate: float) -> None:
+        self._learning_rate = rate
+
+    def set_false_alarm_decay(self, rate: float) -> None:
+        self._false_alarm_decay = rate
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -324,6 +379,65 @@ class AttentionWeightLearner:
         total = sum(self._weights.values())
         for key in self._weights:
             self._weights[key] /= total
+
+    # ------------------------------------------------------------------
+    # Neo4j persistence (batched)
+    # ------------------------------------------------------------------
+
+    def set_neo4j_driver(self, driver: Any, instance_id: str = "") -> None:
+        """Wire Neo4j driver post-construction."""
+        self._neo4j_driver = driver
+        if instance_id:
+            self._instance_id = instance_id
+
+    async def restore_weights(self) -> bool:
+        """Restore learned weights from Neo4j on startup. Returns True if restored."""
+        if self._neo4j_driver is None:
+            return False
+        try:
+            async with self._neo4j_driver.session() as session:
+                result = await session.run(
+                    "MATCH (fw:FoveaWeights {instance_id: $id}) RETURN fw.weights AS w",
+                    id=self._instance_id,
+                )
+                record = await result.single()
+                if record and record["w"]:
+                    restored = json.loads(record["w"])
+                    if isinstance(restored, dict) and restored:
+                        self._weights = restored
+                        self._logger.info(
+                            "weights_restored_from_neo4j",
+                            instance_id=self._instance_id,
+                            weight_count=len(restored),
+                        )
+                        return True
+        except Exception:
+            self._logger.warning("weight_restore_failed", exc_info=True)
+        return False
+
+    async def persist_weights(self, force: bool = False) -> None:
+        """Persist weights to Neo4j. Batched: only writes every N changes unless forced."""
+        self._changes_since_persist += 1
+        if not force and self._changes_since_persist < self._persist_batch_size:
+            return
+        if self._neo4j_driver is None:
+            return
+        self._changes_since_persist = 0
+        try:
+            async with self._neo4j_driver.session() as session:
+                await session.run(
+                    "MERGE (fw:FoveaWeights {instance_id: $id}) "
+                    "SET fw.weights = $weights_json, fw.updated_at = datetime()",
+                    id=self._instance_id,
+                    weights_json=json.dumps(self._weights),
+                )
+                self._logger.debug("weights_persisted", instance_id=self._instance_id)
+        except Exception:
+            self._logger.warning("weight_persist_failed", exc_info=True)
+
+    async def snapshot_weights_for_sleep(self) -> None:
+        """Force-persist weights on sleep entry for Oneiros consolidation."""
+        await self.persist_weights(force=True)
 
     @staticmethod
     def _compute_update_magnitude(event_data: dict[str, Any]) -> float:

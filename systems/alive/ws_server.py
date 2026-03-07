@@ -17,9 +17,38 @@ to connected browser clients:
    - Economic status: balance, burn rate, runway (Oikos) → ``economics``
    - Mutation history: proposed/applied/rejected (Simula) → ``mutations``
    - Benchmark KPI snapshot (via BenchmarkProvider protocol) → ``benchmarks``
+   - Causal discovery state (Kairos) → ``causal``
+   - Compression / world model state (Logos) → ``compression``
+   - Sleep stage and cycle health (Oneiros) → ``sleep``
 
 Messages are JSON-encoded with an envelope:
   {"stream": "synapse" | "affect" | "system_state", "payload": {...}}
+
+RE Training: every system_state snapshot is written to the Redis Stream
+``{prefix}:stream:alive_snapshots`` (maxlen=10_000) for the RE training
+pipeline (Spec 11 §21 Path 1).
+
+─── Protocol Note — Two Distinct Alive Endpoints ──────────────────────────
+This standalone server (port 8001) and the FastAPI ``/ws/alive`` route in
+``main.py`` (port 8000) are **intentionally different protocols**:
+
+  Standalone (port 8001) — ``AliveWebSocketServer``
+    Streams: ``synapse``, ``affect`` (9D Soma + dominance), ``system_state``
+    Affect payload keys: valence, arousal, dominance, curiosity,
+                         care_activation, coherence_stress, energy,
+                         confidence, integrity, temporal_pressure, urgency,
+                         dominant_error, ts
+    Audience: Three.js dashboard, monitoring systems, RE pipeline
+
+  FastAPI (port 8000) — ``/ws/alive``
+    Streams: ``affect`` (6D AffectState), ``synapse``, ``workspace``, ``outcomes``
+    Affect payload keys: valence, arousal, dominance, curiosity,
+                         care_activation, coherence_stress, ts
+    Audience: Cloud Run single-port deployments; perception/decisions pages
+
+These two protocols are governed independently. Do NOT unify them without
+updating consumers on both sides.
+──────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -33,6 +62,9 @@ import websockets
 
 from utils.asyncio_helpers import cancel_and_wait_tasks
 
+# Import at module level — avoids repeated import cache lookups inside 10Hz polling hot path
+from primitives.affect import InteroceptiveDimension
+
 if TYPE_CHECKING:
     from websockets.asyncio.server import ServerConnection
 
@@ -40,8 +72,11 @@ if TYPE_CHECKING:
     from systems.atune.service import AtuneService
     from systems.axon.service import AxonService
     from systems.fovea.service import FoveaService
+    from systems.kairos.pipeline import CausalMiningPipeline
+    from systems.logos.service import LogosService
     from systems.nova.service import NovaService
     from systems.oikos.service import OikosService
+    from systems.oneiros.service import OneirosService
     from systems.simula.service import SimulaService
     from systems.soma.service import SomaService
     from systems.synapse.service import SynapseService
@@ -59,8 +94,20 @@ _STATE_POLL_INTERVAL: float = 1.0
 # How many recent Axon outcomes to include in each snapshot
 _AXON_RECENT_COUNT: int = 10
 
-# How many recent Simula proposals to include in each snapshot
-_SIMULA_RECENT_PROPOSALS: int = 5
+# Per-subsystem timeout for async gathers — spec §13.2 Strategy 3
+# A hung Nova/Oikos/Thymos call must not stall the entire 1Hz poller
+_GATHER_TIMEOUT: float = 0.8
+
+# Redis Stream key suffix for RE training snapshots — spec §21 Path 1
+_ALIVE_SNAPSHOTS_STREAM: str = "stream:alive_snapshots"
+
+# Maximum retained snapshots in the Redis Stream (rolling window ~2.7h at 1Hz)
+_ALIVE_SNAPSHOTS_MAXLEN: int = 10_000
+
+# WebSocket authentication — query-param key name for bearer token (Spec 11 §14.3)
+# Token is validated against AliveWebSocketServer._auth_tokens at handshake time.
+# No token configured → open access (dev/internal LAN mode).
+_AUTH_TOKEN_PARAM: str = "token"
 
 
 def _json(data: dict[str, Any]) -> str:
@@ -107,8 +154,8 @@ class AliveWebSocketServer:
         redis: RedisClient,
         *,
         soma: SomaService,
-        atune: AtuneService | None = None,
         synapse: SynapseService | None = None,
+        atune: AtuneService | None = None,
         telos: TelosService | None = None,
         thymos: ThymosService | None = None,
         nova: NovaService | None = None,
@@ -116,8 +163,12 @@ class AliveWebSocketServer:
         oikos: OikosService | None = None,
         simula: SimulaService | None = None,
         fovea: FoveaService | None = None,
+        kairos: CausalMiningPipeline | None = None,
+        logos: LogosService | None = None,
+        oneiros: OneirosService | None = None,
         benchmarks: BenchmarkProvider | None = None,
         port: int = 8001,
+        auth_tokens: set[str] | None = None,
     ) -> None:
         self._redis = redis
         self._soma = soma
@@ -130,8 +181,13 @@ class AliveWebSocketServer:
         self._oikos = oikos
         self._simula = simula
         self._fovea = fovea
+        self._kairos = kairos
+        self._logos = logos
+        self._oneiros = oneiros
         self._benchmarks = benchmarks
         self._port = port
+        # Non-empty set → auth enforced; None or empty set → open (dev/LAN mode)
+        self._auth_tokens: set[str] = auth_tokens or set()
         self._clients: set[ServerConnection] = set()
         self._server: Any = None
         self._running: bool = False
@@ -164,9 +220,42 @@ class AliveWebSocketServer:
     # ─── Connection Handler ────────────────────────────────────────────
 
     async def _handler(self, ws: ServerConnection) -> None:
-        """Handle a new WebSocket connection."""
-        self._clients.add(ws)
+        """Handle a new WebSocket connection.
+
+        Authentication (Spec 11 §14.3):
+          If ``auth_tokens`` was supplied at construction time, the client must
+          pass a valid token in the ``token`` query parameter, e.g.::
+
+              ws://host:8001/?token=<secret>
+
+          Invalid / missing token → close 4401. When no tokens are configured
+          (dev / internal LAN mode) all connections are accepted.
+        """
         remote = ws.remote_address
+
+        # ── Auth gate ──────────────────────────────────────────────────
+        if self._auth_tokens:
+            # websockets stores the path including query string on request.path
+            raw_path: str = getattr(ws.request, "path", "") or ""
+            # Extract token from query string without pulling in urllib at hot path
+            token: str = ""
+            if "?" in raw_path:
+                qs = raw_path.split("?", 1)[1]
+                for part in qs.split("&"):
+                    if part.startswith(f"{_AUTH_TOKEN_PARAM}="):
+                        token = part[len(_AUTH_TOKEN_PARAM) + 1:]
+                        break
+            if token not in self._auth_tokens:
+                self._logger.warning(
+                    "alive_auth_rejected",
+                    remote=str(remote),
+                    has_token=bool(token),
+                )
+                await ws.close(4401, "Unauthorized")
+                return
+        # ──────────────────────────────────────────────────────────────
+
+        self._clients.add(ws)
         self._logger.info(
             "alive_client_connected",
             remote=str(remote),
@@ -250,18 +339,30 @@ class AliveWebSocketServer:
         if self._soma is None:
             return {"available": False}
         try:
-            from systems.soma.types import InteroceptiveDimension
-
             state = self._soma.get_current_state()
             sensed = state.sensed
+
+            # dominance — from Atune's AffectState if wired (authoritative),
+            # else approximated from Soma's SOCIAL_CHARGE (0→1 proxy).
+            # Spec §4.3 requires this field in the affect stream.
+            dominance: float = 0.5
+            if self._atune is not None:
+                try:
+                    dominance = round(self._atune.current_affect.dominance, 4)
+                except Exception:
+                    dominance = round(sensed.get(InteroceptiveDimension.SOCIAL_CHARGE, 0.5), 4)
+            else:
+                dominance = round(sensed.get(InteroceptiveDimension.SOCIAL_CHARGE, 0.5), 4)
+
             return {
-                # Original 6 dimensions (backward-compatible keys)
+                # Core 6 dimensions (backward-compatible keys)
                 "valence": round(sensed[InteroceptiveDimension.VALENCE], 4),
                 "arousal": round(sensed[InteroceptiveDimension.AROUSAL], 4),
+                "dominance": dominance,
                 "curiosity": round(sensed[InteroceptiveDimension.CURIOSITY_DRIVE], 4),
                 "care_activation": round(sensed[InteroceptiveDimension.SOCIAL_CHARGE], 4),
                 "coherence_stress": round(1.0 - sensed[InteroceptiveDimension.COHERENCE], 4),
-                # NEW Soma-native dimensions
+                # Additional Soma-native dimensions
                 "energy": round(sensed[InteroceptiveDimension.ENERGY], 4),
                 "confidence": round(sensed[InteroceptiveDimension.CONFIDENCE], 4),
                 "integrity": round(sensed[InteroceptiveDimension.INTEGRITY], 4),
@@ -277,17 +378,38 @@ class AliveWebSocketServer:
     # ─── System State Poller ────────────────────────────────────────────
 
     async def _system_state_poller(self) -> None:
-        """Poll all subsystems at ~1Hz and broadcast aggregated system_state."""
+        """Poll all subsystems at ~1Hz and broadcast aggregated system_state.
+
+        Also writes each snapshot to the Redis Stream ``alive_snapshots`` for
+        RE training pipeline consumption (Spec 11 §21 Path 1).
+        """
         try:
             while self._running:
                 payload = await self._build_system_state_payload()
                 msg = _json({"stream": "system_state", "payload": payload})
                 await self._broadcast(msg)
+                await self._write_re_training_snapshot(payload)
                 await asyncio.sleep(_STATE_POLL_INTERVAL)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             self._logger.error("alive_state_poller_error", error=str(exc))
+
+    async def _write_re_training_snapshot(self, payload: dict[str, Any]) -> None:
+        """Write system_state snapshot to Redis Stream for RE training pipeline.
+
+        Ref: Spec 11 §21 Path 1. Fire-and-forget; errors are non-fatal.
+        """
+        try:
+            prefix = self._redis._config.prefix
+            stream_key = f"{prefix}:{_ALIVE_SNAPSHOTS_STREAM}"
+            await self._redis.client.xadd(
+                stream_key,
+                {"snapshot": orjson.dumps(payload)},
+                maxlen=_ALIVE_SNAPSHOTS_MAXLEN,
+            )
+        except Exception as exc:
+            self._logger.debug("alive_re_snapshot_write_error", error=str(exc))
 
     async def _build_system_state_payload(self) -> dict[str, Any]:
         """
@@ -296,7 +418,10 @@ class AliveWebSocketServer:
         Each section is gathered independently; failures in one section
         do not prevent the others from being included.
 
-        Key layout (post-consolidation):
+        Async gathers are wrapped in asyncio.wait_for(_GATHER_TIMEOUT) so a
+        hung subsystem cannot stall the entire 1Hz poller (Spec 11 §13.2 Strategy 3).
+
+        Key layout:
           cycle         — Synapse clock + rhythm phase
           drives        — Telos topology multipliers + Thymos rejection counters
           interoceptive — Soma full 9D state + urgency + nearest attractor
@@ -307,19 +432,65 @@ class AliveWebSocketServer:
           economics     — Oikos balance/runway/burn
           mutations     — Simula proposal stats
           benchmarks    — 7 KPI snapshot
+          causal        — Kairos invariant hierarchy stats
+          compression   — Logos world model + Schwarzschild state
+          sleep         — Oneiros stage + cycle health
         """
         return {
             "cycle": self._gather_cycle(),
             "drives": self._gather_drives(),
             "interoceptive": self._gather_interoceptive(),
             "attention": self._gather_attention(),
-            "immune": await self._gather_immune(),
-            "goals": await self._gather_goals(),
+            "immune": await self._gather_immune_safe(),
+            "goals": await self._gather_goals_safe(),
             "actions": self._gather_actions(),
-            "economics": await self._gather_economics(),
+            "economics": await self._gather_economics_safe(),
             "mutations": self._gather_mutations(),
             "benchmarks": self._gather_benchmarks(),
+            "causal": await self._gather_causal_safe(),
+            "compression": await self._gather_compression_safe(),
+            "sleep": self._gather_sleep(),
         }
+
+    async def _gather_immune_safe(self) -> dict[str, Any]:
+        """Thymos immune gather with timeout guard (Spec 11 §13.2)."""
+        try:
+            return await asyncio.wait_for(self._gather_immune(), timeout=_GATHER_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._logger.warning("alive_gather_timeout", section="immune")
+            return {"available": False, "error": "timeout"}
+
+    async def _gather_goals_safe(self) -> dict[str, Any]:
+        """Nova goals gather with timeout guard (Spec 11 §13.2)."""
+        try:
+            return await asyncio.wait_for(self._gather_goals(), timeout=_GATHER_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._logger.warning("alive_gather_timeout", section="goals")
+            return {"available": False, "error": "timeout"}
+
+    async def _gather_economics_safe(self) -> dict[str, Any]:
+        """Oikos economics gather with timeout guard (Spec 11 §13.2)."""
+        try:
+            return await asyncio.wait_for(self._gather_economics(), timeout=_GATHER_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._logger.warning("alive_gather_timeout", section="economics")
+            return {"available": False, "error": "timeout"}
+
+    async def _gather_causal_safe(self) -> dict[str, Any]:
+        """Kairos causal gather with timeout guard."""
+        try:
+            return await asyncio.wait_for(self._gather_causal(), timeout=_GATHER_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._logger.warning("alive_gather_timeout", section="causal")
+            return {"available": False, "error": "timeout"}
+
+    async def _gather_compression_safe(self) -> dict[str, Any]:
+        """Logos compression gather with timeout guard."""
+        try:
+            return await asyncio.wait_for(self._gather_compression(), timeout=_GATHER_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._logger.warning("alive_gather_timeout", section="compression")
+            return {"available": False, "error": "timeout"}
 
     # ── interoceptive (Soma full 9D state + urgency + attractor) ────────
 
@@ -328,8 +499,6 @@ class AliveWebSocketServer:
         if self._soma is None:
             return {"available": False}
         try:
-            from systems.soma.types import InteroceptiveDimension
-
             state = self._soma.get_current_state()
             if state is None:
                 return {"available": False}
@@ -607,6 +776,95 @@ class AliveWebSocketServer:
             self._logger.debug("alive_gather_benchmarks_error", error=str(exc))
             return {"available": False, "error": str(exc)}
 
+    # ── causal (Kairos invariant hierarchy) ─────────────────────────────
+
+    async def _gather_causal(self) -> dict[str, Any]:
+        """Causal invariant mining state from Kairos.
+
+        Ref: Spec 11 §22 gap 4 — Kairos absent from Alive telemetry.
+        Exposes the organism's most scientifically interesting signal:
+        how many causal rules it has discovered and at what tier.
+        """
+        if self._kairos is None:
+            return {"available": False}
+        try:
+            h = await self._kairos.health()
+            hierarchy = h.get("hierarchy") or {}
+            ledger = h.get("intelligence_ledger") or {}
+            return {
+                "available": True,
+                "pipeline_runs": h.get("pipeline_runs"),
+                "invariants_created": h.get("invariants_created"),
+                "tier3_discoveries": h.get("tier3_discoveries"),
+                "counter_invariants_found": h.get("counter_invariants_found"),
+                # Hierarchy breakdown by tier
+                "tier1_count": hierarchy.get("tier1_count"),
+                "tier2_count": hierarchy.get("tier2_count"),
+                "tier3_count": hierarchy.get("tier3_count"),
+                "total_active": hierarchy.get("total_active"),
+                # Intelligence ratio contribution
+                "mean_intelligence_ratio": ledger.get("mean_intelligence_ratio"),
+                "total_i_ratio_contribution": ledger.get("total_i_ratio_contribution"),
+            }
+        except Exception as exc:
+            self._logger.debug("alive_gather_causal_error", error=str(exc))
+            return {"available": False, "error": str(exc)}
+
+    # ── compression (Logos world model + Schwarzschild) ──────────────────
+
+    async def _gather_compression(self) -> dict[str, Any]:
+        """Compression and world model state from Logos.
+
+        Ref: Spec 11 §22 gap 4 — Logos absent from Alive telemetry.
+        Exposes cognitive pressure, intelligence ratio, and Schwarzschild proximity.
+        """
+        if self._logos is None:
+            return {"available": False}
+        try:
+            h = await self._logos.health()
+            return {
+                "available": True,
+                "cognitive_pressure": h.get("cognitive_pressure"),
+                "compression_urgency": h.get("compression_urgency"),
+                "intelligence_ratio": h.get("intelligence_ratio"),
+                "world_model_schemas": h.get("world_model_schemas"),
+                "world_model_complexity_bits": h.get("world_model_complexity_bits"),
+                "schwarzschild_met": h.get("schwarzschild_met"),
+                "anchor_memories": h.get("anchor_memories"),
+            }
+        except Exception as exc:
+            self._logger.debug("alive_gather_compression_error", error=str(exc))
+            return {"available": False, "error": str(exc)}
+
+    # ── sleep (Oneiros stage + cycle health) ────────────────────────────
+
+    def _gather_sleep(self) -> dict[str, Any]:
+        """Current sleep stage and cycle health from Oneiros.
+
+        Ref: Spec 11 §22 gap 4 — Oneiros absent from Alive telemetry.
+        Exposes sleep pressure, current stage, and cumulative cycle metrics.
+        """
+        if self._oneiros is None:
+            return {"available": False}
+        try:
+            s = self._oneiros.stats
+            return {
+                "available": True,
+                "is_sleeping": self._oneiros.is_sleeping,
+                "current_stage": s.get("current_stage"),
+                "current_pressure": s.get("current_pressure"),
+                "current_degradation": s.get("current_degradation"),
+                "total_sleep_cycles": s.get("total_sleep_cycles"),
+                "total_dreams": s.get("total_dreams"),
+                "total_insights": s.get("total_insights"),
+                "mean_dream_coherence": s.get("mean_dream_coherence"),
+                "mean_sleep_quality": s.get("mean_sleep_quality"),
+                "episodes_consolidated": s.get("episodes_consolidated"),
+            }
+        except Exception as exc:
+            self._logger.debug("alive_gather_sleep_error", error=str(exc))
+            return {"available": False, "error": str(exc)}
+
     # ─── Broadcast ─────────────────────────────────────────────────────
 
     async def _broadcast(self, message: str) -> None:
@@ -630,6 +888,7 @@ class AliveWebSocketServer:
             "port": self._port,
             "connected_clients": len(self._clients),
             "streams": ["synapse", "affect", "system_state"],
+            "auth_enabled": bool(self._auth_tokens),
             "systems_wired": {
                 "soma": self._soma is not None,
                 "atune": self._atune is not None,
@@ -641,6 +900,9 @@ class AliveWebSocketServer:
                 "oikos": self._oikos is not None,
                 "simula": self._simula is not None,
                 "fovea": self._fovea is not None,
+                "kairos": self._kairos is not None,
+                "logos": self._logos is not None,
+                "oneiros": self._oneiros is not None,
                 "benchmarks": self._benchmarks is not None,
             },
         }

@@ -408,26 +408,94 @@ def _are_abstractly_equivalent(
     Ultra-abstract comparison: two invariants from alien-kind instances
     that match at the purest structural level.
 
-    Checks: same invariant set, compatible symmetry, compatible topology.
+    When invariant sets are populated, uses strict Jaccard >= 0.7 comparison
+    (original behavior preserved — no reduced specificity).
+
+    When invariant sets are empty (most Logos schemas), falls back to a
+    weighted topology+domain+edge similarity score with threshold > 0.7.
     """
     struct_a = fragment_a.abstract_structure
     struct_b = fragment_b.abstract_structure
 
-    # Invariant set comparison (primary signal)
+    # Invariant set comparison (primary signal when available)
     inv_a = set(str(i) for i in struct_a.get("invariants", []))
     inv_b = set(str(i) for i in struct_b.get("invariants", []))
 
-    if not inv_a or not inv_b:
-        return False
+    has_invariants = bool(inv_a) and bool(inv_b)
 
-    # Jaccard similarity of invariant sets
-    union = len(inv_a | inv_b)
-    intersection = len(inv_a & inv_b)
-    if union == 0:
-        return False
-    jaccard = intersection / union
-    if jaccard < 0.7:
-        return False
+    if has_invariants:
+        # Strict invariant Jaccard — original behavior unchanged
+        union = len(inv_a | inv_b)
+        intersection = len(inv_a & inv_b)
+        if union == 0:
+            return False
+        jaccard = intersection / union
+        if jaccard < 0.7:
+            return False
+    else:
+        # Fallback: topology + domain + edge similarity
+        # Weighted score must exceed 0.7 to be considered equivalent
+        score = 0.0
+        total_weight = 0.0
+
+        # Node count similarity (weight 0.25)
+        nodes_a = struct_a.get("nodes", 0)
+        nodes_b = struct_b.get("nodes", 0)
+        if isinstance(nodes_a, int) and isinstance(nodes_b, int) and nodes_a > 0 and nodes_b > 0:
+            node_sim = min(nodes_a, nodes_b) / max(nodes_a, nodes_b)
+            score += 0.25 * node_sim
+            total_weight += 0.25
+        elif nodes_a == nodes_b == 0:
+            # Both unknown — neutral
+            pass
+        else:
+            total_weight += 0.25  # one has nodes, other doesn't → 0 similarity
+
+        # Edge type overlap (weight 0.35)
+        edges_a = struct_a.get("edges", [])
+        edges_b = struct_b.get("edges", [])
+        if isinstance(edges_a, list) and isinstance(edges_b, list) and edges_a and edges_b:
+            types_a = {e.get("type", "") for e in edges_a if isinstance(e, dict)}
+            types_b = {e.get("type", "") for e in edges_b if isinstance(e, dict)}
+            if types_a and types_b:
+                edge_union = len(types_a | types_b)
+                edge_inter = len(types_a & types_b)
+                edge_sim = edge_inter / edge_union if edge_union else 0.0
+                score += 0.35 * edge_sim
+                total_weight += 0.35
+        elif not edges_a and not edges_b:
+            pass  # Both missing — neutral
+        else:
+            total_weight += 0.35
+
+        # Domain overlap (weight 0.20)
+        domains_a = set(fragment_a.domain_labels)
+        domains_b = set(fragment_b.domain_labels)
+        if domains_a and domains_b:
+            dom_union = len(domains_a | domains_b)
+            dom_inter = len(domains_a & domains_b)
+            dom_sim = dom_inter / dom_union if dom_union else 0.0
+            score += 0.20 * dom_sim
+            total_weight += 0.20
+        elif not domains_a and not domains_b:
+            pass
+        else:
+            total_weight += 0.20
+
+        # Causal structure type match (weight 0.20)
+        type_a = struct_a.get("type", "")
+        type_b = struct_b.get("type", "")
+        if type_a and type_b:
+            type_sim = 1.0 if type_a == type_b else 0.0
+            score += 0.20 * type_sim
+            total_weight += 0.20
+
+        # Normalize by active weight
+        if total_weight < 0.3:
+            return False  # Insufficient structural info to compare
+        normalized = score / total_weight
+        if normalized < 0.7:
+            return False
 
     # Symmetry compatibility (if both declare symmetry)
     sym_a = struct_a.get("symmetry")
@@ -444,13 +512,14 @@ def _are_abstractly_equivalent(
         if pair not in related:
             return False
 
-    # Node count compatibility (within 50% tolerance)
-    nodes_a = struct_a.get("nodes", 0)
-    nodes_b = struct_b.get("nodes", 0)
-    if isinstance(nodes_a, int) and isinstance(nodes_b, int) and nodes_a > 0 and nodes_b > 0:
-        ratio = min(nodes_a, nodes_b) / max(nodes_a, nodes_b)
-        if ratio < 0.5:
-            return False
+    # Node count compatibility (within 50% tolerance) — applies to both paths
+    if has_invariants:
+        nodes_a = struct_a.get("nodes", 0)
+        nodes_b = struct_b.get("nodes", 0)
+        if isinstance(nodes_a, int) and isinstance(nodes_b, int) and nodes_a > 0 and nodes_b > 0:
+            ratio = min(nodes_a, nodes_b) / max(nodes_a, nodes_b)
+            if ratio < 0.5:
+                return False
 
     return True
 

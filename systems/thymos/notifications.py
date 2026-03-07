@@ -411,18 +411,27 @@ class NotificationDispatcher:
     # ── Internal helpers ──────────────────────────────────────────────
 
     @staticmethod
+    def _escape_md(text: str) -> str:
+        """Escape Telegram Markdown v1 special characters in plain-text values."""
+        for ch in ("_", "*", "`", "["):
+            text = text.replace(ch, f"\\{ch}")
+        return text
+
+    @staticmethod
     def _format_telegram_text(payload: dict[str, Any]) -> str:
         """Format the escalation payload as a Markdown organism status update."""
-        tried = "\n".join(f"  • {step}" for step in payload.get("what_was_tried", []))
+        esc = NotificationDispatcher._escape_md
+        tried_steps = payload.get("what_was_tried", [])
+        tried = "\n".join(f"  • {esc(str(step))}" for step in tried_steps)
         ts = payload.get("timestamp", "")
         return (
             "🧬 *EOS Escalation*\n"
             "\n"
-            f"System: {payload['system']}\n"
-            f"Severity: {payload['severity']}\n"
-            f"What happened: {payload['what_failed']}\n"
+            f"System: {esc(str(payload['system']))}\n"
+            f"Severity: {esc(str(payload['severity']))}\n"
+            f"What happened: {esc(str(payload['what_failed']))}\n"
             f"What was tried: {tried or '(none)'}\n"
-            f"Needs from you: {payload['recommended_human_action']}\n"
+            f"Needs from you: {esc(str(payload['recommended_human_action']))}\n"
             f"Time: {ts}"
         )
 

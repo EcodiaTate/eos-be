@@ -47,6 +47,14 @@ class SystemID(enum.StrEnum):
     LOGOS = "logos"
     KAIROS = "kairos"
     NEXUS = "nexus"
+    TELOS = "telos"
+    BENCHMARKS = "benchmarks"
+    EIS = "eis"
+    IDENTITY = "identity"
+    SACM = "sacm"
+    MITOSIS = "mitosis"
+    PHANTOM = "phantom"
+    ALIVE = "alive"
     API = "api"
 
 

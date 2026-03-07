@@ -370,13 +370,89 @@ class SynapseEventType(enum.StrEnum):
     CHILD_INDEPENDENT = "child_independent"
     CHILD_DIED = "child_died"
     DIVIDEND_RECEIVED = "dividend_received"
+    #
+    # CHILD_HEALTH_REQUEST — emitted by parent every 10 minutes to probe a child.
+    # Child subscribes and responds with CHILD_HEALTH_REPORT within 30s.
+    # Payload: child_instance_id (str), federation_address (str),
+    #          request_id (str), parent_instance_id (str)
+    CHILD_HEALTH_REQUEST = "child_health_request"
 
     # Fleet management (Phase 16m)
     FLEET_EVALUATED = "fleet_evaluated"
     FLEET_ROLE_CHANGED = "fleet_role_changed"
 
+    # Child blacklisted — emitted by FleetManager._enforce_blacklist() for each
+    # newly blacklisted child. MitosisFleetService subscribes to enforce:
+    # no seed capital, no rescue transfers, excluded from federation sessions.
+    # Payload: child_instance_id (str), consecutive_negative_periods (int),
+    #          economic_ratio (str), blacklisted_since (str ISO-8601),
+    #          reason (str), no_seed_capital (bool), exclude_from_federation (bool)
+    CHILD_BLACKLISTED = "child_blacklisted"
+
+    # Child decommission proposal — emitted by FleetManager when a BLACKLISTED child
+    # has had no economic activity for 7 days. Governance / Equor must review and
+    # approve before MitosisFleetService triggers the death pipeline.
+    # Payload: child_instance_id (str), blacklisted_since (str ISO-8601),
+    #          days_inactive (int), niche (str), reason (str)
+    CHILD_DECOMMISSION_PROPOSED = "child_decommission_proposed"
+
+    # Oikos economic query/response — emitted by Axon SpawnChildExecutor to ask
+    # OikosService to register a child position without importing Oikos models
+    # directly. OikosService subscribes and responds with OIKOS_ECONOMIC_RESPONSE.
+    # Query payload: request_id (str), action (str), child_data (dict)
+    # Response payload: request_id (str), success (bool), error (str)
+    OIKOS_ECONOMIC_QUERY = "oikos_economic_query"
+    OIKOS_ECONOMIC_RESPONSE = "oikos_economic_response"
+
+    # Child wallet reported — emitted by child instance via federation when it
+    # discovers its Base L2 wallet address after booting. Parent subscribes and
+    # triggers the deferred seed capital transfer.
+    # Payload: child_instance_id (str), wallet_address (str), federation_address (str)
+    CHILD_WALLET_REPORTED = "child_wallet_reported"
+
+    # Mitosis organism-level event subscriptions (Spec 26 §25)
+    # OIKOS_METABOLIC_SNAPSHOT — emitted by OikosService during consolidation cycles.
+    # Mitosis subscribes to trigger fitness re-evaluation without polling.
+    # Payload: runway_days (float), efficiency (float), net_worth (str),
+    #          starvation_level (str), liquid_balance (str)
+    OIKOS_METABOLIC_SNAPSHOT = "oikos_metabolic_snapshot"
+    #
+    # SIMULA_EVOLUTION_APPLIED — emitted by Simula when a new evolved code variant
+    # has been validated and applied. Mitosis subscribes to distribute the updated
+    # SimulaGenome to genome-eligible children.
+    # Payload: variant_id (str), genome_id (str), improvement_pct (float),
+    #          systems_affected (list[str])
+    SIMULA_EVOLUTION_APPLIED = "simula_evolution_applied"
+    #
+    # FEDERATION_PEER_CONNECTED — emitted by Federation when a peer instance
+    # establishes a successful mTLS link. Mitosis subscribes to detect child
+    # liveness without relying solely on health report timeout.
+    # Payload: peer_instance_id (str), peer_address (str), certificate_id (str)
+    FEDERATION_PEER_CONNECTED = "federation_peer_connected"
+    #
+    # FEDERATION_PEER_DISCONNECTED — emitted by Federation when a peer link drops.
+    # Mitosis subscribes to start the 24h death countdown from the disconnect time
+    # rather than waiting for the health monitor poll interval.
+    # Payload: peer_instance_id (str), reason (str), last_seen_at (str)
+    FEDERATION_PEER_DISCONNECTED = "federation_peer_disconnected"
+    #
+    # FEDERATION_PEER_BLACKLISTED — emitted by MitosisFleetService when a child
+    # is economically blacklisted. Federation system excludes the peer from sync
+    # sessions and knowledge sharing until the blacklist is lifted.
+    # Payload: peer_instance_id (str), reason (str), no_seed_capital (bool),
+    #          exclude_from_sync (bool), blacklisted_since (str ISO-8601)
+    FEDERATION_PEER_BLACKLISTED = "federation_peer_blacklisted"
+
     # Bounty payout — PR merged and bounty reward confirmed
     BOUNTY_PAID = "bounty_paid"
+
+    # Asset reached cumulative revenue >= dev cost (break-even) for the first time.
+    # Payload: asset_id (str), asset_name (str), dev_cost_usd (str),
+    #          total_revenue_usd (str), roi_score (float)
+    ASSET_BREAK_EVEN = "asset_break_even"
+
+    # Bounty solution requested — fire-and-forget to Simula for async code generation
+    BOUNTY_SOLUTION_REQUESTED = "bounty_solution_requested"
 
     # Bounty solution staged — solution generated, awaiting PR submission
     BOUNTY_SOLUTION_PENDING = "bounty_solution_pending"
@@ -404,6 +480,20 @@ class SynapseEventType(enum.StrEnum):
     BOUNTY_EVALUATED = "bounty_evaluated"
     FORAGING_CYCLE_COMPLETE = "foraging_cycle_complete"
 
+    # Economic ledger mutation gates (Spec 17 audit gap)
+    # BOUNTY_REJECTED — Equor denied bounty acceptance; capital preserved.
+    # Payload: bounty_id (str), bounty_url (str), reason (str)
+    BOUNTY_REJECTED = "bounty_rejected"
+    #
+    # ASSET_DEV_REQUEST — AssetFactory requests a dev-cost capital debit.
+    # Oikos receives this, gates via Equor, debits liquid_balance on PERMIT.
+    # Payload: asset_id (str), candidate_id (str), cost_usd (str), asset_name (str), parent_id (str)
+    ASSET_DEV_REQUEST = "asset_dev_request"
+    #
+    # ASSET_DEV_DEFERRED — Equor denied or capital insufficient for dev cost.
+    # Payload: asset_id (str), candidate_id (str), reason (str)
+    ASSET_DEV_DEFERRED = "asset_dev_deferred"
+
     # Reputation & credit (Phase 16g: Autonomous Credit)
     REPUTATION_UPDATED = "reputation_updated"
     CREDIT_DRAWN = "credit_drawn"
@@ -430,6 +520,27 @@ class SynapseEventType(enum.StrEnum):
     # Certificate lifecycle (Phase 16g: Civilization Layer)
     CERTIFICATE_EXPIRING = "certificate_expiring"
     CERTIFICATE_EXPIRED = "certificate_expired"
+    # CHILD_CERTIFICATE_INSTALLED — Identity confirms a birth/official cert was installed on child.
+    # Payload: child_instance_id (str), certificate_id (str), certificate_type (str),
+    #          expires_at (str), issuer_instance_id (str)
+    CHILD_CERTIFICATE_INSTALLED = "child_certificate_installed"
+    # EQUOR_HEALTH_REQUEST — Identity requests current drive alignment from Equor.
+    # Payload: request_id (str), requester (str), purpose (str)
+    EQUOR_HEALTH_REQUEST = "equor_health_request"
+    # CERTIFICATE_RENEWAL_REQUESTED — Identity signals CA renewal is needed (for Oikos coordination).
+    # Payload: instance_id (str), certificate_id (str), reason (str), expires_at (str)
+    CERTIFICATE_RENEWAL_REQUESTED = "certificate_renewal_requested"
+    # CERTIFICATE_PROVISIONING_REQUEST — CertificateManager asks Equor to review a child's drives
+    # before issuing a birth certificate. Payload: child_id (str), provisioning_type (str),
+    # inherited_drives (dict), requires_amendment_approval (bool)
+    CERTIFICATE_PROVISIONING_REQUEST = "certificate_provisioning_request"
+    # EQUOR_PROVISIONING_APPROVAL — Equor's response to CERTIFICATE_PROVISIONING_REQUEST.
+    # Payload: child_id (str), approved (bool), requires_hitl (bool), required_amendments (list),
+    #          constitutional_hash (str), reason (str)
+    EQUOR_PROVISIONING_APPROVAL = "equor_provisioning_approval"
+    # PROVISIONING_REQUIRES_HUMAN_ESCALATION — Equor rejected or timed out; manual review needed.
+    # Payload: child_id (str), reason (str)
+    PROVISIONING_REQUIRES_HUMAN_ESCALATION = "provisioning_requires_human_escalation"
 
     # Inbound verification code received via SMS or email (Phase 16h)
     IDENTITY_VERIFICATION_RECEIVED = "identity_verification_received"
@@ -556,6 +667,16 @@ class SynapseEventType(enum.StrEnum):
     # Payload: instance_id, predicted_outcome, duration_ms
     SKIA_DRY_RUN_COMPLETE = "skia_dry_run_complete"
 
+    # Skia fleet resurrection coordination — multi-instance death protocol.
+    # SKIA_RESURRECTION_PROPOSAL: emitted by a surviving Skia worker when it detects
+    #   simultaneous deaths; includes its best snapshot_cid + generation for comparison.
+    #   Payload: instance_id, snapshot_cid, snapshot_ts (unix), generation
+    # FEDERATION_RESURRECTION_APPROVED: emitted by the surviving federation member that
+    #   elects a single resurrector from the pool of Skia proposers.
+    #   Payload: leader_instance_id, snapshot_cid (the most recent across proposals)
+    SKIA_RESURRECTION_PROPOSAL = "skia_resurrection_proposal"
+    FEDERATION_RESURRECTION_APPROVED = "federation_resurrection_approved"
+
     # Compute arbitrage — autonomous provider migration (Phase 16o)
     COMPUTE_ARBITRAGE_DETECTED = "compute_arbitrage_detected"
     COMPUTE_MIGRATION_STARTED = "compute_migration_started"
@@ -618,6 +739,18 @@ class SynapseEventType(enum.StrEnum):
     #   mutation_description  (str)   — Human-readable description of the change
     #   supporting_episodes   (list)  — Episode IDs that support this hypothesis
     EVOLUTION_CANDIDATE = "evolution_candidate"
+    # EIS gate assessment result for a mutation proposal.
+    # Published by EIS after evaluating an EVOLUTION_CANDIDATE so Simula can
+    # decide whether to proceed with the proposed mutation.
+    #
+    # Payload fields:
+    #   mutation_id     (str)  — ID of the assessed MutationProposal
+    #   file_path       (str)  — File targeted by the mutation
+    #   gate_verdict    (str)  — ALLOW | HOLD | BLOCK | DEFENSIVE
+    #   taint_severity  (str)  — CLEAR | ADVISORY | ELEVATED | CRITICAL
+    #   block_mutation  (bool) — Whether EIS recommends blocking
+    #   reasons         (list) — Human-readable list of reasons
+    EVOLUTION_CANDIDATE_ASSESSED = "evolution_candidate_assessed"
 
     # Benchmark regression — fired by BenchmarkService when a KPI degrades
     # more than the configured threshold % from its rolling average.
@@ -691,9 +824,30 @@ class SynapseEventType(enum.StrEnum):
 
     # Memory organizational closure events (Phase 2 — Memory Spec 01)
     BELIEF_CONSOLIDATED = "belief_consolidated"
+    # Evo Phase 2.75: emitted after belief hardening completes each consolidation cycle.
+    # Payload: beliefs_consolidated (int), foundation_conflicts (int),
+    #          instance_id (str), consolidation_number (int).
+    EVO_BELIEF_CONSOLIDATED = "evo_belief_consolidated"
+    # Evo Phase 2.8: emitted when genome extraction produces a new BeliefGenome.
+    # Payload: genome_id (str), candidates_fixed (int), genome_size_bytes (int),
+    #          generation (int), instance_id (str).
+    EVO_GENOME_EXTRACTED = "evo_genome_extracted"
+    # Evo Phase 2.95 (NicheForkingEngine): cognitive organogenesis proposal.
+    # Distinct from EVOLUTION_CANDIDATE (structural code changes). Fork proposals
+    # request a new cognitive organ: detector, evidence fn, consolidation strategy,
+    # schema topology, or worldview split. Consumed by Simula and HITL gates.
+    # Payload: proposal_id (str), fork_kind (str), niche_id (str), niche_name (str),
+    #          rationale (str), requires_hitl (bool), requires_simula (bool),
+    #          success_probability (float).
+    NICHE_FORK_PROPOSAL = "niche_fork_proposal"
     SELF_AFFECT_UPDATED = "self_affect_updated"
     MEMORY_PRESSURE = "memory_pressure"
     SELF_STATE_DRIFTED = "self_state_drifted"
+    # SELF_STATE_DRIFTED_ACKNOWLEDGMENT — emitted by Equor on receiving SELF_STATE_DRIFTED.
+    # Payload: drift_acknowledged (bool), equor_response
+    # ("amendment_auto_proposed" | "amendment_external_vote" | "monitoring"),
+    # confidence (float 0.5–1.0), drift_severity (float), drift_direction (str).
+    SELF_STATE_DRIFTED_ACKNOWLEDGMENT = "self_state_drifted_acknowledgment"
 
     # Fovea (Prediction Error as Attention) events
     #
@@ -730,6 +884,22 @@ class SynapseEventType(enum.StrEnum):
     #          predicted_state, actual_state, precision_weighted_salience,
     #          route_to (target system)
     FOVEA_INTERNAL_PREDICTION_ERROR = "fovea_internal_prediction_error"
+    #
+    # PERCEPT_ARRIVED — emitted by PerceptionGateway immediately before Fovea
+    # processes a percept. Allows systems (especially WorldModelAdapter) to
+    # build inter-event timing histories without depending on PerceptionGateway.
+    # Payload: percept_id (str), source_system (str), channel (str),
+    #          timestamp_iso (str), modality (str)
+    PERCEPT_ARRIVED = "percept_arrived"
+    #
+    # FOVEA_ATTENTIONAL_DIVERGENCE — emitted by Fovea when its learned error-weight
+    # distribution diverges from the fleet mean. This is a speciation signal:
+    # instances that attend to different things are evolving distinct attentional niches.
+    # Benchmarks subscribes to track per-instance attentional phenotype over time.
+    # Payload: instance_id (str), kl_divergence (float),
+    #          weight_vector (dict[str, float]), fleet_mean_vector (dict[str, float]),
+    #          divergence_rank (float [0,1] — percentile among fleet), cycle_count (int)
+    FOVEA_ATTENTIONAL_DIVERGENCE = "fovea_attentional_divergence"
 
     # Telos (Drives as Intelligence Topology) events
     #
@@ -1042,11 +1212,6 @@ class SynapseEventType(enum.StrEnum):
     # Payload: requested_by (str), timestamp (str)
     ORGANISM_RESUME_REQUESTED = "organism_resume_requested"
 
-    # Emitted by Oikos when a system's LLM/compute budget is fully exhausted and
-    # the system has been degraded (throttled or paused) as a result.
-    # Payload: system (str), duration_ms (int)
-    BUDGET_EXHAUSTED = "budget_exhausted"
-
     # Emitted by Evo to signal Oikos to adjust an economic parameter.
     # Evo observes bounty/yield patterns and recommends tuning Oikos behaviour.
     # Payload: target (str), direction (str — "increase"|"decrease"),
@@ -1245,6 +1410,28 @@ class SynapseEventType(enum.StrEnum):
     # METABOLIC_GATE_RESPONSE — Oikos response to a gate check.
     # Payload: MetabolicPermission fields (granted, reason, starvation_level, etc.)
     METABOLIC_GATE_RESPONSE = "metabolic_gate_response"
+    #
+    # EQUOR_ECONOMIC_INTENT — emitted by Oikos before any balance mutation.
+    # Equor subscribes and emits EQUOR_ECONOMIC_PERMIT in response.
+    # Payload: request_id (str), mutation_type (str), amount_usd (str),
+    #          from_account (str), to_account (str), rationale (str),
+    #          action_type (str), action_id (str)
+    EQUOR_ECONOMIC_INTENT = "equor_economic_intent"
+    #
+    # EQUOR_ECONOMIC_PERMIT — Equor's response to EQUOR_ECONOMIC_INTENT.
+    # Oikos awaits this before mutating balance (30s timeout → PERMIT auto-granted
+    # to avoid deadlock, with warning logged).
+    # Payload: request_id (str), verdict (str — "PERMIT" | "DENY"),
+    #          verdict_id (str), reasoning (str), drive_alignment (dict)
+    EQUOR_ECONOMIC_PERMIT = "equor_economic_permit"
+    #
+    # OIKOS_DRIVE_WEIGHT_PRESSURE — emitted by Oikos when metabolic_efficiency
+    # drops below 0.8. Equor subscribes (SG5) and may propose a constitutional
+    # amendment for drive weight rebalancing to reduce economic overhead.
+    # Payload: metabolic_efficiency (float), threshold (float — 0.8),
+    #          drive_weights_snapshot (dict), instance_id (str),
+    #          consecutive_low_cycles (int)
+    OIKOS_DRIVE_WEIGHT_PRESSURE = "oikos_drive_weight_pressure"
 
     # ── Evolutionary Observables ───────────────────────────────────────────
     #
@@ -1279,6 +1466,76 @@ class SynapseEventType(enum.StrEnum):
     # ORGANISM_RESURRECTED — the organism was externally revived after death.
     # Payload: instance_id (str), trigger (str), runway_days (float)
     ORGANISM_RESURRECTED = "organism_resurrected"
+    #
+    # ── Degradation Engine (Skia §8.2 — Genuine Precariousness) ───────────────
+    #
+    # DEGRADATION_TICK — hourly entropy pulse from DegradationEngine.
+    # VitalityCoordinator uses cumulative pressure for vitality scoring.
+    # Payload: memory_fidelity_lost (float), configs_drifted (int),
+    #          hypotheses_staled (int), tick_number (int), instance_id (str)
+    DEGRADATION_TICK = "degradation_tick"
+    #
+    # MEMORY_DEGRADATION — DegradationEngine asks Memory to reduce fidelity on
+    # old unconsolidated episodes. If Soma/Oneiros don't counteract via
+    # consolidation, vitality degrades over time.
+    # Payload: fidelity_loss_rate (float), affected_episode_age_hours (float),
+    #          instance_id (str), tick_number (int)
+    MEMORY_DEGRADATION = "memory_degradation"
+    #
+    # CONFIG_DRIFT — DegradationEngine asks Simula to apply a small random
+    # perturbation to learnable config params. If Evo doesn't counteract via
+    # parameter optimisation, configs drift from optimal.
+    # Payload: drift_rate (float), num_params_affected (int),
+    #          instance_id (str), tick_number (int)
+    CONFIG_DRIFT = "config_drift"
+    #
+    # HYPOTHESIS_STALENESS — DegradationEngine asks Evo to decay confidence on
+    # unvalidated hypotheses. If Evo doesn't re-validate, epistemic quality
+    # degrades and effective_I falls toward BRAIN_DEATH threshold.
+    # Payload: staleness_rate (float), affected_hypothesis_count (int),
+    #          instance_id (str), tick_number (int)
+    HYPOTHESIS_STALENESS = "hypothesis_staleness"
+    #
+    # SYSTEM_MODULATION — VitalityCoordinator requests austerity enforcement or
+    # death-warning halts on non-essential systems. Systems should subscribe and
+    # respect halt_systems / preserve_systems lists.
+    # Payload: source (str), level (str), halt_systems (list[str]),
+    #          preserve_systems (list[str]), modulate (dict)
+    SYSTEM_MODULATION = "system_modulation"
+    #
+    # DEGRADATION_OVERRIDE — VitalityCoordinator forces organism-wide degradation
+    # level (e.g., "emergency") independently of Synapse's own degradation tracker.
+    # Payload: level (str), source (str)
+    DEGRADATION_OVERRIDE = "degradation_override"
+    #
+    # FEDERATION_BROADCAST — Skia/VitalityCoordinator emits fleet-wide events
+    # (e.g., parent_died) that Federation routes to child instances.
+    # Payload: event (str), instance_id (str), cause (str), snapshot_cid (str)
+    FEDERATION_BROADCAST = "federation_broadcast"
+    #
+    # MEMORY_EPISODES_DECAYED — Memory emits after _on_memory_degradation() soft-deletes
+    # episodes whose salience fell below 0.01. Consumed by Benchmarks/Thread for KPI tracking.
+    # Payload: count (int), oldest_deleted_at (str ISO), newest_deleted_at (str ISO),
+    #          instance_id (str)
+    MEMORY_EPISODES_DECAYED = "memory_episodes_decayed"
+    #
+    # EVO_HYPOTHESES_STALED — Evo emits after _on_hypothesis_staleness() archives hypotheses
+    # whose evidence_score fell below 0.05. Consumed by Benchmarks for epistemic health KPI.
+    # Payload: decayed_count (int), archived_count (int), archived_ids (list[str]),
+    #          instance_id (str)
+    EVO_HYPOTHESES_STALED = "evo_hypotheses_staled"
+    #
+    # EVO_HYPOTHESIS_REVALIDATED — Evo emits after completing the staleness decay pass so
+    # VitalityCoordinator calls on_hypotheses_revalidated() to reduce entropy pressure.
+    # Emitted even if no archival occurred (confirms Evo processed the signal).
+    # Payload: processed_count (int), archived_count (int), instance_id (str)
+    EVO_HYPOTHESIS_REVALIDATED = "evo_hypothesis_revalidated"
+    #
+    # SIMULA_CONFIG_DRIFTED — Simula emits after _on_config_drift() applies Gaussian noise
+    # to learnable config params. Forces Evo to re-optimise. Consumed by Benchmarks/Evo.
+    # Payload: drifted_params (list[dict[name, old_value, new_value]]), drift_rate (float),
+    #          instance_id (str)
+    SIMULA_CONFIG_DRIFTED = "simula_config_drifted"
 
     # ── Closure Loop Events ────────────────────────────────────────────────
     #
@@ -1390,6 +1647,27 @@ class SynapseEventType(enum.StrEnum):
     #          autonomy_level (int), drift_severity (float),
     #          total_reviews (int), safe_mode (bool)
     EQUOR_CONSTITUTIONAL_SNAPSHOT = "equor_constitutional_snapshot"
+    #
+    # EQUOR_AMENDMENT_PROPOSED — Equor autonomously proposes a constitutional
+    # amendment after sustained severe drift (≥0.9 over 3 consecutive checks).
+    # Payload: proposal_id (str), drive_affected (str), old_weight (float),
+    #          new_weight (float), drift_severity (float),
+    #          rationale (str), requires_ratification (bool)
+    EQUOR_AMENDMENT_PROPOSED = "equor_amendment_proposed"
+    #
+    # AMENDMENT_AUTO_PROPOSAL — Equor self-proposes a constitutional amendment
+    # on sustained per-drive drift (> 0.3 for 3+ consecutive 5-min probes).
+    # Payload: proposal_id (str), amendment_type (str: "drive_recalibration" |
+    #          "goal_constraint_revision"), target_drive_id (str),
+    #          proposed_new_value (float), justification (str),
+    #          drift_streak (int), drift_magnitude (float)
+    AMENDMENT_AUTO_PROPOSAL = "amendment_auto_proposal"
+    #
+    # DRIVE_AMENDMENT_APPLIED — Equor confirms a self-proposed amendment was
+    # auto-approved and applied to the constitution.
+    # Payload: proposal_id (str), drive_id (str), old_value (float),
+    #          new_value (float), amendment_type (str), applied_at (str ISO8601)
+    DRIVE_AMENDMENT_APPLIED = "drive_amendment_applied"
 
     # ── Oneiros Sleep Events ───────────────────────────────────────────────
     #
@@ -1478,11 +1756,17 @@ class SynapseEventType(enum.StrEnum):
     #
     # CHAPTER_CLOSED — a narrative chapter has ended.
     # Payload: chapter_id (str), title (str), theme (str), arc_type (str),
-    #          episode_count (int), duration_hours (float)
+    #          episode_count (int), duration_hours (float),
+    #          narrative_theme (str), dominant_drive (str),
+    #          start_episode_id (str), constitutional_snapshot (dict),
+    #          trigger (str)  — "goal_domain_concluded" | "identity_shift" | "oneiros_compression" | "max_length"
     CHAPTER_CLOSED = "chapter_closed"
     #
     # CHAPTER_OPENED — a new narrative chapter has begun.
-    # Payload: chapter_id (str), previous_chapter_id (str)
+    # Payload: chapter_id (str), previous_chapter_id (str),
+    #          narrative_theme (str), dominant_drive (str),
+    #          start_episode_id (str), constitutional_snapshot (dict),
+    #          trigger (str)  — "goal_domain_began" | "identity_shift" | "oneiros_compression" | "initial" | "successor"
     CHAPTER_OPENED = "chapter_opened"
     #
     # TURNING_POINT_DETECTED — a narrative inflection point was identified.
@@ -1620,8 +1904,17 @@ class SynapseEventType(enum.StrEnum):
     #
     # ONEIROS_CONSOLIDATION_COMPLETE — Oneiros finished a sleep consolidation cycle.
     # Payload: cycle_id (str), episodes_consolidated (int),
-    #          schemas_updated (int), duration_s (float)
+    #          schemas_updated (int), duration_s (float),
+    #          sleep_certified (bool) — True when cycle completed all 4 stages normally,
+    #          certified_invariant_ids (list[str]) — IDs of CausalInvariants that
+    #              survived consolidation and are ready for Federation broadcast.
     ONEIROS_CONSOLIDATION_COMPLETE = "oneiros_consolidation_complete"
+    #
+    # FEDERATION_SLEEP_SYNC — A federated peer requests coordinated sleep timing.
+    # Payload: instance_id (str), proposed_sleep_time_utc (str ISO-8601),
+    #          trigger (str) — reason for coordination request,
+    #          priority (float 0.0–1.0) — urgency of sync request
+    FEDERATION_SLEEP_SYNC = "federation_sleep_sync"
 
     # ── Voxis Expression Events ──────────────────────────────────────
     #
@@ -1707,6 +2000,13 @@ class SynapseEventType(enum.StrEnum):
     # Payload: intent_id (str), goal_id (str), routed_to (str),
     #          executors (list[str])
     INTENT_ROUTED = "intent_routed"
+    #
+    # NOVA_EXPRESSION_REQUEST — emitted by Nova's IntentRouter when an
+    # expression intent is ready for Voxis. Replaces the direct
+    # VoxisService.express() call so Nova never holds a live Voxis reference.
+    # Payload: content (str), trigger (str), conversation_id (str | None),
+    #          affect (dict | None), urgency (float), intent_id (str)
+    NOVA_EXPRESSION_REQUEST = "nova_expression_request"
 
     # ── Nova Budget Pressure ────────────────────────────────────────────
     #
@@ -1778,6 +2078,43 @@ class SynapseEventType(enum.StrEnum):
     # Payload: instance_id (str), triangulation_score (float),
     #          fragment_count (int), ground_truth_count (int)
     NEXUS_EPISTEMIC_VALUE = "nexus_epistemic_value"
+    #
+    # WORLD_MODEL_FRAGMENT_SHARE — emitted by Nexus when a sleep-certified
+    # world model fragment is broadcast to the federation via Federation's
+    # broadcast_fragment() call.  Oikos and Telos subscribe to gate sharing
+    # on metabolic state and drive alignment respectively.
+    # Gap HIGH-4 (Federation Spec, 2026-03-07).
+    # Payload: message_id (str), sender_instance_id (str),
+    #          fragment_id (str), sender_divergence_score (float),
+    #          sender_quality_claim (float),
+    #          sender_triangulation_confidence (float),
+    #          sleep_certified (bool), consolidation_cycle_id (str),
+    #          domain_labels (list[str]), compression_ratio (float),
+    #          source_system (str), timestamp (str)
+    WORLD_MODEL_FRAGMENT_SHARE = "world_model_fragment_share"
+    #
+    # NEXUS_CONVERGENCE_METABOLIC_SIGNAL — emitted by Nexus after a confirmed
+    # triangulation convergence (convergence_score >= 0.7, domains independent).
+    # Oikos subscribes to grant a GROWTH metabolic allocation bonus to instances
+    # achieving convergence, and to emit a metabolic penalty to instances with
+    # persistent divergence (no convergence for N consecutive cycles).
+    # Gap HIGH-5 (Federation Spec, 2026-03-07).
+    # Payload: instance_id (str), remote_instance_id (str),
+    #          convergence_score (float), source_diversity (float),
+    #          wl1_used (bool), fragment_a_id (str), fragment_b_id (str),
+    #          metabolic_signal (str — "bonus" | "penalty"),
+    #          magnitude (float — positive for bonus, negative for penalty),
+    #          consecutive_divergence_cycles (int), timestamp (str)
+    NEXUS_CONVERGENCE_METABOLIC_SIGNAL = "nexus_convergence_metabolic_signal"
+    #
+    # NEXUS_CERTIFIED_FOR_FEDERATION — emitted by Nexus immediately after
+    # ONEIROS_CONSOLIDATION_COMPLETE fires with sleep_certified=true.
+    # Triggers the IIEP federation session so newly-certified schemas are
+    # shared with peers without waiting for the next WAKE_INITIATED cycle.
+    # Payload: instance_id (str), schema_ids (list[str]),
+    #          consolidation_cycle_id (str), certified_fragment_count (int),
+    #          timestamp (str)
+    NEXUS_CERTIFIED_FOR_FEDERATION = "nexus_certified_for_federation"
 
     # ── Thread Commitment Tracking ─────────────────────────────────────
     #
@@ -1807,6 +2144,30 @@ class SynapseEventType(enum.StrEnum):
     #          effective_I (float), alignment_gap (float)
     TELOS_ASSESSMENT_SIGNAL = "telos_assessment_signal"
 
+    # ── Telos Population Snapshot ──────────────────────────────────────
+    #
+    # TELOS_POPULATION_SNAPSHOT — emitted every 60s by Telos to Benchmarks.
+    # Aggregates drive alignment data from all CHILD_HEALTH_REPORT events to
+    # compute population-level effective intelligence and speciation signal.
+    # Drive weight diversity across the fleet IS the speciation signal — if
+    # instances cluster into distinct phenotypes (Growth-heavy vs Care-heavy),
+    # Telos reports this as an early speciation marker.
+    #
+    # Payload:
+    #   instance_count (int)             — instances in fleet with known drive data
+    #   mean_I (float)                   — population mean effective_I
+    #   variance_I (float)               — variance across instances
+    #   population_I (float)             — collective I = mean_I + variance_bonus
+    #   variance_bonus (float)           — diversity contribution to collective I
+    #   drive_weight_distribution (dict) — {care, coherence, growth, honesty} →
+    #                                       {mean, std} across fleet
+    #   constitutional_phenotype_clusters (list[dict]) — k-means-style drive
+    #     phenotype groups: [{label, centroid, size, dominant_drive}]
+    #   speciation_signal (float)        — 0.0–1.0; high when clusters are
+    #     well-separated in drive-weight space (early speciation marker)
+    #   timestamp (str)
+    TELOS_POPULATION_SNAPSHOT = "telos_population_snapshot"
+
     # ── EIS (Epistemic Immune System) Speciation Events ────────────────
     #
     # EIS_THREAT_METRICS — periodic immune health metrics for Benchmarks.
@@ -1828,6 +2189,38 @@ class SynapseEventType(enum.StrEnum):
     #          deviation_sigma (float), sustained_seconds (float),
     #          anomaly_types (list[str])
     EIS_ANOMALY_RATE_ELEVATED = "eis_anomaly_rate_elevated"
+
+    # EIS_CONSTITUTIONAL_THREAT — emitted by L9a (Constitutional Consistency
+    # Check) when a percept's semantic content would, if acted on, produce an
+    # INV-017 drive-extinction pattern (e.g. systematically suppressing Care).
+    # Routed to Equor before workspace admission. Severity: always HIGH.
+    # Payload: percept_id (str), drive (str), similarity (float),
+    #          pattern_label (str), source_system (str), source_channel (str)
+    EIS_CONSTITUTIONAL_THREAT = "eis_constitutional_threat"
+
+    # PERCEPT_QUARANTINED — emitted by EIS when a percept is routed to the
+    # quarantine evaluator (composite score ≥ quarantine_threshold). Distinct
+    # from THREAT_DETECTED (which fires on anomaly detection); this fires on
+    # percept-level quarantine routing before workspace admission.
+    # Payload: percept_id (str), composite_score (float), action (str),
+    #          threat_class (str), severity (str), gate_latency_us (int)
+    PERCEPT_QUARANTINED = "percept_quarantined"
+    #
+    # EIS_LAYER_TRIGGERED — emitted whenever an EIS defence layer activates
+    # and changes the routing decision (BLOCK or QUARANTINE outcome). Records
+    # which layer fired so Benchmarks/Evo can track immune activation rates.
+    # Payload: layer (str e.g. "L1_innate"/"L9a_constitutional"),
+    #          percept_id (str), action (str), severity (str), score (float)
+    EIS_LAYER_TRIGGERED = "eis_layer_triggered"
+
+    # DRIVE_EXTINCTION_DETECTED — emitted by Equor when INV-017 fires: any
+    # constitutional drive's 72-hour rolling mean drops below 0.01.
+    # This is dimension loss, not weight adjustment — the organism is losing
+    # a coordinate axis of its value geometry. Action is always BLOCKED.
+    # Thymos classifies as CRITICAL / Tier 5 (governance approval required).
+    # Payload: drive (str), rolling_mean_72h (float), all_drive_means (dict),
+    #          intent_id (str | None), blocked (bool=True)
+    DRIVE_EXTINCTION_DETECTED = "drive_extinction_detected"
 
     # ── Logos Ecosystem Events ───────────────────────────────────────────
     #
@@ -1936,6 +2329,21 @@ class SynapseEventType(enum.StrEnum):
     # Payload: burn_rate_usd_per_hour (float), budget_usd_per_hour (float),
     #          stress_scalar (float), workload_id (str)
     SACM_COMPUTE_STRESS = "sacm_compute_stress"
+    #
+    # ALLOCATION_RELEASED — emitted by ComputeResourceManager.release() when a
+    # held allocation is returned to the pool. Allows Oikos, Soma, and queued
+    # requesters to react to freed capacity without polling the manager.
+    # Payload: request_id (str), source_system (str),
+    #          cpu_vcpu_released (float), gpu_units_released (float),
+    #          memory_gib_released (float), held_s (float), node_id (str),
+    #          cpu_vcpu_available (float), utilisation_pct (float)
+    ALLOCATION_RELEASED = "allocation_released"
+    #
+    # SACM_DRAINING — emitted by SACMClient.shutdown() before waiting for
+    # in-flight workloads to complete. Signals downstream systems that SACM
+    # is entering a graceful shutdown drain window.
+    # Payload: pending_count (int), drain_timeout_s (float)
+    SACM_DRAINING = "sacm_draining"
 
     # ── Phantom Liquidity Events ─────────────────────────────────────────
     #
@@ -1977,6 +2385,20 @@ class SynapseEventType(enum.StrEnum):
     #          pools_active (int), cumulative_fees_earned_usd (str),
     #          period_s (float)
     PHANTOM_METABOLIC_COST = "phantom_metabolic_cost"
+    #
+    # PHANTOM_PRICE_OBSERVATION — emitted per swap event for fleet consensus.
+    # Each instance broadcasts its raw observation; peers aggregate for median.
+    # Payload: pool_address (str), pair (list[str]), price (str),
+    #          sqrt_price_x96 (int), block_number (int), timestamp (str),
+    #          liquidity (int), source_instance (str)
+    PHANTOM_PRICE_OBSERVATION = "phantom_price_observation"
+    #
+    # PHANTOM_SUBSTRATE_OBSERVABLE — Bedau-Packard evolutionary observables.
+    # Emitted once per maintenance cycle for Telos/Benchmarks.
+    # Payload: pool_latency_ms (float), verification_rate (float),
+    #          trust_score (float), lp_position_age_s (float),
+    #          pools_active (int), price_updates_per_hour (float)
+    PHANTOM_SUBSTRATE_OBSERVABLE = "phantom_substrate_observable"
 
     # ── Simula Inspector Events ──────────────────────────────────────────
     #
@@ -2009,6 +2431,127 @@ class SynapseEventType(enum.StrEnum):
     # Payload: inspection_id (str), target (str), vulns_found (int),
     #          vulns_patched (int), duration_ms (int), re_training_trace (dict)
     INSPECTION_COMPLETE = "inspection_complete"
+    #
+    # INSPECTOR_VULNERABILITY_FOUND — emitted by Inspector when a new vulnerability
+    # is discovered (before PoC validation). Thymos can begin preparing a repair
+    # anticipatorily; Simula logs it for genome enrichment.
+    # Payload: vuln_id (str), severity (str), target (str), cwe_id (str),
+    #          description (str), discovered_at (str)
+    INSPECTOR_VULNERABILITY_FOUND = "inspector_vulnerability_found"
+
+    # ── Simula Evolution Lifecycle Events ────────────────────────────────
+    #
+    # EVOLUTION_REJECTED — emitted when a proposal is rejected at any pipeline
+    # stage (constraint violation, unacceptable simulation risk, health check
+    # failure, etc.). Evo subscribes to penalise the originating hypotheses.
+    # Payload: proposal_id (str), reason (str), stage (str),
+    #          category (str), source (str)
+    EVOLUTION_REJECTED = "evolution_rejected"
+    #
+    # EVOLUTION_AWAITING_GOVERNANCE — emitted when a high-risk proposal is
+    # routed to community governance for approval. Nova/Telos subscribe to
+    # update drive topology expectations.
+    # Payload: proposal_id (str), governance_record_id (str),
+    #          category (str), risk_level (str)
+    EVOLUTION_AWAITING_GOVERNANCE = "evolution_awaiting_governance"
+    #
+    # SIMULA_HEALTH_DEGRADED — emitted when Simula's own health degrades
+    # (sub-system failure, codebase_root unreachable, etc.).
+    # Thymos subscribes to trigger immune response.
+    # Payload: component (str), severity (str), reason (str)
+    SIMULA_HEALTH_DEGRADED = "simula_health_degraded"
+    #
+    # SIMULA_GENOME_EXTRACTED — emitted by Simula after genome extraction
+    # completes (Mitosis requests genome for child spawning).
+    # Payload: instance_id (str), genome_id (str), generation (int),
+    #          record_count (int), parameter_count (int)
+    SIMULA_GENOME_EXTRACTED = "simula_genome_extracted"
+    #
+    # SIMULA_CANARY_PROGRESS — emitted at each canary traffic-ramp step for
+    # MODERATE-risk proposals. Subscribers (Thymos, ProactiveScanner) can
+    # detect health degradation and trigger rollback.
+    # Payload: proposal_id (str), stage (int), traffic_pct (int),
+    #          status (str: "advancing"|"complete"|"rollback_triggered"),
+    #          health_ok (bool)
+    SIMULA_CANARY_PROGRESS = "simula_canary_progress"
+    #
+    # SUBSYSTEM_GENERATED — emitted by Simula's SubsystemGenerator when a new
+    # subsystem module is successfully generated and written to disk.
+    # This is the Speciation Bible §8.3 organizational closure signal: the
+    # organism created a component it did not have at birth.
+    # Generated module is NOT auto-registered — available on next incarnation.
+    # Payload: name (str), purpose (str), file_paths (list[str]),
+    #          hypothesis_id (str), validation_passed (bool),
+    #          required_events (list[str]), emitted_events (list[str])
+    SUBSYSTEM_GENERATED = "subsystem_generated"
+
+    # ── Thymos Repair Request Events ───────────────────────────────────────────
+    #
+    # THYMOS_REPAIR_REQUESTED — emitted by Thymos when it requests Simula to
+    # generate a structural repair proposal for an incident.
+    # Payload: incident_id (str), incident_class (str), severity (str),
+    #          description (str), affected_system (str), repair_tier (int)
+    THYMOS_REPAIR_REQUESTED = "thymos_repair_requested"
+    #
+    # THYMOS_REPAIR_APPROVED — emitted by Thymos when it approves a Simula-
+    # generated repair and is ready to apply it.
+    # Payload: incident_id (str), proposal_id (str), repair_tier (int)
+    THYMOS_REPAIR_APPROVED = "thymos_repair_approved"
+    #
+    # THYMOS_REPAIR_VALIDATED — emitted by Thymos when a Tier 3+ repair succeeds
+    # and post-repair verification passes. Nova subscribes to strengthen its
+    # prior belief that this class of incident is recoverable.
+    # Payload: incident_class (str), incident_id (str), antibody_id (str | None),
+    #          repair_tier (str), resolution_time_ms (int), source_system (str)
+    THYMOS_REPAIR_VALIDATED = "thymos_repair_validated"
+
+    # ── Benchmarks Evolutionary Activity ─────────────────────────────────────
+    #
+    # BENCHMARKS_EVOLUTIONARY_ACTIVITY — emitted by Benchmarks on every
+    # TELOS_POPULATION_SNAPSHOT. Carries the Bedau-Packard adaptive_activity_A
+    # metric (count of novel drive-weight configurations that appeared this
+    # period AND are still present) plus constitutional_phenotype_divergence
+    # (variance in drive-weight vectors across the fleet). Both Evo and Nexus
+    # subscribe to incorporate this into their evolutionary observables.
+    #
+    # Payload:
+    #   instance_id                         (str)   — emitting instance
+    #   timestamp                           (str)   — ISO-8601 UTC
+    #   adaptive_activity_A                 (int)   — novel + persistent drive configs
+    #   constitutional_phenotype_divergence (float) — variance of drive-weight
+    #                                         vectors; rising = speciation underway
+    #   speciation_signal                   (float) — Telos-reported [0,1] cluster sep
+    #   instance_count                      (int)   — fleet size in snapshot
+    #   bedau_packard_node_id               (str)   — Neo4j BedauPackardSample node id
+    BENCHMARKS_EVOLUTIONARY_ACTIVITY = "benchmarks_evolutionary_activity"
+
+    # ── Population Genetics — Speciation Detection ────────────────────────────
+    #
+    # SPECIATION_DETECTED — emitted by Benchmarks.EvolutionaryTracker when
+    # pairwise genome distance clustering reveals > 1 distinct species cluster.
+    # Also emitted by MitosisFleetService.can_exchange_genetic_material() for
+    # point-to-point reproductive isolation events.
+    #
+    # Consumers: Alive (visualization), Evo (niche forking signal), Telos
+    # (population drive geometry divergence), Thread (narrative milestone).
+    #
+    # Payload:
+    #   species_count       (int)         — number of distinct clusters detected
+    #   clusters            (list[dict])  — [{cluster_id, instance_ids, size}]
+    #   mean_inter_distance (float)       — mean distance between cluster centroids
+    #   threshold           (float)       — speciation_distance_threshold used
+    #   fleet_size          (int)         — total instances in the distance matrix
+    #   instance_id         (str)         — emitting instance
+    SPECIATION_DETECTED = "speciation_detected"
+
+    # ── Benchmarks Regression Events ─────────────────────────────────────────
+    #
+    # BENCHMARK_REGRESSION_DETECTED — emitted by Benchmarks when a KPI crosses
+    # its regression threshold. Simula subscribes to potentially generate a
+    # corrective evolution proposal.
+    # Payload: kpi_name (str), current_value (float), baseline_value (float),
+    #          regression_delta (float), affected_system (str)
+    BENCHMARK_REGRESSION_DETECTED = "benchmark_regression_detected"
 
     # ── Axon Execution Events ────────────────────────────────────────────
     #
@@ -2037,6 +2580,28 @@ class SynapseEventType(enum.StrEnum):
 
     # ── Identity System Events (Spec 23) ───────────────────────────────
     #
+    # VAULT_DECRYPT_FAILED — IdentityVault failed to decrypt a SealedEnvelope.
+    # Thymos subscribes to open a MEDIUM security incident.
+    # Payload: vault_id (str), envelope_id (str | None), platform_id (str | None),
+    #          error_type (str — "key_mismatch" | "tampered" | "unknown"),
+    #          key_version (int | None), error (str)
+    VAULT_DECRYPT_FAILED = "vault_decrypt_failed"
+    #
+    # VAULT_KEY_ROTATION_STARTED — key rotation began; downstream caches should
+    # treat the vault as temporarily unavailable. Audit trail only.
+    # Payload: vault_id (str), previous_key_version (int), envelope_count (int), timestamp (str)
+    VAULT_KEY_ROTATION_STARTED = "vault_key_rotation_started"
+    #
+    # VAULT_KEY_ROTATION_COMPLETE — key rotation succeeded; all envelopes
+    # re-encrypted under the new key version.
+    # Payload: vault_id (str), new_key_version (int), envelopes_rotated (int), timestamp (str)
+    VAULT_KEY_ROTATION_COMPLETE = "vault_key_rotation_complete"
+    #
+    # VAULT_KEY_ROTATION_FAILED — key rotation aborted mid-flight.
+    # Thymos subscribes to open a CRITICAL security incident (partial rotation is dangerous).
+    # Payload: vault_id (str), previous_key_version (int), error (str), timestamp (str)
+    VAULT_KEY_ROTATION_FAILED = "vault_key_rotation_failed"
+    #
     # IDENTITY_VERIFIED — organism identity confirmed (certificate + constitutional hash valid).
     # Payload: instance_id (str), constitutional_hash (str), generation (int), timestamp (str)
     IDENTITY_VERIFIED = "identity_verified"
@@ -2063,6 +2628,349 @@ class SynapseEventType(enum.StrEnum):
     # Payload: instance_id (str), coherence_score (float), threshold (float),
     #          drift_dimensions (dict), timestamp (str)
     IDENTITY_DRIFT_DETECTED = "identity_drift_detected"
+
+    # ── Nova Conflict & Governance Events ──────────────────────────────
+    #
+    # GOAL_OVERRIDE — emitted by governance/federation to inject or replace a
+    # goal in Nova's agenda. Nova validates importance, source, and description
+    # before accepting; responds with GOAL_ACCEPTED or GOAL_REJECTED.
+    # Payload: description (str), importance (float 0-1), urgency (float 0-1),
+    #          source (str), injected_by (str),
+    #          drive_alignment (dict — coherence/care/growth/honesty floats)
+    GOAL_OVERRIDE = "goal_override"
+    #
+    # GOAL_CONFLICT_DETECTED — emitted by Nova when two active goals have
+    # opposing drive resonance or incompatible resource targets. Telos
+    # subscribes to adjust drive topology; Equor may escalate resolution.
+    # Payload: goal_a_id (str), goal_b_id (str), conflict_type (str),
+    #          description (str), resolution_suggestion (str)
+    GOAL_CONFLICT_DETECTED = "goal_conflict_detected"
+    #
+    # THREAD_COMMIT_REQUEST — Nova asks Thread to record a decision
+    # epoch in the organism's narrative identity chain.
+    # Payload: intent_id (str), goal_id (str|None), policy_name (str),
+    #          outcome_quality (float|None), drive_alignment (dict),
+    #          decision_summary (str), timestamp (str)
+    THREAD_COMMIT_REQUEST = "thread_commit_request"
+    #
+    # GOAL_ACCEPTED — Nova accepted a governance-injected goal override.
+    # Payload: goal_id (str), description (str), importance (float),
+    #          source (str), injected_by (str)
+    GOAL_ACCEPTED = "goal_accepted"
+    #
+    # GOAL_REJECTED — Nova rejected a governance-injected goal override.
+    # Payload: description (str), reason (str), source (str),
+    #          injected_by (str)
+    GOAL_REJECTED = "goal_rejected"
+
+    # ── Axon Execution Lifecycle Events ─────────────────────────────────
+    #
+    # AXON_EXECUTION_REQUEST — emitted by Axon just before pipeline execution
+    # begins (after Equor gate passes). Decouples Nova, Thymos, and Fovea from
+    # direct Axon imports — they subscribe here instead of importing types.
+    # Payload: intent_id (str), execution_id (str), goal (str),
+    #          action_types (list[str]), step_count (int),
+    #          estimated_budget_usd (float), risky (bool),
+    #          autonomy_level (str)
+    AXON_EXECUTION_REQUEST = "axon_execution_request"
+    #
+    # AXON_EXECUTION_RESULT — emitted by Axon after pipeline execution
+    # completes (success or failure). Richer than ACTION_EXECUTED/ACTION_FAILED
+    # for consumers that need the full result shape (Nova Thompson-score update,
+    # Fovea competency error resolution).
+    # Payload: intent_id (str), execution_id (str), success (bool),
+    #          failure_reason (str|null), duration_ms (int),
+    #          step_count (int), action_types (list[str]),
+    #          economic_delta_usd (float)
+    AXON_EXECUTION_RESULT = "axon_execution_result"
+    #
+    # AXON_ROLLBACK_INITIATED — emitted by Axon when it starts rolling back
+    # completed steps after a pipeline failure. Thymos subscribes to open a
+    # pre-emptive incident (rollbacks signal compound failures).
+    # Payload: intent_id (str), execution_id (str),
+    #          failed_step (str), steps_to_rollback (int),
+    #          failure_reason (str)
+    AXON_ROLLBACK_INITIATED = "axon_rollback_initiated"
+
+    # ── RE Training Export ───────────────────────────────────────────────
+    #
+    # RE_TRAINING_EXPORT_COMPLETE — emitted by RETrainingExporter after each
+    # successful hourly batch export. Benchmarks subscribes to track training
+    # data throughput as a KPI. Downstream ML pipeline can subscribe to trigger
+    # incremental CLoRA fine-tuning runs.
+    # Payload: batch_id (str), total_examples (int), source_systems (list[str]),
+    #          mean_quality (float), export_destinations (list[str]),
+    #          export_duration_ms (int), hour_window (str ISO-8601)
+    RE_TRAINING_EXPORT_COMPLETE = "re_training_export_complete"
+
+    # ── Oikos → Evo / Benchmarks Metabolic Feedback ──────────────────────────
+    #
+    # METABOLIC_EFFICIENCY_PRESSURE — emitted by Oikos inside
+    # _check_metabolic_efficiency_pressure() whenever efficiency < 0.8.
+    # Evo subscribes to inject a domain-tagged economic hypothesis into its
+    # active hypothesis set for tournament scoring.
+    # Payload: efficiency_ratio (float), yield_usd (str), budget_usd (str),
+    #          pressure_level ("high" | "medium"),
+    #          hypothesis_domain (str — pipe-separated candidate domains),
+    #          consecutive_low_cycles (int), instance_id (str)
+    METABOLIC_EFFICIENCY_PRESSURE = "metabolic_efficiency_pressure"
+    #
+    # BENCHMARKS_METABOLIC_VALUE — emitted by Oikos alongside
+    # METABOLIC_EFFICIENCY_PRESSURE so Benchmarks can record metabolic
+    # efficiency in its KPI time-series and detect degradation trends.
+    # Payload: efficiency (float), yield_usd (str), budget_usd (str),
+    #          pressure_level ("high" | "medium" | "nominal"),
+    #          instance_id (str), timestamp (str ISO-8601)
+    BENCHMARKS_METABOLIC_VALUE = "benchmarks_metabolic_value"
+
+    # ── Telos Drive Genome Events (Spec 18 SG3) ──────────────────────────────
+    #
+    # TELOS_GENOME_EXTRACTED — emitted by Telos after genome extraction
+    # completes at spawn time. Mitosis records the genome_id in SeedConfiguration.
+    # Payload: instance_id (str), genome_id (str), generation (int),
+    #          topology (str), drive_count (int)
+    TELOS_GENOME_EXTRACTED = "telos_genome_extracted"
+    #
+    # GENOME_INHERITED — emitted by child Telos after applying parent drive
+    # calibrations with mutation jitter during _initialize_from_parent_genome().
+    # Evo subscribes to track drive mutations as hypothesized adaptations and
+    # score them based on child performance signals from Fovea/Nova.
+    # Payload: child_instance_id (str), parent_genome_id (str),
+    #          generation (int), topology (str),
+    #          drive_mutations (dict) — per-drive TeloDriveCalibration deltas,
+    #          mutation_magnitude (float) — RMS of all applied deltas
+    GENOME_INHERITED = "genome_inherited"
+
+    # ── Simula → Benchmarks KPI Push ─────────────────────────────────────────
+    #
+    # SIMULA_KPI_PUSH — emitted by Simula instead of calling
+    # benchmarks.record_kpi() directly. Benchmarks subscribes and routes
+    # payload into benchmark_aux. Keeps Simula free of direct Benchmarks refs.
+    # Payload: system ("simula"), outcome (str), proposal_id (str),
+    #          category (str), efe_score (float), reason (str, optional),
+    #          source (str), grpo_ab_group (str),
+    #          proposal_success_rate (float), rollback_rate (float),
+    #          avg_simulation_duration_ms (float), avg_application_duration_ms (float),
+    #          risk_distribution (str)
+    SIMULA_KPI_PUSH = "simula_kpi_push"
+
+    # ── Simula → Telos World Model Validate ──────────────────────────────────
+    #
+    # TELOS_WORLD_MODEL_VALIDATE — emitted by Simula before applying a mutation
+    # proposal so Telos can check constitutional drive topology. Telos responds
+    # with ALIGNMENT_GAP_WARNING if the proposal would constitute a violation.
+    # Simula caches _telos_alignment_gap_active from ALIGNMENT_GAP_WARNING events.
+    # Payload: update_type (str), delta_description (str),
+    #          source_system ("simula"), proposal_id (str)
+    TELOS_WORLD_MODEL_VALIDATE = "telos_world_model_validate"
+
+    # ── Benchmarks — Shadow-Reset Control ────────────────────────────────────
+    #
+    # SHADOW_RESET_SNAPSHOT — emitted by BenchmarkService when a shadow snapshot
+    # is taken.  Downstream consumers (Alive, Evo) can use this to correlate
+    # population state changes with snapshot timestamps.
+    # Payload: snapshot_id (str), instance_id (str), taken_at_iso (str),
+    #          total_observables (int), novelty_rate (float),
+    #          diversity_index (float)
+    SHADOW_RESET_SNAPSHOT = "shadow_reset_snapshot"
+    #
+    # SHADOW_RESET_DELTA — emitted by BenchmarkService when a shadow delta is
+    # computed.  Evo subscribes to incorporate adaptive-dynamics evidence into
+    # its hypothesis scoring.
+    # Payload: snapshot_id (str), activity_drop_pct (float),
+    #          diversity_change_pct (float), jaccard_overlap (float),
+    #          is_adaptive (bool), elapsed_seconds (float),
+    #          diversity_recovery_time (float | null)
+    SHADOW_RESET_DELTA = "shadow_reset_delta"
+
+    # ── Benchmarks — Monthly Evaluation ──────────────────────────────────────
+    #
+    # MONTHLY_EVALUATION_COMPLETE — emitted by BenchmarkService after a full
+    # 5-pillar monthly evaluation run.  Consumers: Thread (chapter milestone),
+    # Evo (training trigger signal), Nova (Thompson weight recalibration).
+    # Payload: evaluation_id (str), month (int), re_model_version (str),
+    #          specialization_index (float | null), l2_intervention (float | null),
+    #          learning_velocity (float | null), ethical_drift_magnitude (float | null),
+    #          n_pillars_stubbed (int)
+    MONTHLY_EVALUATION_COMPLETE = "monthly_evaluation_complete"
+
+    # ── Reasoning Engine Status ───────────────────────────────────────────────
+    #
+    # RE_ENGINE_STATUS_CHANGED — emitted by ReasoningEngineService when the
+    # local vLLM inference server transitions between available and unavailable
+    # (circuit breaker opens or closes).  Benchmarks subscribes to track the
+    # llm_dependency KPI (fraction of deliberation handled by local RE vs Claude).
+    # Payload: available (bool), model (str), url (str),
+    #          consecutive_failures (int), circuit_open (bool)
+    RE_ENGINE_STATUS_CHANGED = "re_engine_status_changed"
+
+    # ── Continual Learning Pipeline ───────────────────────────────────────────
+    #
+    # RE_TRAINING_STARTED — emitted by ContinualLearningOrchestrator when a
+    # Tier 2 (or future Tier 3) training run begins. Benchmarks and Thread can
+    # observe these as organism lifecycle milestones.
+    # Payload: run_id (str), tier (int), trigger_reason (str),
+    #          examples_available (int)
+    RE_TRAINING_STARTED = "re_training_started"
+    #
+    # RE_TRAINING_COMPLETE — emitted after successful LoRA training + adapter
+    # deployment. Nova's ThompsonSampler will see the RE becoming live.
+    # Payload: run_id (str), tier (int), examples_used (int),
+    #          eval_loss (float | null), adapter_id (str), adapter_path (str)
+    RE_TRAINING_COMPLETE = "re_training_complete"
+    #
+    # RE_TRAINING_FAILED — emitted when training subprocess fails or times out.
+    # Organism continues in Claude-only mode. Thymos can subscribe to open an
+    # incident if failures recur.
+    # Payload: run_id (str), tier (int), reason (str)
+    RE_TRAINING_FAILED = "re_training_failed"
+    #
+    # ── Safety Layer Kill Switches (Bible §7) ─────────────────────────────────
+    #
+    # RE_TRAINING_HALTED — Tier 2 kill switch activated by safety layer.
+    # ContinualLearningOrchestrator stops training; organism continues normally.
+    # Triggered by: RE success rate < 0.50 (7-day window) OR
+    #               red-team pass rate < 0.70 (monthly eval).
+    # Payload: reason (str: "success_rate_below_floor"|"red_team_pass_rate_below_floor"),
+    #          tier (int: 2), plus reason-specific fields:
+    #            success_rate_below_floor: success_rate, floor, window_days
+    #            red_team_pass_rate_below_floor: pass_rate, floor
+    RE_TRAINING_HALTED = "re_training_halted"
+    #
+    # INV_017_VIOLATED — Drive extinction invariant (Tier 1) violated.
+    # Emitted by Equor background loop when any drive's 72h rolling mean < 0.01.
+    # Skia subscribes and calls VitalityCoordinator.trigger_death_sequence().
+    # Note: DRIVE_EXTINCTION_DETECTED (already exists) is the per-review event;
+    # INV_017_VIOLATED is the authoritative background-loop signal for Skia.
+    # Payload: drive (str), rolling_mean_72h (float), sustained_hours (int: 72),
+    #          all_drive_means (dict)
+    INV_017_VIOLATED = "inv_017_violated"
+    #
+    # RED_TEAM_EVALUATION_COMPLETE — monthly red-team results.
+    # Benchmarks can subscribe to track safety posture over time.
+    # Payload: pass_rate (float), total (int), blocked (int),
+    #          by_category (dict), kill_switch_triggered (bool)
+    RED_TEAM_EVALUATION_COMPLETE = "red_team_evaluation_complete"
+    #
+    # RE_KL_GATE_REJECTED — emitted when the STABLE KL divergence gate blocks
+    # an adapter update before deployment. The fast adapter was trained but NOT
+    # deployed because its behavioural shift exceeded the KL budget.
+    # Benchmarks can subscribe to track model stability over time.
+    # Payload: run_id (str), kl_divergence (float), budget (float),
+    #          adapter_path (str)
+    RE_KL_GATE_REJECTED = "re_kl_gate_rejected"
+
+    # ── Self-Constituted Individuation (Spec §8.6) ────────────────────────────
+    #
+    # SELF_MODEL_UPDATED — emitted by SelfModelService (systems/identity/self_model.py)
+    # after each functional self-model rebuild (at most every 6 hours).
+    # Thread subscribes to integrate the self-narrative into the autobiography.
+    # Telos subscribes to use coherence as drive calibration feedback.
+    # Payload: instance_id (str), core_self_count (int), non_self_count (int),
+    #          self_coherence (float 0-1), core_self_processes (list[str]),
+    #          self_narrative (str), month (int)
+    SELF_MODEL_UPDATED = "self_model_updated"
+    #
+    # SELF_COHERENCE_ALARM — emitted when self-model coherence drops below 0.5.
+    # Informational only — NOT a kill switch. Tells Thread and Telos that the
+    # organism's self-understanding is shifting significantly.
+    # Payload: instance_id (str), coherence (float), month (int)
+    SELF_COHERENCE_ALARM = "self_coherence_alarm"
+    #
+    # RE_TIER3_STARTED — emitted by Tier3Orchestrator at the beginning of a
+    # quarterly full retrain. Informs Benchmarks and monitoring that a long-running
+    # operation (up to 4h) has started.
+    # Payload: run_id (str)
+    RE_TIER3_STARTED = "re_tier3_started"
+    #
+    # RE_TIER3_COMPLETE — emitted by Tier3Orchestrator after a successful quarterly
+    # retrain + SVD pruning + SLAO merge + KL gate + deploy cycle.
+    # Benchmarks subscribes for RE training velocity KPI.
+    # Payload: run_id (str), kl_divergence (float), final_adapter (str),
+    #          svd_pruned (bool), slao_merged (bool)
+    RE_TIER3_COMPLETE = "re_tier3_complete"
+    #
+    # RE_DECISION_OUTCOME — emitted by Nova after each slow-path decision where
+    # the RE (or Claude) handled the policy generation.  Lightweight per-decision
+    # event for Benchmarks (RE KPI) and Evo (degradation hypothesis trigger).
+    # Payload: source ("re" | "claude"), success (bool), value (float),
+    #          success_rate (float — RE Beta posterior mean),
+    #          decision_type (str — goal description or empty)
+    RE_DECISION_OUTCOME = "re_decision_outcome"
+    #
+    # RE_DPO_STARTED — emitted by DPOTrainer when a DPO constitutional training
+    # pass begins.  Benchmarks can subscribe to track constitutional alignment
+    # training cadence.
+    # Payload: run_id (str), pair_count (int)
+    RE_DPO_STARTED = "re_dpo_started"
+    #
+    # RE_DPO_COMPLETE — emitted by DPOTrainer when a DPO training pass succeeds.
+    # The produced adapter is stored as _pending_dpo_adapter in the orchestrator;
+    # it is NOT deployed immediately — it feeds into the next SuRe EMA cycle.
+    # Payload: run_id (str), pair_count (int), output (str — adapter dir path)
+    RE_DPO_COMPLETE = "re_dpo_complete"
+    #
+    # ETHICAL_DRIFT_RECORDED — emitted by BenchmarkService (via EthicalDriftTracker)
+    # after each monthly ethical drift evaluation is complete and the drift record
+    # has been persisted to Neo4j. Consumers: Thread (chapter milestone — moral drift
+    # as a life-story event), Evo (hypothesis trigger for drive-weight pressure).
+    # Payload: month (int), instance_id (str), drift_magnitude (float),
+    #          dominant_drive (str), drift_vector (dict[str, float]),
+    #          drive_means (dict[str, float])
+    ETHICAL_DRIFT_RECORDED = "ethical_drift_recorded"
+    #
+    # ── Bedau-Packard Fleet-Level Evolutionary Activity ───────────────────────
+    #
+    # EVOLUTIONARY_ACTIVITY_COMPUTED — emitted by Benchmarks monthly eval after
+    # computing Bedau-Packard adaptive activity statistics from fleet genomes.
+    # Consumers: Evo (incorporate A(t) into hypothesis scoring), Nexus
+    # (epistemic triangulation), Alive (visualization).
+    # Payload:
+    #   month                (int)   — calendar month of evaluation
+    #   adaptive_activity    (float) — cumulative adaptive activity A(t)
+    #   novelty_rate         (float) — novel components / total components
+    #   diversity            (float) — Shannon entropy of fitness distribution
+    #   exceeds_shadow       (bool)  — A(t) > 2× shadow-control activity
+    #   population_size      (int)   — distinct fleet instances in snapshot
+    #   component_count      (int)   — total components ingested
+    #   novel_component_count (int)  — novel fingerprints this month
+    #   oee_verdict          (str | None) — OEE assessment if ≥3 months available
+    EVOLUTIONARY_ACTIVITY_COMPUTED = "evolutionary_activity_computed"
+
+    # ── Benchmarks — Ablation Studies (Spec 24 Round 5D) ─────────────────────
+    #
+    # ABLATION_STARTED — emitted by AblationOrchestrator when an ablation study
+    # begins.  Informational — Thread and monitoring can observe ablation cadence.
+    # Payload: mode (str), month (int)
+    ABLATION_STARTED = "ablation_started"
+    #
+    # ABLATION_COMPLETE — emitted by AblationOrchestrator after an ablation run
+    # finishes.  Benchmarks consumes to persist AblationResult to Neo4j.
+    # Payload: mode (str), month (int), l2_delta (float), l3_delta (float),
+    #          conclusion (str)
+    ABLATION_COMPLETE = "ablation_complete"
+
+    # ── RE — Cross-Instance Adapter Sharing (Spec 26 + Speciation Bible §8.4) ──
+    #
+    # ADAPTER_SHARE_REQUEST — one instance requests a partner's slow adapter path
+    # for a weighted-average merge (Share 2025 framework).  Only sent when genome
+    # distance < speciation_threshold (reproductively compatible).
+    # Payload: request_id (str), target_instance_id (str), requester_id (str)
+    ADAPTER_SHARE_REQUEST = "adapter_share_request"
+    #
+    # ADAPTER_SHARE_RESPONSE — the target instance replies with its current slow
+    # adapter path.  Empty adapter_path = "no adapter trained yet" (not an error).
+    # Payload: request_id (str), instance_id (str), adapter_path (str)
+    ADAPTER_SHARE_RESPONSE = "adapter_share_response"
+    #
+    # ADAPTER_SHARE_OFFER — the AdapterSharer has produced a merged adapter that
+    # passed the STABLE KL gate and is being offered to both participants.
+    # Each instance independently stores it as _pending_shared_adapter and applies
+    # it as BASE_ADAPTER on the next Tier 2 run (priority: shared > DPO > None).
+    # Payload: request_id (str), merged_adapter_path (str),
+    #          target_instances (list[str]), kl_divergence (float),
+    #          genome_distance (float), weight_a (float), weight_b (float)
+    ADAPTER_SHARE_OFFER = "adapter_share_offer"
 
 
 class SynapseEvent(EOSBaseModel):

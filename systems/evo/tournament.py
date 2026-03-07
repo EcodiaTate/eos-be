@@ -478,7 +478,7 @@ class TournamentEngine:
                 for h_id, b in tournament.beta_parameters.items()
             }
 
-            await self._memory._neo4j.execute_write(
+            await self._memory.execute_write(
                 """
                 MERGE (t:HypothesisTournament {tournament_id: $tournament_id})
                 SET t.stage = $stage,
@@ -504,7 +504,7 @@ class TournamentEngine:
                 beta = tournament.beta_parameters.get(ref.hypothesis_id)
                 is_winner = ref.hypothesis_id == tournament.winner_id
 
-                await self._memory._neo4j.execute_write(
+                await self._memory.execute_write(
                     """
                     MATCH (t:HypothesisTournament {tournament_id: $tournament_id})
                     MERGE (h:Hypothesis {hypothesis_id: $hypothesis_id})

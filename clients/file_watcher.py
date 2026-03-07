@@ -38,7 +38,7 @@ import structlog
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from systems.atune.service import AtuneService
+    from systems.fovea.gateway import AtuneService
 
 logger = structlog.get_logger("file_watcher")
 
@@ -154,7 +154,7 @@ class FileWatcher:
             await self._process(path)
 
     async def _process(self, path: Path) -> None:
-        from systems.atune.types import InputChannel, RawInput
+        from systems.fovea.types import InputChannel, RawInput
 
         try:
             text = path.read_text(encoding="utf-8").strip()

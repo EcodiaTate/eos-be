@@ -135,6 +135,9 @@ class InvariantDistiller:
             # Stop before tautology boundary
             if self._test_tautology(candidate_form, candidate_roles):
                 break
+            # Stop if raising erases directional cause-effect distinction
+            if self._loses_predictive_power(invariant, variable_roles, candidate_roles):
+                break
             variable_roles = candidate_roles
             abstract_form = candidate_form
             abstraction_level += 1
@@ -321,6 +324,55 @@ class InvariantDistiller:
             abstract = abstract.replace(concrete, role)
 
         return abstract
+
+    # --- Step 1b: Predictive Power Check ---
+
+    def _loses_predictive_power(
+        self,
+        invariant: CausalInvariant,
+        original_roles: dict[str, str],
+        raised_roles: dict[str, str],
+    ) -> bool:
+        """
+        Check whether raising the abstraction level from original_roles to
+        raised_roles causes the invariant to lose predictive power.
+
+        Predictive power is lost when the raised form collapses distinct
+        causal roles into a single abstract role, erasing the directional
+        information that makes the invariant predictive.
+
+        Specifically, power is lost when:
+        1. The cause and effect variables map to the same abstract role
+           (the raised form can no longer distinguish cause from effect).
+        2. The number of unique roles drops below 2 (the raised form
+           contains only one role type, making any prediction trivial).
+
+        Returns True if the raised form is weaker than the original.
+        """
+        if not raised_roles:
+            return True
+
+        # Extract roles for cause and effect variables from the invariant form.
+        # The abstract_form is "cause causes effect" — split on " causes ".
+        parts = invariant.abstract_form.split(" causes ")
+        if len(parts) == 2:
+            cause_var = parts[0].strip()
+            effect_var = parts[1].strip()
+            cause_role_orig = original_roles.get(cause_var, cause_var)
+            effect_role_orig = original_roles.get(effect_var, effect_var)
+            cause_role_raised = raised_roles.get(cause_var, cause_var)
+            effect_role_raised = raised_roles.get(effect_var, effect_var)
+
+            # Roles were distinct before, now collapsed → loss
+            if cause_role_orig != effect_role_orig and cause_role_raised == effect_role_raised:
+                return True
+
+        # Also check global role collapse: if all variables map to the same role
+        unique_roles = set(raised_roles.values()) - {"unclassified_variable"}
+        if len(unique_roles) < 2 and len(raised_roles) >= 2:
+            return True
+
+        return False
 
     # --- Step 2: Tautology Test ---
 

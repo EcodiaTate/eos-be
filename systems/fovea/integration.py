@@ -15,6 +15,7 @@ CRITICAL: This module does NOT modify Atune files. It provides a bridge that:
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -35,10 +36,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from primitives.percept import Percept
-    from systems.atune.types import WorkspaceCandidate
-    from systems.atune.workspace import GlobalWorkspace
 
     from .protocols import LogosWorldModel
+    from .types import WorkspaceCandidate
+    from .workspace import GlobalWorkspace
 
 logger = structlog.get_logger("systems.fovea.integration")
 
@@ -120,6 +121,11 @@ class DynamicIgnitionThreshold:
     def current(self) -> float:
         return self._current
 
+    def adjust(self, delta: float) -> float:
+        """Shift the threshold by delta, clamped to [floor, ceiling]. Returns new value."""
+        self._current = max(self._floor, min(self._ceiling, self._current + delta))
+        return self._current
+
 
 # ---------------------------------------------------------------------------
 # Fovea-Atune Bridge
@@ -194,6 +200,23 @@ class FoveaAtuneBridge:
     def dynamic_threshold(self) -> DynamicIgnitionThreshold:
         return self._dynamic_threshold
 
+    def set_world_model(self, world_model: LogosWorldModel) -> None:
+        """Hot-swap the world model on prediction and precision engines."""
+        self._prediction_engine._world_model = world_model
+        self._precision_computer._world_model = world_model
+
+    def consume_dishabituation(self) -> dict[str, float] | None:
+        """Return and clear the last dishabituation info (transient, consumed once)."""
+        info = self._last_dishabituation
+        self._last_dishabituation = None
+        return info
+
+    def consume_habituation_complete(self) -> HabituationCompleteInfo | None:
+        """Return and clear the last habituation-complete info (transient, consumed once)."""
+        info = self._last_habituation_complete
+        self._last_habituation_complete = None
+        return info
+
     # ------------------------------------------------------------------
     # Main processing pipeline
     # ------------------------------------------------------------------
@@ -205,8 +228,13 @@ class FoveaAtuneBridge:
         """
         Full Fovea processing pipeline for a single percept.
 
+        Must complete within Atune's ≤20ms PERCEIVE phase.
+        Prediction computation is guarded by an 18ms asyncio.wait_for;
+        on timeout the pipeline falls back to a zero-prediction error
+        so workspace routing is still possible with neutral salience.
+
         1. Extract context
-        2. Generate prediction from world model
+        2. Generate prediction from world model (≤18ms)
         3. Compute structured prediction error
         4. Apply precision weighting
         5. Compute precision_weighted_salience
@@ -218,11 +246,23 @@ class FoveaAtuneBridge:
         # Step 1: Extract context
         context = self._extract_context(percept)
 
-        # Step 2: Generate prediction
-        prediction = await self._prediction_engine.generate_prediction(context)
-
-        # Step 3: Compute error
-        error = await self._prediction_engine.compute_error(prediction, percept)
+        # Step 2 + 3: Generate prediction and compute error, with 18ms budget.
+        # Atune's PERCEIVE phase is ≤20ms; we reserve 18ms for prediction so
+        # the remaining 2ms covers context extraction, routing, and workspace enqueue.
+        try:
+            prediction = await asyncio.wait_for(
+                self._prediction_engine.generate_prediction(context),
+                timeout=0.018,
+            )
+            error = await self._prediction_engine.compute_error(prediction, percept)
+        except asyncio.TimeoutError:
+            self._logger.debug(
+                "prediction_timeout",
+                percept_id=percept.id,
+                budget_ms=18,
+            )
+            # Neutral-salience fallback: treat as expected percept (no surprise)
+            error = FoveaPredictionError(percept_id=percept.id)
 
         # Step 4: Apply precision weighting (per-component)
         await self._precision_computer.compute_precisions(error, context)
@@ -292,10 +332,10 @@ class FoveaAtuneBridge:
         error-based scores, maintaining compatibility with downstream systems
         that inspect per-head scores.
         """
-        from systems.atune.types import (
+        from .types import (
             PredictionError as AtunePredictionError,
         )
-        from systems.atune.types import (
+        from .types import (
             PredictionErrorDirection,
             SalienceVector,
             WorkspaceCandidate,

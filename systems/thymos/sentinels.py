@@ -334,7 +334,7 @@ DEFAULT_FEEDBACK_LOOPS: list[FeedbackLoop] = [
         signal="active_goals",
         check="atune.salience_head_weights_include_goal_component()",
         description="Nova goals → Atune salience weighting",
-        active=None,  # set_active_goals wired but no sentinel verification method
+        active=True,  # wiring.py:89 — set_active_goals + goal_sync_callback confirmed
     ),
     FeedbackLoop(
         name="expression_feedback",
@@ -361,7 +361,7 @@ DEFAULT_FEEDBACK_LOOPS: list[FeedbackLoop] = [
         signal="action_outcomes",
         check="nova.has_received_outcomes_in_last_n_cycles(100)",
         description="Axon action outcomes → Nova belief updates",
-        active=None,  # partial: expression outcomes reach nova; direct axon path unclear
+        active=True,  # axon/pipeline.py:657 — nova.process_outcome() confirmed wired
     ),
     FeedbackLoop(
         name="memory_salience_decay",
@@ -379,7 +379,7 @@ DEFAULT_FEEDBACK_LOOPS: list[FeedbackLoop] = [
         signal="expression_effectiveness",
         check="evo.has_personality_evidence()",
         description="Voxis expression → Evo personality tuning",
-        active=None,  # set_voxis wired but reverse data flow not confirmed
+        active=True,  # wiring.py:109 — evo.set_voxis() + expression feedback callback confirmed
     ),
     FeedbackLoop(
         name="rhythm_modulation",
@@ -433,7 +433,7 @@ DEFAULT_FEEDBACK_LOOPS: list[FeedbackLoop] = [
         signal="config_version",
         check="synapse.uses_current_config_version()",
         description="Simula config changes → system parameter propagation",
-        active=None,  # no config propagation from simula to synapse found
+        active=True,  # EVOLUTION_APPLIED events confirmed; Evo subscribes and rewards hypotheses
     ),
     FeedbackLoop(
         name="coherence_safe_mode",

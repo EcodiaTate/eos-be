@@ -111,11 +111,14 @@ class SweGrepRetriever:
         all_contexts: list[RetrievedContext] = []
         all_hops: list[RetrievalHop] = []
         total_files_searched: set[str] = set()
+        # Corpus 14 §12: visited set prevents reading the same file across hops
+        # (cycle detection). _contexts_from_hop skips already-visited files.
+        _visited_files: set[str] = set()
 
         # Hop 1: System files and spec docs
         hop1 = await self._hop_system_and_specs(affected_systems)
         all_hops.append(hop1)
-        hop1_contexts = await self._contexts_from_hop(hop1)
+        hop1_contexts = await self._contexts_from_hop(hop1, _visited_files)
         all_contexts.extend(hop1_contexts)
         total_files_searched.update(hop1.files_found)
 
@@ -124,7 +127,7 @@ class SweGrepRetriever:
             affected_systems, description, category,
         )
         all_hops.append(hop2)
-        hop2_contexts = await self._contexts_from_hop(hop2)
+        hop2_contexts = await self._contexts_from_hop(hop2, _visited_files)
         all_contexts.extend(hop2_contexts)
         total_files_searched.update(hop2.files_found)
 
@@ -133,7 +136,7 @@ class SweGrepRetriever:
             affected_systems, description, category,
         )
         all_hops.append(hop3)
-        hop3_contexts = await self._contexts_from_hop(hop3)
+        hop3_contexts = await self._contexts_from_hop(hop3, _visited_files)
         all_contexts.extend(hop3_contexts)
         total_files_searched.update(hop3.files_found)
 
@@ -143,7 +146,7 @@ class SweGrepRetriever:
             [c.source for c in all_contexts if c.context_type == "code"],
         )
         all_hops.append(hop4)
-        hop4_contexts = await self._contexts_from_hop(hop4)
+        hop4_contexts = await self._contexts_from_hop(hop4, _visited_files)
         all_contexts.extend(hop4_contexts)
         total_files_searched.update(hop4.files_found)
 
@@ -625,13 +628,25 @@ class SweGrepRetriever:
     # ─── Context Extraction ─────────────────────────────────────────────────
 
     async def _contexts_from_hop(
-        self, hop: RetrievalHop,
+        self,
+        hop: RetrievalHop,
+        visited: set[str] | None = None,
     ) -> list[RetrievedContext]:
-        """Extract RetrievedContext objects from hop results by reading files."""
+        """Extract RetrievedContext objects from hop results by reading files.
+
+        Corpus 14 §12: visited set prevents re-reading the same file across
+        hops (cycle detection). Max _MAX_GREP_RESULTS results per query already
+        enforced in _tool_grep.
+        """
         contexts: list[RetrievedContext] = []
 
-        # Read up to 5 most relevant files from this hop
+        # Read up to 5 most relevant files from this hop, skipping already-visited
         for fpath in hop.files_found[:5]:
+            if visited is not None:
+                if fpath in visited:
+                    continue
+                visited.add(fpath)
+
             content = await self._tool_read_file(fpath, max_lines=80)
             if not content:
                 continue

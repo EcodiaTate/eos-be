@@ -359,10 +359,8 @@ async def get_recent_episodes(
             )
             raw_episodes: list[dict[str, Any]] = [r["e"] for r in raw_rows]
         else:
-            from systems.memory.episodic import get_recent_episodes as _get_recent
-
-            raw_episodes = await _get_recent(
-                memory._neo4j, limit=limit, min_salience=min_salience
+            raw_episodes = await memory.get_recent_episodes(
+                limit=limit, min_salience=min_salience
             )
 
         return [
@@ -396,9 +394,7 @@ async def get_episode_detail(request: Request, episode_id: str) -> EpisodeItem:
         raise HTTPException(status_code=503, detail="Memory not initialized")
 
     try:
-        from systems.memory.episodic import get_episode as _get_episode
-
-        ep = await _get_episode(memory._neo4j, episode_id)
+        ep = await memory.get_episode(episode_id)
         if ep is None:
             raise HTTPException(status_code=404, detail="Episode not found")
 
@@ -487,17 +483,15 @@ async def get_entity_detail(
         raise HTTPException(status_code=503, detail="Memory not initialized")
 
     try:
-        from systems.memory.semantic import (
-            get_entity as _get_entity,
-        )
-        from systems.memory.semantic import (
-            get_entity_neighbours as _get_neighbours,
-        )
+        from systems.memory.semantic import get_entity_neighbours as _get_neighbours
 
-        raw = await _get_entity(memory._neo4j, entity_id)
+        raw = await memory.get_entity(entity_id)
         if raw is None:
             raise HTTPException(status_code=404, detail="Entity not found")
 
+        # get_entity_neighbours remains an internal call — no MemoryService wrapper
+        # yet; it has no callers outside this router so adding a full wrapper would
+        # be premature (YAGNI). Tracked in CLAUDE.md as a remaining AV6 item.
         neighbours_raw = await _get_neighbours(
             memory._neo4j, entity_id, max_depth=depth
         )
@@ -865,21 +859,13 @@ async def resolve_counterfactual_endpoint(
         raise HTTPException(status_code=503, detail="Memory not initialized")
 
     try:
-        from systems.memory.episodic import (
-            link_counterfactual_to_outcome as _link,
-        )
-        from systems.memory.episodic import (
-            resolve_counterfactual as _resolve,
-        )
-
-        await _resolve(
-            memory._neo4j,
+        await memory.resolve_counterfactual(
             record_id=episode_id,
             outcome_success=body.outcome_success,
             actual_pragmatic_value=body.actual_pragmatic_value,
             regret=body.regret,
         )
-        await _link(memory._neo4j, episode_id, body.outcome_episode_id)
+        await memory.link_counterfactual_to_outcome(episode_id, body.outcome_episode_id)
 
         logger.info(
             "counterfactual_resolved",

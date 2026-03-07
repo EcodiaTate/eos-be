@@ -358,6 +358,72 @@ class BeliefAgingScanner:
                 error=str(exc),
             )
 
+    async def sync_halflife_overrides(
+        self,
+        tuner_params: dict[str, float],
+    ) -> int:
+        """Apply learnable half-life overrides from ParameterTuner to Neo4j beliefs.
+
+        Called during Evo consolidation Phase 5 (after parameter optimization)
+        so that parameter hypothesis changes to ``belief.halflife.*`` keys are
+        propagated both to the in-memory ``DEFAULT_DOMAIN_HALFLIFES`` registry
+        (for new beliefs) and to all existing Neo4j belief nodes in each domain
+        (so the scanner picks up the new values on the next Phase 2.5 pass).
+
+        Spec §VIII gap fix — learnable domain half-lives.
+
+        Returns the number of Neo4j belief nodes updated.
+        """
+        # Map "belief.halflife.<domain>" → domain name
+        overrides: dict[str, float] = {}
+        for key, value in tuner_params.items():
+            if key.startswith("belief.halflife.") and value > 0:
+                domain = key[len("belief.halflife."):]
+                overrides[domain] = value
+
+        if not overrides:
+            return 0
+
+        # Update in-memory registry so new beliefs use the learned values
+        for domain, half_life in overrides.items():
+            DEFAULT_DOMAIN_HALFLIFES[domain] = half_life
+
+        # Propagate to Neo4j — batch update all beliefs per domain
+        updated = 0
+        for domain, half_life in overrides.items():
+            decay_constant = math.log(2) / half_life
+            try:
+                results = await self._neo4j.execute_write(
+                    """
+                    MATCH (b:Belief)
+                    WHERE b.domain = $domain
+                      AND b.half_life_days IS NOT NULL
+                    SET b.half_life_days = $half_life_days,
+                        b.decay_constant = $decay_constant
+                    RETURN count(b) AS updated_count
+                    """,
+                    {
+                        "domain": domain,
+                        "half_life_days": half_life,
+                        "decay_constant": decay_constant,
+                    },
+                )
+                if results:
+                    updated += int(results[0].get("updated_count", 0))
+            except Exception as exc:
+                self._logger.warning(
+                    "halflife_override_sync_failed",
+                    domain=domain,
+                    error=str(exc),
+                )
+
+        self._logger.info(
+            "halflife_overrides_synced",
+            domains=list(overrides.keys()),
+            beliefs_updated=updated,
+        )
+        return updated
+
     async def query_unreliable_in(
         self,
         hours: float,

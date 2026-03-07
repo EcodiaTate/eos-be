@@ -354,17 +354,37 @@ class PathogenStore:
         logger.info("eis_batch_upserted", count=len(points))
 
     async def increment_match_count(self, pathogen_id: str) -> None:
-        """Increment match_count and update last_matched for a pathogen."""
+        """
+        Increment match_count for a pathogen via fetch-modify-update.
+
+        Qdrant does not support atomic increment operations; we fetch the
+        current payload, increment locally, and write back. This is safe
+        under low-concurrency access patterns (single-instance EIS).
+        """
         if self._client is None or not QDRANT_AVAILABLE or qmodels is None:
             return
 
-        await self._client.set_payload(
-            collection_name=self._config.qdrant_collection,
-            payload={
-                "match_count": {"$inc": 1},  # Qdrant doesn't support $inc natively
-            },
-            points=[pathogen_id],
-        )
+        try:
+            results = await self._client.retrieve(
+                collection_name=self._config.qdrant_collection,
+                ids=[pathogen_id],
+                with_payload=True,
+            )
+            if not results:
+                return
+
+            current_count: int = results[0].payload.get("match_count", 0)  # type: ignore[union-attr]
+            await self._client.set_payload(
+                collection_name=self._config.qdrant_collection,
+                payload={"match_count": current_count + 1},
+                points=[pathogen_id],
+            )
+        except Exception as exc:
+            logger.warning(
+                "eis_increment_match_count_failed",
+                pathogen_id=pathogen_id,
+                error=str(exc),
+            )
 
     async def search_by_vector(
         self,

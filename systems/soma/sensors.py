@@ -303,6 +303,7 @@ class ExternalVolatilitySensor:
 
         def _do_request() -> dict[str, Any]:
             import json as _json
+            from typing import cast
 
             req = urllib.request.Request(
                 _COINGECKO_URL,
@@ -312,7 +313,7 @@ class ExternalVolatilitySensor:
                 req, timeout=self._config.volatility_fetch_timeout_s
             ) as resp:
                 body = resp.read()
-            return _json.loads(body)
+            return cast(dict[str, Any], _json.loads(body))
 
         data = await asyncio.wait_for(
             loop.run_in_executor(None, _do_request),

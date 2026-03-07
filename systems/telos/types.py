@@ -447,3 +447,66 @@ class ConstitutionalAuditResult(EOSBaseModel):
         default_factory=list
     )
     timestamp: datetime = Field(default_factory=utc_now)
+
+
+# ─── Population-Level Intelligence (M3) ──────────────────────────────
+
+
+class DriveWeightStats(EOSBaseModel):
+    """Mean and standard deviation of a single drive across the fleet."""
+
+    mean: float = Field(0.0, ge=-1.0, le=1.0)
+    std: float = Field(0.0, ge=0.0)
+
+
+class DriveWeightDistribution(EOSBaseModel):
+    """Per-drive statistical distribution across the fleet."""
+
+    care: DriveWeightStats = Field(default_factory=DriveWeightStats)
+    coherence: DriveWeightStats = Field(default_factory=DriveWeightStats)
+    growth: DriveWeightStats = Field(default_factory=DriveWeightStats)
+    honesty: DriveWeightStats = Field(default_factory=DriveWeightStats)
+
+
+class ConstitutionalPhenotypeCluster(EOSBaseModel):
+    """
+    A detected cluster of instances sharing a similar drive-weight profile.
+
+    When the fleet diverges into distinct clusters (e.g., Growth-heavy vs
+    Care-heavy), this is an early speciation signal — instances are beginning
+    to occupy different regions of the 4D intelligence geometry.
+    """
+
+    label: str = ""  # e.g. "growth_dominant", "care_dominant", "balanced"
+    centroid: dict[str, float] = Field(default_factory=dict)  # {care, coherence, growth, honesty}
+    size: int = 0  # number of instances in cluster
+    dominant_drive: str = ""  # drive with highest centroid value
+
+
+class PopulationIntelligenceSnapshot(EOSBaseModel):
+    """
+    Population-level intelligence measurement emitted to Benchmarks every 60s.
+
+    Collective intelligence is not just the mean — phenotypic diversity in
+    drive weights contributes a variance_bonus: a fleet where some instances
+    specialise in Growth and others in Care covers more of the intelligence
+    landscape than a fleet of identical clones.
+
+    speciation_signal is the key output: when it rises above ~0.3, distinct
+    constitutional phenotypes are emerging — proto-speciation is underway.
+    """
+
+    id: str = Field(default_factory=new_id)
+    instance_count: int = 0
+    mean_I: float = 0.0
+    variance_I: float = 0.0
+    population_I: float = 0.0  # mean_I + variance_bonus
+    variance_bonus: float = 0.0
+    drive_weight_distribution: DriveWeightDistribution = Field(
+        default_factory=DriveWeightDistribution
+    )
+    constitutional_phenotype_clusters: list[ConstitutionalPhenotypeCluster] = Field(
+        default_factory=list
+    )
+    speciation_signal: float = Field(0.0, ge=0.0, le=1.0)
+    timestamp: datetime = Field(default_factory=utc_now)

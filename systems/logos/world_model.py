@@ -333,6 +333,36 @@ class WorldModel:
         self._maybe_tick_schema_hour()
         return self._schema_growth_rate
 
+    def register_schema(self, schema: GenerativeSchema) -> bool:
+        """Register a schema in the world model, checking for domain duplicates.
+
+        Returns True if the schema was registered, False if a duplicate
+        covering the same domain already exists.
+        """
+        # Check for duplicate: same domain + high description overlap
+        for existing in self.generative_schemas.values():
+            if existing.domain == schema.domain and existing.description == schema.description:
+                # Strengthen existing instead of adding duplicate
+                existing.instance_count += schema.instance_count
+                existing.last_instantiated = utc_now()
+                logger.debug(
+                    "schema_merged_with_existing",
+                    existing_id=existing.id,
+                    new_id=schema.id,
+                )
+                return False
+
+        self.generative_schemas[schema.id] = schema
+        self._update_schema_growth_rate()
+        self._recompute_complexity()
+        logger.info(
+            "schema_registered",
+            schema_id=schema.id,
+            domain=schema.domain,
+            description=schema.description[:80],
+        )
+        return True
+
     def ingest_invariant(self, invariant: EmpiricalInvariant) -> None:
         """Ingest a causal invariant (e.g., from Kairos)."""
         self.empirical_invariants.append(invariant)
@@ -342,6 +372,166 @@ class WorldModel:
             invariant_id=invariant.id,
             statement=invariant.statement[:80],
             source=invariant.source,
+        )
+
+    def count_observations_explained_by(self, invariant_id: str) -> int:
+        """
+        Return the number of episodes / observations the invariant explains.
+
+        Uses the invariant's own observation_count field, which is incremented
+        each time the invariant is validated against a new episode.
+        Returns 0 if the invariant is unknown to the world model.
+        """
+        for inv in self.empirical_invariants:
+            if inv.id == invariant_id:
+                return inv.observation_count
+        return 0
+
+    def estimate_description_length_without(self, invariant_id: str) -> float:
+        """
+        Estimate world model total description length (bits) without this invariant.
+
+        Removes the invariant's compressed representation (~80 bits) but adds back
+        the raw observations it was compressing (observation_count bits each,
+        estimated at 50 bits/observation without the rule).
+        Returns current complexity unchanged when the invariant is unknown.
+        """
+        for inv in self.empirical_invariants:
+            if inv.id == invariant_id:
+                # Cost of the invariant rule itself in the model
+                invariant_rule_bits = 80.0
+                # Cost of raw observations the invariant was encoding
+                raw_observation_bits = inv.observation_count * 50.0
+                # Description length without the invariant = current - rule + raw obs
+                return max(
+                    self.current_complexity - invariant_rule_bits + raw_observation_bits,
+                    100.0,
+                )
+        return self.current_complexity
+
+    def snapshot(self) -> dict:
+        """M5: Serialize entire world model state for Mitosis genome cloning."""
+        return {
+            "generative_schemas": {
+                sid: {
+                    "id": s.id,
+                    "name": s.name,
+                    "domain": s.domain,
+                    "description": s.description,
+                    "pattern": s.pattern,
+                    "instance_count": s.instance_count,
+                    "compression_ratio": s.compression_ratio,
+                    "created_at": s.created_at.isoformat(),
+                    "last_instantiated": s.last_instantiated.isoformat(),
+                }
+                for sid, s in self.generative_schemas.items()
+            },
+            "causal_links": {
+                key: {
+                    "cause_id": link.cause_id,
+                    "effect_id": link.effect_id,
+                    "strength": link.strength,
+                    "domain": link.domain,
+                    "observations": link.observations,
+                    "last_observed": link.last_observed.isoformat(),
+                }
+                for key, link in self.causal_structure.links.items()
+            },
+            "predictive_priors": {
+                key: {
+                    "context_key": prior.context_key,
+                    "variance": prior.variance,
+                    "sample_count": prior.sample_count,
+                    "last_updated": prior.last_updated.isoformat(),
+                }
+                for key, prior in self.predictive_priors.items()
+            },
+            "empirical_invariants": [
+                {
+                    "id": inv.id,
+                    "statement": inv.statement,
+                    "domain": inv.domain,
+                    "observation_count": inv.observation_count,
+                    "confidence": inv.confidence,
+                    "source": inv.source,
+                }
+                for inv in self.empirical_invariants
+            ],
+            "metrics": {
+                "current_complexity": self.current_complexity,
+                "coverage": self.coverage,
+                "intelligence_ratio": self.measure_intelligence_ratio(),
+                "total_explained_bits": self._total_explained_bits,
+                "total_episodes_explained": self._total_episodes_explained,
+                "total_episodes_predicted": self._total_episodes_predicted,
+                "total_episodes_received": self._total_episodes_received,
+            },
+        }
+
+    def restore_from_snapshot(self, data: dict) -> None:
+        """M5: Load world model state from a serialized snapshot."""
+        # Restore schemas
+        for sid, sdata in data.get("generative_schemas", {}).items():
+            schema = GenerativeSchema(
+                id=sdata["id"],
+                name=sdata.get("name", ""),
+                domain=sdata.get("domain", ""),
+                description=sdata.get("description", ""),
+                pattern=sdata.get("pattern", {}),
+                instance_count=sdata.get("instance_count", 0),
+                compression_ratio=sdata.get("compression_ratio", 0.0),
+            )
+            self.generative_schemas[sid] = schema
+
+        # Restore causal links
+        for _key, ldata in data.get("causal_links", {}).items():
+            link = CausalLink(
+                cause_id=ldata["cause_id"],
+                effect_id=ldata["effect_id"],
+                strength=ldata.get("strength", 0.5),
+                domain=ldata.get("domain", ""),
+                observations=ldata.get("observations", 0),
+            )
+            self.causal_structure.add_link(link)
+
+        # Restore priors
+        for key, pdata in data.get("predictive_priors", {}).items():
+            prior = PriorDistribution(
+                context_key=pdata["context_key"],
+                variance=pdata.get("variance", 1.0),
+                sample_count=pdata.get("sample_count", 0),
+            )
+            self.predictive_priors[key] = prior
+
+        # Restore invariants
+        for idata in data.get("empirical_invariants", []):
+            invariant = EmpiricalInvariant(
+                id=idata["id"],
+                statement=idata.get("statement", ""),
+                domain=idata.get("domain", ""),
+                observation_count=idata.get("observation_count", 0),
+                confidence=idata.get("confidence", 1.0),
+                source=idata.get("source", ""),
+            )
+            self.empirical_invariants.append(invariant)
+
+        # Restore metrics
+        metrics = data.get("metrics", {})
+        if metrics:
+            self.current_complexity = metrics.get("current_complexity", 100.0)
+            self.coverage = metrics.get("coverage", 0.0)
+            self._total_explained_bits = metrics.get("total_explained_bits", 0.0)
+            self._total_episodes_explained = metrics.get("total_episodes_explained", 0)
+            self._total_episodes_predicted = metrics.get("total_episodes_predicted", 0)
+            self._total_episodes_received = metrics.get("total_episodes_received", 0)
+
+        self._recompute_complexity()
+        logger.info(
+            "world_model_restored_from_snapshot",
+            schemas=len(self.generative_schemas),
+            causal_links=self.causal_structure.link_count,
+            priors=len(self.predictive_priors),
+            invariants=len(self.empirical_invariants),
         )
 
     def get_context_stability_age(self, context_key: str) -> float:

@@ -1,9 +1,14 @@
 """
 Fovea — Type Definitions
 
-The fundamental data structures for prediction-error-based attention.
+The fundamental data structures for prediction-error-based attention,
+input normalisation, and workspace broadcast.
+
 Prediction errors are not scores. They are structured decompositions of how
 reality diverged from the world model's expectations.
+
+This module is the canonical source for all perception-pipeline types,
+including types formerly defined in systems.atune.types.
 """
 
 from __future__ import annotations
@@ -13,9 +18,11 @@ import hashlib
 from datetime import datetime  # noqa: TC003 — Pydantic needs runtime access
 from typing import Any
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 
+from primitives.affect import AffectState  # noqa: TC001 — Pydantic needs at runtime
 from primitives.common import EOSBaseModel, new_id, utc_now
+from primitives.memory_trace import MemoryTrace  # noqa: TC001 — Pydantic needs at runtime
 
 # ---------------------------------------------------------------------------
 # Error type taxonomy
@@ -166,6 +173,12 @@ class FoveaPredictionError(EOSBaseModel):
     # Routing
     routes: list[str] = Field(default_factory=list)
 
+    # Constitutional mismatch signal [0, 1].
+    # Set by the caller when the percept is in a constitutional value domain
+    # (e.g. predicted high-Care action, actual low-Care outcome).
+    # Drives EQUOR + ONEIROS routing when above threshold.
+    constitutional_mismatch: float = 0.0
+
     def compute_precision_weighted_salience(self) -> None:
         """
         Compute salience as sum of (component * precision * learned_weight)
@@ -180,7 +193,13 @@ class FoveaPredictionError(EOSBaseModel):
         self.precision_weighted_salience = total
 
     def compute_routing(self, workspace_threshold: float) -> None:
-        """Determine which downstream systems receive this error."""
+        """Determine which downstream systems receive this error.
+
+        Constitutional mismatches (predicted high-Care action, actual low-Care
+        outcome) are routed to EQUOR and ONEIROS in addition to standard routes.
+        EQUOR gates constitutional drift; ONEIROS accumulates constitutional
+        pattern backlog for sleep-cycle consolidation.
+        """
         self.routes = []
         s = (
             self.habituated_salience
@@ -197,6 +216,13 @@ class FoveaPredictionError(EOSBaseModel):
         # Causal errors always route to Kairos if non-trivial
         if self.causal_error > 0.15:
             self.routes.append(ErrorRoute.KAIROS)
+        # Constitutional value mismatch: route to Equor (governance gate) and
+        # Oneiros (sleep-cycle pattern consolidation) when the error is in a
+        # constitutional domain (Care, Honesty, Coherence, Growth drive alignment).
+        if self.constitutional_mismatch > 0.3:
+            self.routes.append(ErrorRoute.EQUOR)
+        if self.constitutional_mismatch > 0.5:
+            self.routes.append(ErrorRoute.ONEIROS)
 
     def get_dominant_error_type(self) -> ErrorType:
         """Return the error type with the highest weighted contribution."""
@@ -269,6 +295,26 @@ class InternalPredictionError(FoveaPredictionError):
             total += error_val * precision * weight
         self.precision_weighted_salience = total * self.precision_multiplier
 
+    def compute_routing(self, workspace_threshold: float) -> None:
+        """Override: constitutional internal errors always route to Equor and Oneiros.
+
+        A CONSTITUTIONAL self-model violation means EOS predicted its own behaviour
+        would align with a constitutional drive (e.g. Care), but the actual outcome
+        diverged.  That is not just a learning signal — it is a governance event.
+        Equor must evaluate whether the constitutional floor was breached.
+        Oneiros receives it for consolidation into the sleep-cycle pattern backlog.
+        """
+        super().compute_routing(workspace_threshold)
+        if self.internal_error_type == InternalErrorType.CONSTITUTIONAL:
+            if ErrorRoute.EQUOR not in self.routes:
+                self.routes.append(ErrorRoute.EQUOR)
+            if ErrorRoute.ONEIROS not in self.routes:
+                self.routes.append(ErrorRoute.ONEIROS)
+        elif self.internal_error_type == InternalErrorType.BEHAVIORAL:
+            # Behavioral inconsistency also goes to Thread (narrative coherence)
+            if ErrorRoute.THREAD not in self.routes:
+                self.routes.append(ErrorRoute.THREAD)
+
 
 # ---------------------------------------------------------------------------
 # World model update feedback — for weight learning (Phase C, type defined
@@ -327,3 +373,433 @@ class AttentionProfile(EOSBaseModel):
     current_ignition_threshold: float = 0.0
     habituated_pattern_count: int = 0
     highest_recent_error_summary: str | None = None
+
+
+# ===========================================================================
+# Types migrated from systems.atune.types (Atune → Fovea consolidation)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Input channels
+# ---------------------------------------------------------------------------
+
+
+class InputChannel(enum.StrEnum):
+    """All channels from which the perception pipeline can receive raw input."""
+
+    # User-facing
+    TEXT_CHAT = "text_chat"
+    VOICE = "voice"
+    GESTURE = "gesture"
+
+    # Environmental
+    SENSOR_IOT = "sensor_iot"
+    CALENDAR = "calendar"
+    EXTERNAL_API = "external_api"
+
+    # Internal
+    SYSTEM_EVENT = "system_event"
+    MEMORY_BUBBLE = "memory_bubble"
+    AFFECT_SHIFT = "affect_shift"
+    EVO_INSIGHT = "evo_insight"
+
+    # Federation
+    FEDERATION_MSG = "federation_msg"
+
+
+# ---------------------------------------------------------------------------
+# Raw input (pre-normalisation)
+# ---------------------------------------------------------------------------
+
+
+class RawInput(BaseModel):
+    """Raw data before normalisation into a Percept."""
+
+    data: str | bytes
+    channel_id: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Prediction error (Atune-level)
+# ---------------------------------------------------------------------------
+
+
+class PredictionErrorDirection(enum.StrEnum):
+    """Category of surprise."""
+
+    CONTRADICTS_BELIEF = "contradicts_belief"
+    NOVEL = "novel"
+    CONFIRMS_UNEXPECTED = "confirms_unexpected"
+    EXPECTED = "expected"
+
+
+class PredictionError(BaseModel):
+    """How surprising a Percept is given current beliefs."""
+
+    magnitude: float = Field(ge=0.0, le=1.0)
+    direction: PredictionErrorDirection
+    domain: str = ""
+    expected_embedding: list[float] | None = None
+    actual_embedding: list[float] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Salience
+# ---------------------------------------------------------------------------
+
+
+class GradientAttentionVector(BaseModel):
+    """
+    Token-level salience attribution via embedding gradient analysis.
+
+    For a given salience head that uses embedding similarity, this captures
+    *which tokens* in the percept are driving the similarity score —
+    essentially a Jacobian-based saliency map over the input tokens.
+    """
+
+    per_token_importance: list[float] = Field(default_factory=list)
+    """Normalised importance scores (sum to 1.0), one per token."""
+
+    load_bearing_tokens: list[int] = Field(default_factory=list)
+    """Indices of the top-K tokens driving the salience decision."""
+
+    gradient_magnitude: float = 0.0
+    """Overall gradient norm — higher means a sharper, more decisive similarity signal."""
+
+    gradient_direction_conflicts: list[int] = Field(default_factory=list)
+    """Token indices whose gradient direction opposes the reference embedding (contradiction)."""
+
+    head_name: str = ""
+    """Which salience head produced this attribution."""
+
+
+class ThreatTrajectory(enum.StrEnum):
+    """Qualitative label for how a salience head's score is changing."""
+
+    STEADY = "steady"
+    RISING = "rising"
+    FALLING = "falling"
+    ACCELERATING = "accelerating"
+
+
+class HeadMomentum(BaseModel):
+    """Momentum summary for a single salience head."""
+
+    first_derivative: float = 0.0
+    """dv/dt — rate of change of the head's score (units per second)."""
+
+    second_derivative: float = 0.0
+    """d²v/dt² — acceleration of the head's score (units per second²)."""
+
+    trajectory: ThreatTrajectory = ThreatTrajectory.STEADY
+    """Qualitative trajectory label derived from derivatives."""
+
+    time_to_threshold: float | None = None
+    """Seconds until linear extrapolation predicts crossing the salience threshold.
+    ``None`` when the head is not rising or is already above threshold."""
+
+    momentum_bonus: float = 0.0
+    """Additional salience weight awarded when acceleration exceeds threshold."""
+
+
+class SalienceVector(BaseModel):
+    """Per-head salience scores plus composite."""
+
+    scores: dict[str, float] = Field(default_factory=dict)
+    composite: float = Field(ge=0.0, le=1.0, default=0.0)
+    prediction_error: PredictionError | None = None
+    gradient_attention: dict[str, GradientAttentionVector] = Field(default_factory=dict)
+    """Per-head gradient attention vectors (only for embedding-similarity heads)."""
+
+    momentum: dict[str, HeadMomentum] = Field(default_factory=dict)
+    """Per-head momentum (first/second derivatives) when momentum tracking is active."""
+
+    threat_trajectory: ThreatTrajectory = ThreatTrajectory.STEADY
+    """Overall threat trajectory — worst-case across all heads."""
+
+
+# ---------------------------------------------------------------------------
+# Workspace types
+# ---------------------------------------------------------------------------
+
+
+class WorkspaceCandidate(BaseModel):
+    """A candidate competing for workspace broadcast."""
+
+    content: Any  # Percept or other content
+    salience: SalienceVector
+    source: str = ""
+    prediction_error: PredictionError | None = None
+
+
+class MemoryContext(BaseModel):
+    """Memory retrieval results attached to a broadcast."""
+
+    traces: list[MemoryTrace] = Field(default_factory=list)
+    entities: list[Any] = Field(default_factory=list)
+    communities: list[Any] = Field(default_factory=list)
+
+
+class WorkspaceContext(BaseModel):
+    """Contextual information accompanying a workspace broadcast."""
+
+    recent_broadcast_ids: list[str] = Field(default_factory=list)
+    active_goal_ids: list[str] = Field(default_factory=list)
+    memory_context: MemoryContext = Field(default_factory=MemoryContext)
+    prediction_error: PredictionError | None = None
+
+
+class WorkspaceBroadcast(BaseModel):
+    """The output of a workspace cycle — broadcast to all systems."""
+
+    broadcast_id: str = Field(default_factory=lambda: new_id())
+    timestamp: datetime = Field(default_factory=utc_now)
+    content: Any  # Percept or contributed content
+    salience: SalienceVector
+    affect: AffectState
+    context: WorkspaceContext = Field(default_factory=WorkspaceContext)
+    precision: float = Field(ge=0.0, le=1.0, default=0.5)
+    source: str = ""  # e.g. "internal:axon", "spontaneous_recall", percept channel_id
+
+
+# Ensure forward refs are resolved (AffectState must be importable at runtime).
+WorkspaceBroadcast.model_rebuild()
+
+
+class WorkspaceContribution(BaseModel):
+    """Content submitted by another system for workspace consideration."""
+
+    system: str
+    content: Any
+    priority: float = Field(ge=0.0, le=1.0, default=0.5)
+    reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Attention context (passed to Fovea prediction error computation)
+# ---------------------------------------------------------------------------
+
+
+class ActiveGoalSummary(BaseModel):
+    """Minimal goal info needed by Fovea for goal-relevance weighting."""
+
+    id: str
+    target_embedding: list[float]
+    priority: float = Field(ge=0.0, le=1.0, default=0.5)
+
+
+class RiskCategory(BaseModel):
+    """A known risk category with its embedding."""
+
+    name: str
+    embedding: list[float]
+
+
+class LearnedPattern(BaseModel):
+    """A pattern Evo has identified as important."""
+
+    pattern: str
+    weight: float = 1.0
+
+
+class Alert(BaseModel):
+    """An active alert pattern set by governance or Equor."""
+
+    pattern: str
+    severity: float = Field(ge=0.0, le=1.0, default=0.5)
+
+
+class PendingDecision(BaseModel):
+    """A decision awaiting information."""
+
+    id: str
+    description: str
+    embedding: list[float] | None = None
+
+
+class AttentionContext(BaseModel):
+    """
+    Legacy context object from the 7-head Atune salience engine.
+
+    DEAD CODE (Spec 20 D1, 2026-03-07): This type was used to pass context
+    to the old head-scoring pipeline. The Fovea pipeline now uses
+    ``PerceptContext`` instead. No construction sites exist — the fields
+    (active_goals, risk_categories, etc.) are populated individually from
+    ``FoveaCache`` by PerceptionGateway.
+
+    Retained for backward compatibility with any external callers that may
+    import or inspect this type. Do not use in new code.
+    """
+
+    prediction_error: PredictionError
+    affect_state: AffectState
+    active_goals: list[ActiveGoalSummary] = Field(default_factory=list)
+    core_identity_embeddings: list[list[float]] = Field(default_factory=list)
+    community_embedding: list[float] = Field(default_factory=list)
+    source_habituation: dict[str, float] = Field(default_factory=dict)
+    risk_categories: list[RiskCategory] = Field(default_factory=list)
+    learned_patterns: list[LearnedPattern] = Field(default_factory=list)
+    community_vocabulary: set[str] = Field(default_factory=set)
+    active_alerts: list[Alert] = Field(default_factory=list)
+    pending_decisions: list[PendingDecision] = Field(default_factory=list)
+    community_size: int = 0
+    instance_name: str = ""
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+# ---------------------------------------------------------------------------
+# Entity extraction
+# ---------------------------------------------------------------------------
+
+
+class EntityCandidate(BaseModel):
+    """An entity extracted from a Percept by LLM."""
+
+    name: str
+    type: str
+    description: str = ""
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+
+
+class RelationCandidate(BaseModel):
+    """A relation between entities extracted by LLM."""
+
+    from_entity: str
+    to_entity: str
+    type: str
+    strength: float = Field(ge=0.0, le=1.0, default=0.5)
+    temporal: str | None = None
+
+
+class ExtractionResult(BaseModel):
+    """Output of entity/relation extraction from a Percept."""
+
+    entities: list[EntityCandidate] = Field(default_factory=list)
+    relations: list[RelationCandidate] = Field(default_factory=list)
+    source_percept_id: str = ""
+
+
+# ---------------------------------------------------------------------------
+# EIS gate compatibility
+# ---------------------------------------------------------------------------
+
+
+class ThreatAnnotationLocal(EOSBaseModel):
+    """
+    Threat annotation, structurally compatible with EIS ``ThreatAnnotation``.
+
+    Populated by the normalisation pipeline (initially empty) so that the
+    EIS fast-path can append its own annotations without schema mismatch.
+    """
+
+    source: str = ""
+    threat_class: str = "benign"
+    severity: str = "none"
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    evidence: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SentimentAnalysis(EOSBaseModel):
+    """LLM-derived sentiment analysis result attached during normalisation."""
+
+    valence: float = Field(0.0, ge=-1.0, le=1.0)
+    arousal: float = Field(0.0, ge=0.0, le=1.0)
+    dominant_emotion: str = ""
+    summary: str = ""
+
+
+class NormalisedPercept(EOSBaseModel):
+    """
+    Wrapper around a shared ``Percept`` with fields required by the EIS
+    gate and Fovea prediction error computation.  The ``threat_annotations``
+    list is initialised empty during normalisation and populated by the
+    EIS fast-path before Fovea scoring begins.
+    """
+
+    percept_id: str = Field(default_factory=new_id)
+    threat_annotations: list[ThreatAnnotationLocal] = Field(default_factory=list)
+    evidence_tags: list[str] = Field(default_factory=list)
+    confidence_score: float = Field(0.5, ge=0.0, le=1.0)
+    sentiment: SentimentAnalysis = Field(default_factory=lambda: SentimentAnalysis())
+    entities: list[EntityCandidate] = Field(default_factory=list)
+    relations: list[RelationCandidate] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Meta-attention
+# ---------------------------------------------------------------------------
+
+
+class MetaContext(BaseModel):
+    """
+    Legacy context for the meta-attention controller.
+
+    DEAD CODE (Spec 20 D2, 2026-03-07): No construction or consumption sites
+    exist in the Fovea pipeline. Meta-attention is now implicit in
+    DynamicIgnitionThreshold and the affect-coupled τ modulation.
+
+    Retained for backward compatibility. Do not use in new code.
+    """
+
+    risk_level: float = Field(ge=0.0, le=1.0, default=0.0)
+    recent_broadcast_count: int = 0
+    cycles_since_last_broadcast: int = 0
+    active_goal_count: int = 0
+    pending_hypothesis_count: int = 0
+    rhythm_state: str = "normal"
+
+
+# ---------------------------------------------------------------------------
+# System load (for affect computation)
+# ---------------------------------------------------------------------------
+
+
+class SystemLoad(BaseModel):
+    """
+    Current system resource utilisation, accepted by PerceptionGateway.run_cycle().
+
+    Partially live (Spec 20 D3, 2026-03-07): accepted as a parameter to
+    ``run_cycle()`` for API compatibility, but its fields (cpu_utilisation,
+    memory_utilisation, queue_depth) are not currently read inside the method.
+    Synapse uses its own ``SystemLoad`` (systems.synapse.types).
+
+    The field values can be plumbed into threshold modulation in a future pass.
+    """
+
+    cpu_utilisation: float = Field(ge=0.0, le=1.0, default=0.0)
+    memory_utilisation: float = Field(ge=0.0, le=1.0, default=0.0)
+    queue_depth: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Cache structure
+# ---------------------------------------------------------------------------
+
+
+class FoveaCache(BaseModel):
+    """Slowly-changing data cached to meet latency requirements."""
+
+    core_identity_embeddings: list[list[float]] = Field(default_factory=list)
+    community_embedding: list[float] = Field(default_factory=list)
+    risk_categories: list[RiskCategory] = Field(default_factory=list)
+    learned_patterns: list[LearnedPattern] = Field(default_factory=list)
+    community_vocabulary: set[str] = Field(default_factory=set)
+    active_alerts: list[Alert] = Field(default_factory=list)
+    instance_name: str = ""
+
+    # Refresh counters
+    cycles_since_identity_refresh: int = 0
+    cycles_since_risk_refresh: int = 0
+    cycles_since_vocab_refresh: int = 0
+    cycles_since_alert_refresh: int = 0
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+# Backwards-compat alias
+AtuneCache = FoveaCache

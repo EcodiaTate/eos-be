@@ -48,17 +48,21 @@ from systems.simula.agents.test_executor import TestExecutorAgent
 from systems.simula.analytics import EvolutionAnalyticsEngine
 from systems.simula.bridge import EvoSimulaBridge
 from systems.simula.code_agent import SimulaCodeAgent
+from systems.simula.constraint_checker import ConstraintSatisfactionChecker
 from systems.simula.evolution_types import (
     FORBIDDEN,
     GOVERNANCE_REQUIRED,
     SELF_APPLICABLE,
     SIMULA_IRON_RULES,
+    CanaryDeploymentPlan,
+    CanaryTrafficStep,
     CategorySuccessRate,
     CautionAdjustment,
     ChangeCategory,
     ChangeSpec,
     CodeChangeResult,
     ConfigVersion,
+    ConstraintViolation,
     CounterfactualResult,
     DependencyImpact,
     EnrichedSimulationResult,
@@ -66,12 +70,14 @@ from systems.simula.evolution_types import (
     EvolutionProposal,
     EvolutionRecord,
     EvoProposalEnriched,
+    HealthStatus,
     ProposalCluster,
     ProposalPriority,
     ProposalResult,
     ProposalStatus,
     ResourceCostEstimate,
     RiskLevel,
+    SimulaMetrics,
     SimulationResult,
     TriageResult,
     TriageStatus,
@@ -191,6 +197,15 @@ __all__ = [
     "EvolutionAnalytics",
     "TriageStatus",
     "TriageResult",
+    # Canary deployment
+    "CanaryDeploymentPlan",
+    "CanaryTrafficStep",
+    # Constraint satisfaction
+    "ConstraintSatisfactionChecker",
+    "ConstraintViolation",
+    # Health & metrics
+    "HealthStatus",
+    "SimulaMetrics",
     # Constants
     "FORBIDDEN",
     "GOVERNANCE_REQUIRED",

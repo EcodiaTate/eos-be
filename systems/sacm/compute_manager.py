@@ -26,7 +26,8 @@ from typing import Any
 import structlog
 from pydantic import Field
 
-from primitives.common import EOSBaseModel, new_id
+from primitives.common import EOSBaseModel, SystemID, new_id
+from primitives.genome import GenomeExtractionProtocol, OrganGenomeSegment
 from systems.sacm.workload import OffloadClass, ResourceEnvelope, WorkloadPriority
 
 logger = structlog.get_logger("systems.sacm.compute_manager")
@@ -202,6 +203,13 @@ class ComputeResourceManager:
         # Federation channel reference — wired externally
         self._federation: Any = None
 
+        # Pre-warming engine reference — wired externally
+        self._pre_warming: Any = None
+
+        # Organism lifecycle state
+        self._organism_sleeping: bool = False
+        self._metabolic_emergency: bool = False
+
         # Metrics
         self._total_allocated: int = 0
         self._total_queued: int = 0
@@ -245,9 +253,36 @@ class ComputeResourceManager:
             self._on_resource_pressure,
         )
 
+        # Organism lifecycle: sleep, wake, metabolic emergency
+        event_bus.subscribe(
+            SynapseEventType.ORGANISM_SLEEP,
+            self._on_organism_sleep,
+        )
+        event_bus.subscribe(
+            SynapseEventType.ORGANISM_WAKE,
+            self._on_organism_wake,
+        )
+        event_bus.subscribe(
+            SynapseEventType.METABOLIC_EMERGENCY,
+            self._on_metabolic_emergency,
+        )
+
+        # Genome extraction for Mitosis inheritance
+        event_bus.subscribe(
+            SynapseEventType.GENOME_EXTRACT_REQUEST,
+            self._on_genome_extract_request,
+        )
+
         self._log.info(
             "compute_events_subscribed",
-            events=["compute_request_submitted", "resource_pressure"],
+            events=[
+                "compute_request_submitted",
+                "resource_pressure",
+                "organism_sleep",
+                "organism_wake",
+                "metabolic_emergency",
+                "genome_extract_request",
+            ],
         )
 
     async def _emit(self, event_type: str, data: dict[str, Any]) -> None:
@@ -275,7 +310,126 @@ class ComputeResourceManager:
         self._federation = federation
         self._log.info("federation_wired_to_sacm")
 
+    def set_pre_warming(self, pre_warming: Any) -> None:
+        """Wire the PreWarmingEngine so lifecycle events can pause/resume it."""
+        self._pre_warming = pre_warming
+        if self._synapse is not None and hasattr(pre_warming, "set_synapse"):
+            pre_warming.set_synapse(self._synapse)
+        self._log.info("pre_warming_wired_to_sacm")
+
     # ─── Event Handlers ───────────────────────────────────────────
+
+    async def _on_organism_sleep(self, event: Any) -> None:
+        """
+        Handle ORGANISM_SLEEP: downgrade non-CRITICAL queued workloads to BATCH
+        priority and pause pre-warming to reduce burn rate during sleep.
+        """
+        self._organism_sleeping = True
+        downgraded = 0
+        for request in self._queue:
+            if request.priority > WorkloadPriority.CRITICAL:
+                request.priority = WorkloadPriority.BATCH
+                downgraded += 1
+
+        # Pause pre-warming
+        if self._pre_warming is not None:
+            await self._pre_warming.stop()
+
+        self._log.info(
+            "organism_sleep_handled",
+            downgraded_workloads=downgraded,
+            queue_depth=len(self._queue),
+            pre_warming_paused=self._pre_warming is not None,
+        )
+
+    async def _on_organism_wake(self, event: Any) -> None:
+        """Handle ORGANISM_WAKE: resume normal operation and restart pre-warming."""
+        self._organism_sleeping = False
+
+        # Resume pre-warming
+        if self._pre_warming is not None:
+            self._pre_warming.start()
+
+        self._log.info("organism_wake_handled")
+
+    async def _on_metabolic_emergency(self, event: Any) -> None:
+        """
+        Handle METABOLIC_EMERGENCY: immediately shed non-critical compute.
+
+        - Cancel all non-CRITICAL queued workloads
+        - Suspend pre-warming
+        - Deny new non-CRITICAL requests until emergency clears
+        """
+        self._metabolic_emergency = True
+
+        # Drain non-critical from queue
+        critical_only: list[ComputeRequest] = []
+        shed_count = 0
+        for request in self._queue:
+            if request.priority <= WorkloadPriority.CRITICAL:
+                critical_only.append(request)
+            else:
+                shed_count += 1
+        self._queue = critical_only
+
+        # Pause pre-warming immediately
+        if self._pre_warming is not None:
+            await self._pre_warming.stop()
+
+        self._log.warning(
+            "metabolic_emergency_handled",
+            shed_workloads=shed_count,
+            remaining_queue=len(self._queue),
+            starvation_level=event.data.get("starvation_level", "unknown"),
+        )
+
+        await self._emit("compute_capacity_exhausted", {
+            "reason": "metabolic_emergency",
+            "starvation_level": event.data.get("starvation_level", "unknown"),
+            "shed_count": shed_count,
+        })
+
+    async def _on_genome_extract_request(self, event: Any) -> None:
+        """
+        Handle GENOME_EXTRACT_REQUEST: return SACM's heritable state as a
+        genome segment via GENOME_EXTRACT_RESPONSE.
+        """
+        from primitives.common import SystemID
+        from primitives.genome import OrganGenomeSegment
+
+        segment = OrganGenomeSegment(
+            system_id=SystemID.SACM,
+            payload=self._extract_heritable_state(),
+        )
+
+        await self._emit("genome_extract_response", {
+            "request_id": event.data.get("request_id", ""),
+            "segment": segment.model_dump(mode="json"),
+        })
+
+        self._log.info(
+            "genome_segment_extracted",
+            request_id=event.data.get("request_id", ""),
+        )
+
+    def _extract_heritable_state(self) -> dict[str, Any]:
+        """Collect SACM's heritable state for genome extraction."""
+        return {
+            "fair_shares": dict(_FAIR_SHARES),
+            "default_fair_share": _DEFAULT_FAIR_SHARE,
+            "max_queue_depth": _MAX_QUEUE_DEPTH,
+            "queue_stale_timeout_s": _QUEUE_STALE_TIMEOUT_S,
+            "capacity_config": {
+                "cpu_vcpu_total": self._capacity.cpu_vcpu_total,
+                "memory_gib_total": self._capacity.memory_gib_total,
+                "gpu_units_total": self._capacity.gpu_units_total,
+            },
+            "allocation_stats": {
+                "total_allocated": self._total_allocated,
+                "total_denied": self._total_denied,
+                "total_offloaded": self._total_offloaded,
+            },
+        }
 
     async def _on_compute_request(self, event: Any) -> None:
         """Handle inbound COMPUTE_REQUEST_SUBMITTED from the event bus."""
@@ -326,6 +480,22 @@ class ComputeResourceManager:
             gpu=request.resources.gpu_units,
         )
 
+        # 0. Metabolic emergency gate — deny all non-CRITICAL immediately
+        if self._metabolic_emergency and request.priority > WorkloadPriority.CRITICAL:
+            decision = AllocationDecision(
+                request_id=request.request_id,
+                source_system=request.source_system,
+                outcome="denied",
+                reason="metabolic_emergency",
+            )
+            self._total_denied += 1
+            await self._emit("compute_request_denied", {
+                "request_id": request.request_id,
+                "source_system": request.source_system,
+                "reason": "metabolic_emergency",
+            })
+            return decision
+
         # Evict stale requests first
         self._evict_stale_queue_entries()
 
@@ -357,6 +527,7 @@ class ComputeResourceManager:
                 "source_system": request.source_system,
                 "reason": decision.reason,
             })
+            self._emit_re_training(request, decision)
             return decision
 
         # 2. Try local allocation
@@ -391,6 +562,7 @@ class ComputeResourceManager:
             "source_system": request.source_system,
             "reason": "queue_full",
         })
+        self._emit_re_training(request, decision)
         return decision
 
     async def release(self, request_id: str) -> None:
@@ -411,6 +583,21 @@ class ComputeResourceManager:
             source=allocation.source_system,
             held_s=round(allocation.held_s, 1),
         )
+
+        # Emit ALLOCATION_RELEASED so the Synapse bus reflects capacity recovery.
+        # Downstream systems (Oikos, Soma, other compute requesters) can react
+        # to freed capacity without polling the manager.
+        await self._emit("allocation_released", {
+            "request_id": request_id,
+            "source_system": allocation.source_system,
+            "cpu_vcpu_released": allocation.resources.cpu_vcpu,
+            "gpu_units_released": allocation.resources.gpu_units,
+            "memory_gib_released": allocation.resources.memory_gib,
+            "held_s": round(allocation.held_s, 1),
+            "node_id": allocation.node_id,
+            "cpu_vcpu_available": self._capacity.cpu_vcpu_available,
+            "utilisation_pct": self._capacity.utilisation_pct,
+        })
 
         # Drain queued requests now that capacity freed up
         await self._drain_queue()
@@ -454,6 +641,8 @@ class ComputeResourceManager:
             node=self._capacity.node_id,
             utilisation_pct=self._capacity.utilisation_pct,
         )
+
+        self._emit_re_training(request, decision)
         return decision
 
     async def _enqueue(self, request: ComputeRequest) -> AllocationDecision:
@@ -630,6 +819,129 @@ class ComputeResourceManager:
             )
 
         return len(expired_ids)
+
+    # ─── Genome Protocol ────────────────────────────────────────────
+
+    async def extract_genome_segment(self) -> OrganGenomeSegment:
+        """
+        GenomeExtractionProtocol: serialise SACM's heritable state.
+
+        Heritable traits: fair-share ratios, capacity config, pre-warming
+        strategies, workload history patterns, allocation heuristics.
+        """
+        payload = self._extract_heritable_state()
+
+        # Include pre-warming heritable state if available
+        if self._pre_warming is not None:
+            pw_cfg = getattr(self._pre_warming, "_cfg", None)
+            if pw_cfg is not None:
+                payload["pre_warming"] = {
+                    "ema_alpha": pw_cfg.prediction.ema_alpha,
+                    "burst_stddev_factor": pw_cfg.prediction.burst_stddev_factor,
+                    "burst_multiplier": pw_cfg.prediction.burst_multiplier,
+                    "max_warm_instances": pw_cfg.budget.max_warm_instances,
+                    "max_pre_warm_budget_usd_per_hour": pw_cfg.budget.max_pre_warm_budget_usd_per_hour,
+                }
+
+        import hashlib
+        import json
+
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode()
+        return OrganGenomeSegment(
+            system_id=SystemID.SACM,
+            payload=payload,
+            payload_hash=hashlib.sha256(payload_bytes).hexdigest(),
+            size_bytes=len(payload_bytes),
+        )
+
+    async def seed_from_genome_segment(self, segment: OrganGenomeSegment) -> bool:
+        """
+        GenomeExtractionProtocol: restore heritable state from a parent's segment.
+        """
+        if segment.system_id != SystemID.SACM:
+            return False
+
+        payload = segment.payload
+        if not payload:
+            return False
+
+        # Restore fair-share ratios
+        if "fair_shares" in payload:
+            global _FAIR_SHARES
+            _FAIR_SHARES = payload["fair_shares"]
+
+        # Restore capacity config
+        if "capacity_config" in payload:
+            cap = payload["capacity_config"]
+            self._capacity.cpu_vcpu_total = cap.get(
+                "cpu_vcpu_total", self._capacity.cpu_vcpu_total
+            )
+            self._capacity.memory_gib_total = cap.get(
+                "memory_gib_total", self._capacity.memory_gib_total
+            )
+            self._capacity.gpu_units_total = cap.get(
+                "gpu_units_total", self._capacity.gpu_units_total
+            )
+
+        self._log.info(
+            "genome_segment_seeded",
+            payload_keys=list(payload.keys()),
+        )
+        return True
+
+    # ─── RE Training Emission ─────────────────────────────────────
+
+    def _emit_re_training(
+        self,
+        request: ComputeRequest,
+        decision: AllocationDecision,
+    ) -> None:
+        """
+        Emit an RE training trace for this allocation decision.
+
+        Captures workload profile, decision outcome, and resource utilisation
+        so the Reasoning Engine can learn allocation heuristics.
+        """
+        if self._synapse is None:
+            return
+
+        from primitives.common import SystemID
+        from primitives.re_training import RETrainingExample
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        example = RETrainingExample(
+            source_system=SystemID.SACM,
+            instruction="Allocate compute resources for workload request",
+            input_context=(
+                f"source={request.source_system} "
+                f"priority={request.priority.name} "
+                f"cpu={request.resources.cpu_vcpu} "
+                f"gpu={request.resources.gpu_units} "
+                f"mem={request.resources.memory_gib}GiB "
+                f"offload={request.offload_class.value} "
+                f"utilisation={self._capacity.utilisation_pct}% "
+                f"queue_depth={len(self._queue)} "
+                f"active={len(self._active)}"
+            ),
+            output=(
+                f"outcome={decision.outcome} "
+                f"node={decision.node_id} "
+                f"reason={decision.reason}"
+            ),
+            outcome_quality=1.0 if decision.outcome == "allocated" else 0.5,
+            category="compute_allocation",
+        )
+
+        asyncio.create_task(
+            self._synapse.event_bus.emit(
+                SynapseEvent(
+                    event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                    source_system="sacm",
+                    data=example.model_dump(mode="json"),
+                )
+            ),
+            name=f"sacm_re_trace_{request.request_id[:8]}",
+        )
 
     # ─── Inventory & Health ───────────────────────────────────────
 

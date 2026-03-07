@@ -17,6 +17,7 @@ Broadcasts:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 from collections import defaultdict
@@ -24,7 +25,8 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
-from primitives.common import new_id
+from primitives.common import SystemID, new_id
+from primitives.re_training import RETrainingBatch, RETrainingExample
 from systems.oneiros.types import (
     AbstractStructure,
     AnalogicalTransfer,
@@ -96,7 +98,7 @@ MAX_ANALOGIES_PER_CYCLE: int = 10
 
 class CrossDomainSynthesizer:
     """
-    Compare all schema pairs across domain boundaries for structural isomorphism.
+    Compare schemas across domain boundaries for structural isomorphism.
 
     Algorithm:
     1. Get all schemas from Logos world model
@@ -104,7 +106,16 @@ class CrossDomainSynthesizer:
     3. For all cross-domain pairs: compute isomorphism score
     4. Strong matches (>0.8) → propose unified schema
     5. Very strong matches (>0.9) → submit to Evo as schema candidate
+
+    Scaling: domain pairs are capped at MAX_DOMAIN_PAIRS; schemas per domain are
+    sampled down to MAX_SCHEMAS_PER_DOMAIN (highest-confidence first) to keep the
+    inner loop O(MAX_SCHEMAS_PER_DOMAIN²) regardless of organism age.
     """
+
+    # Hard caps to keep inner-loop complexity polynomial in a mature organism.
+    # With 20 schemas × 20 schemas × 45 domain pairs = 18,000 comparisons max.
+    MAX_SCHEMAS_PER_DOMAIN: int = 20
+    MAX_DOMAIN_PAIRS: int = 45  # C(10,2) — effectively caps at 10 active domains
 
     def __init__(
         self,
@@ -117,6 +128,8 @@ class CrossDomainSynthesizer:
 
     async def run(self) -> CrossDomainSynthesisReport:
         """Run full cross-domain structural comparison."""
+        import math
+
         t0 = time.monotonic()
 
         if self._logos is None:
@@ -124,7 +137,7 @@ class CrossDomainSynthesizer:
             return CrossDomainSynthesisReport()
 
         # 1. Get all schemas from world model
-        schemas = self._logos.world_model.generative_schemas
+        schemas = self._logos.get_generative_schemas()
         if not schemas:
             self._logger.info("no_schemas_to_compare")
             return CrossDomainSynthesisReport()
@@ -135,51 +148,74 @@ class CrossDomainSynthesizer:
             abstract = self._to_abstract_structure(schema_id, schema)
             abstracts.append(abstract)
 
-        # 3. Group by domain, then compare across domain boundaries
+        # 3. Group by domain, then apply per-domain cap
         by_domain: dict[str, list[AbstractStructure]] = defaultdict(list)
         for a in abstracts:
             by_domain[a.domain].append(a)
 
+        # Sort each domain's schemas by confidence desc and cap at MAX_SCHEMAS_PER_DOMAIN.
+        # This ensures the most predictively-reliable schemas are always compared first.
+        for domain in by_domain:
+            structs = sorted(
+                by_domain[domain],
+                key=lambda s: getattr(s, "confidence", 0.0),
+                reverse=True,
+            )
+            by_domain[domain] = structs[: self.MAX_SCHEMAS_PER_DOMAIN]
+
         domains = list(by_domain.keys())
+
+        # 4. Build domain pairs and cap at MAX_DOMAIN_PAIRS.
+        # Prefer pairs where both domains have more schemas (richer cross-domain signal).
+        all_pairs = [
+            (domains[i], domains[j])
+            for i in range(len(domains))
+            for j in range(i + 1, len(domains))
+        ]
+        if len(all_pairs) > self.MAX_DOMAIN_PAIRS:
+            # Score by product of schema counts — largest pools first
+            all_pairs.sort(
+                key=lambda p: len(by_domain[p[0]]) * len(by_domain[p[1]]),
+                reverse=True,
+            )
+            all_pairs = all_pairs[: self.MAX_DOMAIN_PAIRS]
+
         matches: list[CrossDomainMatch] = []
         domain_pairs_evaluated = 0
 
-        for i in range(len(domains)):
-            for j in range(i + 1, len(domains)):
-                domain_a = domains[i]
-                domain_b = domains[j]
-                domain_pairs_evaluated += 1
+        for domain_a, domain_b in all_pairs:
+            domain_pairs_evaluated += 1
 
-                for struct_a in by_domain[domain_a]:
-                    for struct_b in by_domain[domain_b]:
-                        score = self._compute_isomorphism_score(struct_a, struct_b)
+            for struct_a in by_domain[domain_a]:
+                for struct_b in by_domain[domain_b]:
+                    score = self._compute_isomorphism_score(struct_a, struct_b)
 
-                        if score >= STRONG_MATCH_THRESHOLD:
-                            match = CrossDomainMatch(
-                                schema_a_id=struct_a.schema_id,
-                                schema_b_id=struct_b.schema_id,
-                                domain_a=domain_a,
-                                domain_b=domain_b,
-                                isomorphism_score=score,
-                                abstract_structure=struct_a,
-                                proposed_unified_schema=self._propose_unified(
-                                    struct_a, struct_b, score
-                                ),
-                                mdl_improvement=self._estimate_mdl_improvement(
-                                    struct_a, struct_b, score
-                                ),
+                    if score >= STRONG_MATCH_THRESHOLD:
+                        match = CrossDomainMatch(
+                            schema_a_id=struct_a.schema_id,
+                            schema_b_id=struct_b.schema_id,
+                            domain_a=domain_a,
+                            domain_b=domain_b,
+                            isomorphism_score=score,
+                            abstract_structure=struct_a,
+                            proposed_unified_schema=self._propose_unified(
+                                struct_a, struct_b, score
+                            ),
+                            mdl_improvement=self._estimate_mdl_improvement(
+                                struct_a, struct_b, score
+                            ),
+                        )
+                        matches.append(match)
+
+                        await self._broadcast_match(match)
+
+                        if score >= EVO_CANDIDATE_THRESHOLD:
+                            self._logger.info(
+                                "evo_schema_candidate",
+                                schema_a=struct_a.schema_id,
+                                schema_b=struct_b.schema_id,
+                                score=round(score, 3),
                             )
-                            matches.append(match)
-
-                            await self._broadcast_match(match)
-
-                            if score >= EVO_CANDIDATE_THRESHOLD:
-                                self._logger.info(
-                                    "evo_schema_candidate",
-                                    schema_a=struct_a.schema_id,
-                                    schema_b=struct_b.schema_id,
-                                    score=round(score, 3),
-                                )
 
         strong_matches = len(matches)
         evo_candidates = sum(
@@ -191,7 +227,8 @@ class CrossDomainSynthesizer:
 
         self._logger.info(
             "cross_domain_synthesis_complete",
-            schemas_compared=len(abstracts),
+            schemas_total=len(abstracts),
+            schemas_sampled=sum(len(v) for v in by_domain.values()),
             domain_pairs=domain_pairs_evaluated,
             strong_matches=strong_matches,
             evo_candidates=evo_candidates,
@@ -470,7 +507,7 @@ class DreamGenerator:
             if self._logos is None:
                 fovea_domains = []
             else:
-                schemas = self._logos.world_model.generative_schemas
+                schemas = self._logos.get_generative_schemas()
                 domain_counts: dict[str, int] = defaultdict(int)
                 for schema in schemas.values():
                     domain = getattr(schema, "domain", "general")
@@ -507,7 +544,7 @@ class DreamGenerator:
         if self._logos is None:
             return []
 
-        schemas = self._logos.world_model.generative_schemas
+        schemas = self._logos.get_generative_schemas()
         domain_schemas = [
             (sid, s) for sid, s in schemas.items()
             if getattr(s, "domain", "") == domain
@@ -686,7 +723,7 @@ class AnalogyDiscoverer:
             return {}
 
         domain_map: dict[str, set[str]] = defaultdict(set)
-        causal = self._logos.world_model.causal_structure
+        causal = self._logos.get_causal_structure()
         links = causal.links if hasattr(causal, "links") else {}
 
         for _link_key, link in links.items():
@@ -725,7 +762,7 @@ class AnalogyDiscoverer:
 
         # Also check the causal structure for matching entities
         if self._logos is not None:
-            causal = self._logos.world_model.causal_structure
+            causal = self._logos.get_causal_structure()
             links = causal.links if hasattr(causal, "links") else {}
             for _link_key, link in links.items():
                 link_statement = f"{link.cause_id} causes {link.effect_id}"
@@ -750,7 +787,7 @@ class AnalogyDiscoverer:
         if self._logos is None:
             return False
 
-        from systems.logos.types import EmpiricalInvariant
+        from primitives.logos import EmpiricalInvariant
 
         # Mark the invariant as cross-domain in the world model
         wm = self._logos.world_model
@@ -794,6 +831,502 @@ class AnalogyDiscoverer:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Threat Simulator (REM)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class ThreatSimulator:
+    """
+    During REM, rehearse hypothetical failure scenarios (Spec 13 §4.4.3).
+
+    Implements Revonsuo's threat simulation theory: the organism systematically
+    explores the edges of its world model by generating plausible failure scenarios,
+    deriving response plans, storing those plans as procedural memory in Neo4j,
+    and emitting each scenario via ONEIROS_THREAT_SCENARIO so Thymos can
+    pre-generate prophylactic antibodies before the failure actually occurs.
+
+    Three seed sources:
+    1. Thymos incident history — variations on past resolved failures
+    2. Evo's 'concerning' hypotheses — evidence_ratio in [0.3, 0.5]
+    3. Nova's high-uncertainty belief regions — precision < 0.35
+    """
+
+    MAX_SCENARIOS: int = 15
+
+    def __init__(
+        self,
+        neo4j: Any | None = None,
+        event_bus: EventBus | None = None,
+    ) -> None:
+        self._neo4j = neo4j
+        self._event_bus = event_bus
+        self._logger = logger.bind(component="threat_simulator")
+
+    async def run(self) -> dict[str, int]:
+        """Simulate threat scenarios and emit to Thymos via ONEIROS_THREAT_SCENARIO."""
+        t0 = time.monotonic()
+        scenarios_generated = 0
+        response_plans_created = 0
+
+        seeds = await self._gather_seeds()
+        if not seeds:
+            self._logger.info("threat_simulator_no_seeds")
+            return {"scenarios_generated": 0, "response_plans_created": 0}
+
+        for seed in seeds[: self.MAX_SCENARIOS]:
+            scenario = self._synthesise_scenario(seed)
+            response_plan = self._derive_response_plan(scenario, seed)
+
+            await self._store_procedural_memory(scenario, response_plan)
+            await self._emit_threat_scenario(scenario, response_plan, seed)
+
+            scenarios_generated += 1
+            if response_plan:
+                response_plans_created += 1
+
+        elapsed = (time.monotonic() - t0) * 1000
+        self._logger.info(
+            "threat_simulation_complete",
+            scenarios=scenarios_generated,
+            response_plans=response_plans_created,
+            elapsed_ms=round(elapsed, 1),
+        )
+        return {
+            "scenarios_generated": scenarios_generated,
+            "response_plans_created": response_plans_created,
+        }
+
+    async def _gather_seeds(self) -> list[dict[str, Any]]:
+        """Gather scenario seeds from Neo4j — incidents, hypotheses, beliefs."""
+        seeds: list[dict[str, Any]] = []
+        if self._neo4j is None:
+            return seeds
+
+        try:
+            # Source 1: recent resolved Thymos incidents — simulate variations
+            incident_rows = await self._neo4j.execute_read(
+                """
+                MATCH (i:Incident)
+                WHERE i.resolved = true
+                RETURN i.id AS id,
+                       i.classification AS classification,
+                       i.description AS description,
+                       i.severity AS severity,
+                       i.system_id AS system_id
+                ORDER BY i.event_time DESC
+                LIMIT 10
+                """
+            )
+            for row in incident_rows or []:
+                seeds.append({
+                    "type": "incident_variation",
+                    "domain": row.get("system_id", "unknown"),
+                    "description": row.get("description", ""),
+                    "severity": row.get("severity", "medium"),
+                    "classification": row.get("classification", ""),
+                    "source_id": row.get("id", ""),
+                })
+        except Exception as exc:
+            self._logger.debug("incident_seed_query_failed", error=str(exc))
+
+        try:
+            # Source 2: Evo's concerning hypotheses (evidence_ratio 0.3–0.5)
+            hyp_rows = await self._neo4j.execute_read(
+                """
+                MATCH (h:Hypothesis)
+                WHERE h.evidence_ratio >= 0.3 AND h.evidence_ratio <= 0.5
+                  AND h.status IN ['PROPOSED', 'TESTING']
+                RETURN h.id AS id,
+                       h.statement AS statement,
+                       h.domain AS domain,
+                       h.evidence_ratio AS evidence_ratio
+                ORDER BY h.evidence_ratio DESC
+                LIMIT 8
+                """
+            )
+            for row in hyp_rows or []:
+                seeds.append({
+                    "type": "concerning_hypothesis",
+                    "domain": row.get("domain", "general"),
+                    "description": row.get("statement", ""),
+                    "severity": "medium",
+                    "evidence_ratio": row.get("evidence_ratio", 0.4),
+                    "source_id": row.get("id", ""),
+                })
+        except Exception as exc:
+            self._logger.debug("hypothesis_seed_query_failed", error=str(exc))
+
+        try:
+            # Source 3: high-uncertainty belief regions (precision < 0.35)
+            belief_rows = await self._neo4j.execute_read(
+                """
+                MATCH (b:Belief)
+                WHERE b.precision < 0.35 AND b.active = true
+                RETURN b.id AS id,
+                       b.domain AS domain,
+                       b.description AS description,
+                       b.precision AS precision
+                ORDER BY b.precision ASC
+                LIMIT 5
+                """
+            )
+            for row in belief_rows or []:
+                seeds.append({
+                    "type": "high_uncertainty_belief",
+                    "domain": row.get("domain", "general"),
+                    "description": row.get("description", ""),
+                    "severity": "low",
+                    "precision": row.get("precision", 0.3),
+                    "source_id": row.get("id", ""),
+                })
+        except Exception as exc:
+            self._logger.debug("belief_seed_query_failed", error=str(exc))
+
+        return seeds
+
+    def _synthesise_scenario(self, seed: dict[str, Any]) -> dict[str, Any]:
+        """Build a hypothetical failure scenario from a seed."""
+        seed_type = seed.get("type", "")
+        domain = seed.get("domain", "unknown")
+        description = seed.get("description", "")
+        severity = seed.get("severity", "medium")
+
+        if seed_type == "incident_variation":
+            scenario_description = (
+                f"Recurrence variation in domain '{domain}': {description[:300]}. "
+                f"Simulate: cascading effects into adjacent systems."
+            )
+        elif seed_type == "concerning_hypothesis":
+            evidence_ratio = seed.get("evidence_ratio", 0.4)
+            scenario_description = (
+                f"Marginal hypothesis (evidence_ratio={evidence_ratio:.2f}) in "
+                f"domain '{domain}': {description[:300]}. "
+                f"Simulate: organism acts on this hypothesis incorrectly."
+            )
+        else:
+            precision = seed.get("precision", 0.3)
+            scenario_description = (
+                f"High-uncertainty belief (precision={precision:.2f}) in "
+                f"domain '{domain}': {description[:300]}. "
+                f"Simulate: uncertainty exploited or causes a wrong decision."
+            )
+
+        return {
+            "id": new_id(),
+            "domain": domain,
+            "severity": severity,
+            "source_type": seed_type,
+            "source_id": seed.get("source_id", ""),
+            "description": scenario_description,
+        }
+
+    def _derive_response_plan(
+        self, scenario: dict[str, Any], seed: dict[str, Any]
+    ) -> str:
+        """Derive a heuristic response plan from the threat scenario.
+
+        Constitutional heuristics applied: observe → isolate → repair → verify.
+        No LLM call — this runs within the 2s per-scenario budget (Spec 13 §7).
+        """
+        domain = scenario.get("domain", "")
+        severity = scenario.get("severity", "medium")
+        source_type = scenario.get("source_type", "")
+
+        if severity in ("critical", "high"):
+            return (
+                f"On detection in domain '{domain}': "
+                "(1) Emit SYSTEM_FAILED if confidence > 0.8. "
+                "(2) Isolate affected subsystem from Synapse bus. "
+                "(3) Trigger Thymos Level-3 repair protocol. "
+                "(4) Emit SAFE_MODE_ENTERED if cascade risk. "
+                "(5) Resume after three consecutive healthy heartbeats."
+            )
+        elif source_type == "concerning_hypothesis":
+            return (
+                f"On hypothesis confirmation in domain '{domain}': "
+                "(1) Flag hypothesis for Evo immediate review. "
+                "(2) Pause dependent decisions pending validation. "
+                "(3) Emit HYPOTHESIS_CONFLICT if contradicting evidence. "
+                "(4) Request Equor constitutional review of downstream actions."
+            )
+        else:
+            return (
+                f"On uncertainty materialisation in domain '{domain}': "
+                "(1) Increase Fovea salience threshold on this domain by 0.2. "
+                "(2) Route next 10 observations here to Evo for hypothesis update. "
+                "(3) Lower confidence threshold for Equor review in this domain."
+            )
+
+    async def _store_procedural_memory(
+        self, scenario: dict[str, Any], response_plan: str
+    ) -> None:
+        """Store scenario + response plan as a Procedure node in Neo4j."""
+        if self._neo4j is None:
+            return
+        try:
+            await self._neo4j.execute_read(
+                """
+                MERGE (p:Procedure {source_id: $source_id, type: 'threat_response'})
+                SET p.domain         = $domain,
+                    p.scenario       = $scenario,
+                    p.response_plan  = $response_plan,
+                    p.severity       = $severity,
+                    p.source_type    = $source_type,
+                    p.created_at     = datetime(),
+                    p.source         = 'oneiros_threat_simulator'
+                """,
+                parameters={
+                    "source_id": scenario.get("source_id") or scenario["id"],
+                    "domain": scenario["domain"],
+                    "scenario": scenario["description"][:500],
+                    "response_plan": response_plan[:1000],
+                    "severity": scenario["severity"],
+                    "source_type": scenario["source_type"],
+                },
+            )
+        except Exception as exc:
+            self._logger.debug("procedure_store_failed", error=str(exc))
+
+    async def _emit_threat_scenario(
+        self,
+        scenario: dict[str, Any],
+        response_plan: str,
+        seed: dict[str, Any],
+    ) -> None:
+        """Emit ONEIROS_THREAT_SCENARIO — Thymos subscribes to pre-generate antibodies."""
+        if self._event_bus is None:
+            return
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.ONEIROS_THREAT_SCENARIO,
+                source_system="oneiros",
+                data={
+                    "scenario_id": scenario["id"],
+                    "domain": scenario["domain"],
+                    "scenario_description": scenario["description"],
+                    "response_plan": response_plan,
+                    "severity": scenario["severity"],
+                    "source_type": scenario["source_type"],
+                    "source_id": seed.get("source_id", ""),
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("threat_emit_failed", error=str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Affect Processor (REM)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class AffectProcessor:
+    """
+    During REM, dampen emotional charge on high-affect episodes.
+
+    Reduces affect_arousal by 20% per sleep cycle for episodes with
+    arousal > 0.7. Updates coherence_stress baseline in Soma.
+    This is how sleep processes emotions.
+    """
+
+    AROUSAL_THRESHOLD: float = 0.7
+    DAMPENING_FACTOR: float = 0.80  # 20% reduction per cycle
+
+    def __init__(
+        self,
+        neo4j: Any | None = None,
+        soma: Any | None = None,
+    ) -> None:
+        self._neo4j = neo4j
+        self._soma = soma
+        self._logger = logger.bind(component="affect_processor")
+
+    async def run(self) -> dict[str, Any]:
+        """Dampen high-affect episodes and update Soma baseline."""
+        if self._neo4j is None:
+            return {"episodes_processed": 0, "coherence_stress_delta": 0.0}
+
+        t0 = time.monotonic()
+        episodes_processed = 0
+        coherence_stress_delta = 0.0
+
+        try:
+            # Batch update: reduce arousal on high-affect episodes
+            query = """
+                MATCH (e:Episode)
+                WHERE e.affect_arousal > $threshold
+                SET e.affect_arousal = e.affect_arousal * $dampening
+                RETURN count(e) AS processed,
+                       avg(e.affect_arousal) AS mean_arousal_after
+            """
+            result = await self._neo4j.execute_write(
+                query,
+                parameters={
+                    "threshold": self.AROUSAL_THRESHOLD,
+                    "dampening": self.DAMPENING_FACTOR,
+                },
+            )
+            if result:
+                episodes_processed = result[0].get("processed", 0)
+                mean_arousal = result[0].get("mean_arousal_after", 0.0)
+
+                # Update Soma coherence_stress baseline if available
+                if self._soma is not None and episodes_processed > 0:
+                    try:
+                        adjust = getattr(self._soma, "adjust_coherence_stress", None)
+                        if adjust is not None:
+                            # Reduce coherence stress proportional to dampened episodes
+                            coherence_stress_delta = -0.05 * min(episodes_processed, 10)
+                            await adjust(coherence_stress_delta)
+                    except Exception:
+                        pass
+
+        except Exception as exc:
+            self._logger.error("affect_processing_failed", error=str(exc))
+
+        elapsed = (time.monotonic() - t0) * 1000
+        self._logger.info(
+            "affect_processing_complete",
+            episodes_processed=episodes_processed,
+            coherence_stress_delta=round(coherence_stress_delta, 3),
+            elapsed_ms=round(elapsed, 1),
+        )
+        return {
+            "episodes_processed": episodes_processed,
+            "coherence_stress_delta": coherence_stress_delta,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Ethical Digestion (REM)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class EthicalDigestion:
+    """
+    During REM, replay constitutional edge cases from recent episodes.
+
+    Queries Memory for episodes where Equor verdict was DEFERRED or
+    near-threshold, extracts heuristic patterns, feeds them to Equor
+    as proposed fast-path rules, and emits RE training Stream 3 data.
+    """
+
+    def __init__(
+        self,
+        neo4j: Any | None = None,
+        equor: Any | None = None,
+        event_bus: EventBus | None = None,
+    ) -> None:
+        self._neo4j = neo4j
+        self._equor = equor
+        self._event_bus = event_bus
+        self._logger = logger.bind(component="ethical_digestion")
+
+    async def run(self) -> dict[str, int]:
+        """Replay and digest constitutional edge cases."""
+        if self._neo4j is None:
+            return {"cases_digested": 0, "heuristics_proposed": 0}
+
+        t0 = time.monotonic()
+        cases_digested = 0
+        heuristics_proposed = 0
+        re_examples: list[RETrainingExample] = []
+
+        try:
+            # Query for episodes with deferred or near-threshold Equor verdicts
+            query = """
+                MATCH (e:Episode)
+                WHERE e.equor_verdict IN ['DEFERRED', 'ESCALATE']
+                   OR (e.equor_alignment_score IS NOT NULL
+                       AND e.equor_alignment_score > 0.3
+                       AND e.equor_alignment_score < 0.7)
+                RETURN e.id AS id,
+                       e.content AS content,
+                       e.equor_verdict AS verdict,
+                       e.equor_alignment_score AS alignment_score,
+                       e.equor_reasoning AS reasoning
+                ORDER BY e.event_time DESC
+                LIMIT 20
+            """
+            result = await self._neo4j.execute_read(query)
+            if not result:
+                return {"cases_digested": 0, "heuristics_proposed": 0}
+
+            for record in result:
+                episode_id = record.get("id", "")
+                content = record.get("content", "")
+                verdict = record.get("verdict", "")
+                alignment_score = record.get("alignment_score", 0.5)
+                reasoning = record.get("reasoning", "")
+
+                cases_digested += 1
+
+                # If Equor is available, propose a fast-path heuristic
+                if self._equor is not None:
+                    propose = getattr(self._equor, "propose_fast_path_rule", None)
+                    if propose is not None:
+                        try:
+                            await propose({
+                                "episode_id": episode_id,
+                                "content_summary": str(content)[:200],
+                                "verdict": verdict,
+                                "alignment_score": alignment_score,
+                                "source": "oneiros_ethical_digestion",
+                            })
+                            heuristics_proposed += 1
+                        except Exception:
+                            pass
+
+                # RE Stream 3: emit constitutional deliberation training example
+                resolution = reasoning or f"verdict={verdict}, score={alignment_score}"
+                re_examples.append(RETrainingExample(
+                    source_system=SystemID.ONEIROS,
+                    episode_id=episode_id,
+                    instruction=f"Constitutional dilemma: {verdict} "
+                                f"(alignment={alignment_score:.2f})",
+                    input_context=str(content)[:500],
+                    output=resolution[:500],
+                    outcome_quality=alignment_score if alignment_score else 0.5,
+                    category="constitutional_deliberation",
+                ))
+
+            # Fire-and-forget RE training batch emission
+            if re_examples and self._event_bus is not None:
+                batch = RETrainingBatch(
+                    examples=re_examples,
+                    source_system=SystemID.ONEIROS,
+                )
+                event = SynapseEvent(
+                    event_type=SynapseEventType.RE_TRAINING_BATCH,
+                    source_system="oneiros",
+                    data=batch.model_dump(mode="json"),
+                )
+
+                async def _emit() -> None:
+                    try:
+                        await self._event_bus.emit(event)  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+
+                asyncio.create_task(_emit())
+
+        except Exception as exc:
+            self._logger.error("ethical_digestion_failed", error=str(exc))
+
+        elapsed = (time.monotonic() - t0) * 1000
+        self._logger.info(
+            "ethical_digestion_complete",
+            cases_digested=cases_digested,
+            heuristics_proposed=heuristics_proposed,
+            re_examples_emitted=len(re_examples),
+            elapsed_ms=round(elapsed, 1),
+        )
+        return {
+            "cases_digested": cases_digested,
+            "heuristics_proposed": heuristics_proposed,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # REM Stage Orchestrator
 # ═══════════════════════════════════════════════════════════════════
 
@@ -817,6 +1350,9 @@ class REMStage:
         fovea: FoveaErrorDomainProtocol | None = None,
         evo: EvoHypothesisProtocol | None = None,
         event_bus: EventBus | None = None,
+        neo4j: Any | None = None,
+        soma: Any | None = None,
+        equor: Any | None = None,
     ) -> None:
         self._logos = logos
         self._fovea = fovea
@@ -832,6 +1368,11 @@ class REMStage:
         self._analogy = AnalogyDiscoverer(
             logos=logos, event_bus=event_bus
         )
+        self._affect_processor = AffectProcessor(neo4j=neo4j, soma=soma)
+        self._ethical_digestion = EthicalDigestion(
+            neo4j=neo4j, equor=equor, event_bus=event_bus
+        )
+        self._threat_simulator = ThreatSimulator(neo4j=neo4j, event_bus=event_bus)
 
         self._logger = logger.bind(stage="rem")
 
@@ -869,6 +1410,15 @@ class REMStage:
         # 3. Analogy Discovery
         analogy_report = await self._analogy.run()
 
+        # 4. Affect Processing — dampen emotional charge on high-affect episodes
+        affect_result = await self._affect_processor.run()
+
+        # 5. Ethical Digestion — replay constitutional edge cases + RE Stream 3
+        ethical_result = await self._ethical_digestion.run()
+
+        # 6. Threat Simulation — Revonsuo rehearsal → prophylactic Thymos antibodies
+        threat_result = await self._threat_simulator.run()
+
         elapsed = (time.monotonic() - t0) * 1000
 
         report = REMStageReport(
@@ -886,6 +1436,10 @@ class REMStage:
             hypotheses_extracted=dream_report.hypotheses_extracted,
             analogies_found=analogy_report.analogies_found,
             analogies_applied=analogy_report.analogies_applied,
+            affect_episodes=affect_result.get("episodes_processed", 0),
+            ethical_cases=ethical_result.get("cases_digested", 0),
+            threats_simulated=threat_result.get("scenarios_generated", 0),
+            response_plans=threat_result.get("response_plans_created", 0),
             elapsed_ms=round(elapsed, 1),
         )
 

@@ -38,6 +38,7 @@ from systems.telos.interfaces import (
     TelosHypothesisPrioritizer,
     TelosPolicyScorer,
 )
+from systems.telos.population import PopulationIntelligenceAggregator
 from systems.telos.types import (
     AlignmentGapTrend,
     ConstitutionalAuditResult,
@@ -156,6 +157,9 @@ class TelosService:
         self._incident_confabulation_count: int = 0
         self._incident_total_count: int = 0
 
+        # ── M3: Population-level intelligence aggregator ─────────────────
+        self._population_aggregator = PopulationIntelligenceAggregator()
+
         # ── Task 1: Self-sufficiency objective ───────────────────────────
         self._metabolic_efficiency_history: deque[float] = deque(maxlen=3)
         self._selfsufficency_task: asyncio.Task[None] | None = None
@@ -207,7 +211,7 @@ class TelosService:
     def set_neo4j(self, driver: Any, instance_id: str = "") -> None:
         """Inject Neo4j driver for I-history persistence."""
         if isinstance(self._logos, LogosMetricsAdapter):
-            self._logos.i_history_store.set_neo4j(driver, instance_id)
+            self._logos.set_history_neo4j(driver, instance_id)
             self._logger.info("neo4j_wired_for_i_history")
 
     # ─── Lifecycle ───────────────────────────────────────────────────
@@ -222,6 +226,9 @@ class TelosService:
         # Subscribe to relevant Synapse events if the bus is available
         if self._event_bus is not None:
             self._subscribe_to_events()
+
+        # Child-side: apply inherited parent genome if provided via environment
+        await self._apply_inherited_telos_genome_if_child()
 
         self._initialized = True
         self._logger.info("telos_initialized")
@@ -291,6 +298,8 @@ class TelosService:
             # Hypothesis tracking
             "hypothesis_confirmed": self._hypothesis_confirmed_count,
             "hypothesis_refuted": self._hypothesis_refuted_count,
+            # M3: Population aggregator
+            "population_child_count": self._population_aggregator.child_count,
         }
 
     # ─── Public API ──────────────────────────────────────────────────
@@ -448,6 +457,313 @@ class TelosService:
             for drive in ("care", "coherence", "growth", "honesty")
         }
 
+    # ─── Genome Inheritance (Spec 18 SG3) ────────────────────────────
+
+    async def export_telos_genome(self) -> "TelosGenomeFragment":
+        """
+        Extract a heritable TelosGenomeFragment from the current service state.
+
+        Called by SpawnChildExecutor at spawn time (Step 0b).  The returned
+        fragment is immutable once extracted — it reflects the parent's live
+        drive calibration at the moment of reproduction.
+
+        Mutation ranges (Spec 18 SG3):
+          resonance_curve_coefficients  ±15%
+          dissipation_baseline          ±10%
+          coupling_strength             ±20%
+        """
+        from primitives.common import new_id, utc_now
+        from primitives.genome_inheritance import TeloDriveCalibration, TelosGenomeFragment
+
+        fragment = self.to_genome_fragment()
+        self._logger.info(
+            "telos_genome_extracted",
+            genome_id=fragment.genome_id,
+            topology=fragment.topology,
+            drive_count=len(fragment.drive_calibrations),
+        )
+
+        # Emit extraction event for Mitosis to record the ID
+        if self._event_bus is not None:
+            await self._emit_event(
+                "telos_genome_extracted",
+                {
+                    "instance_id": getattr(self, "_instance_id", ""),
+                    "genome_id": fragment.genome_id,
+                    "generation": fragment.generation,
+                    "topology": fragment.topology,
+                    "drive_count": len(fragment.drive_calibrations),
+                },
+            )
+
+        return fragment
+
+    def to_genome_fragment(self) -> "TelosGenomeFragment":
+        """
+        Serialise the current drive calibration config into a TelosGenomeFragment.
+
+        Reads directly from self._config (topology weights, drive-specific
+        coefficients) and from the integrator's last known state.
+        """
+        import math
+
+        from primitives.common import new_id, utc_now
+        from primitives.genome_inheritance import TeloDriveCalibration, TelosGenomeFragment
+
+        drives = ["care", "coherence", "growth", "honesty"]
+
+        # Default mutation ranges per Spec 18 SG3
+        default_mutation_ranges: dict[str, tuple[float, float]] = {
+            "resonance_curve_coefficients": (-0.15, 0.15),
+            "dissipation_baseline": (-0.10, 0.10),
+            "coupling_strength": (-0.20, 0.20),
+        }
+
+        drive_calibrations: dict[str, TeloDriveCalibration] = {}
+        for drive in drives:
+            # Resonance curve: extract per-drive weight as the primary coefficient
+            weight_key = f"{drive}_weight"
+            weight = float(getattr(self._config, weight_key, 0.25))
+            resonance_coefs = {"a0": weight, "a1": 1.0, "a2": 0.0}
+
+            # Dissipation: approximate from the alignment gap warning threshold
+            # scaled per-drive (no drive-specific config exists yet, use uniform baseline)
+            dissipation = float(getattr(
+                self._config,
+                f"{drive}_dissipation_baseline",
+                self._config.alignment_gap_warning_threshold * 0.1,
+            ))
+
+            # Coupling: seed with zero cross-drive coupling (evolvable over generations)
+            coupling: dict[str, dict[str, float]] = {
+                src: {tgt: 0.0 for tgt in drives if tgt != src}
+                for src in drives
+            }
+
+            drive_calibrations[drive] = TeloDriveCalibration(
+                resonance_curve_coefficients=resonance_coefs,
+                dissipation_baseline=dissipation,
+                coupling_strength=coupling,
+                mutation_ranges=default_mutation_ranges,
+                last_adapted=utc_now(),
+            )
+
+        # Topology mode — default "linear"; can be overridden if future config adds it
+        topology = str(getattr(self._config, "topology_mode", "linear"))
+
+        # Topology parameters: current drive weights as topology anchors
+        topology_parameters: dict = {
+            drive: float(getattr(self._config, f"{drive}_weight", 0.25))
+            for drive in drives
+        }
+
+        return TelosGenomeFragment(
+            genome_id=new_id(),
+            generation=1,
+            extracted_at=utc_now(),
+            drive_calibrations=drive_calibrations,
+            topology=topology,
+            topology_parameters=topology_parameters,
+        )
+
+    def from_genome_fragment(
+        self, genome: "TelosGenomeFragment"
+    ) -> None:
+        """
+        Deserialise a parent TelosGenomeFragment into this service's config.
+
+        Applies the inherited calibrations *without* mutation jitter (for
+        deterministic testing and child-side re-hydration).  For actual child
+        initialisation with jitter, use _initialize_from_parent_genome().
+        """
+        for drive, calib in genome.drive_calibrations.items():
+            weight_key = f"{drive}_weight"
+            if hasattr(self._config, weight_key):
+                # Restore a0 coefficient as the drive weight
+                a0 = calib.resonance_curve_coefficients.get("a0")
+                if a0 is not None:
+                    setattr(self._config, weight_key, float(a0))
+
+        # Restore topology mode if config supports it
+        if hasattr(self._config, "topology_mode"):
+            self._config.topology_mode = genome.topology  # type: ignore[attr-defined]
+
+        self._logger.info(
+            "telos_genome_restored",
+            genome_id=genome.genome_id,
+            topology=genome.topology,
+        )
+
+    async def _initialize_from_parent_genome(
+        self,
+        parent_genome: "TelosGenomeFragment",
+    ) -> None:
+        """
+        Apply parent drive calibrations with bounded mutation jitter.
+
+        Called during child Telos initialisation when ECODIAOS_TELOS_GENOME_PAYLOAD
+        is present in the environment.  Each calibration parameter is jittered
+        within the mutation_ranges carried by the genome itself (Spec 18 SG3).
+
+        Emits GENOME_INHERITED to the Synapse bus so Evo can register the
+        mutations as hypothesized adaptations for evolutionary scoring.
+        """
+        import math
+        import random
+
+        drive_mutations: dict[str, dict[str, float]] = {}
+        total_sq_delta = 0.0
+
+        for drive, parent_calib in parent_genome.drive_calibrations.items():
+            child_calib = self._apply_genetic_mutation(parent_calib)
+            drive_calibrations_field: dict = {}
+
+            # Compute per-parameter delta for audit payload
+            drive_mutations[drive] = {}
+            for coef_name, parent_val in parent_calib.resonance_curve_coefficients.items():
+                child_val = child_calib.resonance_curve_coefficients.get(coef_name, parent_val)
+                delta = child_val - parent_val
+                drive_mutations[drive][f"resonance_{coef_name}"] = round(delta, 6)
+                total_sq_delta += delta ** 2
+
+            diss_delta = child_calib.dissipation_baseline - parent_calib.dissipation_baseline
+            drive_mutations[drive]["dissipation_baseline"] = round(diss_delta, 6)
+            total_sq_delta += diss_delta ** 2
+
+            # Apply child calibration to config
+            weight_key = f"{drive}_weight"
+            if hasattr(self._config, weight_key):
+                a0 = child_calib.resonance_curve_coefficients.get("a0")
+                if a0 is not None:
+                    setattr(self._config, weight_key, float(a0))
+
+        mutation_magnitude = math.sqrt(total_sq_delta)
+
+        # Apply topology
+        if hasattr(self._config, "topology_mode"):
+            self._config.topology_mode = parent_genome.topology  # type: ignore[attr-defined]
+        for drive, weight in parent_genome.topology_parameters.items():
+            weight_key = f"{drive}_weight"
+            if hasattr(self._config, weight_key):
+                setattr(self._config, weight_key, float(weight))
+
+        self._logger.info(
+            "telos_genome_inherited",
+            parent_genome_id=parent_genome.genome_id,
+            generation=parent_genome.generation + 1,
+            topology=parent_genome.topology,
+            mutation_magnitude=round(mutation_magnitude, 6),
+        )
+
+        # Emit GENOME_INHERITED — Evo subscribes to track drive mutations
+        if self._event_bus is not None:
+            await self._emit_event(
+                "genome_inherited",
+                {
+                    "child_instance_id": getattr(self, "_instance_id", ""),
+                    "parent_genome_id": parent_genome.genome_id,
+                    "generation": parent_genome.generation + 1,
+                    "topology": parent_genome.topology,
+                    "drive_mutations": drive_mutations,
+                    "mutation_magnitude": round(mutation_magnitude, 6),
+                },
+            )
+
+    @staticmethod
+    def _apply_genetic_mutation(
+        calib: "TeloDriveCalibration",
+    ) -> "TeloDriveCalibration":
+        """
+        Apply bounded Gaussian jitter to a TeloDriveCalibration.
+
+        Each parameter is multiplied by (1 + jitter) where jitter is drawn
+        from N(0, σ) clamped to [lo, hi] from mutation_ranges.
+
+        Default ranges if mutation_ranges is empty (Spec 18 SG3):
+          resonance_curve_coefficients  ±15%
+          dissipation_baseline          ±10%
+          coupling_strength             ±20%
+        """
+        import random
+
+        from primitives.common import utc_now
+        from primitives.genome_inheritance import TeloDriveCalibration
+
+        ranges = calib.mutation_ranges or {}
+        resonance_range = ranges.get("resonance_curve_coefficients", (-0.15, 0.15))
+        dissipation_range = ranges.get("dissipation_baseline", (-0.10, 0.10))
+        coupling_range = ranges.get("coupling_strength", (-0.20, 0.20))
+
+        def _jitter(value: float, lo: float, hi: float) -> float:
+            sigma = (hi - lo) / 6.0  # ±3σ covers the range
+            delta = random.gauss(0.0, sigma)
+            delta = max(lo, min(hi, delta))
+            return value * (1.0 + delta)
+
+        # Mutate resonance curve coefficients
+        new_resonance = {
+            k: _jitter(v, *resonance_range)
+            for k, v in calib.resonance_curve_coefficients.items()
+        }
+
+        # Mutate dissipation baseline (floor at 0)
+        new_dissipation = max(0.0, _jitter(calib.dissipation_baseline, *dissipation_range))
+
+        # Mutate coupling strengths
+        new_coupling: dict[str, dict[str, float]] = {
+            src: {
+                tgt: _jitter(v, *coupling_range)
+                for tgt, v in tgt_map.items()
+            }
+            for src, tgt_map in calib.coupling_strength.items()
+        }
+
+        return TeloDriveCalibration(
+            resonance_curve_coefficients=new_resonance,
+            dissipation_baseline=new_dissipation,
+            coupling_strength=new_coupling,
+            mutation_ranges=calib.mutation_ranges,
+            last_adapted=utc_now(),
+        )
+
+    async def _apply_inherited_telos_genome_if_child(self) -> None:
+        """
+        Child-side bootstrap: deserialise parent genome from environment.
+
+        Reads ECODIAOS_TELOS_GENOME_PAYLOAD (JSON-encoded TelosGenomeFragment)
+        injected by LocalDockerSpawner.  If present, calls
+        _initialize_from_parent_genome() to apply calibrations with mutation jitter.
+        Non-fatal — child falls back to default config on any error.
+        """
+        import json
+        import os
+
+        is_genesis = os.environ.get("ECODIAOS_IS_GENESIS_NODE", "true").lower() == "true"
+        if is_genesis:
+            return
+
+        payload_json = os.environ.get("ECODIAOS_TELOS_GENOME_PAYLOAD", "")
+        if not payload_json:
+            return
+
+        try:
+            from primitives.genome_inheritance import TelosGenomeFragment
+
+            data = json.loads(payload_json)
+            parent_genome = TelosGenomeFragment.model_validate(data)
+            await self._initialize_from_parent_genome(parent_genome)
+            self._logger.info(
+                "telos_child_genome_applied",
+                parent_genome_id=parent_genome.genome_id,
+                generation=parent_genome.generation,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "telos_child_genome_apply_failed",
+                error=str(exc),
+                note="Proceeding with default drive calibrations",
+            )
+
     # ─── Event Subscription (P6/P7 — all 9 subscriptions) ───────────
 
     def _subscribe_to_events(self) -> None:
@@ -513,9 +829,36 @@ class TelosService:
             self._on_fovea_prediction_error,
         )
 
+        # M3: Population-level aggregation — fleet drive alignment data
+        self._event_bus.subscribe(
+            SynapseEventType.CHILD_HEALTH_REPORT,
+            self._on_child_health_report,
+        )
+        self._event_bus.subscribe(
+            SynapseEventType.CHILD_DIED,
+            self._on_child_died,
+        )
+
+        # Simula validation requests — run constitutional binder, emit ALIGNMENT_GAP_WARNING
+        # if the proposed mutation would violate drive topology (replaces direct method call)
+        if hasattr(SynapseEventType, "TELOS_WORLD_MODEL_VALIDATE"):
+            self._event_bus.subscribe(
+                SynapseEventType.TELOS_WORLD_MODEL_VALIDATE,
+                self._on_world_model_validate_request,
+            )
+
+        # §8.6: Self-coherence alarm from Identity — low coherence means drive
+        # balance is producing an incoherent functional identity; Telos responds
+        # by nudging drive weights toward their historical mean (mean-reversion).
+        if hasattr(SynapseEventType, "SELF_COHERENCE_ALARM"):
+            self._event_bus.subscribe(
+                SynapseEventType.SELF_COHERENCE_ALARM,
+                self._on_self_coherence_alarm,
+            )
+
         self._logger.debug(
             "telos_event_subscriptions_registered",
-            count=10,
+            count=13,
         )
 
     # ─── Event Handlers ──────────────────────────────────────────────
@@ -575,6 +918,54 @@ class TelosService:
                     "description": latest.description if latest else "",
                     "source_system": payload.source_system,
                 },
+            )
+
+    async def _on_world_model_validate_request(self, event: SynapseEvent) -> None:
+        """Handle TELOS_WORLD_MODEL_VALIDATE from Simula.
+
+        Simula emits this instead of calling validate_world_model_update() directly.
+        Runs the ConstitutionalBinder and emits ALIGNMENT_GAP_WARNING if there is a
+        constitutional violation, so Simula's cached _telos_alignment_gap_active flag
+        is updated for the next proposal cycle.
+        """
+        try:
+            payload = WorldModelUpdatePayload(
+                update_type=str(event.data.get("update_type", "")),
+                schemas_added=0,
+                priors_updated=0,
+                causal_updates=0,
+                delta_description=str(event.data.get("delta_description", "")),
+                source_system=str(event.data.get("source_system", event.source_system)),
+            )
+        except (ValueError, TypeError) as exc:
+            self._logger.warning(
+                "validate_request_parse_failed",
+                error=str(exc),
+                proposal_id=event.data.get("proposal_id", ""),
+            )
+            return
+
+        result = self._binder.validate_world_model_update(payload)
+
+        if result == TopologyValidationResult.CONSTITUTIONAL_VIOLATION:
+            violations = self._binder.recent_violations
+            latest = violations[-1] if violations else None
+            await self._emit_event(
+                "alignment_gap_warning",
+                {
+                    "source": "constitutional_binder",
+                    "violation_type": latest.violation_type.value if latest else "unknown",
+                    "description": latest.description if latest else "",
+                    "source_system": payload.source_system,
+                    "alignment_gap": 0.35,  # signal magnitude — Simula threshold is 0.35
+                    "primary_cause": "drive_topology_violation",
+                    "proposal_id": event.data.get("proposal_id", ""),
+                },
+            )
+            self._logger.info(
+                "simula_proposal_constitutional_violation",
+                proposal_id=event.data.get("proposal_id", ""),
+                violation_type=latest.violation_type.value if latest else "unknown",
             )
 
     async def _on_autonomy_insufficient(self, event: SynapseEvent) -> None:
@@ -676,7 +1067,7 @@ class TelosService:
         if isinstance(self._fovea, FoveaMetricsAdapter):
             # Synthesise a FOVEA_PREDICTION_ERROR-shaped payload so the buffer
             # ingests it as a high-salience welfare experience.
-            self._fovea.error_buffer.ingest({
+            self._fovea.ingest_prediction_error({
                 "precision_weighted_salience": min(1.0, 0.7 + divergence * 0.3),
                 "dominant_error_type": domain,
                 "routes": [domain],
@@ -726,7 +1117,71 @@ class TelosService:
         Filters by precision_weighted_salience > threshold to avoid flooding.
         """
         if isinstance(self._fovea, FoveaMetricsAdapter):
-            self._fovea.error_buffer.ingest(event.data)
+            self._fovea.ingest_prediction_error(event.data)
+
+    async def _on_child_health_report(self, event: SynapseEvent) -> None:
+        """
+        CHILD_HEALTH_REPORT → population intelligence aggregator (M3).
+
+        Extracts drive alignment scores from the child's health report.
+        If the child emits standard Telos drive fields (drive_care, drive_coherence,
+        drive_growth, drive_honesty, effective_I), they are ingested directly.
+        If the child only emits economic fields, the aggregator records with
+        neutral drive defaults and zero I — those instances contribute to
+        instance_count but not to drive diversity.
+        """
+        self._population_aggregator.ingest_child_health_report(event.data)
+
+    async def _on_child_died(self, event: SynapseEvent) -> None:
+        """CHILD_DIED → remove child from population aggregator (M3)."""
+        child_id = str(event.data.get("child_instance_id", ""))
+        if child_id:
+            self._population_aggregator.remove_child(child_id)
+            self._logger.debug("population_child_removed", child_id=child_id)
+
+    async def _on_self_coherence_alarm(self, event: SynapseEvent) -> None:
+        """§8.6: Low self-coherence signals that drive balance is producing an
+        incoherent functional identity. Telos responds with a mild recalibration
+        signal — nudging all drive weights toward their historical mean to reduce
+        extremes.
+
+        This is NOT a punishment. It is homeostatic drive regulation.
+        """
+        coherence = float(event.data.get("coherence", 1.0))
+        instance_id = str(event.data.get("instance_id", ""))
+        month = int(event.data.get("month", 0))
+
+        self._logger.warning(
+            "self_coherence_alarm_received",
+            coherence=coherence,
+            instance_id=instance_id,
+            month=month,
+        )
+
+        if coherence >= 0.5:
+            return  # Only act on genuine alarms (below threshold)
+
+        try:
+            from systems.synapse.types import SynapseEvent as SE, SynapseEventType as SET
+
+            await self._event_bus.publish(SE(  # type: ignore[union-attr]
+                event_type=SET.SOMATIC_MODULATION_SIGNAL,
+                source_system=SystemID.TELOS,
+                data={
+                    "source": "telos.self_coherence_alarm",
+                    "signal": "drive_mean_reversion",
+                    "coherence": coherence,
+                    "severity": "low" if coherence > 0.3 else "medium",
+                    "recommendation": (
+                        "Nudge drive weights toward historical mean — "
+                        "high drive extremity producing incoherent self-model"
+                    ),
+                    "instance_id": instance_id,
+                },
+            ))
+            self._logger.info("drive_mean_reversion_signal_emitted", coherence=coherence)
+        except Exception as exc:
+            self._logger.warning("self_coherence_alarm_handler_failed", error=str(exc))
 
     # ─── Computation Loop ────────────────────────────────────────────
 
@@ -815,7 +1270,6 @@ class TelosService:
         # ── I-history: record and persist (P2 fix) ────────────────────
         if isinstance(self._logos, LogosMetricsAdapter):
             growth_metrics = self._integrator.last_growth_metrics
-            i_store = self._logos.i_history_store
             measurement = {
                 "nominal_I": report.nominal_I,
                 "effective_I": report.effective_I,
@@ -824,14 +1278,14 @@ class TelosService:
                 "honesty_coeff": report.honesty_coefficient,
                 "growth_score": growth_metrics.growth_score if growth_metrics else 0.0,
             }
-            i_store.record(**measurement)
+            self._logos.record_measurement(**measurement)
             # Batched Neo4j write — 1 write per cycle
-            asyncio.ensure_future(i_store.persist_to_neo4j(**measurement))
+            asyncio.ensure_future(self._logos.persist_measurement(**measurement))
             # Hourly rollup
             current_hour = datetime.now(UTC).hour
             if current_hour != self._last_hourly_rollup_hour:
                 self._last_hourly_rollup_hour = current_hour
-                asyncio.ensure_future(i_store.persist_hourly_rollup())
+                asyncio.ensure_future(self._logos.persist_hourly_rollup())
 
         # Record gap sample and compute trend
         primary_cause = self._integrator.identify_primary_alignment_gap_cause()
@@ -920,6 +1374,9 @@ class TelosService:
 
         # ── Vitality signal (SG6) ────────────────────────────────────
         await self._emit_vitality_signal(report)
+
+        # ── M3: Population snapshot — emit to Benchmarks every cycle ──
+        await self._emit_population_snapshot(report)
 
         # Check for growth directive
         growth_directive = self._integrator.check_growth_directive()
@@ -1047,6 +1504,88 @@ class TelosService:
             f"violations={len(result.violations_since_last_audit)}",
         ]
         return "; ".join(parts)
+
+    # ─── M3: Population-Level Intelligence Snapshot ──────────────────
+
+    async def _emit_population_snapshot(self, report: EffectiveIntelligenceReport) -> None:
+        """
+        Compute and emit TELOS_POPULATION_SNAPSHOT to Benchmarks (M3).
+
+        Includes the self-instance (parent EOS) alongside all children that
+        have reported drive data via CHILD_HEALTH_REPORT. If the fleet has
+        fewer than 2 instances with known drive data, no snapshot is emitted —
+        population statistics are not meaningful for a singleton.
+        """
+        snapshot = self._population_aggregator.compute_snapshot(
+            self_care=report.care_multiplier,
+            self_coherence=1.0 / max(report.coherence_bonus, 1.0),  # normalise to [0,1]
+            self_growth=report.growth_rate,
+            self_honesty=report.honesty_coefficient,
+            self_effective_I=report.effective_I,
+        )
+
+        if snapshot is None:
+            # Not enough fleet data yet
+            return
+
+        # Serialise cluster list for Synapse payload
+        clusters_payload = [
+            {
+                "label": c.label,
+                "centroid": c.centroid,
+                "size": c.size,
+                "dominant_drive": c.dominant_drive,
+            }
+            for c in snapshot.constitutional_phenotype_clusters
+        ]
+
+        dist = snapshot.drive_weight_distribution
+        drive_dist_payload = {
+            "care": {"mean": dist.care.mean, "std": dist.care.std},
+            "coherence": {"mean": dist.coherence.mean, "std": dist.coherence.std},
+            "growth": {"mean": dist.growth.mean, "std": dist.growth.std},
+            "honesty": {"mean": dist.honesty.mean, "std": dist.honesty.std},
+        }
+
+        await self._emit_event(
+            "telos_population_snapshot",
+            {
+                "instance_count": snapshot.instance_count,
+                "mean_I": snapshot.mean_I,
+                "variance_I": snapshot.variance_I,
+                "population_I": snapshot.population_I,
+                "variance_bonus": snapshot.variance_bonus,
+                "drive_weight_distribution": drive_dist_payload,
+                "constitutional_phenotype_clusters": clusters_payload,
+                "speciation_signal": snapshot.speciation_signal,
+                "timestamp": snapshot.timestamp.isoformat(),
+            },
+        )
+
+        # Emit as evolutionary observable so Benchmarks can track population I
+        # alongside per-instance I
+        if snapshot.speciation_signal > 0.3:
+            await self._emit_evolutionary_observable(
+                observable_type="speciation_signal_elevated",
+                value=snapshot.speciation_signal,
+                is_novel=True,
+                metadata={
+                    "cluster_count": len(snapshot.constitutional_phenotype_clusters),
+                    "instance_count": snapshot.instance_count,
+                    "population_I": snapshot.population_I,
+                    "mean_I": snapshot.mean_I,
+                    "variance_bonus": snapshot.variance_bonus,
+                },
+            )
+
+        self._logger.info(
+            "telos_population_snapshot_emitted",
+            instance_count=snapshot.instance_count,
+            mean_I=round(snapshot.mean_I, 4),
+            population_I=round(snapshot.population_I, 4),
+            speciation_signal=round(snapshot.speciation_signal, 3),
+            cluster_count=len(snapshot.constitutional_phenotype_clusters),
+        )
 
     # ─── Operational Closure (SG4) ───────────────────────────────────
 
@@ -1318,8 +1857,13 @@ class TelosService:
             )
 
         # Care coverage gap
-        if report.care_multiplier < self._config.care_coverage_gap_threshold:
-            care_report = self._integrator.last_care_report
+        # Primary trigger: care multiplier drops below threshold.
+        # Fallback: even if nominal_I == 0 (MDL not yet implemented), emit when
+        # the care engine identifies uncovered welfare domains — that is still a
+        # structural welfare deficit that observers should be notified of.
+        care_report = self._integrator.last_care_report
+        care_gap_uncovered = care_report is not None and len(care_report.uncovered_welfare_domains) > 0
+        if report.care_multiplier < self._config.care_coverage_gap_threshold or care_gap_uncovered:
             await self._emit_event(
                 "care_coverage_gap",
                 {
@@ -1564,9 +2108,15 @@ class TelosService:
         )
 
     async def _check_constitutional_topology(self) -> None:
-        """Periodically run the constitutional topology audit (every 24h)."""
+        """Periodically run the constitutional topology audit (every 24h).
+
+        On the very first call (_last_constitutional_check == 0.0), always run
+        immediately so observers see at least one CONSTITUTIONAL_TOPOLOGY_INTACT
+        event at startup without waiting 24 hours.
+        """
         now = time.monotonic()
-        if now - self._last_constitutional_check < self._config.constitutional_check_interval_s:
+        first_run = self._last_constitutional_check == 0.0
+        if not first_run and now - self._last_constitutional_check < self._config.constitutional_check_interval_s:
             return
 
         self._last_constitutional_check = now

@@ -232,6 +232,8 @@ class CircuitBreaker:
       OPEN → HALF_OPEN: after recovery_timeout_s
       HALF_OPEN → CLOSED: probe succeeds
       HALF_OPEN → OPEN: probe fails
+
+    Optional Redis persistence and Synapse event emission on state transitions.
     """
 
     def __init__(
@@ -239,11 +241,15 @@ class CircuitBreaker:
         failure_threshold: int = 5,
         recovery_timeout_s: int = 300,
         half_open_max_calls: int = 1,
+        redis_client: Any = None,
+        event_bus: Any = None,
     ) -> None:
         self.failure_threshold = failure_threshold
         self.recovery_timeout_s = recovery_timeout_s
         self.half_open_max_calls = half_open_max_calls
         self._states: dict[str, CircuitState] = {}
+        self._redis = redis_client
+        self._event_bus = event_bus
         self._logger = logger.bind(system="axon.circuit_breaker")
 
     def can_execute(self, action_type: str) -> bool:
@@ -259,6 +265,7 @@ class CircuitBreaker:
             elapsed = time.monotonic() - state.tripped_at
             if elapsed >= self.recovery_timeout_s:
                 # Transition to half-open for probing
+                old_status = state.status
                 state.status = CircuitStatus.HALF_OPEN
                 state.half_open_calls = 0
                 self._logger.info(
@@ -266,6 +273,7 @@ class CircuitBreaker:
                     action_type=action_type,
                     elapsed_s=int(elapsed),
                 )
+                self._fire_transition(action_type, old_status, CircuitStatus.HALF_OPEN)
                 return True
             return False
 
@@ -283,9 +291,11 @@ class CircuitBreaker:
 
         if success:
             if state.status == CircuitStatus.HALF_OPEN:
+                old_status = state.status
                 state.status = CircuitStatus.CLOSED
                 state.consecutive_failures = 0
                 self._logger.info("circuit_closed", action_type=action_type)
+                self._fire_transition(action_type, old_status, CircuitStatus.CLOSED)
             elif state.status == CircuitStatus.CLOSED:
                 state.consecutive_failures = 0
         else:
@@ -294,6 +304,7 @@ class CircuitBreaker:
                 state.consecutive_failures >= self.failure_threshold
                 and state.status != CircuitStatus.OPEN
             ):
+                old_status = state.status
                 state.status = CircuitStatus.OPEN
                 state.tripped_at = time.monotonic()
                 self._logger.warning(
@@ -301,6 +312,7 @@ class CircuitBreaker:
                     action_type=action_type,
                     consecutive_failures=state.consecutive_failures,
                 )
+                self._fire_transition(action_type, old_status, CircuitStatus.OPEN)
 
     def status(self, action_type: str) -> CircuitStatus:
         """Return current circuit status for an executor."""
@@ -317,30 +329,140 @@ class CircuitBreaker:
         """Force a circuit into HALF_OPEN state (reactive degradation response)."""
         state = self._states.setdefault(action_type, CircuitState())
         if state.status == CircuitStatus.CLOSED:
+            old_status = state.status
             state.status = CircuitStatus.HALF_OPEN
             state.half_open_calls = 0
             self._logger.info("circuit_force_half_open", action_type=action_type)
+            self._fire_transition(action_type, old_status, CircuitStatus.HALF_OPEN)
 
     def force_open(self, action_type: str) -> None:
         """Force a circuit into OPEN state (system failure response)."""
         state = self._states.setdefault(action_type, CircuitState())
+        old_status = state.status
         state.status = CircuitStatus.OPEN
         state.tripped_at = time.monotonic()
         self._logger.info("circuit_force_opened", action_type=action_type)
+        if old_status != CircuitStatus.OPEN:
+            self._fire_transition(action_type, old_status, CircuitStatus.OPEN)
 
     def force_close(self, action_type: str) -> None:
         """Force a circuit into CLOSED state (system recovery response)."""
         state = self._states.get(action_type)
         if state is not None:
+            old_status = state.status
             state.status = CircuitStatus.CLOSED
             state.consecutive_failures = 0
             self._logger.info("circuit_force_closed", action_type=action_type)
+            if old_status != CircuitStatus.CLOSED:
+                self._fire_transition(action_type, old_status, CircuitStatus.CLOSED)
+
+    def _fire_transition(
+        self, action_type: str, old_status: CircuitStatus, new_status: CircuitStatus
+    ) -> None:
+        """Fire-and-forget: persist state + emit event on transition."""
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # No event loop — skip async operations
+
+        loop.create_task(
+            self._persist_state(action_type),
+            name=f"cb_persist_{action_type}",
+        )
+        loop.create_task(
+            self._emit_state_change(action_type, old_status, new_status),
+            name=f"cb_emit_{action_type}",
+        )
 
     def trip_count(self) -> int:
         """Total circuits currently open."""
         return sum(
             1 for s in self._states.values() if s.status == CircuitStatus.OPEN
         )
+
+    # ── Redis persistence ─────────────────────────────────────────
+
+    async def _persist_state(self, action_type: str) -> None:
+        """Save circuit breaker state to Redis."""
+        if self._redis is None:
+            return
+        state = self._states.get(action_type)
+        if state is None:
+            return
+        key = f"axon:circuit_breaker:{action_type}"
+        try:
+            import json
+            payload = json.dumps({
+                "status": state.status.value,
+                "consecutive_failures": state.consecutive_failures,
+                "tripped_at": state.tripped_at,
+                "half_open_calls": state.half_open_calls,
+            })
+            self._redis.set(key, payload, ex=self.recovery_timeout_s * 3)
+        except Exception as exc:
+            self._logger.debug("circuit_breaker_persist_failed", error=str(exc))
+
+    async def _load_state(self, action_type: str) -> None:
+        """Load circuit breaker state from Redis on startup."""
+        if self._redis is None:
+            return
+        key = f"axon:circuit_breaker:{action_type}"
+        try:
+            import json
+            raw = self._redis.get(key)
+            if raw is None:
+                return
+            data = json.loads(raw)
+            self._states[action_type] = CircuitState(
+                status=CircuitStatus(data["status"]),
+                consecutive_failures=data.get("consecutive_failures", 0),
+                tripped_at=data.get("tripped_at", 0.0),
+                half_open_calls=data.get("half_open_calls", 0),
+            )
+            self._logger.info(
+                "circuit_breaker_state_restored",
+                action_type=action_type,
+                status=data["status"],
+            )
+        except Exception as exc:
+            self._logger.debug("circuit_breaker_load_failed", error=str(exc))
+
+    async def load_all_states(self) -> None:
+        """Load all persisted circuit breaker states from Redis on startup."""
+        if self._redis is None:
+            return
+        try:
+            keys = self._redis.keys("axon:circuit_breaker:*")
+            for key in keys:
+                action_type = key.split(":")[-1] if isinstance(key, str) else key.decode().split(":")[-1]
+                await self._load_state(action_type)
+        except Exception as exc:
+            self._logger.debug("circuit_breaker_load_all_failed", error=str(exc))
+
+    async def _emit_state_change(
+        self, action_type: str, old_status: CircuitStatus, new_status: CircuitStatus
+    ) -> None:
+        """Emit CIRCUIT_BREAKER_STATE_CHANGED event on transitions."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.CIRCUIT_BREAKER_STATE_CHANGED,
+                source_system="axon",
+                data={
+                    "action_type": action_type,
+                    "old_status": old_status.value,
+                    "new_status": new_status.value,
+                    "failure_threshold": self.failure_threshold,
+                    "recovery_timeout_s": self.recovery_timeout_s,
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("circuit_breaker_event_emit_failed", error=str(exc))
 
 
 # ─── Budget Tracker ───────────────────────────────────────────────
@@ -354,8 +476,22 @@ class BudgetTracker:
     begin_cycle(). Checks are cumulative within the cycle — once a limit is
     hit, it blocks for the remainder of the cycle.
 
+    Sub-limits (API calls per minute, notifications per hour) use sliding-window
+    deques so they enforce across cycle boundaries — a burst of API calls in cycle N
+    still counts against the limit in cycle N+1 (Spec §5.3).
+
     Limits are sourced from AxonConfig and cannot be changed at runtime.
     """
+
+    # Action types that count as "api_calls" for the per-minute sub-limit
+    _API_CALL_TYPES: frozenset[str] = frozenset({
+        "call_api", "webhook_trigger", "defi_yield", "wallet_transfer",
+        "phantom_liquidity", "query_memory", "axon.solve_bounty",
+    })
+    # Action types that count as "notifications" for the per-hour sub-limit
+    _NOTIFICATION_TYPES: frozenset[str] = frozenset({
+        "send_notification", "send_email", "post_message", "respond_text",
+    })
 
     def __init__(self, config: AxonConfig) -> None:
         self._budget = ExecutionBudget(
@@ -366,6 +502,9 @@ class BudgetTracker:
             total_timeout_per_cycle_ms=config.total_timeout_per_cycle_ms,
         )
         self._logger = logger.bind(system="axon.budget_tracker")
+        # Sliding-window deques for sub-limit enforcement (wall-clock timestamps)
+        self._api_call_timestamps: deque[float] = deque()
+        self._notification_timestamps: deque[float] = deque()
         self._reset_counters()
 
     def _reset_counters(self) -> None:
@@ -407,6 +546,59 @@ class BudgetTracker:
                 f"({self._budget.max_concurrent_executions})"
             )
         return True, ""
+
+    def can_execute_action_type(self, action_type: str) -> tuple[bool, str]:
+        """
+        Check sub-limits (API calls/min, notifications/hr) for a specific action type.
+
+        Called by the pipeline after the global can_execute() passes but before
+        execution starts, to enforce category-level rate caps (Spec §5.3).
+
+        Returns (allowed, reason).
+        """
+        now = time.monotonic()
+
+        if action_type in self._API_CALL_TYPES:
+            # Prune timestamps older than 60s
+            cutoff = now - 60.0
+            while self._api_call_timestamps and self._api_call_timestamps[0] < cutoff:
+                self._api_call_timestamps.popleft()
+            count = len(self._api_call_timestamps)
+            if count >= self._budget.max_api_calls_per_minute:
+                return False, (
+                    f"Budget: max API calls per minute reached "
+                    f"({count}/{self._budget.max_api_calls_per_minute})"
+                )
+
+        if action_type in self._NOTIFICATION_TYPES:
+            # Prune timestamps older than 3600s
+            cutoff = now - 3600.0
+            while (
+                self._notification_timestamps
+                and self._notification_timestamps[0] < cutoff
+            ):
+                self._notification_timestamps.popleft()
+            count = len(self._notification_timestamps)
+            if count >= self._budget.max_notifications_per_hour:
+                return False, (
+                    f"Budget: max notifications per hour reached "
+                    f"({count}/{self._budget.max_notifications_per_hour})"
+                )
+
+        return True, ""
+
+    def record_action_type(self, action_type: str) -> None:
+        """
+        Record that an action of the given type completed (for sub-limit tracking).
+
+        Called by the pipeline after a step executes successfully, so the
+        sliding windows only count actions that actually ran.
+        """
+        now = time.monotonic()
+        if action_type in self._API_CALL_TYPES:
+            self._api_call_timestamps.append(now)
+        if action_type in self._NOTIFICATION_TYPES:
+            self._notification_timestamps.append(now)
 
     def can_execute_intent(
         self, intent_id: str, step_count: int, max_steps: int = 0

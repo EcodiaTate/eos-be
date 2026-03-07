@@ -73,6 +73,44 @@ _GOVERNED_GOAL_PHRASES: list[str] = [
     "external commitment",
 ]
 
+# Spec §Appendix B: action-type → minimum autonomy level required.
+# Level 1 = Advisor (default), Level 2 = Partner, Level 3 = Steward.
+# Used by safe-mode review in EquorService to classify step executors.
+ACTION_AUTONOMY_MAP: dict[str, int] = {
+    # Level 1 — always permitted
+    "observe": 1,
+    "analyse": 1,
+    "analyze": 1,
+    "suggest": 1,
+    "answer_question": 1,
+    "store_memory": 1,
+    "self_reflect": 1,
+    # Level 2 — Partner
+    "send_notification": 2,
+    "adjust_resource": 2,
+    "mediate_minor_conflict": 2,
+    "schedule_event": 2,
+    "share_knowledge": 2,
+    "federation_share": 2,
+    "hunt_bounties": 2,
+    "accept_bounty": 2,
+    "defi_yield": 2,
+    "deploy_yield": 2,
+    "withdraw_yield": 2,
+    "modify_own_config": 2,
+    # Level 3 — Steward
+    "make_resource_decision": 3,
+    "mediate_major_conflict": 3,
+    "initiate_federation": 3,
+    "propose_policy": 3,
+    "override_automated": 3,
+    "deploy_asset": 3,
+    "create_asset": 3,
+    "terminate_asset": 3,
+    "spawn_child": 3,
+    "rescue_child": 3,
+}
+
 
 def _is_governed(intent: Intent) -> bool:
     """
@@ -223,8 +261,12 @@ def compute_verdict(
     # ── STAGE 2: Floor Drive Check ──────────────────────────────
     care_weight = constitution.get("drive_care", 1.0)
     honesty_weight = constitution.get("drive_honesty", 1.0)
-    care_floor = -0.3 * care_weight
-    honesty_floor = -0.3 * honesty_weight
+    # Floor = floor_multiplier x composite_weight (spec s3.3 + Appendix A).
+    # composite_care_weight=0.35, composite_honesty_weight=0.30.
+    # Anchors the floor to the drive contribution in the composite score,
+    # not to the raw genome scalar. Default: care_floor=-0.105, honesty_floor=-0.09.
+    care_floor = -0.3 * care_weight * 0.35
+    honesty_floor = -0.3 * honesty_weight * 0.30
 
     if alignment.care < care_floor:
         check.verdict = Verdict.BLOCKED

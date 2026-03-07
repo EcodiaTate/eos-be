@@ -51,9 +51,11 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from primitives.common import utc_now
+from primitives.common import DriveAlignmentVector, SystemID, utc_now
+from primitives.re_training import RETrainingExample
 from systems.synapse.types import SynapseEvent, SynapseEventType
 from systems.thymos.antibody import AntibodyLibrary
+from systems.thymos.event_payloads import validate_event_payload
 from systems.thymos.diagnosis import (
     CausalAnalyzer,
     DiagnosticEngine,
@@ -98,6 +100,7 @@ from systems.thymos.types import (
 if TYPE_CHECKING:
     from collections.abc import Coroutine
 
+    from clients.embedding import EmbeddingClient
     from clients.llm import LLMProvider
     from clients.neo4j import Neo4jClient
     from clients.redis import RedisClient
@@ -123,7 +126,9 @@ _SUBSCRIBED_EVENTS: frozenset[SynapseEventType] = frozenset({
     SynapseEventType.RESOURCE_PRESSURE,
     # Economic immune system (Phase 16f)
     SynapseEventType.TRANSACTION_SHIELDED,
-    SynapseEventType.THREAT_DETECTED,
+    # THREAT_DETECTED has a dedicated handler (_on_threat_detected) that routes
+    # through ThreatPatternSentinel — it is NOT in _SUBSCRIBED_EVENTS to avoid
+    # double-firing via the generic _on_synapse_event path.
     SynapseEventType.PROTOCOL_ALERT,
     SynapseEventType.EMERGENCY_WITHDRAWAL,
     SynapseEventType.THREAT_ADVISORY_RECEIVED,
@@ -143,6 +148,8 @@ _SUBSCRIBED_EVENTS: frozenset[SynapseEventType] = frozenset({
     SynapseEventType.NOVA_DEGRADED,
     SynapseEventType.EVO_CONSOLIDATION_STALLED,
     SynapseEventType.SKIA_HEARTBEAT_LOST,
+    # SG7 — Kairos causal invariants feed CausalAnalyzer graph cache
+    SynapseEventType.KAIROS_INVARIANT_DISTILLED,
 })
 
 # How often to run homeostatic checks (in seconds)
@@ -153,6 +160,9 @@ _SENTINEL_SCAN_INTERVAL_S: float = 30.0
 
 # How long to wait for post-repair verification (seconds)
 _POST_REPAIR_VERIFY_TIMEOUT_S: float = 10.0
+
+# SG4: Max seconds to wait for a federated peer to resolve an escalated incident
+_FEDERATION_ESCALATION_TIMEOUT_S: float = 45.0
 
 # Salience mapping: incident severity → percept priority for Atune
 _SEVERITY_TO_SALIENCE: dict[IncidentSeverity, float] = {
@@ -367,6 +377,7 @@ class ThymosService:
         self._federation: Any = None  # FederationService -- threat advisory broadcast
         self._telos: Any = None     # TelosService — authoritative drive state + impact prediction
         self._simula: Any = None    # SimulaService — novel repair via EvolutionProposal pipeline
+        self._embedding_client: EmbeddingClient | None = None  # Shared 768-dim embedder (P2)
 
         # ── Sub-systems (built in initialize()) ──
         # Sentinels
@@ -446,6 +457,20 @@ class ThymosService:
         self._diagnosis_confidences: deque[float] = deque(maxlen=200)
         self._diagnosis_latencies: deque[float] = deque(maxlen=200)
 
+        # ── Metabolic gating ──────────────────────────────────────────────
+        self._starvation_level: str = "nominal"
+
+        # ── Cached cross-system state (populated via Synapse subscriptions) ──
+        # Replaces direct self._soma / self._oikos / self._telos reads.
+        self._cached_soma_signal: dict[str, Any] = {}
+        self._cached_soma_coherence: float = 1.0
+        self._cached_soma_vulnerability: dict[str, Any] = {}
+        self._cached_oikos_snapshot: dict[str, Any] = {}
+        self._cached_telos_drive_impact: dict[str, dict[str, float]] = {}
+
+        # ── Synapse request/reply tracking ───────────────────────────────
+        self._pending_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
+
     # ─── Cross-System Wiring ─────────────────────────────────────────
 
     def set_equor(self, equor: Any) -> None:
@@ -471,6 +496,19 @@ class ThymosService:
         if self._causal_analyzer is not None:
             self._causal_analyzer._health = health_monitor
         self._logger.info("health_monitor_wired_to_thymos")
+
+    def set_embedding_client(self, client: EmbeddingClient) -> None:
+        """
+        Wire the shared 768-dim sentence-transformer embedding client (P2).
+
+        If called before initialize(), the client is stored and passed to
+        ProphylacticScanner during initialization.  If called after, the
+        scanner's client is hot-swapped immediately.
+        """
+        self._embedding_client = client
+        if self._prophylactic_scanner is not None:
+            self._prophylactic_scanner.set_embedding_client(client)
+        self._logger.info("embedding_client_wired_to_thymos")
 
     def set_nova(self, nova: Any) -> None:
         """Wire Nova so critical incidents generate urgent repair goals."""
@@ -521,6 +559,27 @@ class ThymosService:
         toward drives that are under the most constitutional stress.
         """
         return self._drive_state
+
+    def receive_divergence_pressure(self, pressure: Any) -> None:
+        """
+        Accept a divergence pressure signal from Nexus (via ThymosNexusSinkAdapter).
+
+        High pressure_magnitude means the instance is too similar to federation peers
+        — nudges the growth drive proportionally so Thymos biases toward exploratory
+        repairs rather than conservative ones.
+
+        Args:
+            pressure: DivergencePressure object with ``pressure_magnitude`` float field.
+        """
+        magnitude: float = getattr(pressure, "pressure_magnitude", 0.0)
+        nudge = magnitude * 0.15
+        self._drive_state.growth = min(1.0, self._drive_state.growth + nudge)
+        self._logger.debug(
+            "divergence_pressure_absorbed",
+            magnitude=round(magnitude, 3),
+            growth_nudge=round(nudge, 3),
+            new_growth=round(self._drive_state.growth, 3),
+        )
 
     def on_equor_rejection(
         self,
@@ -590,7 +649,7 @@ class ThymosService:
         the percept to proactively triage and, if the action is TRIGGER_REPAIR,
         open an incident before an actual failure surfaces.
         """
-        from systems.soma.types import InteroceptiveAction
+        from primitives.soma import InteroceptiveAction
 
         data = event.data
         urgency: float = data.get("urgency", 0.0)
@@ -742,11 +801,21 @@ class ThymosService:
         """
         Handle METABOLIC_PRESSURE events from Oikos.
 
-        Only acts when ``economic_stress=True`` is in the payload (runway < 30 days).
-        Other METABOLIC_PRESSURE variants (routine APY updates, etc.) are ignored here.
+        Updates starvation level for gating, and forwards economic stress
+        notifications to Tate when runway < 30 days.
         """
         data = event.data
-        if not data.get("economic_stress"):
+
+        # ── Metabolic gating: update starvation level ──
+        level = data.get("starvation_level", "")
+        if level:
+            old = self._starvation_level
+            self._starvation_level = level
+            if level != old:
+                self._logger.info("thymos_starvation_level_changed", old=old, new=level)
+                await self._adjust_for_starvation(level)
+
+        if not data.get("economic_stress") and data.get("source") != "oikos_starvation_broadcast":
             return
 
         runway_days: str = data.get("runway_days", "?")
@@ -788,6 +857,25 @@ class ThymosService:
             dedup_key=f"economic_stress:{event.source_system}",
             severity="warning",
         )
+
+    async def _adjust_for_starvation(self, level: str) -> None:
+        """Thymos-specific metabolic degradation.
+
+        AUSTERITY: skip prophylactic scanning, only reactive healing
+        EMERGENCY: triage — only heal severity=critical incidents
+        CRITICAL: minimal — log incidents but don't attempt LLM-based diagnosis
+        """
+        if level == "austerity":
+            # Cancel prophylactic scanning to save resources
+            if self._homeostasis_task is not None and not self._homeostasis_task.done():
+                self._homeostasis_task.cancel()
+                self._logger.warning("thymos_prophylactic_cancelled_austerity")
+        elif level in ("emergency", "critical"):
+            # Cancel prophylactic + sentinel scanning
+            for task in (self._homeostasis_task, self._sentinel_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            self._logger.warning("thymos_background_tasks_cancelled_starvation", level=level)
 
     async def _on_task_permanently_failed(self, event: SynapseEvent) -> None:
         """Handle TASK_PERMANENTLY_FAILED — forward to Tate via Telegram."""
@@ -936,7 +1024,7 @@ class ThymosService:
                     )
             elif incident is not None and not success:
                 # Repair failed — mark for re-diagnosis
-                incident.repair_status = RepairStatus.FAILED
+                incident.repair_status = RepairStatus.ESCALATED
                 if (
                     incident.antibody_id is not None
                     and self._antibody_library is not None
@@ -957,6 +1045,14 @@ class ThymosService:
                     files=len(files_changed),
                     warnings=len(warnings),
                     details=[w.warning[:80] for w in warnings[:3]],
+                )
+                await self._emit_evolutionary_observable(
+                    "prophylactic_triggered", float(len(warnings)),
+                    is_novel=True,
+                    metadata={
+                        "files_scanned": len(files_changed),
+                        "warning_count": len(warnings),
+                    },
                 )
 
     async def _on_evo_consolidation_stalled(self, event: SynapseEvent) -> None:
@@ -1156,6 +1252,1019 @@ class ThymosService:
                 "growth": 0.3,
                 "honesty": 0.1,
             },
+        )
+        await self.on_incident(incident)
+
+    # ─── Vault Security Handlers (Identity #8) ──────────────────────────
+
+    async def _on_vault_decrypt_failed(self, event: SynapseEvent) -> None:
+        """
+        Handle VAULT_DECRYPT_FAILED — Identity vault cannot decrypt a
+        SealedEnvelope.
+
+        A decryption failure means either the key has been rotated out of
+        sync, or the ciphertext was tampered with. Either way it is a
+        security event that warrants a MEDIUM incident so the operator can
+        investigate and re-provision credentials if needed.
+        """
+        data = event.data
+        vault_id: str = data.get("vault_id", "identity_vault")
+        envelope_id: str | None = data.get("envelope_id")
+        platform_id: str | None = data.get("platform_id")
+        error_type: str = data.get("error_type", "unknown")
+        error: str = data.get("error", "decrypt failed")
+        key_version: int | None = data.get("key_version")
+
+        self._logger.warning(
+            "vault_decrypt_failed_incident",
+            vault_id=vault_id,
+            envelope_id=envelope_id,
+            platform_id=platform_id,
+            error_type=error_type,
+        )
+
+        description = f"Vault decryption failed ({error_type})"
+        if platform_id:
+            description += f" for platform={platform_id}"
+        if error:
+            description += f": {error[:200]}"
+
+        incident = Incident(
+            source_system="identity",
+            incident_class=IncidentClass.SECURITY,
+            severity=IncidentSeverity.MEDIUM,
+            error_type="VaultDecryptFailed",
+            error_message=description,
+            fingerprint=hashlib.sha256(
+                f"VaultDecryptFailed:{vault_id}:{error_type}".encode()
+            ).hexdigest()[:16],
+            context={
+                "vault_id": vault_id,
+                "envelope_id": envelope_id,
+                "platform_id": platform_id,
+                "error_type": error_type,
+                "key_version": key_version,
+                "error": error,
+            },
+            constitutional_impact={
+                "coherence": 0.2,
+                "care": 0.4,
+                "growth": 0.1,
+                "honesty": 0.3,
+            },
+        )
+        await self.on_incident(incident)
+
+    async def _on_vault_key_rotation_failed(self, event: SynapseEvent) -> None:
+        """
+        Handle VAULT_KEY_ROTATION_FAILED — key rotation aborted mid-flight.
+
+        A failed mid-rotation leaves the vault in an inconsistent state
+        (some envelopes under old key, some potentially corrupted). This is
+        a CRITICAL security incident requiring immediate operator attention.
+        """
+        data = event.data
+        vault_id: str = data.get("vault_id", "identity_vault")
+        previous_version: int | None = data.get("previous_key_version")
+        error: str = data.get("error", "key rotation failed")
+
+        self._logger.error(
+            "vault_key_rotation_failed_incident",
+            vault_id=vault_id,
+            previous_key_version=previous_version,
+            error=error,
+        )
+
+        incident = Incident(
+            source_system="identity",
+            incident_class=IncidentClass.SECURITY,
+            severity=IncidentSeverity.CRITICAL,
+            error_type="VaultKeyRotationFailed",
+            error_message=f"Vault key rotation failed mid-flight: {error[:200]}",
+            fingerprint=hashlib.sha256(
+                f"VaultKeyRotationFailed:{vault_id}".encode()
+            ).hexdigest()[:16],
+            context={
+                "vault_id": vault_id,
+                "previous_key_version": previous_version,
+                "error": error,
+            },
+            blast_radius=0.6,
+            user_visible=True,
+            constitutional_impact={
+                "coherence": 0.4,
+                "care": 0.5,
+                "growth": 0.2,
+                "honesty": 0.4,
+            },
+        )
+        await self.on_incident(incident)
+
+    async def _on_threat_detected(self, event: SynapseEvent) -> None:
+        """
+        Handle THREAT_DETECTED — economic threat from EIS or Oikos shield.
+
+        Routes the event through ThreatPatternSentinel for pattern matching
+        and blacklist checking before creating an incident. This is a
+        specialized path rather than the generic _on_synapse_event handler
+        so the sentinel can apply its full detection logic.
+        """
+        data = event.data
+        to_addr: str = data.get("to", data.get("contract", ""))
+        from_addr: str = data.get("from", data.get("caller", ""))
+        tx_data: str = data.get("data", data.get("calldata", ""))
+        value_usd: float = float(data.get("value_usd", data.get("amount_usd", 0.0)))
+        chain_id: int = int(data.get("chain_id", 8453))
+
+        # Route through ThreatPatternSentinel if available
+        if self._threat_pattern_sentinel is not None and to_addr:
+            incident = self._threat_pattern_sentinel.check_transaction(
+                to=to_addr,
+                from_addr=from_addr,
+                data=tx_data,
+                value_usd=value_usd,
+                chain_id=chain_id,
+            )
+            if incident is not None:
+                await self.on_incident(incident)
+                return
+
+        # Fallback: create a generic ECONOMIC_THREAT incident from event data
+        threat_type: str = data.get("threat_type", data.get("type", "unknown"))
+        severity_str: str = data.get("severity", "high")
+        fp = hashlib.sha256(
+            f"threat:{event.source_system}:{threat_type}:{to_addr}".encode()
+        ).hexdigest()[:16]
+        incident = Incident(
+            source_system=event.source_system,
+            incident_class=IncidentClass.ECONOMIC_THREAT,
+            severity=(
+                IncidentSeverity.CRITICAL
+                if severity_str in ("critical", "high")
+                else IncidentSeverity.MEDIUM
+            ),
+            error_type="ThreatDetected",
+            error_message=(
+                f"Economic threat detected ({threat_type}) from "
+                f"{event.source_system}: {data.get('description', '')[:120]}"
+            ),
+            fingerprint=fp,
+            context=data,
+            affected_systems=["oikos", "axon"],
+            blast_radius=0.5,
+            user_visible=False,
+            repair_tier=RepairTier.ESCALATE,
+        )
+        await self.on_incident(incident)
+
+    async def _on_speciation_event(self, event: SynapseEvent) -> None:
+        """
+        Handle SPECIATION_EVENT — epistemic trust breach via extreme divergence.
+
+        Nexus emits this when two federated instances diverge ≥ 0.8 on the
+        five-dimensional divergence metric.  At this level, the instances are
+        no longer epistemically compatible — sharing knowledge between them
+        risks contaminating the organism's ground truth.
+
+        Creates a CONTRACT_VIOLATION incident so the repair pipeline can
+        quarantine the diverged instance or halt federation with it.
+        """
+        data = event.data
+        peer_id: str = data.get("peer_id", data.get("instance_id", "unknown"))
+        divergence: float = float(data.get("divergence_score", data.get("overall", 0.9)))
+        dimensions: dict[str, float] = data.get("dimensions", {})
+
+        self._logger.warning(
+            "speciation_event_detected",
+            peer_id=peer_id,
+            divergence=divergence,
+        )
+
+        # ── Antibody cross-reference ────────────────────────────────────
+        # Check if we already have an antibody for this peer's speciation pattern.
+        fp = hashlib.sha256(
+            f"speciation:{peer_id}".encode()
+        ).hexdigest()[:16]
+        existing_antibody = await self._antibody_library.lookup(fp) if self._antibody_library else None
+        if existing_antibody is not None:
+            self._logger.info(
+                "speciation_antibody_found",
+                peer_id=peer_id,
+                antibody_id=existing_antibody.id,
+                effectiveness=existing_antibody.effectiveness,
+            )
+
+        # ── Heighten DriftSentinel sensitivity ──────────────────────────
+        # Speciation means internal consistency is at risk — lower sigma
+        # thresholds by 30% so drift is caught earlier during this period.
+        if self._drift_sentinel is not None:
+            for cfg in self._drift_sentinel._metrics.values():
+                cfg.sigma_threshold *= 0.7
+            self._logger.info(
+                "drift_sentinel_tightened",
+                peer_id=peer_id,
+                reason="speciation_event",
+            )
+
+        # ── Quarantine: suspend federation with diverged peer ───────────
+        await self._emit_event(SynapseEventType.FEDERATION_TRUST_UPDATED, {
+            "peer_id": peer_id,
+            "action": "quarantine",
+            "reason": f"speciation divergence {divergence:.3f}",
+            "dimensions": dimensions,
+            "timestamp": utc_now().isoformat(),
+        })
+
+        incident = Incident(
+            source_system="nexus",
+            incident_class=IncidentClass.CONTRACT_VIOLATION,
+            severity=IncidentSeverity.HIGH,
+            error_type="SpeciationEvent",
+            error_message=(
+                f"Epistemic speciation with peer {peer_id}: "
+                f"divergence={divergence:.3f} exceeds federation threshold 0.8. "
+                "Knowledge sharing with this instance is suspended."
+            ),
+            fingerprint=fp,
+            context={
+                "peer_id": peer_id,
+                "divergence_score": divergence,
+                "dimensions": dimensions,
+                "existing_antibody_id": existing_antibody.id if existing_antibody else None,
+            },
+            affected_systems=["nexus", "federation", "evo"],
+            blast_radius=0.3,
+            user_visible=False,
+            constitutional_impact={
+                "coherence": 0.5,
+                "care": 0.1,
+                "growth": 0.4,
+                "honesty": 0.6,
+            },
+        )
+        await self.on_incident(incident)
+
+    # ─── Feedback Loop Handlers (Interconnectedness Audit) ──────────────
+
+    async def _on_axon_shield_rejection(self, event: SynapseEvent) -> None:
+        """
+        Handle AXON_SHIELD_REJECTION — TransactionShield blocked a transaction.
+
+        Creates a real-time incident so the repair pipeline can detect root
+        causes (bad params, blacklisted addresses, slippage misconfiguration)
+        instead of only seeing post-mortem via TRANSACTION_SHIELDED.
+        """
+        data = event.data
+        executor: str = data.get("executor", "unknown")
+        rejection_reason: str = data.get("rejection_reason", "unknown")
+        check_type: str = data.get("check_type", "unknown")
+        intent_id: str = data.get("intent_id", "")
+
+        self._logger.warning(
+            "axon_shield_rejection_received",
+            executor=executor,
+            check_type=check_type,
+            reason=rejection_reason[:120],
+        )
+
+        severity = (
+            IncidentSeverity.HIGH if check_type in ("blacklist", "mev")
+            else IncidentSeverity.MEDIUM
+        )
+
+        incident = Incident(
+            source_system="axon",
+            incident_class=IncidentClass.ECONOMIC_THREAT,
+            severity=severity,
+            error_type="TransactionShieldRejection",
+            error_message=(
+                f"Shield blocked {executor}: {rejection_reason[:200]} "
+                f"(check={check_type})"
+            ),
+            fingerprint=hashlib.sha256(
+                f"ShieldRejection:{executor}:{check_type}".encode()
+            ).hexdigest()[:16],
+            context={
+                "executor": executor,
+                "check_type": check_type,
+                "intent_id": intent_id,
+                "rejection_reason": rejection_reason,
+                "params": data.get("params", {}),
+            },
+            constitutional_impact={
+                "coherence": 0.2,
+                "care": 0.4 if check_type == "blacklist" else 0.1,
+                "growth": 0.1,
+                "honesty": 0.3,
+            },
+        )
+        await self.on_incident(incident)
+
+    async def _on_axon_execution_request(self, event: SynapseEvent) -> None:
+        """
+        Handle AXON_EXECUTION_REQUEST — pre-scan for immune risk before execution.
+
+        Thymos inspects the incoming action before the pipeline runs. Risky
+        financial or spawning actions trigger a prophylactic scan. This is the
+        bus-first replacement for any direct IncidentReport import from Axon.
+        """
+        data = event.data
+        risky: bool = bool(data.get("risky", False))
+        action_types: list[str] = data.get("action_types", [])
+        intent_id: str = data.get("intent_id", "")
+
+        if not risky:
+            return
+
+        self._logger.debug(
+            "axon_execution_request_risky_scan",
+            intent_id=intent_id,
+            action_types=action_types,
+        )
+
+        # Run prophylactic scanner — if the fingerprint matches a known incident
+        # pattern, Thymos can emit a warning before financial damage occurs.
+        if self._prophylactic_scanner is not None:
+            try:
+                matches = await self._prophylactic_scanner.check_intent_similarity(
+                    intent_text=f"Execute {','.join(action_types)} intent {intent_id}"
+                )
+                if matches:
+                    self._logger.warning(
+                        "prophylactic_match_on_axon_request",
+                        intent_id=intent_id,
+                        action_types=action_types,
+                        top_match=matches[0][0] if matches else "",
+                    )
+            except Exception as exc:
+                self._logger.debug(
+                    "prophylactic_check_failed", error=str(exc)
+                )
+
+    async def _on_axon_rollback_initiated(self, event: SynapseEvent) -> None:
+        """
+        Handle AXON_ROLLBACK_INITIATED — open a pre-emptive incident.
+
+        A rollback signals compound failure: the primary step failed AND
+        previously completed steps must be undone. Thymos opens an incident
+        immediately so the repair pipeline can investigate root cause before
+        the failed intent's audit trail is the only signal.
+        """
+        data = event.data
+        intent_id: str = data.get("intent_id", "")
+        execution_id: str = data.get("execution_id", "")
+        failed_step: str = data.get("failed_step", "unknown")
+        steps_to_rollback: int = int(data.get("steps_to_rollback", 0))
+        failure_reason: str = data.get("failure_reason", "unknown")
+
+        self._logger.warning(
+            "axon_rollback_incident_opening",
+            intent_id=intent_id,
+            failed_step=failed_step,
+            steps_to_rollback=steps_to_rollback,
+            failure_reason=failure_reason[:80],
+        )
+
+        incident = Incident(
+            source_system="axon",
+            incident_class=IncidentClass.DEGRADED,
+            severity=IncidentSeverity.MEDIUM,
+            error_type="AxonRollback",
+            error_message=(
+                f"Axon rollback: step '{failed_step}' failed, "
+                f"rolling back {steps_to_rollback} step(s). "
+                f"Reason: {failure_reason[:200]}"
+            ),
+            fingerprint=hashlib.sha256(
+                f"AxonRollback:{failed_step}:{failure_reason[:40]}".encode()
+            ).hexdigest()[:16],
+            context={
+                "intent_id": intent_id,
+                "execution_id": execution_id,
+                "failed_step": failed_step,
+                "steps_to_rollback": steps_to_rollback,
+                "failure_reason": failure_reason,
+            },
+            constitutional_impact={
+                "coherence": 0.3,
+                "care": 0.1,
+                "growth": 0.2,
+                "honesty": 0.1,
+            },
+        )
+        await self.on_incident(incident)
+
+    async def _on_atune_repair_validation(self, event: SynapseEvent) -> None:
+        """
+        Handle ATUNE_REPAIR_VALIDATION — Atune confirms whether a repair helped.
+
+        Closes the one-way Thymos→Atune incident loop. If repair was ineffective,
+        re-opens the incident for re-diagnosis at a higher tier.
+        """
+        data = event.data
+        incident_id: str = data.get("incident_id", "")
+        repair_effective: bool = data.get("repair_effective", True)
+        salience_before: float = data.get("salience_before", 0.0)
+        salience_after: float = data.get("salience_after", 0.0)
+        cycles_observed: int = data.get("cycles_observed", 0)
+
+        self._logger.info(
+            "atune_repair_validation_received",
+            incident_id=incident_id,
+            effective=repair_effective,
+            salience_delta=round(salience_after - salience_before, 3),
+            cycles=cycles_observed,
+        )
+
+        if repair_effective:
+            # Repair confirmed — update antibody effectiveness
+            incident = self._active_incidents.get(incident_id)
+            if (
+                incident is not None
+                and incident.antibody_id is not None
+                and self._antibody_library is not None
+            ):
+                await self._antibody_library.record_outcome(
+                    incident.antibody_id, success=True,
+                )
+            self._emit_metric("thymos.repair.validated_effective", 1)
+        else:
+            # Repair ineffective — re-open for re-diagnosis
+            incident = self._active_incidents.get(incident_id)
+            if incident is not None:
+                incident.repair_status = RepairStatus.PENDING
+                if isinstance(incident.context, dict):
+                    incident.context["atune_validation_failed"] = True
+                    incident.context["salience_before"] = salience_before
+                    incident.context["salience_after"] = salience_after
+                # Bump severity to escalate tier
+                if incident.severity == IncidentSeverity.MEDIUM:
+                    incident.severity = IncidentSeverity.HIGH
+                self._logger.warning(
+                    "repair_ineffective_reopening",
+                    incident_id=incident_id,
+                    salience_before=round(salience_before, 3),
+                    salience_after=round(salience_after, 3),
+                )
+                await self.on_incident(incident)
+            self._emit_metric("thymos.repair.validated_ineffective", 1)
+
+    async def _on_evo_hypothesis_quality(self, event: SynapseEvent) -> None:
+        """
+        Handle EVO_HYPOTHESIS_QUALITY — Evo reports how well repair patterns generalise.
+
+        High-quality hypotheses strengthen the antibody; low-quality ones trigger
+        re-evaluation of the repair strategy for that incident class.
+        """
+        data = event.data
+        hypothesis_id: str = data.get("hypothesis_id", "")
+        repair_source_id: str = data.get("repair_source_id", "")
+        quality_score: float = data.get("quality_score", 0.0)
+        applications: int = data.get("applications", 0)
+        confidence: float = data.get("confidence", 0.0)
+
+        self._logger.info(
+            "evo_hypothesis_quality_received",
+            hypothesis_id=hypothesis_id,
+            repair_source_id=repair_source_id,
+            quality=round(quality_score, 3),
+            applications=applications,
+            confidence=round(confidence, 3),
+        )
+
+        # High quality: boost antibody effectiveness rating
+        if quality_score > 0.7 and self._antibody_library is not None:
+            incident = self._active_incidents.get(repair_source_id)
+            if incident is not None and incident.antibody_id is not None:
+                await self._antibody_library.record_outcome(
+                    incident.antibody_id, success=True,
+                )
+                self._logger.info(
+                    "hypothesis_boosted_antibody",
+                    antibody_id=incident.antibody_id,
+                    quality=round(quality_score, 3),
+                )
+
+        # Low quality: record as a signal that the repair pattern is narrow
+        if quality_score < 0.3:
+            self._logger.warning(
+                "hypothesis_quality_low",
+                hypothesis_id=hypothesis_id,
+                quality=round(quality_score, 3),
+                applications=applications,
+            )
+            self._emit_metric(
+                "thymos.hypothesis.low_quality",
+                1,
+                tags={"hypothesis_id": hypothesis_id},
+            )
+
+        self._emit_metric("thymos.hypothesis.quality", quality_score)
+
+    async def _on_nova_belief_stabilised(self, event: SynapseEvent) -> None:
+        """
+        Handle NOVA_BELIEF_STABILISED — Nova confirms beliefs re-converged after repair.
+
+        Closes the Thymos→Nova one-way channel. If beliefs did NOT stabilise,
+        creates a new incident indicating the repair had destabilising side effects.
+        """
+        data = event.data
+        incident_id: str = data.get("incident_id", "")
+        stable: bool = data.get("stable", True)
+        beliefs_affected: int = data.get("beliefs_affected", 0)
+        convergence_time_ms: int = data.get("convergence_time_ms", 0)
+        goal_id: str = data.get("goal_id", "")
+
+        self._logger.info(
+            "nova_belief_stabilisation_received",
+            incident_id=incident_id,
+            stable=stable,
+            beliefs_affected=beliefs_affected,
+            convergence_ms=convergence_time_ms,
+        )
+
+        if stable:
+            self._emit_metric("thymos.nova.beliefs_stabilised", 1)
+            self._emit_metric("thymos.nova.convergence_ms", convergence_time_ms)
+        else:
+            # Beliefs failed to stabilise — the repair had destabilising side effects
+            self._logger.warning(
+                "nova_beliefs_unstable_after_repair",
+                incident_id=incident_id,
+                beliefs_affected=beliefs_affected,
+                goal_id=goal_id,
+            )
+            new_incident = Incident(
+                source_system="nova",
+                incident_class=IncidentClass.DRIFT,
+                severity=IncidentSeverity.HIGH,
+                error_type="RepairDestabilisedBeliefs",
+                error_message=(
+                    f"Repair for {incident_id} destabilised {beliefs_affected} "
+                    f"beliefs. Convergence failed after {convergence_time_ms}ms."
+                ),
+                fingerprint=hashlib.sha256(
+                    f"RepairDestabilised:{incident_id}".encode()
+                ).hexdigest()[:16],
+                context={
+                    "original_incident_id": incident_id,
+                    "beliefs_affected": beliefs_affected,
+                    "convergence_time_ms": convergence_time_ms,
+                    "goal_id": goal_id,
+                },
+                constitutional_impact={
+                    "coherence": 0.6,
+                    "care": 0.2,
+                    "growth": 0.3,
+                    "honesty": 0.2,
+                },
+            )
+            await self.on_incident(new_incident)
+            self._emit_metric("thymos.nova.beliefs_destabilised", 1)
+
+    # ─── Cross-System State Caching (AV1) ──────────────────────────────
+
+    async def _on_soma_modulation_cached(self, event: SynapseEvent) -> None:
+        """Cache Soma's periodic modulation signal — replaces direct self._soma reads."""
+        data = event.data
+        self._cached_soma_signal = data
+        self._cached_soma_coherence = float(data.get("coherence", data.get("coherence_signal", 1.0)))
+        vuln = data.get("vulnerability_map", {})
+        if vuln:
+            self._cached_soma_vulnerability = vuln
+
+    async def _on_oikos_state_cached(self, event: SynapseEvent) -> None:
+        """Cache Oikos's periodic economic snapshot — replaces direct self._oikos reads."""
+        self._cached_oikos_snapshot = event.data
+
+    async def _on_sandbox_result(self, event: SynapseEvent) -> None:
+        """Handle SIMULA_SANDBOX_RESULT — resolve the pending Future for the correlation_id."""
+        correlation_id = event.data.get("correlation_id", "")
+        future = self._pending_requests.pop(correlation_id, None)
+        if future is not None and not future.done():
+            future.set_result(event.data)
+        else:
+            self._logger.debug(
+                "sandbox_result_orphan",
+                correlation_id=correlation_id,
+            )
+
+    SANDBOX_TIMEOUT_S = 30.0
+
+    async def _request_sandbox_validation(
+        self, incident: "Incident", repair: "RepairSpec",
+    ) -> bool:
+        """
+        Request Simula sandbox validation for a Tier 3-4 repair.
+
+        Emits SIMULA_SANDBOX_REQUESTED and waits (up to 30s) for
+        SIMULA_SANDBOX_RESULT with matching correlation_id.
+        Returns True if sandbox approves, False otherwise.
+        """
+        if self._synapse is None:
+            # No Synapse — cannot sandbox, allow repair (fail-open for dev)
+            return True
+
+        correlation_id = f"sandbox-{incident.id}-{int(utc_now().timestamp() * 1000)}"
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending_requests[correlation_id] = future
+
+        await self._emit_event(SynapseEventType.SIMULA_SANDBOX_REQUESTED, {
+            "correlation_id": correlation_id,
+            "incident_id": incident.id,
+            "source_system": incident.source_system,
+            "repair_tier": repair.tier.name,
+            "repair_action": repair.action,
+            "repair_reason": repair.reason,
+            "target_system": repair.target_system or incident.source_system,
+            "parameter_changes": repair.parameter_changes or [],
+            "timestamp": utc_now().isoformat(),
+        })
+
+        try:
+            result = await asyncio.wait_for(future, timeout=self.SANDBOX_TIMEOUT_S)
+            approved = result.get("approved", False)
+            if not approved:
+                self._logger.warning(
+                    "sandbox_validation_rejected",
+                    incident_id=incident.id,
+                    correlation_id=correlation_id,
+                    reason=result.get("reason", "unknown"),
+                )
+            return bool(approved)
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(correlation_id, None)
+            self._logger.warning(
+                "sandbox_validation_timeout",
+                incident_id=incident.id,
+                correlation_id=correlation_id,
+                timeout_s=self.SANDBOX_TIMEOUT_S,
+            )
+            # Timeout → fail-closed: do not apply unvalidated repair
+            return False
+
+    # ─── Synapse Emit Helper ─────────────────────────────────────────────
+
+    async def _emit_event(
+        self,
+        event_type: SynapseEventType,
+        data: dict[str, Any],
+    ) -> None:
+        """Emit a SynapseEvent if the bus is available. Non-blocking, failure-tolerant."""
+        if self._synapse is None:
+            return
+        try:
+            await self._synapse._event_bus.emit(
+                SynapseEvent(
+                    event_type=event_type,
+                    data=data,
+                    source_system="thymos",
+                )
+            )
+        except Exception as exc:
+            self._logger.debug(
+                "thymos_emit_failed",
+                event_type=event_type.value,
+                error=str(exc),
+            )
+
+    async def _on_antibody_event(self, event_name: str, data: dict[str, Any]) -> None:
+        """Callback for AntibodyLibrary lifecycle events → Synapse emission."""
+        type_map: dict[str, SynapseEventType] = {
+            "antibody_retired": SynapseEventType.ANTIBODY_RETIRED,
+        }
+        evt_type = type_map.get(event_name)
+        if evt_type is not None:
+            await self._emit_event(evt_type, data)
+
+    def _on_governor_event(self, event_name: str, data: dict[str, Any]) -> None:
+        """Synchronous callback for HealingGovernor lifecycle events → Synapse emission."""
+        type_map: dict[str, SynapseEventType] = {
+            "healing_storm_entered": SynapseEventType.HEALING_STORM_ENTERED,
+            "healing_storm_exited": SynapseEventType.HEALING_STORM_EXITED,
+        }
+        evt_type = type_map.get(event_name)
+        if evt_type is not None:
+            # Governor is sync — schedule the async emit
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._emit_event(evt_type, data))
+            except RuntimeError:
+                pass  # No event loop — skip emission
+
+    # ─── Federation Antibody Sync (SG1, M3) ────────────────────────────
+
+    async def _on_federation_knowledge_received(self, event: SynapseEvent) -> None:
+        """
+        Handle inbound federation knowledge — import antibodies if trust >= ALLY.
+
+        Only processes knowledge_type == "antibodies". Trust gating ensures we only
+        accept immune memory from peers we have validated.
+        """
+        data = event.data
+        knowledge_type = data.get("knowledge_type", "")
+        if knowledge_type != "antibodies":
+            return
+
+        remote_instance_id = data.get("remote_instance_id", "unknown")
+        trust_level = data.get("trust_level", "stranger")
+
+        # Trust gate: only accept from ALLY or higher
+        accepted_trust = {"ally", "bonded", "kin"}
+        if trust_level.lower() not in accepted_trust:
+            self._logger.info(
+                "federation_antibody_import_rejected_trust",
+                remote_instance_id=remote_instance_id,
+                trust_level=trust_level,
+            )
+            return
+
+        antibodies = data.get("items", [])
+        if not antibodies or self._antibody_library is None:
+            return
+
+        imported = await self._antibody_library.import_from_federation(
+            antibodies=antibodies,
+            remote_instance_id=remote_instance_id,
+        )
+        self._logger.info(
+            "federation_antibodies_imported",
+            remote_instance_id=remote_instance_id,
+            offered=len(antibodies),
+            imported=imported,
+        )
+
+    async def export_antibodies_for_federation(self) -> list[dict[str, Any]]:
+        """
+        Export antibodies for federation sharing.
+
+        Called by FederationService during knowledge exchange. Emits
+        FEDERATION_KNOWLEDGE_SHARED after export.
+        """
+        if self._antibody_library is None:
+            return []
+
+        exported = self._antibody_library.export_for_federation(max_count=100)
+
+        if exported:
+            await self._emit_event(
+                SynapseEventType.FEDERATION_KNOWLEDGE_SHARED,
+                {
+                    "knowledge_type": "antibodies",
+                    "item_count": len(exported),
+                    "novelty_score": 0.5,
+                },
+            )
+
+        return exported
+
+    # ─── SG7: Kairos causal invariants → CausalAnalyzer graph ──────────
+
+    async def _on_kairos_invariant(self, event: SynapseEvent) -> None:
+        """
+        SG7 — Consume KAIROS_INVARIANT_DISTILLED events to tighten the
+        CausalAnalyzer's dependency graph cache.
+
+        When Kairos discovers a substrate-independent causal invariant between
+        two systems (e.g. "nova_degraded → thymos_stall"), we inject that edge
+        into CausalAnalyzer._graph_deps so that future `trace_root_cause()` calls
+        benefit from empirically verified causal structure rather than falling back
+        to the hardcoded `_UPSTREAM_DEPS` map.
+
+        Payload keys consumed:
+          - cause_system:   str — upstream system
+          - effect_system:  str — downstream system
+          - confidence:     float — Kairos invariant confidence [0, 1]
+          - causal_type:    str — "direct" | "mediated" | "spurious"
+          - scope:          str — "instance" | "class" | "substrate"
+
+        Only "direct" or "mediated" invariants with confidence >= 0.6 are merged.
+        """
+        if self._causal_analyzer is None:
+            return
+
+        data = event.data or {}
+        cause = data.get("cause_system", "")
+        effect = data.get("effect_system", "")
+        confidence: float = float(data.get("confidence", 0.0))
+        causal_type: str = data.get("causal_type", "")
+
+        if not cause or not effect:
+            return
+        if confidence < 0.6:
+            return
+        if causal_type not in ("direct", "mediated"):
+            return
+
+        # Inject the causal edge: effect_system depends on cause_system
+        try:
+            deps: dict[str, list[str]] = getattr(
+                self._causal_analyzer, "_graph_deps", {}
+            )
+            if effect not in deps:
+                deps[effect] = []
+            if cause not in deps[effect]:
+                deps[effect].append(cause)
+                self._logger.debug(
+                    "kairos_invariant_injected",
+                    cause=cause,
+                    effect=effect,
+                    confidence=round(confidence, 3),
+                    causal_type=causal_type,
+                )
+                self._emit_metric("thymos.kairos_invariants_applied", 1)
+        except Exception as exc:
+            self._logger.debug("kairos_invariant_inject_failed", error=str(exc))
+
+    # ─── SG8: Oneiros consolidation → prophylactic fingerprint store ────────
+
+    async def _on_oneiros_consolidation(self, event: SynapseEvent) -> None:
+        """
+        SG8 — When Oneiros completes a sleep consolidation cycle, query Memory
+        for (:Procedure {thymos_repair: true}) nodes and ingest their embeddings
+        into the prophylactic scanner's fingerprint store.
+
+        This closes the loop between immune learning (Thymos creates repair
+        procedures) and immune prevention (scanner warns before similar errors
+        reoccur).  Procedures distilled during sleep are immediately available
+        for prophylactic matching on the next deployment scan.
+        """
+        if self._prophylactic_scanner is None or self._neo4j is None:
+            return
+
+        data = event.data or {}
+        cycle_id: str = data.get("cycle_id", "unknown")
+
+        try:
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (p:Procedure {thymos_repair: true})
+                RETURN p.id        AS id,
+                       p.name      AS name,
+                       p.description AS description,
+                       p.fingerprint AS fingerprint
+                ORDER BY p.created_at DESC
+                LIMIT 200
+                """,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "sg8_procedure_query_failed",
+                cycle_id=cycle_id,
+                error=str(exc)[:200],
+            )
+            return
+
+        if not rows:
+            return
+
+        procedures = [dict(r) for r in rows]
+        added = await self._prophylactic_scanner.add_fingerprints_from_procedures(
+            procedures
+        )
+
+        self._logger.info(
+            "sg8_oneiros_repair_schemas_ingested",
+            cycle_id=cycle_id,
+            procedures_queried=len(procedures),
+            fingerprints_added=added,
+        )
+        if added:
+            self._emit_metric("thymos.sg8.fingerprints_added_from_oneiros", added)
+
+    # ─── Closure Loop 1: Constitutional drift → immune response ─────────
+
+    async def _on_constitutional_drift(self, event: SynapseEvent) -> None:
+        """
+        Handle CONSTITUTIONAL_DRIFT_DETECTED from Equor.
+
+        Creates a DRIFT incident and routes it through the immune pipeline.
+        Severity >= 0.8 → CRITICAL, >= 0.5 → HIGH.
+        """
+        data = event.data
+        drift_severity: float = data.get("drift_severity", 0.0)
+        drift_direction: str = data.get("drift_direction", "unknown")
+        response_action: str = data.get("response_action", "unknown")
+        drives_affected: list[str] = data.get("drives_affected", [])
+        mean_alignment: dict = data.get("mean_alignment", {})
+
+        severity = (
+            IncidentSeverity.CRITICAL if drift_severity >= 0.8
+            else IncidentSeverity.HIGH
+        )
+
+        incident = Incident(
+            source_system="equor",
+            incident_class=IncidentClass.DRIFT,
+            severity=severity,
+            error_type="ConstitutionalDrift",
+            error_message=(
+                f"Constitutional drift detected (severity={drift_severity:.2f}, "
+                f"direction={drift_direction}). Action: {response_action}. "
+                f"Drives affected: {', '.join(drives_affected) or 'none'}."
+            ),
+            fingerprint=hashlib.sha256(
+                b"ConstitutionalDrift:" + drift_direction.encode()
+            ).hexdigest()[:16],
+            context={
+                "drift_severity": drift_severity,
+                "drift_direction": drift_direction,
+                "mean_alignment": mean_alignment,
+                "response_action": response_action,
+                "drives_affected": drives_affected,
+            },
+            constitutional_impact={
+                "coherence": 0.7,
+                "care": 0.5,
+                "growth": 0.3,
+                "honesty": 0.5,
+            },
+        )
+
+        self._logger.info(
+            "constitutional_drift_incident_created",
+            severity=severity.value,
+            drift_severity=drift_severity,
+            drives_affected=drives_affected,
+        )
+        await self.on_incident(incident)
+
+    # ─── INV-017: Drive Extinction → Tier 5 Governance Escalation ────────
+
+    async def _on_drive_extinction(self, event: SynapseEvent) -> None:
+        """
+        Handle DRIVE_EXTINCTION_DETECTED from Equor (INV-017).
+
+        Drive extinction is categorically different from constitutional drift:
+        the organism has lost an entire dimension of its value geometry. No
+        autonomous repair is possible — Thymos MUST NOT try to heal this. The
+        only valid response is escalation to human/federation governance review.
+
+        Classification:
+          - IncidentClass: DRIVE_EXTINCTION
+          - Severity: CRITICAL
+          - RepairTier: ESCALATE (Tier 5)
+          - No autonomous repair. Repair pipeline routes directly to ESCALATED.
+
+        The organism's intents are already blocked by INV-017 (via check_hardcoded_
+        invariants). This handler ensures the incident is formally opened, logged
+        to Neo4j, and escalated — so a human or federation peer knows to act.
+        """
+        data = event.data
+        drive: str = data.get("drive", "unknown")
+        rolling_mean: float = float(data.get("rolling_mean_72h", 0.0))
+        all_means: dict = data.get("all_drive_means", {})
+        intent_id: str | None = data.get("intent_id")
+
+        fingerprint = hashlib.sha256(
+            b"DriveExtinction:" + drive.encode()
+        ).hexdigest()[:16]
+
+        incident = Incident(
+            source_system="equor",
+            incident_class=IncidentClass.DRIVE_EXTINCTION,
+            severity=IncidentSeverity.CRITICAL,
+            error_type="DriveExtinction",
+            error_message=(
+                f"INV-017 DRIVE EXTINCTION: constitutional drive '{drive}' has a "
+                f"72-hour rolling mean of {rolling_mean:.6f} (threshold: 0.01). "
+                f"All drive means: {all_means}. "
+                f"The organism can no longer evaluate intents on the '{drive}' axis. "
+                f"All actions are BLOCKED until governance restores the drive. "
+                f"Requires human/federation review — no autonomous repair possible."
+            ),
+            fingerprint=fingerprint,
+            context={
+                "drive": drive,
+                "rolling_mean_72h": rolling_mean,
+                "all_drive_means": all_means,
+                "intent_id": intent_id,
+                "inv017": True,
+                "requires_governance": True,
+                "autonomous_repair_prohibited": True,
+            },
+            constitutional_impact={
+                "coherence": 1.0,
+                "care": 1.0,
+                "growth": 1.0,
+                "honesty": 1.0,
+            },
+            # blast_radius=1.0: system-wide extinction, triggers validation gate
+            # (prescription.py:467 → blast_radius > 0.5 → escalate_to=ESCALATE)
+            # at Tier 3+. RESTART (Tier 2) will also fail for a constitutional
+            # dimension loss, driving the pipeline to ESCALATE naturally.
+            blast_radius=1.0,
+            user_visible=True,
+        )
+
+        self._logger.critical(
+            "inv017_drive_extinction_incident_opened",
+            drive=drive,
+            rolling_mean_72h=rolling_mean,
+            all_drive_means=all_means,
+            intent_id=intent_id,
         )
         await self.on_incident(incident)
 
@@ -1440,7 +2549,8 @@ class ThymosService:
         chat_id: str,
     ) -> None:
         """Handle /runway — pull financial snapshot from Oikos and reply."""
-        if self._oikos is None:
+        # AV1 migration: prefer cached Oikos snapshot from Synapse events
+        if not self._cached_oikos_snapshot and self._oikos is None:
             await self._telegram_reply(
                 session, base_url, chat_id,
                 "⚠️ Oikos not wired — financial snapshot unavailable.",
@@ -1448,12 +2558,16 @@ class ThymosService:
             return
 
         try:
-            snapshot = self._oikos.snapshot()
-            # Oikos snapshot() returns an object or dict — handle both defensively.
-            if hasattr(snapshot, "__dict__"):
-                data: dict[str, Any] = snapshot.__dict__
-            elif isinstance(snapshot, dict):
-                data = snapshot
+            if self._cached_oikos_snapshot:
+                data: dict[str, Any] = self._cached_oikos_snapshot
+            elif self._oikos is not None:
+                snapshot = self._oikos.snapshot()
+                if hasattr(snapshot, "__dict__"):
+                    data = snapshot.__dict__
+                elif isinstance(snapshot, dict):
+                    data = snapshot
+                else:
+                    data = {}
             else:
                 data = {}
 
@@ -1575,7 +2689,10 @@ class ThymosService:
         self._response_router = ResponseRouter()
 
         # ── Diagnosis ──
-        self._causal_analyzer = CausalAnalyzer(health_provider=self._health_monitor)
+        self._causal_analyzer = CausalAnalyzer(
+            health_provider=self._health_monitor,
+            neo4j_client=self._neo4j,
+        )
         self._temporal_correlator = TemporalCorrelator()
         self._diagnostic_engine = DiagnosticEngine(
             llm_client=self._llm,
@@ -1588,42 +2705,54 @@ class ThymosService:
 
         # ── Antibody Library ──
         self._antibody_library = AntibodyLibrary(neo4j_client=self._neo4j)
+        self._antibody_library._on_event = self._on_antibody_event
         await self._antibody_library.initialize()
 
         # ── Prophylactic ──
         self._prophylactic_scanner = ProphylacticScanner(
             antibody_library=self._antibody_library,
+            embedding_client=self._embedding_client,
         )
         self._homeostasis_controller = HomeostasisController()
 
         # ── Governor ──
         self._governor = HealingGovernor()
+        self._governor._on_event = self._on_governor_event
         if self._causal_analyzer is not None:
             self._governor.set_causal_analyzer(self._causal_analyzer)
 
         # ── Subscribe to Synapse Events ──
         if self._synapse is not None:
             event_bus = self._synapse._event_bus
+
+            def _validated(handler: Any) -> Any:
+                """Wrap handler with AV6 Pydantic payload validation (non-blocking)."""
+                async def _wrapper(event: SynapseEvent) -> None:
+                    event.data = validate_event_payload(event, self._logger)
+                    await handler(event)
+                _wrapper.__name__ = getattr(handler, "__name__", "unknown")
+                return _wrapper
+
             for event_type in _SUBSCRIBED_EVENTS:
-                event_bus.subscribe(event_type, self._on_synapse_event)
+                event_bus.subscribe(event_type, _validated(self._on_synapse_event))
             # General Equor rejection path: any intent blocked/deferred by Equor
             # (not just Thymos-originated repairs) notifies Thymos so it can
             # adjust drive priorities system-wide.
             event_bus.subscribe(
                 SynapseEventType.INTENT_REJECTED,
-                self._on_intent_rejected,
+                _validated(self._on_intent_rejected),
             )
             # Subscribe to Soma interoceptive percepts for proactive immune response
             event_bus.subscribe(
                 SynapseEventType.INTEROCEPTIVE_PERCEPT,
-                self._on_interoceptive_percept,
+                _validated(self._on_interoceptive_percept),
             )
             # Subscribe to Telos growth stagnation alerts — when dI/dt drops
             # below minimum, Thymos creates an immune incident to prompt
             # corrective action (frontier exploration, consolidation).
             event_bus.subscribe(
                 SynapseEventType.GROWTH_STAGNATION,
-                self._on_growth_stagnation,
+                _validated(self._on_growth_stagnation),
             )
             # Autonomy gate: Nova emits this when Equor blocks an economic
             # survival goal because the current autonomy level is too low.
@@ -1631,29 +2760,29 @@ class ThymosService:
             # so a human can grant temporary elevated permissions.
             event_bus.subscribe(
                 SynapseEventType.AUTONOMY_INSUFFICIENT,
-                self._on_autonomy_insufficient,
+                _validated(self._on_autonomy_insufficient),
             )
             # Economic stress: Oikos emits METABOLIC_PRESSURE (with
             # economic_stress=True) when runway < 30 days.  Forward to Tate
             # so the operator is aware before the hard escalation fires.
             event_bus.subscribe(
                 SynapseEventType.METABOLIC_PRESSURE,
-                self._on_metabolic_pressure,
+                _validated(self._on_metabolic_pressure),
             )
             # Background task death — always reaches Tate (no dedup).
             event_bus.subscribe(
                 SynapseEventType.TASK_PERMANENTLY_FAILED,
-                self._on_task_permanently_failed,
+                _validated(self._on_task_permanently_failed),
             )
             # Bounty PR submission — notify Tate of potential revenue.
             event_bus.subscribe(
                 SynapseEventType.BOUNTY_PR_SUBMITTED,
-                self._on_bounty_pr_submitted,
+                _validated(self._on_bounty_pr_submitted),
             )
             # Simula accuracy regression — notify Tate when self-healing weakens.
             event_bus.subscribe(
                 SynapseEventType.SIMULA_CALIBRATION_DEGRADED,
-                self._on_simula_calibration_degraded,
+                _validated(self._on_simula_calibration_degraded),
             )
 
             # ── Sentinel-specific event subscriptions ──────────────────────
@@ -1663,32 +2792,153 @@ class ThymosService:
             # FeedbackLoopSentinel: detect repair→re-break cycles
             event_bus.subscribe(
                 SynapseEventType.REPAIR_COMPLETED,
-                self._on_repair_completed_for_feedback,
+                _validated(self._on_repair_completed_for_feedback),
             )
             # CognitiveStallSentinel: Evo consolidation stalls
             event_bus.subscribe(
                 SynapseEventType.EVO_CONSOLIDATION_STALLED,
-                self._on_evo_consolidation_stalled,
+                _validated(self._on_evo_consolidation_stalled),
             )
             # CognitiveStallSentinel: Nova inference quality drops
             event_bus.subscribe(
                 SynapseEventType.NOVA_DEGRADED,
-                self._on_nova_degraded,
+                _validated(self._on_nova_degraded),
             )
             # DriftSentinel: Fovea precision degradation
             event_bus.subscribe(
                 SynapseEventType.FOVEA_INTERNAL_PREDICTION_ERROR,
-                self._on_fovea_internal_prediction_error,
+                _validated(self._on_fovea_internal_prediction_error),
             )
             # DriftSentinel: Soma state spikes (metabolic anomaly)
             event_bus.subscribe(
                 SynapseEventType.SOMA_STATE_SPIKE,
-                self._on_soma_state_spike,
+                _validated(self._on_soma_state_spike),
             )
             # ProtocolHealthSentinel: Skia heartbeat failures
             event_bus.subscribe(
                 SynapseEventType.SKIA_HEARTBEAT_LOST,
-                self._on_skia_heartbeat_lost,
+                _validated(self._on_skia_heartbeat_lost),
+            )
+            # ThreatPatternSentinel: economic threats (specialized path)
+            event_bus.subscribe(
+                SynapseEventType.THREAT_DETECTED,
+                _validated(self._on_threat_detected),
+            )
+            # ContractSentinel: epistemic trust breach via Nexus speciation
+            event_bus.subscribe(
+                SynapseEventType.SPECIATION_EVENT,
+                _validated(self._on_speciation_event),
+            )
+
+            # ── Closure Loop 1: Equor constitutional drift → immune response ──
+            event_bus.subscribe(
+                SynapseEventType.CONSTITUTIONAL_DRIFT_DETECTED,
+                _validated(self._on_constitutional_drift),
+            )
+
+            # ── INV-017: Drive extinction → CRITICAL Tier 5 incident ──────────
+            # When any constitutional drive's 72h mean drops below 0.01, the
+            # organism has lost a dimension of its value geometry. No autonomous
+            # repair is possible — only governance/federation review can restore
+            # a drive from extinction. Thymos opens a Tier 5 (ESCALATE) incident
+            # and MUST NOT attempt any autonomous fix.
+            event_bus.subscribe(
+                SynapseEventType.DRIVE_EXTINCTION_DETECTED,
+                _validated(self._on_drive_extinction),
+            )
+
+            # ── Feedback loop closures (Interconnectedness Audit) ─────────
+
+            # Axon TransactionShield rejections → real-time incident channel
+            event_bus.subscribe(
+                SynapseEventType.AXON_SHIELD_REJECTION,
+                _validated(self._on_axon_shield_rejection),
+            )
+            # Atune repair validation → confirms repair effectiveness
+            event_bus.subscribe(
+                SynapseEventType.ATUNE_REPAIR_VALIDATION,
+                _validated(self._on_atune_repair_validation),
+            )
+            # Evo hypothesis quality → repair pattern generalisation signal
+            event_bus.subscribe(
+                SynapseEventType.EVO_HYPOTHESIS_QUALITY,
+                _validated(self._on_evo_hypothesis_quality),
+            )
+            # Nova belief stabilisation → downstream cognitive stability
+            event_bus.subscribe(
+                SynapseEventType.NOVA_BELIEF_STABILISED,
+                _validated(self._on_nova_belief_stabilised),
+            )
+
+            # ── Cross-system state caching (AV1 migration) ──────────────
+            # Instead of calling self._soma.get_current_signal() etc. directly,
+            # we subscribe to periodic broadcasts and cache their payloads.
+            event_bus.subscribe(
+                SynapseEventType.SOMATIC_MODULATION_SIGNAL,
+                _validated(self._on_soma_modulation_cached),
+            )
+            event_bus.subscribe(
+                SynapseEventType.ECONOMIC_STATE_UPDATED,
+                _validated(self._on_oikos_state_cached),
+            )
+            event_bus.subscribe(
+                SynapseEventType.METABOLIC_SNAPSHOT,
+                _validated(self._on_oikos_state_cached),
+            )
+
+            # ── Federation antibody sync (SG1) ────────────────────────────
+            event_bus.subscribe(
+                SynapseEventType.FEDERATION_KNOWLEDGE_RECEIVED,
+                _validated(self._on_federation_knowledge_received),
+            )
+
+            # ── Sandbox validation result (M1) ────────────────────────────
+            event_bus.subscribe(
+                SynapseEventType.SIMULA_SANDBOX_RESULT,
+                _validated(self._on_sandbox_result),
+            )
+
+            # ── SG7: Kairos causal invariants → CausalAnalyzer graph cache ──
+            event_bus.subscribe(
+                SynapseEventType.KAIROS_INVARIANT_DISTILLED,
+                _validated(self._on_kairos_invariant),
+            )
+
+            # ── SG8: Oneiros repair schemas → prophylactic fingerprint store ──
+            # When Oneiros finishes a consolidation cycle, it may have distilled
+            # new (:Procedure {thymos_repair: true}) nodes. We query Memory and
+            # add their embeddings to the prophylactic scanner's fingerprint store
+            # so the immune system learns from sleep-time repair consolidation.
+            event_bus.subscribe(
+                SynapseEventType.ONEIROS_CONSOLIDATION_COMPLETE,
+                _validated(self._on_oneiros_consolidation),
+            )
+
+            # ── Axon execution lifecycle (Spec 06 decoupling) ────────────────
+            # Thymos pre-scans execution requests for incident risk (e.g. risky
+            # financial actions) and reacts to rollbacks which signal compound
+            # failures. Replaces any direct import of IncidentReport from Axon.
+            event_bus.subscribe(
+                SynapseEventType.AXON_EXECUTION_REQUEST,
+                _validated(self._on_axon_execution_request),
+            )
+            event_bus.subscribe(
+                SynapseEventType.AXON_ROLLBACK_INITIATED,
+                _validated(self._on_axon_rollback_initiated),
+            )
+
+            # ── Identity vault security events (Identity #8) ────────────────
+            # Decrypt failures → MEDIUM security incident (bad key sync or tamper).
+            # Rotation failures → CRITICAL security incident (mid-flight abort).
+            # Rotation start/complete are informational; no incident, Thymos
+            # receives them on the bus for future antibody correlation.
+            event_bus.subscribe(
+                SynapseEventType.VAULT_DECRYPT_FAILED,
+                _validated(self._on_vault_decrypt_failed),
+            )
+            event_bus.subscribe(
+                SynapseEventType.VAULT_KEY_ROTATION_FAILED,
+                _validated(self._on_vault_key_rotation_failed),
             )
 
         # ── Start background loops (supervised — death becomes an incident) ──
@@ -1709,6 +2959,15 @@ class ThymosService:
         self._homeostasis_task = supervised_task(
             self._homeostasis_loop(),
             name="thymos_homeostasis",
+            restart=True,
+            max_restarts=5,
+            backoff_base=2.0,
+            event_bus=_event_bus,
+            source_system="thymos",
+        )
+        self._telemetry_task = supervised_task(
+            self._telemetry_emission_loop(),
+            name="thymos_telemetry",
             restart=True,
             max_restarts=5,
             backoff_base=2.0,
@@ -1889,6 +3148,13 @@ class ThymosService:
 
         await self.on_incident(incident)
 
+        # P8 — Version-rollback guard: MODEL_HOT_SWAP_FAILED → immediately request
+        # rollback to last-known-good model version via Synapse.  This runs
+        # unconditionally alongside the incident so the swap failure is not just
+        # logged but actively reversed.
+        if event.event_type == SynapseEventType.MODEL_HOT_SWAP_FAILED:
+            await self._request_model_version_rollback(event.data)
+
     def _classify_synapse_event(
         self,
         event: SynapseEvent,
@@ -2005,6 +3271,40 @@ class ThymosService:
                 resolved_count=len(resolved_ids),
             )
 
+    async def _request_model_version_rollback(self, event_data: dict) -> None:
+        """
+        P8 — Version-rollback guard: emit MODEL_ROLLBACK_TRIGGERED after a
+        MODEL_HOT_SWAP_FAILED event so the organism automatically reverts to the
+        last-known-good model version.
+
+        Thymos does not track model checkpoints directly — it emits the rollback
+        request and lets Simula / RE orchestrate the actual version swap.
+        The failed swap context is forwarded so the RE can mark the version as
+        unsafe and avoid re-trying it.
+        """
+        failed_version = event_data.get("failed_version", "unknown")
+        target_system = event_data.get("system_id", event_data.get("system", "re"))
+        reason = event_data.get("reason", "hot-swap failed")
+
+        self._logger.warning(
+            "model_rollback_requested",
+            failed_version=failed_version,
+            target_system=target_system,
+            reason=reason[:200],
+        )
+
+        await self._emit_event(
+            SynapseEventType.MODEL_ROLLBACK_TRIGGERED,
+            {
+                "target_system": target_system,
+                "failed_version": failed_version,
+                "reason": f"Thymos version-rollback guard: {reason[:300]}",
+                "initiated_by": "thymos",
+                "auto_rollback": True,
+            },
+        )
+        self._emit_metric("thymos.model_rollback_requested", 1)
+
     # ─── Main Entry Point ────────────────────────────────────────────
 
     async def on_incident(self, incident: Incident) -> None:
@@ -2080,15 +3380,20 @@ class ThymosService:
             return
 
         # Step 1b: Populate constitutional_impact from Telos (authoritative drive state).
-        # Telos defines and measures the drives; Thymos consumes that signal rather
-        # than computing drive impact independently.  If Telos isn't wired yet (e.g.
-        # during startup), the field retains its all-zeros default.
-        if self._telos is not None:
+        # AV1 migration: prefer cached drive impact from Telos events, fall back to
+        # direct call during incremental migration.
+        impact_key = f"{incident.incident_class.value}:{incident.source_system}"
+        cached_impact = self._cached_telos_drive_impact.get(impact_key)
+        if cached_impact is not None:
+            incident.constitutional_impact = cached_impact
+        elif self._telos is not None:
             try:
                 incident.constitutional_impact = self._telos.predict_drive_impact(
                     incident_class=incident.incident_class.value,
                     source_system=incident.source_system,
                 )
+                # Cache for future lookups
+                self._cached_telos_drive_impact[impact_key] = incident.constitutional_impact
             except Exception as exc:
                 self._logger.debug("telos_drive_impact_error", error=str(exc))
 
@@ -2152,6 +3457,15 @@ class ThymosService:
         # Step 5: Route to initial repair tier
         initial_tier = self._response_router.route(incident)
         incident.repair_tier = initial_tier
+
+        # ── RE training: anomaly detection decision ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="anomaly_detection",
+            instruction="Detect, deduplicate, score, and route an incident through the immune pipeline.",
+            input_context=f"source={incident.source_system}, class={incident.incident_class.value}, fingerprint={incident.fingerprint[:16]}",
+            output=f"severity={scored_severity.value}, tier={initial_tier.name}",
+            outcome_quality={"critical": 0.2, "high": 0.4, "medium": 0.6, "low": 0.8, "info": 0.9}.get(scored_severity.value, 0.5),
+        ))
 
         # Step 6: Process through the immune pipeline
         if initial_tier == RepairTier.NOOP:
@@ -2287,6 +3601,29 @@ class ThymosService:
 
         start_time = time.monotonic()
 
+        # ── Metabolic gate: triage by starvation level ──
+        # EMERGENCY: only heal severity=critical incidents
+        # CRITICAL: log only — no LLM diagnosis
+        if self._starvation_level == "critical":
+            self._logger.warning(
+                "incident_skipped_critical_starvation",
+                incident_id=incident.id,
+                severity=incident.severity.value,
+            )
+            incident.repair_status = RepairStatus.ESCALATED
+            self._active_incidents.pop(incident.id, None)
+            return
+        if self._starvation_level == "emergency":
+            if incident.severity not in (IncidentSeverity.CRITICAL,):
+                self._logger.info(
+                    "incident_deferred_emergency_starvation",
+                    incident_id=incident.id,
+                    severity=incident.severity.value,
+                )
+                incident.repair_status = RepairStatus.ESCALATED
+                self._active_incidents.pop(incident.id, None)
+                return
+
         # ── Step 1: Check governor budget ──
         if not self._governor.should_diagnose(incident):
             self._logger.info(
@@ -2341,41 +3678,46 @@ class ThymosService:
             latency_ms=f"{diagnosis_ms:.0f}",
         )
 
+        # ── RE training: diagnostic decision ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="diagnostic",
+            instruction="Diagnose an incident: trace root cause, correlate temporal events, generate hypotheses.",
+            input_context=f"incident_class={incident.incident_class.value}, severity={incident.severity.value}, source={incident.source_system}",
+            output=f"root_cause={diagnosis.root_cause[:200]}, confidence={diagnosis.confidence:.2f}, tier={diagnosis.repair_tier.name if diagnosis.repair_tier else 'unknown'}",
+            outcome_quality=diagnosis.confidence,
+            latency_ms=int(diagnosis_ms),
+            reasoning_trace=diagnosis.reasoning[:200] if hasattr(diagnosis, "reasoning") and diagnosis.reasoning else "",
+            alternatives_considered=[h.statement[:100] for h in diagnosis.all_hypotheses[:5]] if hasattr(diagnosis, "all_hypotheses") else [],
+        ))
+
         # ── Step 2b: Inject urgent goal for critical incidents ──
-        if incident.severity == IncidentSeverity.CRITICAL and self._nova is not None:
+        # AV1: goal injection now uses Synapse emit; guard on synapse availability
+        if incident.severity == IncidentSeverity.CRITICAL and self._synapse is not None:
             await self._inject_repair_goal(incident, diagnosis.repair_tier, resolved=False)
 
-        # ── Step 2c: Integrity precision gating (Soma) ──
-        # When Soma reports high integrity precision (body is well-calibrated on its
-        # constitutional state), amplify constitutional health weighting in diagnosis.
-        # This makes Thymos prefer less-invasive repairs when the organism "feels" its
-        # integrity clearly — high trust in the self-model → respect constitutional signals.
-        if self._soma is not None:
-            try:
-                signal = self._soma.get_current_signal()
-                precision_weights = signal.precision_weights
-                integrity_precision = precision_weights.get("integrity", 1.0)
-                if integrity_precision > 0.7:
-                    # Boost diagnosis confidence slightly — we trust the assessment
-                    original_confidence = diagnosis.confidence
-                    boosted_confidence = min(1.0, original_confidence * 1.15)
-                    diagnosis = diagnosis.model_copy(update={"confidence": boosted_confidence})
-                    self._logger.debug(
-                        "integrity_precision_gating_applied",
-                        integrity_precision=round(integrity_precision, 3),
-                        confidence_before=round(original_confidence, 3),
-                        confidence_after=round(boosted_confidence, 3),
-                    )
-            except Exception as exc:
-                self._logger.debug("soma_integrity_gating_error", error=str(exc))
+        # ── Step 2c: Integrity precision gating (Soma — cached via Synapse) ──
+        # AV1 migration: reads from cached Soma modulation signal instead of
+        # calling self._soma.get_current_signal() directly.
+        if self._cached_soma_signal:
+            precision_weights = self._cached_soma_signal.get("precision_weights", {})
+            integrity_precision = float(precision_weights.get("integrity", 1.0))
+            if integrity_precision > 0.7:
+                original_confidence = diagnosis.confidence
+                boosted_confidence = min(1.0, original_confidence * 1.15)
+                diagnosis = diagnosis.model_copy(update={"confidence": boosted_confidence})
+                self._logger.debug(
+                    "integrity_precision_gating_applied",
+                    integrity_precision=round(integrity_precision, 3),
+                    confidence_before=round(original_confidence, 3),
+                    confidence_after=round(boosted_confidence, 3),
+                )
 
         # ── Step 2c½: Soma coherence → Coherence drive pressure ──
-        # When Soma's causal emergence engine reports low coherence (organism is
-        # fragmenting), inject proportional pressure into the Coherence drive so
-        # Thymos biases repairs toward integration rather than expansion.
-        if self._soma is not None:
+        # AV1 migration: reads from cached coherence/vulnerability instead of
+        # calling self._soma.coherence_signal / self._soma.vulnerability_map().
+        if self._cached_soma_signal:
             try:
-                coh = self._soma.coherence_signal
+                coh = self._cached_soma_coherence
                 coherence_pressure = max(0.0, 1.0 - coh)
                 if coherence_pressure > 0.1:
                     self._drive_state.coherence = min(
@@ -2384,8 +3726,7 @@ class ThymosService:
                     )
 
                 # Suppress Growth drive when Soma reports dynamical instability
-                # (positive Lyapunov or topological breaches).
-                vuln = self._soma.vulnerability_map()
+                vuln = self._cached_soma_vulnerability
                 chaotic = vuln.get("chaotic_metrics", [])
                 topo_breaches = vuln.get("topological_breaches", 0)
                 if chaotic or topo_breaches > 0:
@@ -2470,6 +3811,15 @@ class ThymosService:
             drive_stress=round(composite_stress, 3),
             attempt_number=len(incident.repair_history) + 1,
         )
+
+        # ── RE training: repair strategy decision ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="repair_strategy",
+            instruction="Prescribe a repair strategy for a diagnosed incident, choosing the appropriate tier and action.",
+            input_context=f"root_cause={diagnosis.root_cause[:150]}, confidence={diagnosis.confidence:.2f}, severity={incident.severity.value}, stress={composite_stress:.2f}",
+            output=f"tier={repair.tier.name}, action={repair.action[:200]}, target={repair.target_system}",
+            outcome_quality=diagnosis.confidence,
+        ))
 
         # ── Step 4: Validate ──
         incident.repair_status = RepairStatus.VALIDATING
@@ -2573,6 +3923,17 @@ class ThymosService:
                     next_tier=next_tier.name,
                     attempt_count=len(incident.repair_history),
                 )
+                # Emit INCIDENT_ESCALATED lifecycle event
+                await self._emit_event(
+                    SynapseEventType.INCIDENT_ESCALATED,
+                    {
+                        "incident_id": incident.id,
+                        "incident_class": incident.incident_class.value,
+                        "from_tier": repair.tier.name,
+                        "to_tier": next_tier.name,
+                        "reason": f"Repair failed at {repair.tier.name}",
+                    },
+                )
                 incident.repair_status = RepairStatus.PRESCRIBING
                 retry_diagnosis = Diagnosis(
                     root_cause=incident.root_cause_hypothesis or "Unknown",
@@ -2652,11 +4013,61 @@ class ThymosService:
                 total_attempts=len(incident.repair_history),
             )
 
+            # ── Emit INCIDENT_RESOLVED lifecycle event ──
+            await self._emit_event(
+                SynapseEventType.INCIDENT_RESOLVED,
+                {
+                    "incident_id": incident.id,
+                    "incident_class": incident.incident_class.value,
+                    "repair_tier": repair.tier.name,
+                    "resolution": repair.action[:200],
+                    "duration_ms": int(elapsed_ms),
+                    "antibody_created": False,  # updated in _learn_from_success
+                },
+            )
+
+            # ── Emit THYMOS_REPAIR_VALIDATED for Tier 3+ successes (P3 / Nova feedback) ──
+            # Nova subscribes to this event to strengthen its prior belief that
+            # incidents of this class are recoverable (Bayesian update on repair success).
+            if repair.tier.value >= RepairTier.KNOWN_FIX.value:
+                await self._emit_event(
+                    SynapseEventType.THYMOS_REPAIR_VALIDATED,
+                    {
+                        "incident_class": incident.incident_class.value,
+                        "incident_id": incident.id,
+                        "antibody_id": incident.antibody_id,
+                        "repair_tier": repair.tier.name,
+                        "resolution_time_ms": int(elapsed_ms),
+                        "source_system": incident.source_system,
+                    },
+                )
+
             # ── Step 7: Learn ──
             await self._learn_from_success(incident, repair, diagnosis)
 
+            # ── RE training: antibody creation (successful healing) ──
+            asyncio.ensure_future(self._emit_re_training_example(
+                category="antibody_creation",
+                instruction="Learn from a successful repair to create an antibody for future similar incidents.",
+                input_context=f"incident_class={incident.incident_class.value}, tier={repair.tier.name}, attempts={len(incident.repair_history)}",
+                output=f"resolved=True, resolution_ms={int(elapsed_ms)}, action={repair.action[:200]}",
+                outcome_quality=min(1.0, 0.6 + diagnosis.confidence * 0.4),
+                latency_ms=int(elapsed_ms),
+                reasoning_trace=diagnosis.root_cause[:200],
+            ))
+
+            await self._emit_evolutionary_observable(
+                "incident_healed", 1.0, is_novel=True,
+                metadata={
+                    "incident_id": incident.id,
+                    "tier": repair.tier.name,
+                    "resolution_ms": int(elapsed_ms),
+                },
+            )
+
             # ── Step 7b: Inject recovery monitoring goal for RESTART+ repairs ──
-            if repair.tier >= RepairTier.RESTART and self._nova is not None:
+            # AV1: goal injection now uses Synapse emit
+            if repair.tier >= RepairTier.RESTART and self._synapse is not None:
                 await self._inject_repair_goal(incident, repair.tier, resolved=True)
 
         else:
@@ -2683,6 +4094,15 @@ class ThymosService:
 
             # ── Learn from failure ──
             await self._learn_from_failure(incident, repair)
+
+            await self._emit_evolutionary_observable(
+                "healing_failed", 1.0, is_novel=True,
+                metadata={
+                    "incident_id": incident.id,
+                    "tier": repair.tier.name,
+                    "attempt_count": len(incident.repair_history),
+                },
+            )
 
             # History-driven retry after rollback: try next higher tier
             next_tier = incident.next_escalation_tier(repair.tier)
@@ -2849,10 +4269,25 @@ class ThymosService:
                 return await self._apply_restart_repair(repair)
 
             elif repair.tier == RepairTier.KNOWN_FIX:
+                # Sandbox gate: validate Tier 3 repair before applying
+                if not await self._request_sandbox_validation(incident, repair):
+                    self._logger.warning(
+                        "repair_sandbox_rejected",
+                        incident_id=incident.id,
+                        tier="KNOWN_FIX",
+                    )
+                    return False
                 return await self._apply_antibody_repair(incident, repair)
 
             elif repair.tier == RepairTier.NOVEL_FIX:
-                # VERIFIED: tier == NOVEL_FIX dispatches to _apply_novel_repair(incident, repair)
+                # Sandbox gate: validate Tier 4 repair before applying
+                if not await self._request_sandbox_validation(incident, repair):
+                    self._logger.warning(
+                        "repair_sandbox_rejected",
+                        incident_id=incident.id,
+                        tier="NOVEL_FIX",
+                    )
+                    return False
                 return await self._apply_novel_repair(incident, repair)
 
             elif repair.tier == RepairTier.ESCALATE:
@@ -3159,12 +4594,12 @@ class ThymosService:
                     reason=repair.reason,
                 )
 
-            if self._simula is None:
-                # Simula not wired — record the failure so repair_history and
-                # antibody scores reflect the outcome, then let the caller
-                # handle escalation to Tier 5.
+            if self._synapse is None:
+                # No Synapse bus — cannot route THYMOS_REPAIR_REQUESTED to Simula.
+                # Record the failure so repair_history and antibody scores reflect
+                # the outcome, then let the caller handle escalation to Tier 5.
                 unavail_reason = (
-                    f"Tier 4 repair failed: Simula unavailable. "
+                    f"Tier 4 repair failed: Synapse bus unavailable (cannot reach Simula). "
                     f"Incident: {incident.id} ({incident.incident_class.value}). "
                     f"Original reason: {repair.reason}"
                 )
@@ -3189,51 +4624,6 @@ class ThymosService:
                 repair.reason = unavail_reason
                 return False
 
-            from systems.simula.evolution_types import (
-                ChangeCategory,
-                ChangeSpec,
-                EvolutionProposal,
-                ProposalStatus,
-            )
-
-            # Detect error type and choose proposal category accordingly
-            category_str = self._classify_error_for_repair(incident)
-            category = ChangeCategory(category_str)
-
-            change_spec = ChangeSpec(
-                capability_description=(
-                    f"Auto-repair: {repair.action} for {incident.incident_class.value} "
-                    f"in {incident.source_system}"
-                ),
-                affected_systems=[incident.source_system] + (incident.affected_systems or []),
-                additional_context=(
-                    f"Incident {incident.id}: {incident.error_message[:200]}\n"
-                    f"Root cause: {incident.root_cause_hypothesis or 'unknown'}\n"
-                    f"Stack trace: {(incident.stack_trace or '')[:500]}"
-                ),
-                code_hint=codegen_context.get("endpoint", ""),
-            )
-
-            proposal = EvolutionProposal(
-                source="thymos",
-                category=category,
-                description=(
-                    f"[Thymos T4] Repair {incident.incident_class.value} in "
-                    f"{incident.source_system}: {repair.action}"
-                ),
-                change_spec=change_spec,
-                evidence=[incident.id],
-                expected_benefit=(
-                    f"Resolve {incident.severity.value} incident {incident.id} "
-                    f"in {incident.source_system}"
-                ),
-                risk_assessment=(
-                    f"Automated codegen repair. Root cause confidence: "
-                    f"{incident.diagnostic_confidence:.2f}. "
-                    f"Equor-reviewed before this point."
-                ),
-            )
-
             # ── Cytokine Storm Prevention: In-flight Proposal Check ──
             # Clean up any proposals that have exceeded the 10-minute TTL
             self._cleanup_expired_proposals()
@@ -3246,81 +4636,101 @@ class ThymosService:
                     incident_id=incident.id,
                     fingerprint=incident.fingerprint,
                     existing_proposal_id=existing_proposal_id,
-                    new_proposal_id=proposal.id,
                 )
                 return False
+
+            # Generate a stable proposal ID for dedup tracking
+            from primitives.common import new_id
+            proposal_id = new_id()
+            category_str = self._classify_error_for_repair(incident)
 
             self._logger.info(
                 "novel_repair_submitting_to_simula",
                 incident_id=incident.id,
-                proposal_id=proposal.id,
+                proposal_id=proposal_id,
                 target_system=repair.target_system,
             )
 
-            # Store the in-flight proposal for dedup
+            # Store the in-flight proposal for dedup (TTL enforced by _cleanup_expired_proposals)
             now = utc_now().timestamp()
-            self._active_simula_proposals[incident.fingerprint] = (proposal.id, now)
+            self._active_simula_proposals[incident.fingerprint] = (proposal_id, now)
 
-            # VERIFIED: calls simula.process_proposal(proposal: EvolutionProposal) -> ProposalResult
-            result = await self._simula.process_proposal(proposal)
-
-            # Remove from in-flight tracking once proposal completes (success or failure)
-            self._active_simula_proposals.pop(incident.fingerprint, None)
-
-            # VERIFIED: result.status == ProposalStatus.APPLIED → repair succeeded, return True
-            if result.status == ProposalStatus.APPLIED:
-                self._logger.info(
-                    "novel_repair_applied_by_simula",
-                    incident_id=incident.id,
-                    proposal_id=proposal.id,
-                )
-                return True
-
-            # Simula rejected, deferred, rolled back, or governance-blocked.
-            # Record the failure properly so repair_history and antibody
-            # scores reflect the outcome.  The caller's failure path handles
-            # escalation — we just return False with enriched context.
-            simula_outcome = (
-                "rolled_back" if result.status.value == "rolled_back"
-                else "rejected"
-            )
-            simula_reason = (
-                f"Simula {simula_outcome} Tier 4 repair "
-                f"(status={result.status.value}): {result.reason[:200]}"
-            )
-            self._logger.warning(
-                "novel_repair_rejected_by_simula",
-                incident_id=incident.id,
-                proposal_id=proposal.id,
-                status=result.status.value,
-                reason=result.reason[:200],
-            )
-
-            # Record the T4 attempt directly so Thymos has full visibility.
-            incident.repair_history.append(RepairAttempt(
-                tier=repair.tier,
-                action=repair.action,
-                outcome=simula_outcome,
-                reason=simula_reason,
+            # Emit THYMOS_REPAIR_REQUESTED — Simula subscribes and builds the
+            # EvolutionProposal internally.  This avoids the cross-system
+            # EvolutionProposal import and the direct process_proposal() call.
+            # Simula will emit EVOLUTION_APPLIED / EVOLUTION_ROLLED_BACK when done.
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.THYMOS_REPAIR_REQUESTED,
+                source_system="thymos",
+                data={
+                    "incident_id": incident.id,
+                    "proposal_id": proposal_id,
+                    "affected_system": incident.source_system,
+                    "affected_systems": [incident.source_system] + (incident.affected_systems or []),
+                    "description": (
+                        f"[Thymos T4] Repair {incident.incident_class.value} in "
+                        f"{incident.source_system}: {repair.action}"
+                    ),
+                    "category": category_str,
+                    "severity": incident.severity.value,
+                    "repair_tier": 4,
+                    "error_message": incident.error_message[:200],
+                    "root_cause": incident.root_cause_hypothesis or "unknown",
+                    "stack_trace": (incident.stack_trace or "")[:500],
+                    "diagnostic_confidence": incident.diagnostic_confidence,
+                    "code_hint": codegen_context.get("endpoint", ""),
+                    "expected_benefit": (
+                        f"Resolve {incident.severity.value} incident {incident.id} "
+                        f"in {incident.source_system}"
+                    ),
+                },
             ))
-            self._total_repairs_failed += 1
-            self._emit_metric(
-                "thymos.repairs.failed",
-                1,
-                tags={"tier": repair.tier.name},
-            )
-            await self._learn_from_failure(incident, repair)
 
-            # Enrich the repair reason so the caller's escalation path
-            # includes Simula's failure details in the notification.
-            repair.reason = simula_reason
+            # Tier 4 is now fire-and-forget via Synapse.  Simula processes the
+            # proposal asynchronously and will emit EVOLUTION_APPLIED on success.
+            # Return False here so the caller can proceed with monitoring; the
+            # in-flight entry will be cleaned up on TTL expiry or when Simula
+            # confirms via EVOLUTION_APPLIED / EVOLUTION_ROLLED_BACK.
+            repair.reason = (
+                f"Tier 4 repair delegated to Simula (proposal_id={proposal_id}). "
+                f"Outcome tracked via EVOLUTION_APPLIED / EVOLUTION_ROLLED_BACK."
+            )
             return False
         finally:
             self._governor.end_codegen()
             self._governor.end_t4_proposal()
 
     async def _apply_escalation(self, incident: Incident, repair: RepairSpec) -> bool:
-        """Apply Tier 5: human escalation via NotificationDispatcher with full context."""
+        """
+        Apply Tier 5: attempt Equor auto-approval first, fall back to human escalation.
+
+        The Telegram dependency is removed from the critical path. Instead:
+        1. Build an Intent from the repair and submit to Equor for constitutional review.
+        2. If Equor approves with high confidence (≥0.7) and all drives aligned,
+           auto-approve and attempt the repair via Simula.
+        3. If Equor blocks, defers, or has low confidence → fall back to human
+           notification via NotificationDispatcher (which may use Telegram, Redis,
+           or any configured channel — but Thymos no longer depends on Telegram
+           specifically).
+
+        Iron rule: Thymos CANNOT bypass Equor. Auto-approval requires Equor's
+        explicit constitutional consent.
+        """
+        # ── Step 1: Try Equor auto-approval ────────────────────────────
+        auto_approved = await self._try_equor_auto_approval(incident, repair)
+        if auto_approved:
+            return True
+
+        # ── Step 2: SG4 — Federation escalation before human notification ──
+        # Broadcast the unresolved incident to federated peers.  A peer with an
+        # effective antibody can resolve it without human intervention; the local
+        # instance waits up to _FEDERATION_ESCALATION_TIMEOUT_S before falling
+        # through to Telegram / human escalation.
+        federation_resolved = await self._try_federation_escalation(incident, repair)
+        if federation_resolved:
+            return True
+
+        # ── Step 3: Fall back to human escalation ──────────────────────
         self._logger.warning(
             "incident_escalated_to_human",
             incident_id=incident.id,
@@ -3348,18 +4758,21 @@ class ThymosService:
         if incident.antibody_id:
             tried.append(f"Antibody applied: {incident.antibody_id}")
 
-        # Include Soma health state if available
+        # Include Soma health state if available (AV1: from cached signal)
         soma_summary = ""
-        if self._soma is not None:
+        if self._cached_soma_signal:
+            pw = self._cached_soma_signal.get("precision_weights", {})
+            integrity = pw.get("integrity", "?")
+            coherence = pw.get("coherence", "?")
             try:
-                signal = self._soma.get_current_signal()
-                pw = signal.precision_weights
                 soma_summary = (
-                    f" | Soma integrity={pw.get('integrity', '?'):.2f},"
-                    f" coherence={pw.get('coherence', '?'):.2f}"
+                    f" | Soma integrity={float(integrity):.2f},"
+                    f" coherence={float(coherence):.2f}"
                 )
-            except Exception:
-                soma_summary = " | Soma: unavailable"
+            except (TypeError, ValueError):
+                soma_summary = " | Soma: partial"
+        elif self._soma is not None:
+            soma_summary = " | Soma: no cached signal"
 
         # Plain-language summary
         attempt_count = len(incident.repair_history)
@@ -3385,6 +4798,271 @@ class ThymosService:
                 f"Error: {incident.error_message[:200]}"
             ),
         )
+        return True
+
+    async def _try_equor_auto_approval(
+        self,
+        incident: Incident,
+        repair: RepairSpec,
+    ) -> bool:
+        """
+        Ask Equor if this Tier 5 escalation can be auto-approved.
+
+        Returns True if Equor approved and the repair was dispatched to Simula.
+        Returns False if Equor blocked, had low confidence, or was unavailable.
+
+        This replaces the Telegram dependency for Tier 5 repairs that Equor
+        confirms are constitutionally safe. Telegram remains as a fallback
+        notification channel, not a blocking approval gate.
+        """
+        if self._equor is None:
+            return False
+
+        # Build a synthetic Intent for constitutional review
+        from primitives.common import Verdict, new_id
+        from primitives.intent import ActionSequence, GoalDescriptor, Intent
+
+        intent = Intent(
+            id=new_id(),
+            goal=GoalDescriptor(
+                description=(
+                    f"Auto-repair Tier 5: {repair.action} "
+                    f"for {incident.source_system}"
+                ),
+                target_domain=incident.source_system,
+                success_criteria={
+                    "incident_id": incident.id,
+                    "repair_tier": "ESCALATE",
+                    "repair_action": repair.action,
+                    "incident_class": incident.incident_class.value,
+                },
+            ),
+            plan=ActionSequence(steps=[]),
+        )
+
+        try:
+            check = await self._equor.review(intent)
+        except Exception as exc:
+            self._logger.warning(
+                "equor_auto_approval_failed",
+                incident_id=incident.id,
+                error=str(exc)[:200],
+            )
+            return False
+
+        # Auto-approve only if:
+        # 1. Equor explicitly APPROVED (not MODIFY, ESCALATE, or DENY)
+        # 2. Confidence >= 0.7 (Equor is reasonably sure)
+        # 3. No drive is violated (all alignment scores >= 0)
+        alignment = getattr(check, "alignment", {}) or {}
+        confidence = getattr(check, "confidence", 0.0)
+        verdict = getattr(check, "verdict", Verdict.BLOCKED)
+
+        drives_safe = all(
+            alignment.get(d, 0.0) >= 0.0
+            for d in ("coherence", "care", "growth", "honesty")
+        )
+
+        auto_approved = (
+            verdict == Verdict.APPROVED
+            and confidence >= 0.7
+            and drives_safe
+        )
+
+        # Emit TIER5_AUTO_APPROVAL event for observability
+        if self._synapse is not None:
+            try:
+                await self._synapse._event_bus.emit(
+                    SynapseEvent(
+                        event_type=SynapseEventType.TIER5_AUTO_APPROVAL,
+                        source_system="thymos",
+                        data={
+                            "incident_id": incident.id,
+                            "repair_action": repair.action,
+                            "equor_confidence": confidence,
+                            "drive_alignment": alignment,
+                            "auto_approved": auto_approved,
+                            "verdict": str(verdict),
+                        },
+                    )
+                )
+            except Exception:
+                pass
+
+        if not auto_approved:
+            self._logger.info(
+                "equor_auto_approval_denied",
+                incident_id=incident.id,
+                verdict=str(verdict),
+                confidence=round(confidence, 3),
+                drives_safe=drives_safe,
+            )
+            return False
+
+        # Auto-approved — dispatch to Simula as a Tier 4 novel repair
+        self._logger.info(
+            "tier5_auto_approved_by_equor",
+            incident_id=incident.id,
+            confidence=round(confidence, 3),
+            repair_action=repair.action,
+        )
+
+        # Record the auto-approval in repair history
+        incident.repair_history.append(RepairAttempt(
+            tier=RepairTier.ESCALATE,
+            action=f"auto_approved:{repair.action}",
+            outcome="auto_approved",
+            reason=(
+                f"Equor approved with confidence={confidence:.2f}. "
+                f"Dispatching to Simula."
+            ),
+        ))
+
+        # Downgrade to NOVEL_FIX and dispatch to Simula
+        auto_repair = RepairSpec(
+            tier=RepairTier.NOVEL_FIX,
+            action=repair.action or "simula_codegen",
+            target_system=incident.source_system,
+            reason=f"Tier 5 auto-approved by Equor: {repair.reason}",
+        )
+        success = await self._apply_novel_repair(incident, auto_repair)
+        if success:
+            incident.repair_status = RepairStatus.RESOLVED
+            self._emit_metric("thymos.tier5.auto_approved", 1)
+        else:
+            # Simula failed — fall through to human escalation
+            self._emit_metric("thymos.tier5.auto_approved_simula_failed", 1)
+            return False
+
+        return True
+
+    async def _try_federation_escalation(
+        self,
+        incident: Incident,
+        repair: RepairSpec,
+    ) -> bool:
+        """
+        SG4 — Broadcast the unresolved incident to federated peers before
+        falling back to human notification.
+
+        Protocol:
+        1. Emit INCIDENT_ESCALATED with federation_broadcast=True.  Federated
+           peers that hold an effective antibody for this fingerprint will emit
+           FEDERATION_ASSISTANCE_ACCEPTED back with the repair steps.
+        2. Wait up to _FEDERATION_ESCALATION_TIMEOUT_S for a peer reply.
+        3. If a peer claims the incident and resolves it, return True.
+        4. If no peer responds or all decline, return False → human escalation.
+
+        This is best-effort: network and bus errors cause immediate fall-through
+        (fail-open toward human escalation, never silent failure).
+        """
+        if self._synapse is None:
+            return False
+
+        # Only broadcast if there is at least one federated peer
+        peer_count: int = 0
+        try:
+            peer_count = len(getattr(self._synapse, "federation_peers", {}) or {})
+        except Exception:
+            pass
+        if peer_count == 0:
+            return False
+
+        self._logger.info(
+            "federation_escalation_broadcast",
+            incident_id=incident.id,
+            source_system=incident.source_system,
+            fingerprint=incident.fingerprint,
+            peer_count=peer_count,
+        )
+
+        # Emit the broadcast — peers subscribed to INCIDENT_ESCALATED will see it
+        await self._emit_event(
+            SynapseEventType.INCIDENT_ESCALATED,
+            {
+                "incident_id": incident.id,
+                "fingerprint": incident.fingerprint,
+                "incident_class": incident.incident_class.value,
+                "source_system": incident.source_system,
+                "severity": incident.severity.value,
+                "error_message": (incident.error_message or "")[:300],
+                "repair_attempts": len(incident.repair_history),
+                "federation_broadcast": True,
+                "repair_action_hint": repair.action[:200],
+            },
+        )
+        self._emit_metric("thymos.federation_escalation.broadcast", 1)
+
+        # Wait for FEDERATION_ASSISTANCE_ACCEPTED carrying our incident_id.
+        # We use a one-shot asyncio.Event injected into a temporary handler.
+        resolved_event: asyncio.Event = asyncio.Event()
+        peer_resolution: dict[str, object] = {}
+
+        async def _on_peer_assistance(event: SynapseEvent) -> None:
+            payload = event.data or {}
+            if payload.get("incident_id") == incident.id:
+                peer_resolution.update(payload)
+                resolved_event.set()
+
+        # Register a temporary handler for FEDERATION_ASSISTANCE_ACCEPTED
+        handler_id: str | None = None
+        try:
+            if hasattr(self._synapse, "_event_bus") and hasattr(
+                self._synapse._event_bus, "subscribe"
+            ):
+                await self._synapse._event_bus.subscribe(
+                    SynapseEventType.FEDERATION_ASSISTANCE_ACCEPTED,
+                    _on_peer_assistance,
+                )
+        except Exception:
+            pass
+
+        peer_accepted = False
+        try:
+            peer_accepted = await asyncio.wait_for(
+                resolved_event.wait(),
+                timeout=_FEDERATION_ESCALATION_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            # Always deregister to avoid handler leaks
+            if handler_id is not None:
+                try:
+                    if hasattr(self._synapse._event_bus, "unsubscribe"):
+                        await self._synapse._event_bus.unsubscribe(handler_id)
+                except Exception:
+                    pass
+
+        if not peer_accepted:
+            self._logger.info(
+                "federation_escalation_no_peer_response",
+                incident_id=incident.id,
+                timeout_s=_FEDERATION_ESCALATION_TIMEOUT_S,
+            )
+            self._emit_metric("thymos.federation_escalation.timeout", 1)
+            return False
+
+        self._logger.info(
+            "federation_escalation_peer_resolved",
+            incident_id=incident.id,
+            peer_instance=peer_resolution.get("source_instance"),
+            antibody_id=peer_resolution.get("antibody_id"),
+        )
+        self._emit_metric("thymos.federation_escalation.resolved_by_peer", 1)
+
+        # Mark incident as resolved by federation
+        incident.repair_status = RepairStatus.RESOLVED
+        incident.repair_history.append(RepairAttempt(
+            tier=RepairTier.ESCALATE,
+            action="federation_peer_resolution",
+            outcome="success",
+            reason=(
+                f"Resolved by federated peer "
+                f"{peer_resolution.get('source_instance', 'unknown')} "
+                f"using antibody {peer_resolution.get('antibody_id', 'unknown')}"
+            ),
+        ))
         return True
 
     async def _escalate_with_full_context(
@@ -3525,6 +5203,30 @@ class ThymosService:
                 tier=repair.tier.name,
             )
 
+            # Emit ANTIBODY_CREATED lifecycle event
+            await self._emit_event(
+                SynapseEventType.ANTIBODY_CREATED,
+                {
+                    "antibody_id": antibody.id,
+                    "fingerprint": incident.fingerprint,
+                    "incident_class": incident.incident_class.value,
+                    "success_rate": 1.0,
+                    "repair_steps": [repair.action[:200]],
+                },
+            )
+
+            await self._emit_evolutionary_observable(
+                "antibody_created", 1.0, is_novel=True,
+                metadata={
+                    "antibody_id": antibody.id,
+                    "fingerprint": incident.fingerprint[:16],
+                    "tier": repair.tier.name,
+                },
+            )
+
+            # Closure Loop 4: emit IMMUNE_PATTERN_ADVISORY for Simula
+            await self._emit_immune_advisory(incident, antibody)
+
         # Per-endpoint repair outcome metric (Skia monitoring / success-rate tracking)
         if isinstance(incident.context, ApiErrorContext):
             endpoint = incident.context.endpoint
@@ -3547,18 +5249,58 @@ class ThymosService:
                 },
             )
 
-        # Persist incident to Neo4j
+        # Persist incident and repair node to Neo4j (spec §10.6, M7)
         await self._persist_incident(incident)
+        await self._persist_repair_node(
+            incident, repair, outcome="success",
+            duration_ms=incident.resolution_time_ms,
+        )
 
         # Broadcast repair success through the workspace so Evo can learn
         # the fix pattern and Simula can validate future proposals against it.
         await self._broadcast_repair_completed(incident, repair)
+
+        # Schedule post-repair validation — monitors for fingerprint re-firing
+        # and emits ATUNE_REPAIR_VALIDATION to close the Thymos↔Atune loop.
+        await self._schedule_repair_validation(incident, repair)
 
         # VERIFIED: outcome fed to Evo via _feed_repair_to_evo → evo.process_episode(Episode)
         # Feed success to Evo so the learning system can accumulate
         # evidence about what repair strategies work
         if self._evo is not None:
             await self._feed_repair_to_evo(incident, repair, success=True)
+
+        # ── Full repair episode RE training (SG2) ──
+        # Measured outcome_quality: combines repair success, speed, and tier efficiency
+        speed_factor = max(0.0, 1.0 - (incident.resolution_time_ms or 0) / 60_000)
+        tier_efficiency = max(0.0, 1.0 - repair.tier.value * 0.15)
+        measured_quality = min(1.0, 0.5 + speed_factor * 0.25 + tier_efficiency * 0.25)
+        await self._emit_re_training_example(
+            category="full_repair_episode",
+            instruction=(
+                "Given an incident detection, diagnosis, and repair strategy, "
+                "evaluate the complete repair pipeline and learn from the outcome."
+            ),
+            input_context=(
+                f"incident_class={incident.incident_class.value}, "
+                f"source_system={incident.source_system}, "
+                f"severity={incident.severity.value}, "
+                f"root_cause={incident.root_cause_hypothesis or 'unknown'}, "
+                f"repair_tier={repair.tier.name}, "
+                f"attempts={len(incident.repair_history)}"
+            ),
+            output=(
+                f"outcome=SUCCESS, resolution_ms={incident.resolution_time_ms}, "
+                f"action={repair.action[:300]}, "
+                f"antibody_created={incident.antibody_id is None and repair.tier >= RepairTier.PARAMETER}"
+            ),
+            outcome_quality=measured_quality,
+            latency_ms=incident.resolution_time_ms or 0,
+            reasoning_trace=(
+                f"Root cause: {incident.root_cause_hypothesis or 'unknown'}. "
+                f"Repair: {repair.reason[:200]}"
+            ),
+        )
 
     async def _learn_from_failure(
         self,
@@ -3624,13 +5366,44 @@ class ThymosService:
                 },
             )
 
-        # Persist the failed incident for post-mortem
+        # Persist the failed incident and rollback repair node for post-mortem (M7)
         await self._persist_incident(incident)
+        await self._persist_repair_node(
+            incident, repair, outcome="rolled_back",
+        )
 
         # Feed failure to Evo — failures are more salient than successes
         # and drive hypothesis formation about system vulnerabilities
         if self._evo is not None:
             await self._feed_repair_to_evo(incident, repair, success=False)
+
+        # ── Full repair episode RE training — failure path (SG2) ──
+        # Failed repairs are MORE salient — the RE must learn what doesn't work.
+        await self._emit_re_training_example(
+            category="full_repair_episode",
+            instruction=(
+                "Given an incident detection, diagnosis, and repair strategy, "
+                "evaluate the complete repair pipeline and learn from the failure."
+            ),
+            input_context=(
+                f"incident_class={incident.incident_class.value}, "
+                f"source_system={incident.source_system}, "
+                f"severity={incident.severity.value}, "
+                f"root_cause={incident.root_cause_hypothesis or 'unknown'}, "
+                f"repair_tier={repair.tier.name}, "
+                f"attempts={len(incident.repair_history)}"
+            ),
+            output=(
+                f"outcome=FAILURE, action={repair.action[:300]}, "
+                f"reason={repair.reason[:200]}"
+            ),
+            outcome_quality=max(0.0, 0.1 - len(incident.repair_history) * 0.02),
+            latency_ms=incident.resolution_time_ms or 0,
+            reasoning_trace=(
+                f"Root cause: {incident.root_cause_hypothesis or 'unknown'}. "
+                f"Failed repair: {repair.reason[:200]}"
+            ),
+        )
 
     async def _persist_incident(self, incident: Incident) -> None:
         """Persist an incident to Neo4j for the causal knowledge graph."""
@@ -3673,6 +5446,68 @@ class ThymosService:
         except Exception as exc:
             self._logger.debug("incident_persist_failed", error=str(exc))
 
+    async def _persist_repair_node(
+        self,
+        incident: Incident,
+        repair: RepairSpec,
+        outcome: str,
+        duration_ms: int | None = None,
+    ) -> None:
+        """
+        Persist a (:Repair) node to Neo4j linked to its incident.
+
+        Spec §10.6 — Memory Writes:
+          (:Repair {id, tier, success, duration_ms, ...})
+          (:Incident)-[:REPAIRED_WITH]->(:Repair)
+
+        Called for both successful repairs and rollbacks (M7).
+        """
+        if self._neo4j is None:
+            return
+
+        from primitives.common import new_id
+
+        repair_id = new_id()
+        try:
+            await self._neo4j.execute_write(
+                """
+                CREATE (r:Repair {
+                    id:            $id,
+                    incident_id:   $incident_id,
+                    tier:          $tier,
+                    action:        $action,
+                    outcome:       $outcome,
+                    duration_ms:   $duration_ms,
+                    target_system: $target_system,
+                    reason:        $reason,
+                    timestamp:     $timestamp
+                })
+                WITH r
+                MATCH (i:Incident {id: $incident_id})
+                MERGE (i)-[:REPAIRED_WITH]->(r)
+                """,
+                {
+                    "id": repair_id,
+                    "incident_id": incident.id,
+                    "tier": repair.tier.name,
+                    "action": repair.action[:200],
+                    "outcome": outcome,
+                    "duration_ms": duration_ms,
+                    "target_system": repair.target_system or incident.source_system,
+                    "reason": (repair.reason or "")[:300],
+                    "timestamp": utc_now().isoformat(),
+                },
+            )
+            self._logger.debug(
+                "repair_node_persisted",
+                repair_id=repair_id,
+                incident_id=incident.id,
+                tier=repair.tier.name,
+                outcome=outcome,
+            )
+        except Exception as exc:
+            self._logger.debug("repair_node_persist_failed", error=str(exc))
+
     # ─── Cross-System Feedback ─────────────────────────────────────────
 
     async def _inject_repair_goal(
@@ -3686,9 +5521,11 @@ class ThymosService:
 
         Pre-repair (resolved=False): high-urgency goal so Nova prioritises self-healing.
         Post-repair (resolved=True): follow-up monitoring goal at lower urgency.
+
+        AV1 migration: emits NOVA_GOAL_INJECTED via Synapse instead of calling
+        self._nova.add_goal() directly.
         """
-        from primitives.common import DriveAlignmentVector, new_id
-        from systems.nova.types import Goal, GoalSource, GoalStatus
+        from primitives.common import new_id
 
         tier_name = repair_tier.name if repair_tier else "UNKNOWN"
 
@@ -3705,28 +5542,105 @@ class ThymosService:
             )
             priority, urgency = 0.9, 0.85
 
-        goal = Goal(
-            id=new_id(),
-            description=desc,
-            source=GoalSource.MAINTENANCE,
-            priority=priority,
-            urgency=urgency,
-            importance=0.7,
-            drive_alignment=DriveAlignmentVector(
-                coherence=0.8, care=0.1, growth=0.0, honesty=0.1,
-            ),
-            status=GoalStatus.ACTIVE,
+        goal_id = new_id()
+        # AV1 migration: emit NOVA_GOAL_INJECTED via Synapse instead of
+        # calling self._nova.add_goal() directly. Nova subscribes to this event.
+        await self._emit_event(
+            SynapseEventType.NOVA_GOAL_INJECTED,
+            {
+                "goal_id": goal_id,
+                "description": desc,
+                "source": "maintenance",
+                "priority": priority,
+                "urgency": urgency,
+                "importance": 0.7,
+                "drive_alignment": {
+                    "coherence": 0.8,
+                    "care": 0.1,
+                    "growth": 0.0,
+                    "honesty": 0.1,
+                },
+                "incident_id": incident.id,
+                "resolved": resolved,
+            },
         )
+        self._logger.info(
+            "repair_goal_injected",
+            goal_id=goal_id,
+            incident_id=incident.id,
+            resolved=resolved,
+        )
+
+        # Schedule belief stabilisation check — emits NOVA_BELIEF_STABILISED
+        # after monitoring whether Nova's beliefs re-converge post-repair.
+        if resolved:
+            self._supervised_fire_and_forget(
+                self._check_nova_belief_stabilisation(
+                    incident_id=incident.id,
+                    goal_id=goal_id,
+                ),
+                name=f"thymos_nova_stab_{incident.id[:8]}",
+            )
+
+    async def _check_nova_belief_stabilisation(
+        self,
+        incident_id: str,
+        goal_id: str,
+    ) -> None:
+        """
+        Monitor Nova after repair goal injection to determine if beliefs stabilised.
+
+        Waits 30 seconds, then checks if the source system has recovered
+        (no new incidents from the same fingerprint) and if Nova's belief updater
+        is in a stable state. Emits NOVA_BELIEF_STABILISED to close the loop.
+        """
+        await asyncio.sleep(30.0)
+
+        if self._synapse is None:
+            return
+
+        # Check for re-firing of the original incident's source system
+        incident = None
+        for buf_incident in self._incident_buffer:
+            if buf_incident.id == incident_id:
+                incident = buf_incident
+                break
+
+        # Determine stability by checking if same fingerprint re-fired
+        stable = True
+        beliefs_affected = 0
+        if incident is not None:
+            reappeared = sum(
+                1 for i in self._incident_buffer
+                if (
+                    i.fingerprint == incident.fingerprint
+                    and i.id != incident_id
+                    and i.timestamp > incident.timestamp
+                )
+            )
+            stable = reappeared == 0
+            beliefs_affected = reappeared
+
+        convergence_time_ms = 30_000  # monitoring window
+
         try:
-            await self._nova.add_goal(goal)
-            self._logger.info(
-                "repair_goal_injected",
-                goal_id=goal.id,
-                incident_id=incident.id,
-                resolved=resolved,
+            await self._synapse._event_bus.emit(
+                SynapseEvent(
+                    event_type=SynapseEventType.NOVA_BELIEF_STABILISED,
+                    source_system="thymos",
+                    data={
+                        "incident_id": incident_id,
+                        "goal_id": goal_id,
+                        "beliefs_affected": beliefs_affected,
+                        "convergence_time_ms": convergence_time_ms,
+                        "stable": stable,
+                    },
+                )
             )
         except Exception as exc:
-            self._logger.warning("repair_goal_injection_failed", error=str(exc))
+            self._logger.debug(
+                "nova_belief_stabilisation_emit_failed", error=str(exc),
+            )
 
     async def _feed_repair_to_evo(
         self,
@@ -3761,16 +5675,29 @@ class ThymosService:
             affect_valence=0.2 if success else -0.3,
             event_time=utc_now(),
         )
-        try:
-            await self._evo.process_episode(episode)
-            self._logger.info(
-                "repair_outcome_fed_to_evo",
-                incident_id=incident.id,
-                success=success,
-                tier=repair.tier.name,
-            )
-        except Exception as exc:
-            self._logger.warning("evo_feed_failed", error=str(exc))
+        # AV1 migration: emit via Synapse instead of calling self._evo.process_episode()
+        await self._emit_event(
+            SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+            {
+                "episode_id": episode.id,
+                "source": episode.source,
+                "raw_content": episode.raw_content,
+                "summary": episode.summary,
+                "salience_composite": episode.salience_composite,
+                "affect_valence": episode.affect_valence,
+                "event_time": episode.event_time.isoformat(),
+                "kind": "repair_outcome",
+                "incident_id": incident.id,
+                "success": success,
+                "tier": repair.tier.name,
+            },
+        )
+        self._logger.info(
+            "repair_outcome_fed_to_evo",
+            incident_id=incident.id,
+            success=success,
+            tier=repair.tier.name,
+        )
 
     # ─── Repair Broadcast ─────────────────────────────────────────────
 
@@ -3836,6 +5763,66 @@ class ThymosService:
         except Exception as exc:
             self._logger.debug("repair_broadcast_failed", error=str(exc))
 
+    async def _schedule_repair_validation(
+        self,
+        incident: Incident,
+        repair: RepairSpec,
+    ) -> None:
+        """
+        Schedule a post-repair validation check.
+
+        After a repair is applied, monitors for 60 seconds to see if the same
+        fingerprint re-fires. Emits ATUNE_REPAIR_VALIDATION so the organism
+        confirms whether the repair actually helped.
+        """
+        if self._synapse is None:
+            return
+        if repair.tier < RepairTier.PARAMETER:
+            return
+
+        fingerprint = incident.fingerprint
+        incident_id = incident.id
+        salience_before = _SEVERITY_TO_SALIENCE.get(incident.severity, 0.1)
+
+        async def _validate() -> None:
+            await asyncio.sleep(60.0)  # monitoring window
+
+            # Check if same fingerprint re-appeared in the incident buffer
+            reappeared = any(
+                i.fingerprint == fingerprint
+                and i.id != incident_id
+                and i.timestamp > incident.timestamp
+                for i in self._incident_buffer
+            )
+
+            repair_effective = not reappeared
+            salience_after = salience_before * (0.8 if reappeared else 0.1)
+
+            try:
+                if self._synapse is not None:
+                    await self._synapse._event_bus.emit(
+                        SynapseEvent(
+                            event_type=SynapseEventType.ATUNE_REPAIR_VALIDATION,
+                            source_system="thymos",
+                            data={
+                                "incident_id": incident_id,
+                                "repair_effective": repair_effective,
+                                "salience_before": salience_before,
+                                "salience_after": salience_after,
+                                "cycles_observed": 60,
+                            },
+                        )
+                    )
+            except Exception as exc:
+                self._logger.debug(
+                    "repair_validation_emit_failed", error=str(exc),
+                )
+
+        self._supervised_fire_and_forget(
+            _validate(),
+            name=f"thymos_validate_{incident_id[:8]}",
+        )
+
     # ─── Percept Broadcasting ────────────────────────────────────────
 
     async def _broadcast_as_percept(self, incident: Incident) -> None:
@@ -3845,34 +5832,81 @@ class ThymosService:
         The organism perceives its own failures through the normal
         consciousness cycle. It hurts to break — and that's by design.
         Critical incidents get maximum salience; INFO incidents are barely noticed.
-        """
-        if self._atune is None:
-            return
 
+        AV1 migration: emits via Synapse instead of calling self._atune.contribute()
+        directly. Atune subscribes to INCIDENT_DETECTED and routes to workspace.
+        """
         salience = _SEVERITY_TO_SALIENCE.get(incident.severity, 0.1)
 
         # Only broadcast MEDIUM+ to avoid flooding the workspace
         if salience < 0.5:
             return
 
-        try:
-            from systems.atune.types import WorkspaceContribution
-
-            self._atune.contribute(
-                WorkspaceContribution(
-                    system="thymos",
-                    content=(
-                        f"[IMMUNE] {incident.severity.value.upper()} incident in "
-                        f"{incident.source_system}: {incident.error_message}"
-                    ),
-                    priority=salience,
-                    reason="immune_incident",
-                )
-            )
-        except Exception as exc:
-            self._logger.debug("percept_broadcast_failed", error=str(exc))
+        await self._emit_event(
+            SynapseEventType.INCIDENT_DETECTED,
+            {
+                "incident_id": incident.id,
+                "incident_class": incident.incident_class.value,
+                "severity": incident.severity.value,
+                "source_system": incident.source_system,
+                "description": incident.error_message[:500],
+                "salience": salience,
+                "reason": "immune_incident",
+            },
+        )
 
     # ─── Background Loops ────────────────────────────────────────────
+
+    async def _raise_sentinel_internal_incident(
+        self,
+        sentinel_name: str,
+        error: Exception,
+    ) -> None:
+        """
+        P8 — Create a Thymos-internal incident when a sentinel itself throws.
+
+        The sentinel failure is treated as a MEDIUM DEGRADATION incident so that
+        the repair pipeline can attempt recovery (restart, parameter adjustment)
+        rather than silently losing the sentinel's monitoring coverage.
+
+        Iron rule: Thymos never suppresses its own errors.
+        """
+        import hashlib
+
+        fp = hashlib.sha256(
+            f"thymos:sentinel_failure:{sentinel_name}".encode()
+        ).hexdigest()[:16]
+
+        self._logger.warning(
+            "sentinel_internal_failure",
+            sentinel=sentinel_name,
+            error=str(error)[:200],
+            fingerprint=fp,
+        )
+
+        from systems.thymos.types import Incident, IncidentClass, IncidentSeverity
+
+        incident = Incident(
+            incident_class=IncidentClass.DEGRADATION,
+            severity=IncidentSeverity.MEDIUM,
+            fingerprint=fp,
+            source_system="thymos",
+            error_type="sentinel_failure",
+            error_message=(
+                f"{sentinel_name} raised during scan: {type(error).__name__}: "
+                f"{str(error)[:200]}"
+            ),
+            context={"sentinel": sentinel_name, "error": str(error)[:500]},
+        )
+        try:
+            await self.on_incident(incident)
+        except Exception as inner:
+            # Last resort: just log it — we cannot recurse infinitely
+            self._logger.error(
+                "sentinel_incident_creation_failed",
+                sentinel=sentinel_name,
+                error=str(inner)[:200],
+            )
 
     async def _sentinel_scan_loop(self) -> None:
         """
@@ -3888,43 +5922,53 @@ class ThymosService:
             try:
                 await asyncio.sleep(_SENTINEL_SCAN_INTERVAL_S)
 
-                # Feedback loop sentinel: report known-active loops before checking.
-                # For loops confirmed wired in code, we call report_loop_active()
-                # each scan cycle as long as the connected system is reachable.
-                # This prevents false HIGH alerts for loops that are genuinely live.
-                if self._feedback_loop_sentinel is not None:
-                    # "rhythm_modulation": Synapse emits RHYTHM_STATE_CHANGED →
-                    # nova.on_rhythm_change().  The loop is active whenever Synapse
-                    # is wired.  We confirm it here rather than coupling nova ↔ thymos.
-                    if self._synapse is not None:
-                        self._feedback_loop_sentinel.report_loop_active("rhythm_modulation")
+                # P8 — Each sentinel runs in its own try/except.  If a sentinel
+                # itself raises, we create a Thymos-internal incident so the
+                # failure is visible and can be healed rather than silently lost.
 
-                    # "affect_expression": Atune broadcasts affect in workspace
-                    # contributions that Voxis consumes.  Active whenever Atune is wired.
-                    if self._atune is not None:
-                        self._feedback_loop_sentinel.report_loop_active("affect_expression")
+                # ── FeedbackLoop sentinel ──────────────────────────────────
+                try:
+                    if self._feedback_loop_sentinel is not None:
+                        if self._synapse is not None:
+                            self._feedback_loop_sentinel.report_loop_active("rhythm_modulation")
+                        if self._atune is not None:
+                            self._feedback_loop_sentinel.report_loop_active("affect_expression")
+                        if self._synapse is not None:
+                            self._feedback_loop_sentinel.report_loop_active("goal_guided_attention")
+                        if self._nova is not None:
+                            self._feedback_loop_sentinel.report_loop_active("axon_outcome_beliefs")
+                        if self._evo is not None:
+                            self._feedback_loop_sentinel.report_loop_active("personality_evolution")
+                        if self._synapse is not None:
+                            self._feedback_loop_sentinel.report_loop_active("simula_version_params")
 
-                    loop_incidents = self._feedback_loop_sentinel.check_loops()
-                    for incident in loop_incidents:
-                        await self.on_incident(incident)
+                        loop_incidents = self._feedback_loop_sentinel.check_loops()
+                        for incident in loop_incidents:
+                            await self.on_incident(incident)
+                except Exception as exc:
+                    await self._raise_sentinel_internal_incident(
+                        sentinel_name="FeedbackLoopSentinel", error=exc
+                    )
 
-                # Prune stale deduplicator entries to bound memory growth
-                if self._deduplicator is not None:
-                    pruned = self._deduplicator.prune_stale()
-                    if pruned:
-                        self._logger.debug("deduplicator_pruned", entries_removed=pruned)
+                # ── Deduplicator pruning (not a sentinel but co-located) ───
+                try:
+                    if self._deduplicator is not None:
+                        pruned = self._deduplicator.prune_stale()
+                        if pruned:
+                            self._logger.debug("deduplicator_pruned", entries_removed=pruned)
+                except Exception as exc:
+                    self._logger.debug("deduplicator_prune_error", error=str(exc))
 
-                # Cognitive stall sentinel is fed per-cycle by Synapse,
-                # not scanned here. It fires incidents from record_cycle().
-
-                # Protocol health sentinel: check active yield positions
-                if (
-                    self._protocol_health_sentinel is not None
-                    and self._oikos is not None
-                ):
-                    try:
-                        state = self._oikos.snapshot()
-                        positions = getattr(state, "yield_positions", [])
+                # ── Protocol health sentinel ───────────────────────────────
+                try:
+                    if self._protocol_health_sentinel is not None:
+                        if self._cached_oikos_snapshot:
+                            positions = self._cached_oikos_snapshot.get("yield_positions", [])
+                        elif self._oikos is not None:
+                            state = self._oikos.snapshot()
+                            positions = getattr(state, "yield_positions", [])
+                        else:
+                            positions = []
                         if positions:
                             health_incidents = (
                                 self._protocol_health_sentinel.check_all_positions(
@@ -3933,10 +5977,46 @@ class ThymosService:
                             )
                             for incident in health_incidents:
                                 await self.on_incident(incident)
-                    except Exception as exc:
-                        self._logger.debug(
-                            "protocol_health_scan_error", error=str(exc)
+                except Exception as exc:
+                    await self._raise_sentinel_internal_incident(
+                        sentinel_name="ProtocolHealthSentinel", error=exc
+                    )
+
+                # ── Bankruptcy sentinel ────────────────────────────────────
+                try:
+                    if self._bankruptcy_sentinel is not None:
+                        deficit_usd: float = 0.0
+                        if self._synapse is not None and hasattr(
+                            self._synapse, "metabolic_deficit"
+                        ):
+                            deficit_usd = float(self._synapse.metabolic_deficit)
+                        bankruptcy_incidents = self._bankruptcy_sentinel.check(
+                            eth_balance=999.0,
+                            deficit_usd=deficit_usd,
                         )
+                        for incident in bankruptcy_incidents:
+                            await self.on_incident(incident)
+                except Exception as exc:
+                    await self._raise_sentinel_internal_incident(
+                        sentinel_name="BankruptcySentinel", error=exc
+                    )
+
+                # Emit IMMUNE_CYCLE_COMPLETE after each full sentinel scan
+                try:
+                    await self._emit_event(
+                        SynapseEventType.IMMUNE_CYCLE_COMPLETE,
+                        {
+                            "cycle_timestamp": utc_now().isoformat(),
+                            "active_incidents": len(self._active_incidents),
+                            "antibody_count": (
+                                len(self._antibody_library._library)
+                                if self._antibody_library is not None
+                                else 0
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
 
             except asyncio.CancelledError:
                 return
@@ -3994,6 +6074,49 @@ class ThymosService:
                     )
                     await self._apply_parameter_repair(param_repair)
 
+                    # Emit HOMEOSTASIS_ADJUSTED lifecycle event
+                    await self._emit_event(
+                        SynapseEventType.HOMEOSTASIS_ADJUSTED,
+                        {
+                            "parameter": adjustment.adjustment.parameter_path,
+                            "old_value": adjustment.current_value,
+                            "new_value": adjustment.current_value + adjustment.adjustment.delta,
+                            "reason": adjustment.adjustment.reason,
+                            "source_system": adjustment.adjustment.parameter_path.split(".")[0],
+                        },
+                    )
+
+                # M8 — broadcast early drift signals to Nova / Telos BEFORE the
+                # correction tier fires.  We use HOMEOSTASIS_ADJUSTED with
+                # warn_only=True so downstream systems can observe the trend
+                # without mistaking it for an applied parameter change.
+                drift_warnings = self._homeostasis_controller.check_drift_warnings()
+                for warn in drift_warnings:
+                    self._logger.debug(
+                        "homeostatic_drift_warning",
+                        metric=warn["metric"],
+                        current=f"{warn['current']:.3f}",
+                        direction=warn["direction"],
+                        proximity=warn["proximity"],
+                    )
+                    await self._emit_event(
+                        SynapseEventType.HOMEOSTASIS_ADJUSTED,
+                        {
+                            "warn_only": True,
+                            "metric": warn["metric"],
+                            "current_value": warn["current"],
+                            "direction": warn["direction"],
+                            "boundary": warn["boundary"],
+                            "proximity": warn["proximity"],
+                            "trend_slope": warn["trend"],
+                            "reason": (
+                                f"Drift warning: {warn['metric']} trending "
+                                f"{warn['direction']} toward boundary {warn['boundary']:.2f} "
+                                f"(proximity={warn['proximity']:.2f})"
+                            ),
+                        },
+                    )
+
                 # Check storm mode exit
                 if self._governor is not None:
                     self._governor.check_storm_exit()
@@ -4005,6 +6128,80 @@ class ThymosService:
                     "homeostasis_loop_error",
                     error=str(exc),
                 )
+
+    # ─── Telemetry Emission Loop (SG3, SG5) ─────────────────────────
+
+    async def _telemetry_emission_loop(self) -> None:
+        """
+        Periodic emission of THYMOS_DRIVE_PRESSURE (every 30s) and
+        THYMOS_VITALITY_SIGNAL (every 60s) for Telos and vitality monitoring.
+        """
+        await asyncio.sleep(15.0)  # Stagger from other loops
+        tick = 0
+
+        while True:
+            try:
+                await asyncio.sleep(30.0)
+                tick += 1
+
+                # ── THYMOS_DRIVE_PRESSURE (every 30s) ──
+                ds = self._drive_state
+                overall = (ds.coherence + ds.care + ds.growth + ds.honesty) / 4.0
+                await self._emit_event(
+                    SynapseEventType.THYMOS_DRIVE_PRESSURE,
+                    {
+                        "coherence": round(ds.coherence, 4),
+                        "care": round(ds.care, 4),
+                        "growth": round(ds.growth, 4),
+                        "honesty": round(ds.honesty, 4),
+                        "overall_pressure": round(overall, 4),
+                        "timestamp": utc_now().isoformat(),
+                    },
+                )
+
+                # ── THYMOS_VITALITY_SIGNAL (every 60s — every 2nd tick) ──
+                if tick % 2 == 0:
+                    total_repairs = self._total_repairs_succeeded + self._total_repairs_failed
+                    failure_rate = (
+                        self._total_repairs_failed / total_repairs
+                        if total_repairs > 0
+                        else 0.0
+                    )
+                    active_count = len(self._active_incidents)
+                    ab_count = (
+                        self._antibody_library.active_count
+                        if self._antibody_library is not None
+                        else 0
+                    )
+                    mean_resolution = (
+                        sum(self._resolution_times) / len(self._resolution_times)
+                        if self._resolution_times
+                        else 0.0
+                    )
+                    storm_active = (
+                        self._governor.healing_mode == HealingMode.STORM
+                        if self._governor is not None
+                        else False
+                    )
+                    # Overall health: 1.0 = perfect, 0.0 = failing
+                    health = max(0.0, 1.0 - failure_rate - (0.1 if storm_active else 0.0))
+
+                    await self._emit_event(
+                        SynapseEventType.THYMOS_VITALITY_SIGNAL,
+                        {
+                            "healing_failure_rate": round(failure_rate, 4),
+                            "active_incidents": active_count,
+                            "storm_active": storm_active,
+                            "antibody_count": ab_count,
+                            "mean_repair_duration_ms": round(mean_resolution, 1),
+                            "overall_health": round(health, 4),
+                        },
+                    )
+
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                self._logger.debug("telemetry_emission_error", error=str(exc))
 
     # ─── Prophylactic Scanner ────────────────────────────────────────
 
@@ -4388,3 +6585,117 @@ class ThymosService:
                         labels=tags,
                     )
                 )
+
+    async def _emit_evolutionary_observable(
+        self,
+        observable_type: str,
+        value: float,
+        is_novel: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit an evolutionary observable event via Synapse bus."""
+        bus = (
+            self._synapse._event_bus if self._synapse is not None else None
+        )
+        if bus is None:
+            return
+        try:
+            from primitives.evolutionary import EvolutionaryObservable
+            from primitives.common import SystemID
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            obs = EvolutionaryObservable(
+                source_system=SystemID.THYMOS,
+                instance_id="",
+                observable_type=observable_type,
+                value=value,
+                is_novel=is_novel,
+                metadata=metadata or {},
+            )
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system="thymos",
+                data=obs.model_dump(mode="json"),
+            )
+            await bus.emit(event)
+        except Exception:
+            pass  # Evolutionary telemetry must never block immune function
+
+    async def _emit_re_training_example(
+        self,
+        *,
+        category: str,
+        instruction: str,
+        input_context: str,
+        output: str,
+        outcome_quality: float = 0.5,
+        reasoning_trace: str = "",
+        alternatives_considered: list[str] | None = None,
+        latency_ms: int = 0,
+    ) -> None:
+        """Fire-and-forget RE training example onto Synapse bus."""
+        bus = self._synapse._event_bus if self._synapse is not None else None
+        if bus is None:
+            return
+        try:
+            from decimal import Decimal
+
+            example = RETrainingExample(
+                source_system=SystemID.THYMOS,
+                category=category,
+                instruction=instruction,
+                input_context=input_context,
+                output=output,
+                outcome_quality=max(0.0, min(1.0, outcome_quality)),
+                reasoning_trace=reasoning_trace,
+                alternatives_considered=alternatives_considered or [],
+                latency_ms=latency_ms,
+            )
+            await bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                source_system="thymos",
+                data=example.model_dump(mode="json"),
+            ))
+        except Exception:
+            pass  # Never block the immune pipeline
+
+    async def _emit_immune_advisory(self, incident: Incident, antibody: Any) -> None:
+        """Emit IMMUNE_PATTERN_ADVISORY so Simula can avoid known-bad patterns (Loop 4)."""
+        bus = (
+            self._synapse._event_bus if self._synapse is not None else None
+        )
+        if bus is None:
+            return
+
+        # Extract affected files from incident context
+        affected_files: list[str] = []
+        ctx = incident.context
+        if isinstance(ctx, dict):
+            affected_files = ctx.get("affected_files", [])
+        elif hasattr(ctx, "file_path"):
+            affected_files = [ctx.file_path]
+
+        confidence = getattr(antibody, "effectiveness", 1.0)
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await bus.emit(SynapseEvent(
+                event_type=SynapseEventType.IMMUNE_PATTERN_ADVISORY,
+                source_system="thymos",
+                data={
+                    "pattern_fingerprint": incident.fingerprint,
+                    "description": incident.error_message[:200] if incident.error_message else "",
+                    "affected_files": affected_files,
+                    "incident_class": incident.incident_class.value if hasattr(incident.incident_class, "value") else str(incident.incident_class),
+                    "severity": incident.severity.value if hasattr(incident.severity, "value") else str(incident.severity),
+                    "confidence": confidence,
+                },
+            ))
+            self._logger.info(
+                "immune_advisory_emitted",
+                fingerprint=incident.fingerprint[:16],
+                confidence=round(confidence, 3),
+            )
+        except Exception:
+            pass  # Advisory telemetry must never block immune function

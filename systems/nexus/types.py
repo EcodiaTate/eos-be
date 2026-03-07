@@ -65,6 +65,96 @@ class SleepCertification(EOSBaseModel):
         return self.survived_slow_wave and self.survived_rem and self.sleep_cycles_survived >= 1
 
 
+# ─── Abstract Structure (Formal) ─────────────────────────────────
+
+
+class AbstractStructure(EOSBaseModel):
+    """
+    Formally typed representation of a world model fragment's abstract
+    relational skeleton.
+
+    Replaces the previous ``dict[str, Any]`` used as
+    ``ShareableWorldModelFragment.abstract_structure`` so the wire format is
+    typed, validated, and directly comparable by ConvergenceDetector.
+
+    Domain-specific labels are stripped before building this object.  The
+    structure captures SHAPE, not CONTENT.
+
+    Gap HIGH-2 (Federation Spec, 2026-03-07): formalised from dict[str, Any].
+    Gap MEDIUM-6 (Federation Spec, 2026-03-07): ``sleep_certified`` flag
+      added for the sleep certification handshake gate.
+    """
+
+    node_count: int = 0
+    """Total number of nodes in the relational graph."""
+
+    edge_count: int = 0
+    """Total number of directed or undirected edges."""
+
+    schema_type: str = ""
+    """
+    High-level topology class:
+    "chain" | "cycle" | "star" | "tree" | "complete" | "bipartite" |
+    "lattice" | "arbitrary".
+    """
+
+    compression_ratio: float = 0.0
+    """MDL compression ratio achieved for this structure (higher = more parsimonious)."""
+
+    provenance_hash: str = ""
+    """
+    SHA-256 of the canonical abstract structure JSON.
+    Used for structural dedup across the federation.
+    """
+
+    sleep_certified: bool = False
+    """
+    True only after this fragment has survived at least one complete
+    Oneiros sleep cycle (slow-wave + REM consolidation).
+
+    Fragments are NOT eligible for WORLD_MODEL_FRAGMENT_SHARE emission
+    until this flag is True.  Set by NexusService when
+    ONEIROS_CONSOLIDATION_COMPLETE fires with this fragment's schema_id
+    in the payload.
+
+    Gap MEDIUM-6: sleep certification handshake.
+    """
+
+    node_type_distribution: dict[str, int] = Field(default_factory=dict)
+    """Count of each node type label (e.g. {"entity": 3, "event": 2})."""
+
+    edge_type_distribution: dict[str, int] = Field(default_factory=dict)
+    """Count of each edge type label (e.g. {"causal": 4, "temporal": 1})."""
+
+    symmetry: str = ""
+    """Declared symmetry class (``chain`` | ``cycle`` | ``star`` | ``tree``)."""
+
+    invariants: list[str] = Field(default_factory=list)
+    """Named structural invariants preserved under isomorphism (e.g. "acyclic")."""
+
+    nodes: list[dict[str, Any]] = Field(default_factory=list)
+    """
+    Ordered node descriptors for WL-1 hashing.
+    Each dict: {"type": str, ...}.  Domain-specific names must be stripped.
+    """
+
+    edges: list[dict[str, Any]] = Field(default_factory=list)
+    """
+    Ordered edge descriptors for WL-1 hashing.
+    Each dict: {"type": str, "from": int, "to": int, ...}.
+    Integer indices reference positions in ``nodes``.
+    """
+
+    def to_legacy_dict(self) -> dict[str, Any]:
+        """Backwards-compatible dict export for existing convergence helpers."""
+        return {
+            "nodes": self.nodes if self.nodes else self.node_count,
+            "edges": self.edges,
+            "symmetry": self.symmetry or self.schema_type,
+            "invariants": self.invariants,
+        }
+
+
 # ─── Compression Path (Provenance) ───────────────────────────────
 
 
@@ -82,11 +172,38 @@ class CompressionPath(EOSBaseModel):
     """
     Full provenance record of how a fragment was compressed.
 
-    This is the transformation record, NOT the raw data. Shared so
-    other instances can compare compression strategies and detect
-    when different paths converge on the same structure.
+    Gap HIGH-3 (Federation Spec, 2026-03-07): formalised with explicit typed
+    fields (source_system, target_system, compression_steps, fidelity_score,
+    created_at) replacing the prior implicit dict-like structure.
+
+    This is the transformation record, NOT the raw data. Shared so other
+    instances can compare compression strategies and detect when different
+    paths converge on the same structure.
     """
 
+    source_system: str = ""
+    """System ID that produced this fragment (e.g. ``logos``, ``oneiros``)."""
+
+    target_system: str = ""
+    """Intended consumer system. For world model fragments, always ``nexus``."""
+
+    compression_steps: list[str] = Field(default_factory=list)
+    """
+    Ordered list of stage names applied during compression.
+    E.g. ["holographic_encoding", "slow_wave_distillation", "schema_induction"].
+    Fast comparison path — mirrors step[*].stage without traversing step records.
+    """
+
+    fidelity_score: float = 0.0
+    """
+    Fraction of original semantic content preserved after compression (0-1).
+    Computed as 1.0 - (bits_lost / bits_in_first_step).
+    """
+
+    created_at: datetime = Field(default_factory=utc_now)
+    """When this compression path was recorded."""
+
+    # Detailed per-step records (optional, richer than compression_steps)
     steps: list[CompressionPathStep] = Field(default_factory=list)
     total_compression_ratio: float = 0.0
     source_domain: str = ""
@@ -94,7 +211,7 @@ class CompressionPath(EOSBaseModel):
 
     @property
     def path_length(self) -> int:
-        return len(self.steps)
+        return len(self.steps) or len(self.compression_steps)
 
 
 # ─── Triangulation State ─────────────────────────────────────────
@@ -181,6 +298,18 @@ class ShareableWorldModelFragment(Identified):
     symmetries, invariants — everything except domain-specific names.
     Example: {"nodes": 3, "edges": [{"type": "causal", "from": 0, "to": 1},
               {"type": "causal", "from": 1, "to": 2}], "symmetry": "chain"}
+
+    Typed variant: use ``typed_structure`` (AbstractStructure) when available.
+    The dict form is kept for backward compatibility with Logos adapters.
+    """
+
+    typed_structure: AbstractStructure | None = None
+    """
+    Formally typed version of abstract_structure.  When present, ConvergenceDetector
+    uses WL-1 hashing from this field.  When absent, falls back to the legacy
+    dict form in abstract_structure.
+
+    Gap HIGH-2: AbstractStructure added as typed alternative to dict[str, Any].
     """
 
     # Original domain labels (kept separate from structure)
@@ -247,6 +376,9 @@ class ConvergenceResult(EOSBaseModel):
     source_a_instance_id: str = ""
     source_b_instance_id: str = ""
     source_diversity: float = 0.0
+
+    # WL-1 hashing path used (True = more accurate, False = legacy heuristic)
+    wl1_used: bool = False
 
     detected_at: datetime = Field(default_factory=utc_now)
 
@@ -406,23 +538,45 @@ class DivergencePressure(EOSBaseModel):
 
 class WorldModelFragmentShare(EOSBaseModel):
     """
-    IIEP message payload for sharing a world model fragment.
+    IIEP message payload for sharing a world model fragment via
+    WORLD_MODEL_FRAGMENT_SHARE Synapse event.
 
     This is the wire format — what actually gets sent over federation.
     The receiving instance's Nexus validates, compares structures,
     and updates triangulation metadata.
+
+    Gap HIGH-4 (Federation Spec, 2026-03-07): explicit fields documented.
     """
 
     message_id: str = Field(default_factory=new_id)
     sender_instance_id: str = ""
     sender_divergence_score: float = 0.0
+    """Overall divergence of sender relative to federation average (0-1)."""
 
     fragment: ShareableWorldModelFragment
-    """The fragment being shared."""
+    """The fragment being shared (includes typed_structure if built with AbstractStructure)."""
 
     # Sender's self-assessment
     sender_quality_claim: float = 0.0
+    """Sender's assessment of this fragment's quality_score (0-1)."""
+
     sender_triangulation_confidence: float = 0.0
+    """Sender's current triangulation_confidence for this fragment (0-1)."""
+
+    # Sleep certification metadata (Gap MEDIUM-6)
+    sleep_certified: bool = False
+    """
+    Mirror of fragment.sleep_certification.is_certified — lifted to top level
+    so receivers can gate without deserialising the full fragment.
+    Must be True for the receiver to accept the fragment.
+    """
+
+    consolidation_cycle_id: str = ""
+    """
+    ID of the Oneiros sleep cycle that certified this fragment.
+    Populated from the ONEIROS_CONSOLIDATION_COMPLETE event payload.
+    Allows receivers to cross-reference and verify certification provenance.
+    """
 
     timestamp: datetime = Field(default_factory=utc_now)
 
@@ -434,7 +588,89 @@ class WorldModelFragmentShareResponse(EOSBaseModel):
     outcome: FragmentShareOutcome = FragmentShareOutcome.ACCEPTED
     convergence_detected: bool = False
     convergence_score: float = 0.0
+    wl1_used: bool = False
+    """True if WL-1 graph isomorphism was used for this comparison."""
     reason: str = ""
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
+# ─── IIEP: Inter-Instance Epistemic Protocol ─────────────────────
+
+
+class IIEPFragmentType(enum.StrEnum):
+    """Type of epistemic payload within an IIEP session message."""
+
+    WORLD_MODEL_FRAGMENT = "world_model_fragment"
+    """Standard sleep-certified world model fragment (most common)."""
+
+    CAUSAL_INVARIANT = "causal_invariant"
+    """Kairos Tier 3 substrate-independent invariant."""
+
+    CONVERGENCE_SUMMARY = "convergence_summary"
+    """Summary of convergence results for triangulation book-keeping."""
+
+    SESSION_OPEN = "session_open"
+    """Protocol handshake — sent once per session to establish context."""
+
+    SESSION_CLOSE = "session_close"
+    """Graceful session termination."""
+
+
+class IIEPMessage(EOSBaseModel):
+    """
+    Inter-Instance Epistemic Protocol (IIEP) wire message.
+
+    Every epistemic exchange across the federation is wrapped in this
+    envelope.  The message is carried as the ``payload`` of a
+    WORLD_MODEL_FRAGMENT_SHARE Synapse event.
+
+    Design rationale:
+    - ``session_id`` groups all messages in one sharing session so
+      receivers can correlate convergence results back to a session.
+    - ``fragment_type`` lets receivers fast-path routing without
+      deserialising the full payload.
+    - ``sleep_certified`` is duplicated from the inner fragment so
+      receivers can gate without full deserialization.
+    - ``convergence_round`` supports multi-round triangulation: round 0
+      is the initial share, round N is a re-share after N confirmations.
+
+    Gap CRITICAL (Spec 19, 2026-03-07): formalises the IIEP schema that
+    was previously implicit in WorldModelFragmentShare.  NexusService
+    wraps every outbound fragment in this envelope and unwraps inbound.
+    """
+
+    # Session envelope
+    session_id: str = Field(default_factory=new_id)
+    """Unique ID for this epistemic sharing session."""
+
+    initiator_id: str = ""
+    """Instance ID of the session initiator."""
+
+    responder_id: str = ""
+    """Instance ID of the intended recipient (empty = broadcast)."""
+
+    # Payload classification
+    fragment_type: IIEPFragmentType = IIEPFragmentType.WORLD_MODEL_FRAGMENT
+
+    # Core payload — the actual epistemic content being shared.
+    # Typed as dict[str, Any] so any serialisable payload fits;
+    # receivers use fragment_type to deserialise to the correct type.
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    # Sleep certification (fast-path gate — receivers check before full parse)
+    sleep_certified: bool = False
+    """True only when the carried fragment survived full Oneiros consolidation."""
+
+    # Triangulation round counter
+    convergence_round: int = 0
+    """
+    0 = initial share.
+    N = re-share after N independent confirmations.
+    Receivers use this to weight the triangulation evidence appropriately —
+    re-shared fragments already have prior confirmation and require more
+    diverse sources to advance the next triangulation level.
+    """
+
     timestamp: datetime = Field(default_factory=utc_now)
 
 
@@ -484,6 +720,13 @@ class NexusConfig(EOSBaseModel):
     convergence_threshold: float = 0.7
     min_node_match_ratio: float = 0.6
 
+    # WL-1 hashing (Gap HIGH-1)
+    wl1_iterations: int = 3
+    """Number of WL-1 refinement rounds. More = more discriminative, O(n·d·k) cost."""
+
+    wl1_min_nodes_to_activate: int = 3
+    """Minimum node count to use WL-1 hashing; smaller graphs use legacy comparison."""
+
     # Divergence measurement intervals
     divergence_measurement_interval_s: float = 300.0  # 5 minutes
     divergence_pressure_threshold: float = 0.4  # Below this, apply pressure
@@ -508,6 +751,45 @@ class NexusConfig(EOSBaseModel):
     level_3_min_diversity: float = 0.7
     level_4_adversarial_required: bool = True
     level_4_competition_required: bool = True
+
+    # Oikos metabolic coupling (Gap HIGH-5)
+    convergence_growth_bonus: float = 0.15
+    """
+    GROWTH metabolic allocation bonus emitted when triangulation convergence
+    is achieved (convergence_score >= convergence_threshold AND
+    domains_are_independent). Sent as NEXUS_CONVERGENCE_METABOLIC_SIGNAL.
+    """
+
+    # Oikos economic reward (HIGH-2: selection pressure toward knowledge sharing)
+    convergence_economic_reward_usdc_per_tier: float = 0.001
+    """
+    Economic reward in USDC per convergence tier when triangulation convergence
+    is confirmed.  Formula: convergence_tier × 0.001 USDC.
+
+    convergence_tier is derived from the local fragment's current EpistemicLevel:
+      HYPOTHESIS (0)         → tier 0 → $0.000 (no reward yet)
+      CORROBORATED (1)       → tier 1 → $0.001
+      TRIANGULATED (2)       → tier 2 → $0.002
+      GROUND_TRUTH_CANDIDATE (3) → tier 3 → $0.003
+      EMPIRICAL_INVARIANT (4)    → tier 4 → $0.004
+
+    Instances that achieve convergence receive this reward;
+    divergent instances receive nothing — selection pressure toward sharing.
+    Emitted as ``economic_reward_usd`` in NEXUS_CONVERGENCE_METABOLIC_SIGNAL.
+    """
+
+    divergence_penalty_threshold: int = 5
+    """
+    Number of consecutive divergence cycles without any convergence before
+    a metabolic penalty signal is emitted to Oikos.
+    """
+
+    divergence_metabolic_penalty: float = -0.10
+    """
+    GROWTH metabolic penalty magnitude (negative) emitted when an instance
+    is persistently stuck in divergence (no convergence for
+    divergence_penalty_threshold cycles).
+    """
 
 
 # ─── Phase C: Speciation Types ─────────────────────────────────
@@ -535,6 +817,9 @@ class SpeciationEvent(EOSBaseModel):
     After speciation, normal fragment sharing is impossible — only causal
     invariants (the most compressed structures) can cross the boundary
     via InvariantBridge.
+
+    Gap MEDIUM-7 (Federation Spec, 2026-03-07): ``genome_distance`` and
+    ``is_new_species`` fields added for Neo4j (:SpeciationEvent) storage.
     """
 
     id: str = Field(default_factory=new_id)
@@ -545,6 +830,21 @@ class SpeciationEvent(EOSBaseModel):
     shared_invariant_count: int = 0
     incompatible_schema_count: int = 0
     new_cognitive_kind_registered: bool = False
+
+    # Gap MEDIUM-7: speciation registry storage fields
+    genome_distance: float = 0.0
+    """
+    Genetic distance between the two instance genomes at the time of speciation.
+    Computed from Mitosis genome divergence (Hamming or cosine distance on
+    genome parameter vectors). 0.0 if genomes are unavailable.
+    """
+
+    is_new_species: bool = False
+    """
+    True if this speciation event created a new cognitive kind entry in the
+    SpeciationRegistry — i.e., at least one of the instances was not
+    previously classified in any existing cognitive kind.
+    """
 
 
 class ConvergedInvariant(EOSBaseModel):

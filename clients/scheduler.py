@@ -36,8 +36,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
-    from systems.atune.service import AtuneService
-    from systems.atune.types import InputChannel
+    from systems.fovea.gateway import AtuneService
+    from systems.fovea.types import InputChannel
 
 logger = structlog.get_logger("scheduler")
 
@@ -157,7 +157,7 @@ class PerceptionScheduler:
     # ── Internals ─────────────────────────────────────────────────
 
     async def _run_task(self, task: _ScheduledTask) -> None:
-        from systems.atune.types import RawInput
+        from systems.fovea.types import RawInput
 
         # Fire immediately on first run, then at interval
         first = True

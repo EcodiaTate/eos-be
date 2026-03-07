@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from primitives.affect import AffectState
-from systems.atune.types import (
+from systems.fovea.types import (
     PredictionError,
     PredictionErrorDirection,
     SalienceVector,

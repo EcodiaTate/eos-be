@@ -25,6 +25,8 @@ from decimal import Decimal
 from datetime import datetime
 from typing import Any
 
+from typing import TYPE_CHECKING
+
 import structlog
 from pydantic import Field
 
@@ -35,11 +37,28 @@ from primitives.federation import (
     InteractionOutcome,
     TrustLevel,
 )
-from systems.identity.certificate import (
-    CertificateStatus,
-    EcodianCertificate,
-    verify_certificate_signature,
-)
+
+if TYPE_CHECKING:
+    from systems.identity.certificate import (
+        CertificateStatus,
+        EcodianCertificate,
+    )
+
+
+def _lazy_verify_certificate_signature(
+    certificate: EcodianCertificate,
+    *args: Any,
+    **kwargs: Any,
+) -> bool:
+    """Lazy import wrapper to avoid cross-system import at module level."""
+    from systems.identity.certificate import verify_certificate_signature
+    return verify_certificate_signature(certificate, *args, **kwargs)
+
+
+def _lazy_certificate_status() -> type:
+    """Lazy import wrapper for CertificateStatus enum."""
+    from systems.identity.certificate import CertificateStatus
+    return CertificateStatus
 
 logger = structlog.get_logger("federation.iiep")
 
@@ -268,7 +287,8 @@ def _validate_certificate(
             expected=expected_instance_id,
         )
         return False
-    if certificate.status in (CertificateStatus.EXPIRED, CertificateStatus.REVOKED):
+    _CertStatus = _lazy_certificate_status()
+    if certificate.status in (_CertStatus.EXPIRED, _CertStatus.REVOKED):
         logger.warning(
             "certificate_not_valid",
             instance_id=expected_instance_id,
@@ -979,7 +999,8 @@ class IIEPManager:
             return False, "Certificate does not match instance_id."
 
         # Certificate must be valid (not expired, not revoked)
-        if certificate.status in (CertificateStatus.EXPIRED, CertificateStatus.REVOKED):
+        _CertStatus = _lazy_certificate_status()
+        if certificate.status in (_CertStatus.EXPIRED, _CertStatus.REVOKED):
             return False, f"Certificate is {certificate.status.value}."
 
         # Trust level gate
@@ -993,7 +1014,7 @@ class IIEPManager:
 
         # Signature verification (if issuer key is available)
         if certificate.issuer_public_key_pem and certificate.signature:
-            if not verify_certificate_signature(
+            if not _lazy_verify_certificate_signature(
                 certificate, certificate.issuer_public_key_pem
             ):
                 return False, "Certificate signature verification failed."

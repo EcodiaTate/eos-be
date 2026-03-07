@@ -39,7 +39,20 @@ from pathlib import Path
 DATASET_CID = os.environ.get("DATASET_CID", "")
 PINATA_JWT = os.environ.get("PINATA_JWT", "")
 PINATA_GATEWAY_URL = os.environ.get("PINATA_GATEWAY_URL", "https://gateway.pinata.cloud")
-BASE_MODEL = os.environ.get("BASE_MODEL", "unsloth/Meta-Llama-3.1-8B-Instruct")
+BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen3-8B")
+# TRAINING_DATA: local JSONL path, used by ContinualLearningOrchestrator (skips IPFS)
+TRAINING_DATA = os.environ.get("TRAINING_DATA", "")
+# OUTPUT_DIR: local adapter output path, used by ContinualLearningOrchestrator
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "")
+# BASE_ADAPTER: if set, load from this existing adapter (e.g. DPO output) as the
+# starting point for training instead of a fresh LoRA init. CLoRA is still applied
+# to orthogonalize against PREVIOUS_ADAPTER_PATH directions if that is also set.
+BASE_ADAPTER = os.environ.get("BASE_ADAPTER", "")
+# PREVIOUS_ADAPTER_PATH: if set, new LoRA A matrices are initialized in the null space
+# of the previous adapter's directions (CLoRA, ACL 2025). Prevents interference with
+# previously learned features. Non-fatal — skipped if path missing or malformed.
+# This is independent of BASE_ADAPTER — always points to the slow (EMA) adapter.
+PREVIOUS_ADAPTER_PATH = os.environ.get("PREVIOUS_ADAPTER_PATH", "")
 TRAINING_ARGS = json.loads(os.environ.get("TRAINING_ARGS", "{}"))
 STATUS_PORT = int(os.environ.get("STATUS_PORT", "8080"))
 
@@ -176,9 +189,9 @@ def run_training(dataset_path: Path) -> Path:
     TRAINING_STATE["phase"] = "loading_model"
     print(f"[EOS] Loading base model: {BASE_MODEL}")
 
-    # Hyperparameters with defaults
-    lora_rank = TRAINING_ARGS.get("lora_rank", 64)
-    lora_alpha = TRAINING_ARGS.get("lora_alpha", 128)
+    # Hyperparameters with defaults (bible §5 — r=32, lora_alpha=64, 2:1 ratio)
+    lora_rank = TRAINING_ARGS.get("lora_rank", 32)
+    lora_alpha = TRAINING_ARGS.get("lora_alpha", 64)
     lora_dropout = TRAINING_ARGS.get("lora_dropout", 0.05)
     lr = TRAINING_ARGS.get("learning_rate", 2e-4)
     num_epochs = TRAINING_ARGS.get("num_epochs", 3)
@@ -196,19 +209,37 @@ def run_training(dataset_path: Path) -> Path:
         load_in_4bit=True,
     )
 
-    # Apply LoRA adapters
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-    )
+    # Apply LoRA adapters — either load from an existing adapter (BASE_ADAPTER, e.g. DPO
+    # output) or initialize fresh LoRA weights. CLoRA orthogonalization is applied in
+    # both cases if PREVIOUS_ADAPTER_PATH is set (always the slow EMA adapter).
+    if BASE_ADAPTER and os.path.exists(BASE_ADAPTER):
+        # Load from DPO-tuned adapter as training starting point
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, BASE_ADAPTER, is_trainable=True)
+        print(f"[EOS] Loaded DPO base adapter from: {BASE_ADAPTER}")
+        # Apply CLoRA to the loaded adapter's lora_A matrices so new directions
+        # are orthogonal to the slow adapter's accumulated history.
+        if PREVIOUS_ADAPTER_PATH and os.path.exists(PREVIOUS_ADAPTER_PATH):
+            _apply_clora_init(model, PREVIOUS_ADAPTER_PATH)
+            print(f"[EOS] CLoRA orthogonalization applied (on DPO base) from: {PREVIOUS_ADAPTER_PATH}")
+    else:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+        )
+        # CLoRA (ACL 2025): initialize new LoRA A matrices in the null space of
+        # the previous adapter directions — prevents interference with learned features.
+        if PREVIOUS_ADAPTER_PATH and os.path.exists(PREVIOUS_ADAPTER_PATH):
+            _apply_clora_init(model, PREVIOUS_ADAPTER_PATH)
+            print(f"[EOS] CLoRA init applied from: {PREVIOUS_ADAPTER_PATH}")
 
     TRAINING_STATE["phase"] = "preparing_data"
     print("[EOS] Preparing training data...")
@@ -240,8 +271,9 @@ def run_training(dataset_path: Path) -> Path:
     dataset = Dataset.from_list(formatted)
     print(f"[EOS] Formatted {len(formatted)} examples for training")
 
-    # Training arguments
-    output_dir = tempfile.mkdtemp(prefix="eos-finetune-")
+    # Training arguments — prefer OUTPUT_DIR env var for local orchestration
+    output_dir = OUTPUT_DIR if OUTPUT_DIR else tempfile.mkdtemp(prefix="eos-finetune-")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
@@ -256,7 +288,7 @@ def run_training(dataset_path: Path) -> Path:
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
         seed=42,
-        report_to="none",
+        report_to="wandb" if os.environ.get("WANDB_API_KEY") else "none",
     )
 
     # Custom callback for progress tracking
@@ -283,7 +315,49 @@ def run_training(dataset_path: Path) -> Path:
         callbacks=[ProgressCallback()],
     )
 
+    # W&B run — guarded; non-fatal if W&B not available or not authenticated
+    _wandb_run = None
+    if os.environ.get("WANDB_API_KEY"):
+        try:
+            import wandb as _wandb
+            _wandb_run = _wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "ecodiaos-reasoning"),
+                entity=os.environ.get("WANDB_ENTITY") or None,
+                name=os.environ.get("WANDB_RUN_NAME", f"tier2_{int(time.time())}"),
+                job_type=os.environ.get("WANDB_JOB_TYPE", "tier2_sft"),
+                config={
+                    "base_model": BASE_MODEL,
+                    "lora_rank": lora_rank,
+                    "lora_alpha": lora_alpha,
+                    "lora_dropout": lora_dropout,
+                    "learning_rate": lr,
+                    "num_epochs": num_epochs,
+                    "batch_size": batch_size,
+                    "grad_accum": grad_accum,
+                    "max_seq_len": max_seq_len,
+                    "clora_applied": bool(PREVIOUS_ADAPTER_PATH),
+                    "base_adapter_applied": bool(BASE_ADAPTER),
+                },
+                resume="allow",
+                settings=_wandb.Settings(silent=True),
+            )
+        except Exception as _wandb_exc:
+            print(f"[EOS] W&B init failed (non-fatal): {_wandb_exc}")
+
     trainer.train()
+
+    # Log final metrics and close W&B run
+    if _wandb_run is not None:
+        try:
+            if trainer.state.log_history:
+                last = trainer.state.log_history[-1]
+                _wandb_run.log({
+                    "final_train_loss": last.get("train_loss", last.get("loss", 0.0)),
+                    "epochs_completed": num_epochs,
+                })
+            _wandb_run.finish()
+        except Exception as _wandb_exc:
+            print(f"[EOS] W&B finish failed (non-fatal): {_wandb_exc}")
 
     TRAINING_STATE["phase"] = "saving_adapter"
     print("[EOS] Saving LoRA adapter...")
@@ -304,6 +378,84 @@ def run_training(dataset_path: Path) -> Path:
     return adapter_dir
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _write_status_json(out_dir: str) -> None:
+    """
+    Write TRAINING_STATE to status.json in out_dir.
+    Called after training completes so ContinualLearningOrchestrator can
+    read eval_loss without parsing stdout.
+    """
+    try:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        (Path(out_dir) / "status.json").write_text(
+            json.dumps(TRAINING_STATE), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+# ── CLoRA Orthogonal Subspace Init (ACL 2025) ────────────────────────────────
+
+
+def _apply_clora_init(model: object, previous_adapter_path: str) -> None:
+    """CLoRA (ACL 2025): Initialize new LoRA A matrices in the null space of
+    previous adapter directions. This prevents interference with previously
+    learned features.
+
+    Algorithm:
+    1. Load previous adapter weights from safetensors
+    2. For each lora_A weight: compute null space via SVD
+       (Vh rows span the row space of A_prev)
+    3. Null space projector: P = I - Vh.T @ Vh
+    4. Re-initialize new model's lora_A with a random matrix projected
+       onto that null space: param = randn @ P
+
+    Non-fatal: if safetensors unavailable, path missing, or any per-layer
+    error occurs, logs the issue and skips that layer.
+    """
+    import torch
+
+    try:
+        from safetensors.torch import load_file
+        prev_weights = load_file(f"{previous_adapter_path}/adapter_model.safetensors")
+    except ImportError:
+        print("[CLoRA] safetensors not installed — skipping CLoRA init.")
+        return
+    except Exception as e:
+        print(f"[CLoRA] Could not load previous adapter: {e} — skipping CLoRA init.")
+        return
+
+    applied = 0
+    skipped = 0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_A" not in name or not param.requires_grad:
+                continue
+            # Match by layer name (strip "base_model.model." prefix if needed)
+            prev_key = name.replace("base_model.model.", "")
+            if prev_key not in prev_weights:
+                skipped += 1
+                continue
+            try:
+                A_prev = prev_weights[prev_key].to(param.device).float()
+                # SVD: A_prev = U @ diag(S) @ Vh; Vh rows span the row space of A_prev
+                _, _, Vh = torch.linalg.svd(A_prev, full_matrices=False)
+                # Null space projector: P = I - Vh.T @ Vh  (shape: [d_in, d_in])
+                d_in = param.shape[1]
+                P_null = torch.eye(d_in, device=param.device) - Vh.T @ Vh
+                # Project random init onto null space — result lives in orthogonal complement
+                random_init = torch.randn_like(param.float())
+                param.data = (random_init @ P_null).to(param.dtype)
+                applied += 1
+            except Exception as e:
+                print(f"[CLoRA] Skipping layer {name}: {e}")
+                skipped += 1
+
+    print(f"[CLoRA] Orthogonal init applied to {applied} layers, skipped {skipped}.")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -312,28 +464,37 @@ def main() -> None:
     start_status_server()
 
     try:
-        # Validate environment
-        if not DATASET_CID:
-            raise ValueError("DATASET_CID environment variable is required")
-        if not PINATA_JWT:
-            raise ValueError("PINATA_JWT environment variable is required")
-
-        # Step 1: Download dataset
-        dataset_path = Path(tempfile.mkdtemp()) / "training_data.jsonl"
-        download_dataset(DATASET_CID, dataset_path)
+        # Local training mode (ContinualLearningOrchestrator): use TRAINING_DATA directly
+        if TRAINING_DATA:
+            dataset_path = Path(TRAINING_DATA)
+            if not dataset_path.exists():
+                raise ValueError(f"TRAINING_DATA file not found: {TRAINING_DATA}")
+            print(f"[EOS] Local training mode — dataset: {TRAINING_DATA}")
+        else:
+            # Akash/IPFS mode: download from pinned CID
+            if not DATASET_CID:
+                raise ValueError("DATASET_CID environment variable is required")
+            if not PINATA_JWT:
+                raise ValueError("PINATA_JWT environment variable is required")
+            dataset_path = Path(tempfile.mkdtemp()) / "training_data.jsonl"
+            download_dataset(DATASET_CID, dataset_path)
 
         # Step 2: Run training
         adapter_dir = run_training(dataset_path)
 
-        # Step 3: Upload adapter to IPFS
-        adapter_cid = upload_adapter(adapter_dir)
+        # Step 3: Upload adapter to IPFS (skipped in local training mode)
+        if TRAINING_DATA:
+            adapter_cid = ""  # local mode — no IPFS upload needed
+        else:
+            adapter_cid = upload_adapter(adapter_dir)
 
         # Step 4: Mark completion
         TRAINING_STATE["phase"] = "completed"
         TRAINING_STATE["progress"] = 1.0
-        TRAINING_STATE["adapter_cid"] = adapter_cid
+        TRAINING_STATE["adapter_cid"] = adapter_cid if not TRAINING_DATA else ""
         TRAINING_STATE["completed_at"] = time.time()
-        print(f"[EOS] Fine-tuning complete. Adapter CID: {adapter_cid}")
+        _write_status_json(OUTPUT_DIR or str(adapter_dir.parent))
+        print(f"[EOS] Fine-tuning complete. Adapter CID: {adapter_cid if not TRAINING_DATA else '(local)'}")
 
         # Keep the status server alive for the executor to poll
         signal.pause()

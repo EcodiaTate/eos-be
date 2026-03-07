@@ -71,7 +71,7 @@ from systems.nova.types import (
 if TYPE_CHECKING:
     from primitives.affect import AffectState
     from primitives.constitutional import ConstitutionalCheck
-    from systems.atune.types import WorkspaceBroadcast
+    from systems.fovea.types import WorkspaceBroadcast
     from systems.equor.service import EquorService
     from systems.evo.tournament import TournamentEngine
     from systems.evo.types import TournamentContext
@@ -131,6 +131,11 @@ class DeliberationEngine:
         # Do-nothing EFE override: when urgency is high, the baseline rises so
         # inaction has to beat a higher bar. None = use DO_NOTHING_EFE constant.
         self._do_nothing_efe_override: float | None = None
+
+        # Equor unavailability callback — wired by NovaService after initialize().
+        # Called when Equor times out or raises a connectivity exception so
+        # service.py can log a Thymos DEGRADATION incident. Signature: (reason: str) -> None.
+        self._equor_failure_cb: Any | None = None
 
         # Free energy budget — information-theoretic pressure valve.
         # Tracks cumulative surprise (nats) per window. When exhausted, triggers
@@ -311,6 +316,16 @@ class DeliberationEngine:
             precision_threshold=round(_PRECISION_THRESHOLD + self._precision_threshold_delta, 3),
             do_nothing_efe=self._do_nothing_efe_override,
         )
+
+    def set_equor_failure_callback(self, cb: Any) -> None:
+        """
+        Wire a callback invoked when Equor is unreachable or times out.
+
+        Signature: (reason: str) -> None
+        NovaService uses this to raise a Thymos DEGRADATION incident so the
+        immune system tracks constitutional gate unavailability.
+        """
+        self._equor_failure_cb = cb
 
     @property
     def last_equor_check(self) -> ConstitutionalCheck | None:
@@ -519,6 +534,14 @@ class DeliberationEngine:
         if tournament_ctx is not None:
             update["tournament_id"] = tournament_ctx.tournament_id
             update["tournament_hypothesis_id"] = tournament_ctx.hypothesis_id
+
+        # Mark slow-path records with an intent as RE training eligible.
+        # Fast-path and budget-exhausted records carry too little signal.
+        # model_used is "claude" until Thompson sampling routes to RE.
+        # (Spec §21 — re_training_eligible field, previously missing.)
+        if path == "slow" and intent is not None:
+            update["re_training_eligible"] = True
+            update["model_used"] = "claude"
 
         record = record.model_copy(update=update)
 
@@ -780,7 +803,20 @@ class DeliberationEngine:
                 )
 
                 # Equor critical-path review (≤50ms, cache-only, no DB/LLM I/O)
-                check = await self._equor.review_critical(intent)
+                try:
+                    check = await asyncio.wait_for(
+                        self._equor.review_critical(intent),
+                        timeout=0.1,  # 100ms hard cap for critical path
+                    )
+                except (TimeoutError, asyncio.TimeoutError, OSError, ConnectionError) as exc:
+                    reason = f"equor_fast_path_unavailable: {exc!s}"
+                    self._logger.warning("equor_unavailable_fast_path", reason=reason)
+                    if self._equor_failure_cb is not None:
+                        try:
+                            self._equor_failure_cb(reason)
+                        except Exception:
+                            pass
+                    return None, True  # Escalate to slow path; do-nothing is fallback
 
                 if check.verdict == Verdict.APPROVED:
                     self._last_equor_check = check
@@ -996,7 +1032,20 @@ class DeliberationEngine:
                         all_efe_scores={p.name: e.total for p, e in scored},
                     )
 
-                    check = await self._equor.review(intent)
+                    try:
+                        check = await asyncio.wait_for(
+                            self._equor.review(intent),
+                            timeout=0.6,  # 600ms — generous but bounded
+                        )
+                    except (TimeoutError, asyncio.TimeoutError, OSError, ConnectionError) as exc:
+                        reason = f"equor_slow_path_unavailable: {exc!s}"
+                        self._logger.warning("equor_unavailable_slow_path", reason=reason)
+                        if self._equor_failure_cb is not None:
+                            try:
+                                self._equor_failure_cb(reason)
+                            except Exception:
+                                pass
+                        return None, [], cognition_budget  # do-nothing fallback
 
                     if check.verdict == Verdict.APPROVED:
                         self._last_equor_check = check

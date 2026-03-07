@@ -17,92 +17,13 @@ from typing import TYPE_CHECKING
 import structlog
 
 if TYPE_CHECKING:
-    from systems.nova.types import BeliefState, Goal, Policy
+    from systems.nova.types import Policy
 
 logger = structlog.get_logger()
 
 
 class EFEHeuristics:
     """Fast approximations for Nova's EFE components."""
-
-    @staticmethod
-    def estimate_pragmatic_value_heuristic(
-        policy: Policy,
-        goal: Goal,
-        beliefs: BeliefState,
-    ) -> float:
-        """
-        Heuristic pragmatic value: probability of goal satisfaction.
-
-        LLM alternative: Asks model to estimate goal probability under policy.
-        Heuristic: Use recent history of similar policies.
-
-        Returns:
-            Float in [0.0, 1.0], where 1.0 = certain goal satisfaction
-        """
-        # Base case: do-nothing is low probability for goal achievement
-        if policy.type == "do_nothing":
-            return 0.1
-
-        # Heuristic: actionable policies are more likely to achieve goals
-        action_types_to_weight = {
-            "deliberate": 0.7,
-            "express": 0.6,
-            "observe": 0.4,
-            "defer": 0.2,
-        }
-
-        base_score = action_types_to_weight.get(policy.type, 0.5)
-
-        # Discount if policy conflicts with recent goals
-        # (Simple: if policy name contains opposite keywords)
-        if goal.description and policy.description:
-            goal_lower = goal.description.lower()
-            policy_lower = policy.description.lower()
-
-            # Check for semantic opposition (crude but fast)
-            opposing_pairs = [
-                ("increase", "decrease"),
-                ("approach", "avoid"),
-                ("clarify", "obfuscate"),
-            ]
-            for pos, neg in opposing_pairs:
-                if (
-                    pos in goal_lower and neg in policy_lower
-                    or neg in goal_lower and pos in policy_lower
-                ):
-                    base_score *= 0.3
-
-        return min(1.0, max(0.0, base_score))
-
-    @staticmethod
-    def estimate_epistemic_value_heuristic(
-        policy: Policy,
-        beliefs: BeliefState,
-    ) -> float:
-        """
-        Heuristic epistemic value: expected information gain.
-
-        LLM alternative: Asks model to estimate uncertainty reduction.
-        Heuristic: Information-seeking policies (observe, ask) gain more.
-
-        Returns:
-            Float in [0.0, 1.0], where 1.0 = maximum information gain
-        """
-        # Observation and expression policies are epistemic
-        epistemic_policies = {"observe", "ask", "clarify", "explore"}
-
-        base_score = 0.5 if policy.type in epistemic_policies else 0.2
-
-        # Belief entropy as proxy for information need
-        # (If beliefs are very certain, less room for info gain)
-        # Discount epistemic value if already very certain
-        # BeliefState has overall_confidence (0=uncertain, 1=certain)
-        certainty = getattr(beliefs, "overall_confidence", None)
-        if certainty is not None:
-            base_score *= (1.0 - certainty)
-
-        return min(1.0, max(0.0, base_score))
 
     @staticmethod
     def estimate_feasibility_heuristic(policy: Policy) -> float:

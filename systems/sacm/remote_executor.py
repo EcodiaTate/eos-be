@@ -317,6 +317,12 @@ class RemoteExecutionManager:
             else None
         )
 
+        # Generate our ephemeral keypair for this workload exchange.
+        # The provider needs our public key to encrypt their response back to us.
+        # We MUST use this same private key in Phase 4 to decrypt that response.
+        # Never generate a new keypair for decryption.
+        our_keypair = generate_keypair()
+
         serialized_batch = self._serialize_batch(mixed_batch.items)
         encryption_result = encrypt_payload(
             plaintext=serialized_batch,
@@ -342,6 +348,9 @@ class RemoteExecutionManager:
                     "workload_id": workload.workload_id,
                     "execution_id": execution_id,
                     "item_count": str(mixed_batch.total_size),
+                    # Pass our public key so the provider can encrypt their
+                    # response back to us using ECDH (X25519).
+                    "response_public_key": our_keypair.public_bytes.hex(),
                 },
             ),
             timeout=self._config.dispatch_timeout_s,
@@ -354,8 +363,9 @@ class RemoteExecutionManager:
         )
 
         # ── Phase 4: RECEIVE — decrypt result batch ──────────────
+        # Use the same keypair from Phase 2 — our_keypair.private_key matches
+        # the public key we advertised to the provider for their response encryption.
 
-        our_keypair = generate_keypair()
         result_envelope = self._wire_to_envelope(encrypted_result_bytes)
 
         decrypted_results = decrypt_payload(

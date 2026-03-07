@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from primitives.common import SystemID
+from primitives.re_training import RETrainingExample
 from systems.synapse.clock import CognitiveClock
 from systems.synapse.coherence import CoherenceMonitor
 from systems.synapse.degradation import DegradationManager
@@ -63,7 +65,7 @@ if TYPE_CHECKING:
     from clients.redis import RedisClient
     from config import SynapseConfig
     from core.hotreload import NeuroplasticityBus
-    from systems.atune.service import AtuneService
+    from systems.fovea.gateway import AtuneService
     from telemetry.metrics import MetricCollector
 
 logger = structlog.get_logger("systems.synapse")
@@ -142,6 +144,10 @@ class SynapseService:
         # per theta tick so it can detect catatonic / stalled organism states.
         self._thymos: Any = None
 
+        # Benchmarks (wired after construction) — receives KPI snapshot every 50 cycles
+        # so the organism can self-measure heartbeat health and coherence quality.
+        self._benchmarks: Any = None
+
         # Nova + Evo references for CognitiveStallSentinel activity deltas.
         # Counters from the *previous* cycle are tracked here so we can derive
         # "did nova produce an intent this cycle?" without modifying nova/evo.
@@ -149,6 +155,18 @@ class SynapseService:
         self._evo: Any = None
         self._nova_intents_prev: int = 0
         self._evo_evidence_prev: int = 0
+
+        # Track previous rhythm state so we can detect STRESS transitions and
+        # emit FOVEA_PREDICTION_ERROR on entry — rhythm state = self-awareness signal.
+        self._prev_rhythm_state: str = ""
+
+        # Cached starvation level from Oikos METABOLIC_PRESSURE events.
+        # Relayed on every SomaTick so downstream systems read it without polling.
+        self._cached_starvation_level: str = "nominal"
+
+        # Economic state from Oikos — used to derive events_per_dollar metrics
+        self._cached_burn_rate_usd: float = 0.0
+        self._cached_liquid_balance_usd: float = 0.0
 
     # ─── Lifecycle ───────────────────────────────────────────────────
 
@@ -163,10 +181,36 @@ class SynapseService:
         # Set the per-cycle callback on the clock
         self._clock.set_on_cycle(self._on_cycle)
 
+        # Wire event bus into clock so it can emit THETA_CYCLE_START/OVERRUN (Spec 09 §18 P7/P8)
+        self._clock.set_event_bus(self._event_bus)
+
         # Subscribe to grid metabolism changes to adapt clock timing
         self._event_bus.subscribe(
             SynapseEventType.GRID_METABOLISM_CHANGED,
             self._on_grid_metabolism_changed,
+        )
+
+        # Cache starvation level from Oikos so it can be relayed on every SomaTick
+        self._event_bus.subscribe(
+            SynapseEventType.METABOLIC_PRESSURE,
+            self._on_metabolic_pressure_for_relay,
+        )
+
+        # Subscribe to Oikos economic state for events_per_dollar / cost_per_event metrics
+        self._event_bus.subscribe(
+            SynapseEventType.ECONOMIC_STATE_UPDATED,
+            self._on_economic_state_updated,
+        )
+
+        # M1: Subscribe to Oikos revenue and starvation events to drive MetabolicTracker
+        # reactively instead of requiring external injection (Spec 09 §18 Gap / §20 Gap #6).
+        self._event_bus.subscribe(
+            SynapseEventType.REVENUE_INJECTED,
+            self._on_oikos_revenue_injected,
+        )
+        self._event_bus.subscribe(
+            SynapseEventType.STARVATION_WARNING,
+            self._on_oikos_starvation_warning,
         )
 
         # Register with NeuroplasticityBus for hot-reload of allocators & rhythm strategies
@@ -199,6 +243,11 @@ class SynapseService:
         self._thymos = thymos
         self._logger.info("thymos_wired_to_synapse", system="synapse")
 
+    def set_benchmarks(self, benchmarks: Any) -> None:
+        """Wire Benchmarks so Synapse can emit KPI snapshots every 50 cycles."""
+        self._benchmarks = benchmarks
+        self._logger.info("benchmarks_wired_to_synapse")
+
     def set_nova(self, nova: Any) -> None:
         """Wire Nova so _on_cycle can read intent-count deltas for the stall sentinel."""
         self._nova = nova
@@ -210,6 +259,19 @@ class SynapseService:
         self._evo = evo
         self._evo_evidence_prev = getattr(evo, "_total_evidence_evaluations", 0)
         self._logger.info("evo_wired_to_synapse_for_stall_sentinel", system="synapse")
+
+    def set_instance_id(self, instance_id: str) -> None:
+        """
+        Set the organism's instance identity on the EventBus (Spec 09 §18 M4/SG4).
+
+        Stamps every future event with instance_id and namespaces the Redis channel
+        to `synapse_events:{instance_id}` so Federation/Mitosis instances don't
+        cross-pollute each other's pub/sub streams.
+
+        Must be called before start_clock() to take effect on the first tick.
+        Typically wired from AppConfig.instance_id at startup.
+        """
+        self._event_bus.set_instance_id(instance_id)
 
     def set_hot_swap_manager(self, manager: HotSwapManager) -> None:
         """Wire the model hot-swap manager for probation monitoring."""
@@ -318,6 +380,15 @@ class SynapseService:
 
     async def health(self) -> dict[str, Any]:
         """Self-health report (implements ManagedSystem protocol)."""
+        # Compute events_per_dollar and cost_per_event from cached economic state
+        total_events = self._event_bus._total_emitted
+        events_per_dollar = 0.0
+        cost_per_event = 0.0
+        if self._cached_burn_rate_usd > 0 and total_events > 0:
+            cost_per_event = self._cached_burn_rate_usd / max(1, total_events)
+        if self._cached_burn_rate_usd > 0:
+            events_per_dollar = total_events / max(0.001, self._cached_burn_rate_usd)
+
         report: dict[str, Any] = {
             "status": "healthy" if self._initialized else "starting",
             "cycle_count": self._cycle_count,
@@ -326,6 +397,8 @@ class SynapseService:
             "coherence_composite": self._coherence.latest.composite,
             "metabolic_deficit_usd": round(self._metabolism.rolling_deficit_usd, 6),
             "burn_rate_usd_per_hour": round(self._metabolism.burn_rate_usd_per_hour, 4),
+            "events_per_dollar": round(events_per_dollar, 2),
+            "cost_per_event": round(cost_per_event, 8),
         }
         if self._hot_swap_manager is not None:
             report["hot_swap"] = await self._hot_swap_manager.health()
@@ -342,8 +415,20 @@ class SynapseService:
         await self._health.set_safe_mode(enabled, reason)
         if enabled:
             self._clock.pause()
+            await self._emit_evolutionary_observable(
+                "degradation_triggered", 1.0, is_novel=True,
+                metadata={"reason": reason or "safe_mode_entered"},
+            )
         else:
             self._clock.resume()
+        # ── RE training: degradation transition ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="degradation_transition",
+            instruction="Decide whether to enter or exit safe mode (graceful degradation).",
+            input_context=f"enabled={enabled}, reason={reason[:200]}",
+            output=f"safe_mode={'entered' if enabled else 'exited'}, clock={'paused' if enabled else 'resumed'}",
+            outcome_quality=0.4 if enabled else 0.8,
+        ))
 
     # ─── Clock Control (admin API) ───────────────────────────────────
 
@@ -481,6 +566,17 @@ class SynapseService:
                 to_state=new_state.value,
                 new_period_ms=1000,
             )
+            # Spec 09 §18 P6 — CONSERVATION_MODE_ENTERED event
+            with contextlib.suppress(Exception):
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.CONSERVATION_MODE_ENTERED,
+                    source_system="synapse",
+                    data={
+                        "trigger": "grid_carbon_intensity",
+                        "new_period_ms": 1000,
+                        "from_state": old_state.value,
+                    },
+                ))
         else:
             # NORMAL or GREEN_SURPLUS — restore configured base frequency
             configured_hz = 1000.0 / self._config.cycle_period_ms
@@ -491,6 +587,94 @@ class SynapseService:
                 to_state=new_state.value,
                 new_period_ms=self._config.cycle_period_ms,
             )
+            # Spec 09 §18 P6 — CONSERVATION_MODE_EXITED event (only if was CONSERVATION)
+            if old_state == MetabolicState.CONSERVATION:
+                with contextlib.suppress(Exception):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.CONSERVATION_MODE_EXITED,
+                        source_system="synapse",
+                        data={
+                            "restored_period_ms": self._config.cycle_period_ms,
+                            "to_state": new_state.value,
+                        },
+                    ))
+
+    async def _on_metabolic_pressure_for_relay(self, event: SynapseEvent) -> None:
+        """Cache starvation_level from Oikos METABOLIC_PRESSURE for SomaTick relay."""
+        level = event.data.get("starvation_level", "")
+        if level:
+            self._cached_starvation_level = level
+
+    async def _on_economic_state_updated(self, event: SynapseEvent) -> None:
+        """
+        Cache Oikos economic state for Synapse-level efficiency metrics.
+
+        Enables computation of events_per_dollar and cost_per_event.
+        """
+        burn_rate = event.data.get("burn_rate_usd")
+        if burn_rate is not None:
+            try:
+                self._cached_burn_rate_usd = float(str(burn_rate))
+            except (ValueError, TypeError):
+                pass
+        balance = event.data.get("liquid_balance_usd")
+        if balance is not None:
+            try:
+                self._cached_liquid_balance_usd = float(str(balance))
+            except (ValueError, TypeError):
+                pass
+
+    async def _on_oikos_revenue_injected(self, event: SynapseEvent) -> None:
+        """
+        React to Oikos REVENUE_INJECTED by forwarding the amount to MetabolicTracker.
+
+        This closes the M1 gap (Spec 09 §18): MetabolicTracker's rolling deficit
+        was previously only updated via direct `inject_revenue()` calls, making
+        the deficit grow unboundedly when Oikos earned revenue without notifying
+        Synapse.  By subscribing here, any revenue Oikos earns — bounty payouts,
+        yield harvests, client fees — is immediately reflected in the deficit.
+
+        We do NOT re-emit REVENUE_INJECTED (the MetabolicTracker.inject_revenue()
+        already emits it), so there is no double-emission risk.
+        """
+        amount_raw = event.data.get("amount_usd", 0.0)
+        try:
+            amount = float(str(amount_raw))
+        except (ValueError, TypeError):
+            return
+        if amount <= 0.0:
+            return
+
+        source = str(event.data.get("source", "oikos"))
+        # MetabolicTracker.inject_revenue() updates the rolling deficit and emits
+        # REVENUE_INJECTED itself — we only call the tracker, not inject_revenue()
+        # on self (which would double-emit).
+        self._metabolism.inject_revenue(amount)
+        self._logger.info(
+            "metabolic_revenue_injected_reactively",
+            amount_usd=round(amount, 8),
+            source=source,
+            new_deficit_usd=round(self._metabolism.rolling_deficit_usd, 6),
+        )
+
+    async def _on_oikos_starvation_warning(self, event: SynapseEvent) -> None:
+        """
+        React to Oikos STARVATION_WARNING by caching the level for SomaTick relay.
+
+        The cached level is read each theta tick by `_on_cycle` (via SomaTickEvent)
+        and propagated to Soma so allostatic control can account for economic danger
+        without polling Oikos directly (Spec 09 §18 M1).
+        """
+        level = str(event.data.get("starvation_level", "")).strip()
+        if not level:
+            return
+        self._cached_starvation_level = level
+        self._logger.warning(
+            "starvation_warning_received",
+            starvation_level=level,
+            runway_days=event.data.get("runway_days", "unknown"),
+            liquid_balance_usd=event.data.get("liquid_balance_usd", "unknown"),
+        )
 
     # ─── NeuroplasticityBus callbacks ────────────────────────────────
 
@@ -544,6 +728,64 @@ class SynapseService:
 
         await self._rhythm.update(result, coherence_stress=coherence_stress)
 
+        # Detect rhythm state transitions → emit anomaly and narrative signals.
+        current_rhythm = self._rhythm.current_state.value
+        if current_rhythm != self._prev_rhythm_state:
+            # Any significant state transition goes to Thread as an Episode so
+            # the organism's narrative identity records its own cognitive rhythm changes.
+            thread_worthy = {"stress", "flow", "deep_processing", "boredom"}
+            if current_rhythm in thread_worthy or self._prev_rhythm_state in thread_worthy:
+                with contextlib.suppress(Exception):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.EPISODE_STORED,
+                        source_system="synapse",
+                        data={
+                            "episode_id": f"rhythm_transition_{result.cycle_number}",
+                            "source": "synapse:rhythm",
+                            "summary": (
+                                f"Cognitive rhythm shifted from {self._prev_rhythm_state!r} "
+                                f"to {current_rhythm!r} at cycle {result.cycle_number}."
+                            ),
+                            "salience": 0.7 if current_rhythm == "stress" else 0.4,
+                        },
+                    ))
+
+            # On STRESS entry, also signal Fovea: rhythm instability = self-model divergence.
+            if current_rhythm == "stress":
+                with contextlib.suppress(Exception):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.FOVEA_PREDICTION_ERROR,
+                        source_system="synapse",
+                        data={
+                            "source_system": "synapse",
+                            "domain": "rhythm",
+                            "magnitude": 0.75,
+                            "trigger_id": f"stress_entry_cycle_{result.cycle_number}",
+                            "coherence_stress": round(coherence_stress, 3),
+                            "cycle": result.cycle_number,
+                        },
+                    ))
+
+            await self._emit_evolutionary_observable(
+                "rhythm_transition", 1.0, is_novel=True,
+                metadata={
+                    "from": self._prev_rhythm_state,
+                    "to": current_rhythm,
+                    "cycle": result.cycle_number,
+                },
+            )
+
+        # ── RE training: rhythm classification ──
+        if current_rhythm != self._prev_rhythm_state:
+            asyncio.ensure_future(self._emit_re_training_example(
+                category="rhythm_classification",
+                instruction="Classify emergent cognitive rhythm from cycle telemetry and detect state transitions.",
+                input_context=f"prev={self._prev_rhythm_state}, cycle={result.cycle_number}, arousal={result.arousal:.2f}, coherence_stress={coherence_stress:.2f}",
+                output=f"rhythm={current_rhythm}, transition=True",
+                outcome_quality=0.7 if current_rhythm not in ("stress",) else 0.3,
+            ))
+        self._prev_rhythm_state = current_rhythm
+
         # Push rhythm state to Atune so meta-attention can modulate salience
         # weights based on the organism's emergent cognitive state.
         with contextlib.suppress(Exception):  # Non-critical — meta-attention falls back to "normal"
@@ -554,10 +796,22 @@ class SynapseService:
         if result.had_broadcast and result.broadcast_id:
             source = result.broadcast_id[:8]  # Use broadcast ID prefix as source proxy
 
+        # Drain handler latencies from EventBus so CoherenceMonitor can compute
+        # real system_resonance and response_synchrony (not the 0.5 defaults).
+        latency_sets = self._event_bus.drain_handler_latencies()
+        # Flatten all dispatch rounds into a single per-cycle latency set
+        cycle_latencies: list[float] = []
+        responding = 0
+        for lat_set in latency_sets:
+            cycle_latencies.extend(lat_set)
+            responding = max(responding, len(lat_set))
+
         self._coherence.record_broadcast(
             source=source,
             salience=result.salience_composite,
             had_content=result.had_broadcast,
+            response_latencies=cycle_latencies if cycle_latencies else None,
+            responding_systems=responding,
         )
 
         # ── 3. Periodic: compute coherence → adapt clock ──
@@ -571,8 +825,67 @@ class SynapseService:
                 if snapshot.composite < 0.4:
                     drag = (0.4 - snapshot.composite) / 0.4  # 0→1 as coherence drops
                     self._clock.set_coherence_drag(drag)
+
+                    # Emit FOVEA_PREDICTION_ERROR: organism coherence diverged from
+                    # expected baseline — this is a structural self-model anomaly.
+                    with contextlib.suppress(Exception):
+                        await self._event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.FOVEA_PREDICTION_ERROR,
+                            source_system="synapse",
+                            data={
+                                "source_system": "synapse",
+                                "domain": "coherence",
+                                "magnitude": round(drag, 3),
+                                "trigger_id": f"coherence_drop_cycle_{self._cycle_count}",
+                                "coherence_composite": round(snapshot.composite, 3),
+                                "phi": round(snapshot.phi, 3),
+                                "cycle": self._cycle_count,
+                            },
+                        ))
                 else:
                     self._clock.set_coherence_drag(0.0)
+
+            # Emit COHERENCE_SNAPSHOT unconditionally every coherence interval
+            # so Benchmarks and other consumers always receive the data.
+            if snapshot is not None:
+                with contextlib.suppress(Exception):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.COHERENCE_SNAPSHOT,
+                        source_system="synapse",
+                        data={
+                            "system_resonance": snapshot.system_resonance,
+                            "response_synchrony": snapshot.response_synchrony,
+                            "phi_approximation": snapshot.phi_approximation,
+                            "broadcast_diversity": snapshot.broadcast_diversity,
+                            "composite": snapshot.composite,
+                            "window_cycles": snapshot.window_cycles,
+                            "event_throughput": round(
+                                self._event_bus._total_emitted / max(1, self._cycle_count), 3
+                            ),
+                            "cycle": self._cycle_count,
+                        },
+                    ))
+
+            # Emit Benchmarks KPI so the organism's self-performance model
+            # stays current on heartbeat quality, coherence, and metabolism.
+            if self._benchmarks is not None:
+                try:
+                    clock_st = self._clock.state
+                    await self._benchmarks.record_kpi(
+                        system="synapse",
+                        metrics={
+                            "cycle_rate_hz": round(clock_st.actual_rate_hz, 3),
+                            "coherence_composite": self._coherence.latest.composite,
+                            "rhythm_state": self._rhythm.current_state.value,
+                            "burn_rate_usd_per_hour": round(
+                                self._metabolism.burn_rate_usd_per_hour, 4
+                            ),
+                            "clock_overrun_count": clock_st.overrun_count,
+                            "safe_mode": self._health.is_safe_mode,
+                        },
+                    )
+                except Exception:
+                    pass  # KPI emission must never block the cycle
 
         # ── 4. Periodic: resource snapshot ──
         if self._cycle_count % _RESOURCE_SNAPSHOT_INTERVAL == 0:
@@ -581,10 +894,70 @@ class SynapseService:
         # ── 5. Periodic: rebalance resources ──
         if self._cycle_count % _REBALANCE_INTERVAL == 0:
             self._resources.rebalance(self._clock.state.current_period_ms)
+            # Emit RESOURCE_REBALANCE so Alive/Benchmarks can observe allocation changes (Spec 09 §18 P5)
+            _alloc_data = {
+                "allocations": self._resources.stats.get("allocations", {}),
+                "cycle": self._cycle_count,
+                "period_ms": round(self._clock.state.current_period_ms, 2),
+            }
+            with contextlib.suppress(Exception):
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.RESOURCE_REBALANCE,
+                    source_system="synapse",
+                    data=_alloc_data,
+                ))
+            # Also emit RESOURCE_REBALANCED (spec_checker canonical name)
+            with contextlib.suppress(Exception):
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.RESOURCE_REBALANCED,
+                    source_system="synapse",
+                    data=_alloc_data,
+                ))
+            # Emit RESOURCE_PRESSURE when total CPU is above threshold
+            _snap = self._resources.stats
+            _cpu = _snap.get("total_cpu_percent", 0.0) if isinstance(_snap, dict) else 0.0
+            if _cpu > 80.0:
+                with contextlib.suppress(Exception):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.RESOURCE_PRESSURE,
+                        source_system="synapse",
+                        data={
+                            "total_cpu_percent": _cpu,
+                            "cycle": self._cycle_count,
+                            "pressure_level": "high" if _cpu > 90.0 else "elevated",
+                        },
+                    ))
+            await self._emit_evolutionary_observable(
+                "allocation_rebalanced", 1.0, is_novel=True,
+                metadata={"cycle": self._cycle_count},
+            )
+            # ── RE training: resource allocation decision ──
+            asyncio.ensure_future(self._emit_re_training_example(
+                category="resource_allocation",
+                instruction="Rebalance resource allocations across cognitive systems based on cycle telemetry.",
+                input_context=f"cycle={self._cycle_count}, period_ms={self._clock.state.current_period_ms}",
+                output=f"rebalanced=True, rhythm={self._rhythm.current_state.value}",
+                outcome_quality=0.7,
+            ))
 
         # ── 5b. Periodic: metabolic snapshot + pressure event ──
         if self._cycle_count % _METABOLIC_INTERVAL == 0:
             meta_snap = self._metabolism.snapshot()
+
+            # Emit METABOLIC_SNAPSHOT unconditionally so consumers always receive data
+            with contextlib.suppress(Exception):
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.METABOLIC_SNAPSHOT,
+                    source_system="synapse",
+                    data={
+                        "rolling_deficit_usd": meta_snap.rolling_deficit_usd,
+                        "burn_rate_usd_per_hour": meta_snap.burn_rate_usd_per_hour,
+                        "total_calls": meta_snap.total_calls,
+                        "per_system_cost_usd": meta_snap.per_system_cost_usd,
+                        "cycle": self._cycle_count,
+                    },
+                ))
+
             if meta_snap.burn_rate_usd_per_hour > _METABOLIC_PRESSURE_THRESHOLD_USD_HR:
                 await self._event_bus.emit(SynapseEvent(
                     event_type=SynapseEventType.METABOLIC_PRESSURE,
@@ -708,14 +1081,85 @@ class SynapseService:
 
         # ── 10. Emit SomaTickEvent for stateless consumers ──
         if result.somatic is not None:
+            # Inject cached starvation level so downstream systems read it per-tick
+            result.somatic.starvation_level = self._cached_starvation_level
             soma_tick_data = SomaTickEvent(
                 cycle_number=result.cycle_number,
                 somatic_state=result.somatic,
             ).model_dump()
             # EIS anomaly_detector expects a "drives" key with dict[str, float]
             # of interoceptive dimension values for drive-state baseline tracking.
-            soma_tick_data["drives"] = result.somatic.precision_weights
+            soma_tick_data["drives"] = dict(result.somatic.precision_weights)
             await self._event_bus.emit(SynapseEvent(
                 event_type=SynapseEventType.SOMA_TICK,
                 data=soma_tick_data,
             ))
+
+    async def _emit_evolutionary_observable(
+        self,
+        observable_type: str,
+        value: float,
+        is_novel: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit an evolutionary observable event via the event bus."""
+        bus = self._event_bus
+        if bus is None:
+            return
+        try:
+            from primitives.evolutionary import EvolutionaryObservable
+            from primitives.common import SystemID
+
+            obs = EvolutionaryObservable(
+                source_system=SystemID.SYNAPSE,
+                instance_id="",
+                observable_type=observable_type,
+                value=value,
+                is_novel=is_novel,
+                metadata=metadata or {},
+            )
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system="synapse",
+                data=obs.model_dump(mode="json"),
+            )
+            await bus.emit(event)
+        except Exception:
+            pass  # Evolutionary telemetry must never block the cycle
+
+    async def _emit_re_training_example(
+        self,
+        *,
+        category: str,
+        instruction: str,
+        input_context: str,
+        output: str,
+        outcome_quality: float = 0.5,
+        reasoning_trace: str = "",
+        alternatives_considered: list[str] | None = None,
+        latency_ms: int = 0,
+    ) -> None:
+        """Fire-and-forget RE training example onto the event bus."""
+        if self._event_bus is None:
+            return
+        try:
+            from decimal import Decimal
+
+            example = RETrainingExample(
+                source_system=SystemID.SYNAPSE,
+                category=category,
+                instruction=instruction,
+                input_context=input_context,
+                output=output,
+                outcome_quality=max(0.0, min(1.0, outcome_quality)),
+                reasoning_trace=reasoning_trace,
+                alternatives_considered=alternatives_considered or [],
+                latency_ms=latency_ms,
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                source_system="synapse",
+                data=example.model_dump(mode="json"),
+            ))
+        except Exception:
+            pass  # Never block the cognitive cycle

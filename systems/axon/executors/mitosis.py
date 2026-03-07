@@ -38,9 +38,16 @@ from systems.axon.types import (
 
 if TYPE_CHECKING:
     from clients.wallet import WalletClient
+    from systems.axon.service import AxonService
+    from systems.equor.service import EquorService
+    from systems.evo.service import EvoService
+    from systems.memory.service import MemoryService
+    from systems.mitosis.fleet_service import MitosisFleetService
     from systems.mitosis.spawner import LocalDockerSpawner
     from systems.oikos.service import OikosService
+    from systems.simula.service import SimulaService
     from systems.synapse.service import SynapseService
+    from systems.telos.service import TelosService
 
 logger = structlog.get_logger()
 
@@ -68,6 +75,8 @@ class SpawnChildExecutor(Executor):
       config_overrides (dict): Config overrides for the child.
       belief_genome_id (str): Evo BeliefGenome ID for genetic inheritance.
       simula_genome_id (str): SimulaGenome ID for evolution inheritance.
+      equor_genome_id (str): Equor constitutional genome ID (amendment history).
+      axon_genome_id (str): Axon template genome ID (execution strategy inheritance).
       generation (int): Generation number in the lineage (default 1).
     """
 
@@ -88,11 +97,25 @@ class SpawnChildExecutor(Executor):
         oikos: OikosService | None = None,
         synapse: SynapseService | None = None,
         spawner: LocalDockerSpawner | None = None,
+        fleet_service: MitosisFleetService | None = None,
+        memory: MemoryService | None = None,
+        evo: EvoService | None = None,
+        simula: SimulaService | None = None,
+        equor: EquorService | None = None,
+        axon: AxonService | None = None,
+        telos: TelosService | None = None,
     ) -> None:
         self._wallet = wallet
         self._oikos = oikos
         self._synapse = synapse
         self._spawner = spawner
+        self._fleet_service = fleet_service
+        self._memory = memory
+        self._evo = evo
+        self._simula = simula
+        self._equor = equor
+        self._axon = axon
+        self._telos = telos
         self._logger = logger.bind(system="axon.executor.spawn_child")
 
     # ── Validation ─────────────────────────────────────────────
@@ -183,6 +206,9 @@ class SpawnChildExecutor(Executor):
         container_id = str(params.get("container_id", "")).strip()
         belief_genome_id = str(params.get("belief_genome_id", "")).strip()
         simula_genome_id = str(params.get("simula_genome_id", "")).strip()
+        equor_genome_id = str(params.get("equor_genome_id", "")).strip()
+        axon_genome_id = str(params.get("axon_genome_id", "")).strip()
+        telos_genome_id = str(params.get("telos_genome_id", "")).strip()
         generation = int(params.get("generation", 1))
 
         self._logger.info(
@@ -193,6 +219,145 @@ class SpawnChildExecutor(Executor):
             niche=niche_name,
             execution_id=context.execution_id,
         )
+
+        # ── Step 0: Prepare child genome (extract → mutate → persist) ──
+        organism_genome_id = str(params.get("organism_genome_id", "")).strip()
+        if not organism_genome_id and self._fleet_service is not None:
+            try:
+                child_genome = await self._fleet_service.prepare_child_genome(
+                    parent_instance_id=(
+                        getattr(self._oikos, "_instance_id", None) or "eos-default"
+                    ) if self._oikos is not None else "eos-default",
+                    generation=generation,
+                )
+                if child_genome is not None:
+                    organism_genome_id = child_genome.id
+                    self._logger.info(
+                        "spawn_child_genome_prepared",
+                        child_id=child_id,
+                        genome_id=organism_genome_id,
+                        generation=child_genome.generation,
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding without genome — child will use default",
+                )
+
+        # ── Step 0b: SG4 — Resolve BeliefGenome and SimulaGenome IDs at spawn time ──
+        # belief_genome_id: snapshot of parent's hypothesis set, drive weights, drift history
+        # simula_genome_id: snapshot of Simula's current evolution params + last 10 mutations
+        # Both are resolved NOW so the child inherits the live parent state, not a stale param.
+        if not belief_genome_id and self._evo is not None:
+            try:
+                belief_genome = await self._evo.export_belief_genome()
+                if belief_genome is not None:
+                    belief_genome_id = str(belief_genome.genome_id)
+                    self._logger.info(
+                        "spawn_child_belief_genome_resolved",
+                        child_id=child_id,
+                        belief_genome_id=belief_genome_id,
+                        generation=getattr(belief_genome, "generation", generation),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_belief_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding with empty belief_genome_id — child inherits no belief priors",
+                )
+
+        if not simula_genome_id and self._simula is not None:
+            try:
+                simula_genome = await self._simula.export_simula_genome()
+                if simula_genome is not None:
+                    simula_genome_id = str(simula_genome.genome_id)
+                    self._logger.info(
+                        "spawn_child_simula_genome_resolved",
+                        child_id=child_id,
+                        simula_genome_id=simula_genome_id,
+                        generation=getattr(simula_genome, "generation", generation),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_simula_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding with empty simula_genome_id — child inherits no evolution state",
+                )
+
+        # equor_genome_id: snapshot of parent's constitutional amendment history,
+        # drive calibration deltas, and constitution hash. Children apply inherited
+        # amendments during Equor init so wisdom accumulates across generations.
+        equor_genome: object | None = None
+        if not equor_genome_id and self._equor is not None:
+            try:
+                equor_genome = await self._equor.export_equor_genome()
+                if equor_genome is not None:
+                    equor_genome_id = str(getattr(equor_genome, "genome_id", ""))
+                    self._logger.info(
+                        "spawn_child_equor_genome_resolved",
+                        child_id=child_id,
+                        equor_genome_id=equor_genome_id,
+                        amendment_count=len(getattr(equor_genome, "top_amendments", [])),
+                        total_adopted=getattr(equor_genome, "total_amendments_adopted", 0),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_equor_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding with empty equor_genome_id — child inherits no constitutional wisdom",
+                )
+
+        # axon_genome_id: snapshot of parent's top-10 action templates, circuit breaker
+        # thresholds, and per-pattern success rates. Children apply inherited templates
+        # during Axon init so execution quality is high from the first cognitive cycle.
+        axon_genome: object | None = None
+        if not axon_genome_id and self._axon is not None:
+            try:
+                axon_genome = await self._axon.export_axon_genome(generation=generation)
+                if axon_genome is not None:
+                    axon_genome_id = str(getattr(axon_genome, "genome_id", ""))
+                    self._logger.info(
+                        "spawn_child_axon_genome_resolved",
+                        child_id=child_id,
+                        axon_genome_id=axon_genome_id,
+                        template_count=len(getattr(axon_genome, "templates", [])),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_axon_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding with empty axon_genome_id — child starts with default execution templates",
+                )
+
+        # telos_genome_id: snapshot of parent's drive calibration constants (resonance
+        # curves, dissipation baseline, inter-drive coupling). Child Telos applies these
+        # with bounded mutation jitter so drive geometry evolves across generations.
+        telos_genome: object | None = None
+        if not telos_genome_id and self._telos is not None:
+            try:
+                telos_genome = await self._telos.export_telos_genome()
+                if telos_genome is not None:
+                    telos_genome_id = str(getattr(telos_genome, "genome_id", ""))
+                    self._logger.info(
+                        "spawn_child_telos_genome_resolved",
+                        child_id=child_id,
+                        telos_genome_id=telos_genome_id,
+                        topology=getattr(telos_genome, "topology", ""),
+                        drive_count=len(getattr(telos_genome, "drive_calibrations", {})),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_telos_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding with empty telos_genome_id — child uses default drive calibrations",
+                )
 
         # ── Step 1: Boot child container via LocalDockerSpawner ──
         spawn_container_id = container_id
@@ -207,12 +372,48 @@ class SpawnChildExecutor(Executor):
                 niche_desc=niche_desc,
                 dividend_rate=dividend_rate,
                 config_overrides=params.get("config_overrides", {}),
+                organism_genome_id=organism_genome_id,
                 belief_genome_id=belief_genome_id,
                 simula_genome_id=simula_genome_id,
+                equor_genome_id=equor_genome_id,
+                axon_genome_id=axon_genome_id,
+                telos_genome_id=telos_genome_id,
                 generation=generation,
             )
 
             if seed_config is not None:
+                # Attach EquorGenomeFragment payload to seed config for env injection
+                if equor_genome is not None:
+                    try:
+                        equor_payload = equor_genome.model_dump_for_transport()  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["equor_genome_payload"] = str(
+                            __import__("json").dumps(equor_payload)
+                        )
+                    except Exception:
+                        pass
+
+                # Attach AxonGenomeFragment payload to seed config for env injection
+                # Child AxonService reads ECODIAOS_AXON_GENOME_PAYLOAD on initialize()
+                if axon_genome is not None:
+                    try:
+                        axon_payload = axon_genome.model_dump_for_transport()  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["axon_genome_payload"] = str(
+                            __import__("json").dumps(axon_payload)
+                        )
+                    except Exception:
+                        pass
+
+                # Attach TelosGenomeFragment payload to seed config for env injection
+                # Child TelosService reads ECODIAOS_TELOS_GENOME_PAYLOAD on initialize()
+                if telos_genome is not None:
+                    try:
+                        telos_payload = telos_genome.model_dump_for_transport()  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["telos_genome_payload"] = str(
+                            __import__("json").dumps(telos_payload)
+                        )
+                    except Exception:
+                        pass
+
                 # Get parent certificate for federation handshake
                 parent_cert = ""
                 if self._oikos is not None:
@@ -336,22 +537,99 @@ class SpawnChildExecutor(Executor):
                 note="No wallet address — child will request funding via federation",
             )
 
-        # ── Step 3: Register child in Oikos ──
-        from systems.oikos.models import ChildPosition, ChildStatus
+        # ── Step 3: Register child in Oikos via OIKOS_ECONOMIC_QUERY event ──
+        # Architecture rule: no cross-system imports. Axon emits
+        # OIKOS_ECONOMIC_QUERY{action="register_child"} on the Synapse bus;
+        # OikosService subscribes, constructs ChildPosition, and responds with
+        # OIKOS_ECONOMIC_RESPONSE. Fallback to direct call only when bus is absent.
+        _child_registered = False
+        if self._synapse is not None:
+            import asyncio as _asyncio
 
-        child_position = ChildPosition(
-            instance_id=child_id,
-            niche=niche_name,
-            seed_capital_usd=Decimal(seed_amount) if seed_transferred else Decimal("0"),
-            current_net_worth_usd=Decimal(seed_amount) if seed_transferred else Decimal("0"),
-            dividend_rate=Decimal(dividend_rate),
-            status=ChildStatus.ALIVE if seed_transferred else ChildStatus.SPAWNING,
-            wallet_address=wallet_addr,
-            container_id=spawn_container_id,
-        )
+            from systems.synapse.types import SynapseEvent, SynapseEventType
 
-        if self._oikos is not None:
-            self._oikos.register_child(child_position)
+            _reg_request_id = f"spawn_reg_{child_id}"
+            _reg_future: _asyncio.Future[dict] = _asyncio.get_event_loop().create_future()
+
+            async def _on_reg_response(ev: Any) -> None:
+                ev_data = ev.data if hasattr(ev, "data") else {}
+                if ev_data.get("request_id") == _reg_request_id and not _reg_future.done():
+                    _reg_future.set_result(ev_data)
+
+            self._synapse.event_bus.subscribe(SynapseEventType.OIKOS_ECONOMIC_RESPONSE, _on_reg_response)
+            try:
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.OIKOS_ECONOMIC_QUERY,
+                    source_system="axon.spawn_child",
+                    data={
+                        "request_id": _reg_request_id,
+                        "action": "register_child",
+                        "child_data": {
+                            "instance_id": child_id,
+                            "niche": niche_name,
+                            "seed_capital_usd": seed_amount if seed_transferred else "0",
+                            "current_net_worth_usd": seed_amount if seed_transferred else "0",
+                            "dividend_rate": dividend_rate,
+                            "status": "alive" if seed_transferred else "spawning",
+                            "wallet_address": wallet_addr,
+                            "container_id": spawn_container_id,
+                        },
+                    },
+                ))
+                try:
+                    reg_result = await _asyncio.wait_for(_reg_future, timeout=5.0)
+                    _child_registered = reg_result.get("success", False)
+                    if not _child_registered:
+                        self._logger.warning(
+                            "spawn_child_oikos_registration_failed",
+                            child_id=child_id,
+                            error=reg_result.get("error", "unknown"),
+                        )
+                except _asyncio.TimeoutError:
+                    self._logger.warning(
+                        "spawn_child_oikos_registration_timeout",
+                        child_id=child_id,
+                        note="OikosService did not respond in 5s — registration unconfirmed",
+                    )
+            except Exception as exc:
+                self._logger.warning("spawn_child_oikos_query_failed", child_id=child_id, error=str(exc))
+        elif self._oikos is not None:
+            # No Synapse bus — fallback direct call (dev/test only, bus unavailable)
+            from systems.oikos.models import ChildPosition, ChildStatus  # noqa: PLC0415
+
+            child_position = ChildPosition(
+                instance_id=child_id,
+                niche=niche_name,
+                seed_capital_usd=Decimal(seed_amount) if seed_transferred else Decimal("0"),
+                current_net_worth_usd=Decimal(seed_amount) if seed_transferred else Decimal("0"),
+                dividend_rate=Decimal(dividend_rate),
+                status=ChildStatus.ALIVE if seed_transferred else ChildStatus.SPAWNING,
+                wallet_address=wallet_addr,
+                container_id=spawn_container_id,
+            )
+            await self._oikos.register_child(child_position)
+            _child_registered = True
+
+        # ── Step 3.5: Export parent genome payload for child inheritance ──
+        # Mitosis requires the full genome payload (not just the ID) so the
+        # child can reconstruct its starting belief weights, schema priors, and
+        # procedure library without needing a round-trip back to the parent.
+        parent_genome_payload: dict[str, Any] = {}
+        if self._memory is not None and hasattr(self._memory, "export_genome"):
+            try:
+                parent_genome_payload = await self._memory.export_genome() or {}
+                self._logger.info(
+                    "spawn_child_genome_exported",
+                    child_id=child_id,
+                    genome_keys=list(parent_genome_payload.keys()),
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_genome_export_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding without genome payload — child will use defaults",
+                )
 
         # ── Step 4: Emit CHILD_SPAWNED event ──
         if self._synapse is not None:
@@ -373,9 +651,16 @@ class SpawnChildExecutor(Executor):
                         "container_id": spawn_container_id,
                         "federation_address": spawn_federation_addr,
                         "execution_id": context.execution_id,
+                        "organism_genome_id": organism_genome_id,
                         "belief_genome_id": belief_genome_id,
                         "simula_genome_id": simula_genome_id,
+                        "equor_genome_id": equor_genome_id,
+                        "axon_genome_id": axon_genome_id,
+                        "telos_genome_id": telos_genome_id,
                         "generation": generation,
+                        # Full genome payload — Mitosis seeds the child from this.
+                        # Empty dict when Memory unavailable; child falls back to defaults.
+                        "parent_genome_payload": parent_genome_payload,
                     },
                 ))
             except Exception as exc:
@@ -418,8 +703,12 @@ class SpawnChildExecutor(Executor):
                 "network": network,
                 "container_id": spawn_container_id,
                 "federation_address": spawn_federation_addr,
+                "organism_genome_id": organism_genome_id,
                 "belief_genome_id": belief_genome_id,
                 "simula_genome_id": simula_genome_id,
+                "equor_genome_id": equor_genome_id,
+                "axon_genome_id": axon_genome_id,
+                "telos_genome_id": telos_genome_id,
                 "generation": generation,
             },
             side_effects=[side_effect],
@@ -435,8 +724,12 @@ class SpawnChildExecutor(Executor):
         niche_desc: str,
         dividend_rate: str,
         config_overrides: dict[str, str],
+        organism_genome_id: str = "",
         belief_genome_id: str = "",
         simula_genome_id: str = "",
+        equor_genome_id: str = "",
+        axon_genome_id: str = "",
+        telos_genome_id: str = "",
         generation: int = 1,
     ) -> Any:
         """Build a SeedConfiguration from executor params for the spawner."""
@@ -460,8 +753,12 @@ class SpawnChildExecutor(Executor):
                     "specialisation": niche_name,
                     "niche_description": niche_desc or niche_name,
                 },
+                organism_genome_id=organism_genome_id,
                 belief_genome_id=belief_genome_id,
                 simula_genome_id=simula_genome_id,
+                equor_genome_id=equor_genome_id,
+                axon_genome_id=axon_genome_id,
+                telos_genome_id=telos_genome_id,
                 generation=generation,
             )
         except Exception as exc:

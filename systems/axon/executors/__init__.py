@@ -66,7 +66,13 @@ from systems.axon.executors.observation import (
     SearchExecutor,
 )
 from systems.axon.executors.phantom_liquidity import PhantomLiquidityExecutor
+from systems.axon.executors.adjust_config import AdjustConfigExecutor
+from systems.axon.executors.allocate_resource import AllocateResourceExecutor
+from systems.axon.executors.federation_send import FederationSendExecutor
+from systems.axon.executors.query_memory import QueryMemoryGraphExecutor
+from systems.axon.executors.send_email import SendEmailExecutor
 from systems.axon.executors.simula_codegen_repair import SimulaCodegenRepairExecutor
+from systems.axon.executors.request_telecom import RequestTelecomExecutor
 from systems.axon.executors.simula_codegen_stall_repair import SimulaCodegenStallRepairExecutor
 from systems.axon.executors.social_post import ExecuteSocialPostExecutor
 from systems.axon.executors.solve_bounty import SolveBountyExecutor
@@ -74,8 +80,6 @@ from systems.axon.executors.synapse_cognitive_stall_repair import (
     SynapseCognitiveStallRepairExecutor,
 )
 from systems.axon.registry import ExecutorRegistry
-from systems.sacm.remote_compute_executor import RemoteComputeExecutor
-from systems.sacm.service import SACMClient
 
 __all__ = [
     "build_default_registry",
@@ -123,10 +127,16 @@ __all__ = [
     "DividendCollectorExecutor",
     # Social Presence
     "ExecuteSocialPostExecutor",
-    # Remote Compute — SACM bridge (Section XI)
-    "RemoteComputeExecutor",
     # Phantom Liquidity — sensor network (Phase 16q)
     "PhantomLiquidityExecutor",
+    # Federated Telecom Marketplace (Phase 16j)
+    "RequestTelecomExecutor",
+    # New capability executors
+    "SendEmailExecutor",
+    "FederationSendExecutor",
+    "AllocateResourceExecutor",
+    "AdjustConfigExecutor",
+    "QueryMemoryGraphExecutor",
     # Repair executors (Thymos-triggered)
     "CognitiveStallRepairExecutor",
     "SynapseCognitiveStallRepairExecutor",
@@ -144,6 +154,7 @@ def build_default_registry(
     oikos: Any = None,
     asset_factory: Any = None,
     simula: Any = None,
+    evo: Any = None,
     github_config: Any = None,
     llm: Any = None,
     spawner: Any = None,
@@ -151,7 +162,7 @@ def build_default_registry(
     compute_arbitrage_config: Any = None,
     compute_providers: dict[str, Any] | None = None,
     vault: Any = None,
-    sacm_client: SACMClient | None = None,
+    sacm_client: Any = None,
     registered_agent: Any = None,
     event_bus: Any = None,
     send_admin_notification: Any = None,
@@ -160,6 +171,8 @@ def build_default_registry(
     budget_tracker: Any = None,
     circuit_breaker: Any = None,
     rate_limiter: Any = None,
+    federation: Any = None,
+    identity_comm_config: Any = None,
 ) -> ExecutorRegistry:
     """
     Build and return a fully-populated ExecutorRegistry with all built-in executors.
@@ -187,7 +200,7 @@ def build_default_registry(
 
     # ── Observation (Level 1) ──────────────────────────────────────
     registry.register(ObserveExecutor(memory=memory))
-    registry.register(QueryMemoryExecutor(memory=memory))
+    # QueryMemoryExecutor superseded by QueryMemoryGraphExecutor (registered below)
     registry.register(AnalyseExecutor(memory=memory))
     registry.register(SearchExecutor(memory=memory, llm=llm))
 
@@ -277,6 +290,7 @@ def build_default_registry(
     if wallet is not None or spawner is not None:
         registry.register(SpawnChildExecutor(
             wallet=wallet, oikos=oikos, synapse=synapse, spawner=spawner,
+            memory=memory, evo=evo, simula=simula,
         ))
 
     # ── Social Presence (Level 2) ─────────────────────────────────
@@ -302,6 +316,7 @@ def build_default_registry(
     # provided. Bridges Axon action_type="remote_compute" intents to
     # the SACM pipeline via SACMClient.submit_and_await().
     if sacm_client is not None:
+        from systems.axon.executors.remote_compute import RemoteComputeExecutor
         registry.register(RemoteComputeExecutor(sacm_client=sacm_client))
 
     # ── Legal Entity Provisioning / Phase 16g (Level 3) ──────────
@@ -317,6 +332,24 @@ def build_default_registry(
         send_admin_notification=send_admin_notification,
     )
     registry.register(_establish_entity)
+
+    # ── Federated Telecom Marketplace / Phase 16j (Level 3) ──────────
+    # RequestTelecomExecutor: registered when wallet is available.
+    # Requires SOVEREIGN autonomy (level 3) — moves 5 USDC on-chain.
+    # Degrades gracefully when federation or identity_comm_config are None.
+    if wallet is not None:
+        registry.register(RequestTelecomExecutor(
+            wallet=wallet,
+            federation=federation,
+            identity_comm_config=identity_comm_config,
+        ))
+
+    # ── New Capability Executors ─────────────────────────────────────
+    registry.register(SendEmailExecutor(event_bus=event_bus))
+    registry.register(FederationSendExecutor(event_bus=event_bus))
+    registry.register(AllocateResourceExecutor(event_bus=event_bus))
+    registry.register(AdjustConfigExecutor(event_bus=event_bus))
+    registry.register(QueryMemoryGraphExecutor(memory=memory, event_bus=event_bus))
 
     # ── Repair Executors (Thymos-triggered) ────────────────────────
     # These are invoked by Thymos prescriptions to repair stalled or

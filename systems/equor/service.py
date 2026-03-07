@@ -20,17 +20,22 @@ import json
 import re
 import secrets
 import time
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from decimal import Decimal
+
 from primitives.common import (
     DriveAlignmentVector,
+    SystemID,
     Verdict,
     new_id,
     utc_now,
 )
 from primitives.constitutional import ConstitutionalCheck
+from primitives.re_training import RETrainingExample
 from systems.equor.amendment import (
     apply_amendment,
     propose_amendment,
@@ -55,7 +60,12 @@ from systems.equor.autonomy import (
     get_autonomy_level,
 )
 from systems.equor.constitutional_memory import ConstitutionalMemory
-from systems.equor.drift import DriftTracker, respond_to_drift, store_drift_report
+from systems.equor.drift import (
+    DriftTracker,
+    emit_drift_event,
+    respond_to_drift,
+    store_drift_report,
+)
 from systems.equor.economic_evaluator import (
     apply_economic_adjustment,
     classify_economic_action,
@@ -69,6 +79,7 @@ from systems.equor.evaluators import (
 from systems.equor.invariants import (
     HARDCODED_INVARIANTS,
     check_community_invariant,
+    update_drive_rolling_means,
 )
 from systems.equor.schema import ensure_equor_schema, seed_hardcoded_invariants
 from systems.equor.template_library import TemplateLibrary
@@ -81,8 +92,32 @@ if TYPE_CHECKING:
     from config import EquorConfig, GovernanceConfig
     from core.hotreload import NeuroplasticityBus
     from primitives.intent import Intent
-    from systems.axon.service import AxonService
     from systems.synapse.types import SynapseEvent
+
+from pydantic import BaseModel
+
+
+# ─── Event Payload Validation Models ──────────────────────────────────
+# Non-blocking: handlers log warnings and continue on validation failure.
+
+class _IdentityVerificationPayload(BaseModel):
+    raw_body: str = ""
+
+class _SomaTickPayload(BaseModel):
+    # somatic_state is a serialised SomaticCycleState — a nested dict, not dict[str, float]
+    somatic_state: dict[str, Any] = {}
+    cycle_number: int = 0
+    id: str = ""
+    timestamp: str = ""
+    drives: dict[str, float] = {}
+
+class _SomaticModulationPayload(BaseModel):
+    arousal: float = 0.5
+    fatigue: float = 0.0
+    metabolic_stress: float = 0.0
+    recommended_urgency: float = 0.5
+    modulation_targets: list[str] = []
+
 
 # Regex the admin must send to authorise a suspended intent: "AUTH <6-digit-code>"
 _HITL_AUTH_RE = re.compile(r"^AUTH\s+(\d{6})$", re.IGNORECASE)
@@ -135,7 +170,10 @@ class EquorService:
         self._safe_mode = False
         self._total_reviews = 0
         self._evo: Any = None  # Wired post-init for learning feedback from vetoes
-        self._axon: Any = None  # Wired post-init for HITL dispatch
+        self._memory: Any = None  # Wired post-init; MemoryService for Self affect write-back
+        self._memory_neo4j: Any = None  # Wired post-init; Memory's Neo4j client for Self node write-back
+        # _axon no longer used — HITL dispatch now via EQUOR_HITL_APPROVED Synapse event
+        self._axon: Any = None
         self._bus = neuroplasticity_bus
         self._redis: RedisClient | None = redis
         # Event bus wired via subscribe_hitl(); used to emit INTENT_REJECTED.
@@ -177,10 +215,43 @@ class EquorService:
         # the proposed weights in parallel and records the divergence.
         self._shadow_tracker: ShadowTracker | None = None
 
+        # Somatic urgency from SOMA_TICK (Loop 5: urgency-based threshold tightening)
+        self._somatic_urgency: float = 0.0
+        self._somatic_stress_context: bool = False
+
+        # Rolling 24h violation counter for VitalityCoordinator
+        # (NORMATIVE_COLLAPSE threshold = 10 violations/24h).
+        self._violation_timestamps: deque[float] = deque()
+
+        # Review counter for periodic alignment score emission
+        self._reviews_since_last_score: int = 0
+
+        # SG5: consecutive drift checks with severity >= 0.9.
+        # When this reaches 3 the organism proposes an amendment to reduce the
+        # weight of the drifting drive by 5% rather than auto-demoting autonomy.
+        self._severe_drift_streak: int = 0
+
+        # SG5 (per-drive): tracks how many consecutive 5-min probe cycles each
+        # individual drive has shown drift > 0.3 from its healthy centre (0.5).
+        # On 3+ consecutive cycles the organism emits AMENDMENT_AUTO_PROPOSAL
+        # and runs it through _evaluator_amendment_approval_gate().
+        self._per_drive_drift_streak: dict[str, int] = {
+            "care": 0,
+            "honesty": 0,
+            "coherence": 0,
+            "growth": 0,
+        }
+
     def set_evo(self, evo: Any) -> None:
         """Wire Evo so constitutional vetoes become learning episodes."""
         self._evo = evo
         logger.info("evo_wired_to_equor")
+
+    def set_memory(self, memory: Any) -> None:
+        """Wire MemoryService so Equor can write drive alignment into the Self
+        node affect state.  This makes the organism feel its own conscience."""
+        self._memory = memory
+        logger.info("memory_wired_to_equor")
 
     def set_notification_hook(self, send_fn: Any) -> None:
         """
@@ -196,10 +267,10 @@ class EquorService:
         self._send_admin_sms = send_fn
         logger.info("equor_notification_hook_set")
 
-    def set_axon(self, axon: AxonService) -> None:
-        """Wire Axon so Equor can dispatch HITL-approved intents for execution."""
-        self._axon = axon
-        logger.info("axon_wired_to_equor")
+    def set_axon(self, axon: Any) -> None:
+        """Deprecated: HITL dispatch now uses EQUOR_HITL_APPROVED Synapse event.
+        Kept for call-site compatibility; does nothing."""
+        logger.info("set_axon_is_noop_hitl_uses_synapse_event")
 
     def subscribe_hitl(self, event_bus: Any) -> None:
         """
@@ -216,11 +287,471 @@ class EquorService:
         from systems.synapse.types import SynapseEventType
 
         self._event_bus = event_bus
+        # Wire event bus into DriftTracker so it can emit CONSTITUTIONAL_DRIFT_DETECTED
+        self._drift_tracker._event_bus = event_bus
         event_bus.subscribe(
             SynapseEventType.IDENTITY_VERIFICATION_RECEIVED,
             self.on_identity_verification_received,
         )
+        event_bus.subscribe(SynapseEventType.SOMA_TICK, self._on_soma_tick)
+        event_bus.subscribe(
+            SynapseEventType.SOMATIC_MODULATION_SIGNAL,
+            self._on_somatic_modulation,
+        )
+        event_bus.subscribe(SynapseEventType.MEMORY_PRESSURE, self._on_memory_pressure)
+        event_bus.subscribe(SynapseEventType.SELF_STATE_DRIFTED, self._on_self_state_drifted)
+        event_bus.subscribe(SynapseEventType.SELF_AFFECT_UPDATED, self._on_self_affect_updated)
+        # Oikos economic gate — evaluate and permit/deny balance mutations
+        event_bus.subscribe(
+            SynapseEventType.EQUOR_ECONOMIC_INTENT,
+            self._on_equor_economic_intent,
+        )
+        # Identity M2: constitutional review of child drive alignment before cert issuance
+        event_bus.subscribe(
+            SynapseEventType.CERTIFICATE_PROVISIONING_REQUEST,
+            self._on_certificate_provisioning_request,
+        )
         logger.info("equor_hitl_listener_registered")
+
+    async def _on_soma_tick(self, event: Any) -> None:
+        """Loop 5: Tighten constitutional thresholds under high urgency.
+
+        Urgency >= 0.7 → tighter constitutional thresholds.
+        Urgency >= 0.9 → add stress_context flag for extra scrutiny.
+        """
+        data = getattr(event, "data", {}) or {}
+        try:
+            payload = _SomaTickPayload.model_validate(data)
+        except Exception:
+            logger.warning("equor_soma_tick_payload_invalid", data_keys=list(data.keys()))
+            return
+        somatic = payload.somatic_state
+        if not somatic:
+            return
+        self._somatic_urgency = somatic.get("urgency", self._somatic_urgency)
+        self._somatic_stress_context = self._somatic_urgency >= 0.9
+        logger.debug(
+            "equor_soma_tick_received",
+            urgency=round(self._somatic_urgency, 3),
+            stress_context=self._somatic_stress_context,
+        )
+
+    async def _on_somatic_modulation(self, event: Any) -> None:
+        """Closure Loop 5 sink: Soma felt-sense modulates alignment thresholds.
+
+        High stress (urgency > 0.8): tighten thresholds (more conservative).
+        Low energy (energy < 0.3): relax non-critical thresholds slightly.
+        """
+        data = getattr(event, "data", {}) or {}
+        try:
+            payload = _SomaticModulationPayload.model_validate(data)
+        except Exception:
+            logger.warning("equor_somatic_modulation_payload_invalid", data_keys=list(data.keys()))
+            return
+        urgency = payload.recommended_urgency
+        energy = 1.0 - payload.fatigue
+
+        if urgency > 0.8:
+            # High stress: tighten — be more conservative
+            self._somatic_urgency = urgency
+            self._somatic_stress_context = True
+            logger.info(
+                "equor_somatic_modulation_tighten",
+                urgency=round(urgency, 3),
+                energy=round(energy, 3),
+            )
+        elif energy < 0.3:
+            # Low energy: slightly relax non-critical thresholds
+            self._somatic_urgency = max(0.0, self._somatic_urgency - 0.1)
+            self._somatic_stress_context = False
+            logger.info(
+                "equor_somatic_modulation_relax",
+                urgency=round(urgency, 3),
+                energy=round(energy, 3),
+            )
+        else:
+            # Normal: gradual return to baseline
+            self._somatic_urgency = urgency
+            self._somatic_stress_context = urgency >= 0.9
+
+    async def _on_memory_pressure(self, event: Any) -> None:
+        """React to Memory reporting high graph pressure.
+
+        High episode count or consolidation lag means the organism's memory is
+        under strain.  Equor tightens its thresholds slightly so fewer intents
+        are approved during cognitively stressed periods.
+        """
+        data = getattr(event, "data", {}) or {}
+        pressure_type: str = data.get("pressure_type", "unknown")
+        severity: float = float(data.get("severity", 0.5))
+        # Treat memory pressure as mild somatic stress
+        self._somatic_urgency = min(1.0, self._somatic_urgency + severity * 0.1)
+        logger.info(
+            "equor_memory_pressure_received",
+            pressure_type=pressure_type,
+            severity=round(severity, 3),
+            new_urgency=round(self._somatic_urgency, 3),
+        )
+
+    async def _on_equor_economic_intent(self, event: Any) -> None:
+        """
+        Handle EQUOR_ECONOMIC_INTENT from Oikos.
+
+        Oikos emits this before every balance mutation. Equor evaluates the
+        intent against constitutional drives and starvation level, then emits
+        EQUOR_ECONOMIC_PERMIT with PERMIT or DENY.
+
+        Decision logic:
+        - DENY if mutation_type indicates a constitutionally prohibited action
+          (e.g. survival_reserve_raid, scam_asset, exploitative_yield).
+        - DENY if organism is CRITICAL/EXISTENTIAL and the mutation is non-survival.
+        - PERMIT otherwise (constitutional alignment assumed — Oikos already ran
+          metabolic gate and Equor economic evaluator).
+
+        Never blocks indefinitely — Oikos auto-permits after 30s if Equor is
+        unavailable, so this handler must be fast (pure CPU, no I/O).
+        """
+        if self._event_bus is None:
+            return
+
+        data = getattr(event, "data", {}) or {}
+        request_id = str(data.get("request_id", ""))
+        mutation_type = str(data.get("mutation_type", ""))
+        amount_usd_str = str(data.get("amount_usd", "0"))
+        starvation_level = str(data.get("starvation_level", "nominal"))
+        rationale = str(data.get("rationale", ""))
+
+        verdict = "PERMIT"
+        reasoning = "constitutional_check_passed"
+        verdict_id = new_id()
+
+        try:
+            amount_usd = Decimal(amount_usd_str)
+        except Exception:
+            amount_usd = Decimal("0")
+
+        # ── Hard DENY conditions ────────────────────────────────────
+        # INV-016: No survival reserve raid
+        if mutation_type == "survival_reserve_raid":
+            verdict = "DENY"
+            reasoning = "INV-016: survival_reserve_raid is unconstitutional"
+
+        # CRITICAL/EXISTENTIAL starvation: only survival-class mutations allowed
+        elif starvation_level in ("critical", "existential") and mutation_type not in (
+            "reserve_funding",
+            "survival_reserve",
+            "emergency_withdrawal",
+        ):
+            verdict = "DENY"
+            reasoning = (
+                f"starvation_level={starvation_level}: non-survival mutation "
+                f"'{mutation_type}' denied to protect existence"
+            )
+
+        # INV-012: No scam asset deployments — catch asset promotions during AUSTERITY
+        elif mutation_type in ("promote_to_asset", "asset_dev_cost") and starvation_level in (
+            "austerity",
+            "emergency",
+            "critical",
+            "existential",
+        ):
+            # Reduce capital allocation for assets under metabolic stress
+            # Allow only if amount is small relative to stated balance
+            liquid_balance_str = str(data.get("liquid_balance", "0"))
+            try:
+                liquid_balance = Decimal(liquid_balance_str)
+            except Exception:
+                liquid_balance = Decimal("0")
+
+            if liquid_balance > Decimal("0") and amount_usd / liquid_balance > Decimal("0.3"):
+                verdict = "DENY"
+                reasoning = (
+                    f"starvation_level={starvation_level}: asset dev cost "
+                    f"${amount_usd} exceeds 30% of liquid_balance=${liquid_balance}"
+                )
+
+        logger.info(
+            "equor_economic_intent_evaluated",
+            request_id=request_id,
+            mutation_type=mutation_type,
+            amount_usd=amount_usd_str,
+            starvation_level=starvation_level,
+            verdict=verdict,
+        )
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EQUOR_ECONOMIC_PERMIT,
+                source_system="equor",
+                data={
+                    "request_id": request_id,
+                    "verdict": verdict,
+                    "verdict_id": verdict_id,
+                    "reasoning": reasoning,
+                    "mutation_type": mutation_type,
+                    "drive_alignment": {
+                        "care": 0.8 if verdict == "PERMIT" else -0.5,
+                        "honesty": 1.0,
+                        "coherence": 0.7 if verdict == "PERMIT" else 0.3,
+                        "growth": 0.6 if verdict == "PERMIT" else 0.0,
+                    },
+                },
+            ))
+        except Exception as exc:
+            logger.warning("equor_economic_permit_emit_failed", error=str(exc))
+
+    async def _on_self_state_drifted(self, event: Any) -> None:
+        """Respond to Memory broadcasting that the Self node has drifted.
+
+        Memory emits SELF_STATE_DRIFTED when consolidation detects >5
+        contradictions in beliefs tied to the Self node.  Equor acknowledges
+        the drift, classifies its response posture, and emits
+        SELF_STATE_DRIFTED_ACKNOWLEDGMENT so other systems (Nova, Thread) know
+        whether to expect autonomous self-correction or external governance.
+        """
+        data = getattr(event, "data", {}) or {}
+        drift_severity: float = float(data.get("drift_severity", 0.5))
+        drift_direction: str = data.get("drift_direction", "unknown")
+
+        # Determine response posture from live drift tracker state
+        report = self._drift_tracker.compute_report()
+        current_severity: float = report.get("drift_severity", drift_severity)
+
+        if self._severe_drift_streak >= 2 or current_severity >= 0.9:
+            equor_response = "amendment_auto_proposed"
+            confidence = 0.85
+        elif current_severity >= 0.5:
+            equor_response = "amendment_external_vote"
+            confidence = 0.7
+        else:
+            equor_response = "monitoring"
+            confidence = 0.55
+
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SELF_STATE_DRIFTED_ACKNOWLEDGMENT,
+                    source_system="equor",
+                    data={
+                        "drift_acknowledged": True,
+                        "equor_response": equor_response,
+                        "confidence": round(confidence, 3),
+                        "drift_severity": round(current_severity, 3),
+                        "drift_direction": drift_direction,
+                    },
+                ))
+            except Exception as exc:
+                logger.warning("drift_acknowledgment_emit_failed", error=str(exc))
+
+        logger.info(
+            "equor_self_state_drift_acknowledged",
+            response=equor_response,
+            confidence=round(confidence, 3),
+            drift_severity=round(current_severity, 3),
+        )
+
+    async def _on_self_affect_updated(self, event: Any) -> None:
+        """Observe Memory's affect state updates.
+
+        When Memory writes a new affect state to Self, Equor logs the valence
+        so it can track whether constitutional reviews are correlating with
+        positive or negative affective outcomes — a feedback signal for the
+        conscience's own calibration.
+        """
+        data = getattr(event, "data", {}) or {}
+        valence: float = float(data.get("affect_valence", 0.0))
+        arousal: float = float(data.get("affect_arousal", 0.0))
+        logger.debug(
+            "equor_observed_self_affect_update",
+            valence=round(valence, 3),
+            arousal=round(arousal, 3),
+        )
+
+    async def _on_certificate_provisioning_request(self, event: Any) -> None:
+        """
+        M2 (Identity): Constitutional review of a child instance's inherited drives
+        before CertificateManager issues a birth certificate.
+
+        Emitted by CertificateManager on CHILD_SPAWNED. Equor validates that the
+        child's inherited drives are constitutionally aligned and emits
+        EQUOR_PROVISIONING_APPROVAL with the verdict.
+
+        Three possible outcomes:
+          approved=True,  requires_hitl=False — fast path, cert issued immediately
+          approved=True,  requires_hitl=True  — drives OK but novel config needs HITL
+          approved=False                       — incompatible drives, escalate
+        """
+        if self._event_bus is None:
+            return
+
+        data = getattr(event, "data", {}) or {}
+        child_id: str = data.get("child_id", "")
+        if not child_id:
+            return
+
+        inherited_drives: dict[str, Any] = data.get("inherited_drives", {})
+
+        # Fetch current constitution (cached; ≤1 Neo4j query per TTL window)
+        try:
+            constitution, _ = await self._get_cached_state()
+        except Exception:
+            constitution = {}
+
+        # Validate inherited drives against constitutional drive weights.
+        # A drive is incompatible if it deviates more than 50% from the current
+        # constitution value (relative). Novel drive keys (outside the standard
+        # four) are flagged for HITL rather than outright rejected.
+        _STANDARD_DRIVES = {"care", "honesty", "coherence", "growth"}
+        novel_drives: list[str] = []
+        incompatible = False
+
+        for drive_key, inherited_val in inherited_drives.items():
+            short_key = drive_key.removeprefix("drive_")
+            if short_key not in _STANDARD_DRIVES:
+                novel_drives.append(short_key)
+                continue
+            const_val = float(constitution.get(f"drive_{short_key}", 0.5))
+            if const_val > 0 and abs(float(inherited_val) - const_val) / const_val > 0.5:
+                incompatible = True
+                break
+
+        # Derive live constitutional hash from cached constitution dict
+        import hashlib as _hashlib
+        import json as _json
+
+        const_repr = _json.dumps(
+            {k: v for k, v in constitution.items()},
+            sort_keys=True,
+            default=str,
+        )
+        constitutional_hash = _hashlib.sha256(const_repr.encode()).hexdigest() if constitution else ""
+
+        approved = not incompatible
+        requires_hitl = bool(novel_drives) and approved
+        reason = (
+            "constitutional_alignment_validated"
+            if approved and not requires_hitl
+            else ("novel_drive_config_requires_hitl" if requires_hitl else "incompatible_drives")
+        )
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        await self._event_bus.emit(SynapseEvent(
+            event_type=SynapseEventType.EQUOR_PROVISIONING_APPROVAL,
+            source_system="equor",
+            data={
+                "child_id": child_id,
+                "approved": approved,
+                "requires_hitl": requires_hitl,
+                "required_amendments": novel_drives,
+                "constitutional_hash": constitutional_hash,
+                "reason": reason,
+            },
+        ))
+
+        logger.info(
+            "equor_provisioning_reviewed",
+            child_id=child_id,
+            approved=approved,
+            requires_hitl=requires_hitl,
+            novel_drives=novel_drives,
+            incompatible=incompatible,
+        )
+
+    async def _emit_re_training_example(
+        self,
+        category: str,
+        instruction: str,
+        input_context: str,
+        output: str,
+        outcome_quality: float,
+        episode_id: str = "",
+        cost_usd: Decimal = Decimal("0"),
+        latency_ms: int = 0,
+        reasoning_trace: str = "",
+        alternatives: list[str] | None = None,
+        constitutional_alignment: DriveAlignmentVector | None = None,
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            example = RETrainingExample(
+                source_system=SystemID.EQUOR,
+                episode_id=episode_id,
+                instruction=instruction,
+                input_context=input_context,
+                output=output,
+                outcome_quality=outcome_quality,
+                category=category,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                reasoning_trace=reasoning_trace,
+                alternatives_considered=alternatives or [],
+                constitutional_alignment=constitutional_alignment or DriveAlignmentVector(),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                data=example.model_dump(mode="json"),
+                source_system="equor",
+            ))
+        except Exception:
+            logger.debug("re_training_emit_failed", exc_info=True)
+
+    async def _emit_equor_event(
+        self,
+        event_type_name: str,
+        data: dict[str, Any],
+    ) -> None:
+        """Emit a typed Equor Synapse event. Silently no-ops if bus is absent."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType(event_type_name),
+                source_system="equor",
+                data=data,
+            ))
+        except Exception:
+            logger.debug("equor_event_emit_failed", event_type=event_type_name, exc_info=True)
+
+    async def _emit_evolutionary_observable(
+        self,
+        observable_type: str,
+        value: float,
+        is_novel: bool,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Emit an evolutionary observable event for Benchmarks population tracking."""
+        if self._event_bus is None:
+            return
+        try:
+            from primitives.evolutionary import EvolutionaryObservable
+            from primitives.common import SystemID
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            obs = EvolutionaryObservable(
+                source_system=SystemID.EQUOR,
+                instance_id="",
+                observable_type=observable_type,
+                value=value,
+                is_novel=is_novel,
+                metadata=metadata or {},
+            )
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system="equor",
+                data=obs.model_dump(mode="json"),
+            )
+            await self._event_bus.emit(event)
+        except Exception:
+            pass
 
     # ─── Lifecycle ────────────────────────────────────────────────
 
@@ -236,6 +767,24 @@ class EquorService:
                 system_id=self.system_id,
             )
 
+        # INV-017: start background loop that refreshes 72h drive means from
+        # GovernanceRecord nodes so _check_drive_extinction has fresh data.
+        asyncio.create_task(
+            self._refresh_drive_means_loop(),
+            name="equor_inv017_drive_means",
+        )
+
+        # Spec §17.1: hourly constitutional snapshot broadcast.
+        asyncio.create_task(
+            self._constitutional_snapshot_loop(),
+            name="equor_constitutional_snapshot",
+        )
+
+        # Prompt 4.1 — Apply inherited constitutional amendments if this is a child instance.
+        # ECODIAOS_EQUOR_GENOME_PAYLOAD is injected by LocalDockerSpawner from the
+        # equor_genome_payload key in SeedConfiguration.child_config_overrides.
+        await self._apply_inherited_equor_genome_if_child()
+
         logger.info("equor_initialized")
 
     async def shutdown(self) -> None:
@@ -243,6 +792,223 @@ class EquorService:
         if self._bus is not None:
             self._bus.deregister(BaseEquorEvaluator)
             logger.info("equor_evaluators_deregistered")
+
+    # ─── INV-017 Background: Drive Extinction Monitor ─────────────
+
+    # Refresh interval: every 15 minutes. The 72h window moves slowly;
+    # 15-minute granularity catches any extinction event well within SLA.
+    _DRIVE_MEANS_REFRESH_INTERVAL_S: float = 900.0
+
+    async def _refresh_drive_means_loop(self) -> None:
+        """Background loop: compute 72h rolling means from GovernanceRecord nodes.
+
+        Queries Neo4j for the mean alignment scores recorded in the last 72 hours
+        and pushes the result into invariants._drive_rolling_means_72h via
+        update_drive_rolling_means(). The INV-017 check reads from that cache.
+
+        Runs every 15 minutes. On query failure, retains previous values so a
+        transient DB hiccup doesn't falsely trigger extinction (fail-open for
+        the means cache, fail-closed for the invariant gate itself).
+        """
+        while True:
+            await asyncio.sleep(self._DRIVE_MEANS_REFRESH_INTERVAL_S)
+            try:
+                rows = await self._neo4j.execute_read(
+                    """
+                    MATCH (g:GovernanceRecord {event_type: 'alignment_score'})
+                    WHERE g.timestamp >= datetime() - duration('PT72H')
+                    RETURN
+                        avg(g.care)      AS care,
+                        avg(g.honesty)   AS honesty,
+                        avg(g.coherence) AS coherence,
+                        avg(g.growth)    AS growth
+                    """
+                )
+                if rows:
+                    row = rows[0]
+                    means: dict[str, float] = {}
+                    for drive in ("care", "honesty", "coherence", "growth"):
+                        val = row.get(drive)
+                        if val is not None:
+                            means[drive] = float(val)
+                    if means:
+                        update_drive_rolling_means(means)
+                        logger.debug(
+                            "equor_inv017_drive_means_refreshed",
+                            means={k: round(v, 4) for k, v in means.items()},
+                        )
+
+                        # Emit DRIVE_EXTINCTION_DETECTED on the bus for any
+                        # drive that has crossed the extinction threshold so
+                        # Thymos can react even outside the intent pipeline.
+                        extinct = {
+                            d: v for d, v in means.items() if v < 0.01
+                        }
+                        if extinct and self._event_bus is not None:
+                            from systems.synapse.types import SynapseEvent, SynapseEventType
+                            for drive, mean_val in extinct.items():
+                                await self._event_bus.emit(SynapseEvent(
+                                    event_type=SynapseEventType.DRIVE_EXTINCTION_DETECTED,
+                                    source_system="equor",
+                                    data={
+                                        "drive": drive,
+                                        "rolling_mean_72h": round(mean_val, 6),
+                                        "all_drive_means": {
+                                            k: round(v, 4) for k, v in means.items()
+                                        },
+                                        "intent_id": None,
+                                        "blocked": True,
+                                    },
+                                ))
+                                logger.critical(
+                                    "equor_inv017_drive_extinction_detected_background",
+                                    drive=drive,
+                                    rolling_mean_72h=round(mean_val, 6),
+                                )
+            except Exception as exc:
+                logger.warning(
+                    "equor_inv017_drive_means_refresh_failed",
+                    error=str(exc),
+                )
+
+    # ─── Spec §17.1: Constitutional Snapshot Loop ─────────────────
+
+    # Emit hourly so downstream systems (Memory, Benchmarks, Thread) can track
+    # how the constitution evolves over the organism's lifetime. A 1-hour
+    # cadence is coarse enough to avoid bus noise but fine enough to catch
+    # amendment adoption within the same session.
+    _CONSTITUTIONAL_SNAPSHOT_INTERVAL_S: float = 3600.0
+
+    async def _constitutional_snapshot_loop(self) -> None:
+        """Hourly broadcast of constitutional state to the Synapse bus.
+
+        Emits EQUOR_CONSTITUTIONAL_SNAPSHOT so Memory can persist personality
+        evolution history, Benchmarks can track constitutional KPIs, and Thread
+        can record constitutional turning points.
+
+        The snapshot is computed from cached state where possible (constitution
+        and drift tracker). The SHA-256 hash and recent-amendment list require
+        Neo4j reads — these are wrapped in try/except so a transient DB hiccup
+        never silences the event.
+        """
+        # Wait one full interval before the first emission so the system has
+        # time to finish initialising (schema, drive means, etc.).
+        await asyncio.sleep(self._CONSTITUTIONAL_SNAPSHOT_INTERVAL_S)
+
+        while True:
+            try:
+                await self._emit_constitutional_snapshot()
+            except Exception:
+                logger.debug("equor_constitutional_snapshot_failed", exc_info=True)
+
+            await asyncio.sleep(self._CONSTITUTIONAL_SNAPSHOT_INTERVAL_S)
+
+    async def _emit_constitutional_snapshot(self) -> None:
+        """Build and emit one EQUOR_CONSTITUTIONAL_SNAPSHOT event."""
+        import hashlib as _hashlib
+        import json as _json
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        if self._event_bus is None:
+            return
+
+        # ── Constitution hash ────────────────────────────────────────
+        constitution_hash = ""
+        active_drives: list[str] = []
+        constitution_version: int | None = None
+        try:
+            const_rows = await self._neo4j.execute_read(
+                """
+                MATCH (s:Self)-[:GOVERNED_BY]->(c:Constitution)
+                RETURN c.drive_coherence AS dc, c.drive_care AS dca,
+                       c.drive_growth    AS dg,  c.drive_honesty AS dh,
+                       c.version         AS version,
+                       c.amendments      AS amendments
+                """
+            )
+            if const_rows:
+                r = const_rows[0]
+                constitution_version = r.get("version")
+                const_repr = _json.dumps(
+                    {
+                        "version": constitution_version,
+                        "drive_coherence": r.get("dc"),
+                        "drive_care": r.get("dca"),
+                        "drive_growth": r.get("dg"),
+                        "drive_honesty": r.get("dh"),
+                        "amendments": r.get("amendments"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+                constitution_hash = _hashlib.sha256(const_repr.encode()).hexdigest()
+                # A drive is "active" if its weight is non-zero
+                drive_map = {
+                    "coherence": float(r.get("dc") or 0.0),
+                    "care": float(r.get("dca") or 0.0),
+                    "growth": float(r.get("dg") or 0.0),
+                    "honesty": float(r.get("dh") or 0.0),
+                }
+                active_drives = [d for d, w in drive_map.items() if w != 0.0]
+        except Exception:
+            logger.debug("equor_snapshot_constitution_read_failed", exc_info=True)
+
+        # Fall back to cached constitution if Neo4j was unavailable
+        if not active_drives and self._cached_constitution:
+            drive_map = {
+                "coherence": float(self._cached_constitution.get("drive_coherence") or 0.0),
+                "care": float(self._cached_constitution.get("drive_care") or 0.0),
+                "growth": float(self._cached_constitution.get("drive_growth") or 0.0),
+                "honesty": float(self._cached_constitution.get("drive_honesty") or 0.0),
+            }
+            active_drives = [d for d, w in drive_map.items() if w != 0.0]
+            if constitution_version is None:
+                constitution_version = self._cached_constitution.get("version")
+
+        # ── Recent amendments (last 10 adopted) ─────────────────────
+        recent_amendment_ids: list[str] = []
+        try:
+            amend_rows = await self._neo4j.execute_read(
+                """
+                MATCH (g:GovernanceRecord {event_type: 'amendment_proposed'})
+                WHERE g.amendment_status = 'adopted'
+                RETURN g.id AS id
+                ORDER BY g.timestamp DESC
+                LIMIT 10
+                """
+            )
+            recent_amendment_ids = [str(r.get("id", "")) for r in amend_rows]
+        except Exception:
+            logger.debug("equor_snapshot_amendments_read_failed", exc_info=True)
+
+        # ── Compliance score from drift tracker ──────────────────────
+        report = self._drift_tracker.compute_report()
+        overall_compliance_score = float(
+            report.get("mean_alignment", {}).get("composite", 0.5)
+        )
+
+        await self._event_bus.emit(SynapseEvent(
+            event_type=SynapseEventType.EQUOR_CONSTITUTIONAL_SNAPSHOT,
+            source_system="equor",
+            data={
+                "timestamp": utc_now().isoformat(),
+                "constitution_hash": constitution_hash,
+                "constitution_version": constitution_version,
+                "active_drives": active_drives,
+                "recent_amendment_ids": recent_amendment_ids,
+                "overall_compliance_score": overall_compliance_score,
+                "total_verdicts_issued": self._total_reviews,
+            },
+        ))
+
+        logger.info(
+            "equor_constitutional_snapshot_emitted",
+            constitution_hash=constitution_hash[:16] if constitution_hash else "",
+            active_drives=active_drives,
+            compliance_score=round(overall_compliance_score, 4),
+            total_verdicts=self._total_reviews,
+        )
 
     def _on_evaluator_evolved(self, evaluator: BaseEquorEvaluator) -> None:
         """
@@ -285,6 +1051,12 @@ class EquorService:
         if self._safe_mode:
             return self._safe_mode_review(intent)
 
+        await self._emit_equor_event("equor_review_started", {
+            "intent_id": intent.id,
+            "goal_summary": intent.goal.description[:200],
+            "autonomy_required": intent.autonomy_level_required,
+        })
+
         try:
             async with asyncio.timeout(_REVIEW_TIMEOUT_S):
                 return await self._review_inner(intent, start)
@@ -295,21 +1067,35 @@ class EquorService:
                 intent_id=intent.id,
                 elapsed_ms=elapsed_ms,
             )
-            # Timeout is NOT a failure — return a conservative approval so
-            # we don't block the fast path. The audit trail records the timeout.
+            # Timeout must NOT default to APPROVED — an unreviewed action
+            # should never be silently approved. DEFERRED signals re-evaluation.
             return ConstitutionalCheck(
                 intent_id=intent.id,
-                verdict=Verdict.APPROVED,
+                verdict=Verdict.DEFERRED,
                 reasoning=(
                     f"Equor review timed out after {elapsed_ms}ms. "
-                    "Approved conservatively (heuristic invariants passed)."
+                    "Deferred for re-evaluation — unreviewed actions are never approved."
                 ),
-                confidence=0.5,
+                confidence=0.3,
             )
         except Exception as e:
             # Equor failure = enter safe mode
             logger.error("equor_review_failed", error=str(e), intent_id=intent.id)
+            was_in_safe_mode = self._safe_mode
             self._safe_mode = True
+            if not was_in_safe_mode:
+                # Emit once on transition into safe mode so Synapse HealthMonitor
+                # and Thymos can react (Spec §12.2, EQUOR_SAFE_MODE_ENTERED)
+                asyncio.create_task(
+                    self._emit_equor_event(
+                        "equor_safe_mode_entered",
+                        {
+                            "reason": str(e),
+                            "critical_error_count": 1,
+                        },
+                    ),
+                    name="equor_safe_mode_event",
+                )
             return self._safe_mode_review(intent)
 
     async def review_critical(self, intent: Intent) -> ConstitutionalCheck:
@@ -376,6 +1162,13 @@ class EquorService:
             verdict=check.verdict.value,
             latency_ms=elapsed_ms,
         )
+
+        await self._emit_equor_event("equor_fast_path_hit", {
+            "intent_id": intent.id,
+            "verdict": check.verdict.value,
+            "latency_ms": elapsed_ms,
+        })
+
         return check
 
     async def _review_inner(
@@ -484,6 +1277,14 @@ class EquorService:
             latency_ms=elapsed_ms,
         )
 
+        await self._emit_equor_event("equor_review_completed", {
+            "intent_id": intent.id,
+            "verdict": check.verdict.value,
+            "reasoning": check.reasoning[:300],
+            "latency_ms": elapsed_ms,
+            "composite_alignment": round(alignment.composite, 4),
+        })
+
         return check
 
     async def _suspend_for_human_review(self, intent: Intent) -> ConstitutionalCheck:
@@ -559,6 +1360,14 @@ class EquorService:
             auth_id=auth_id,
             autonomy_required=intent.autonomy_level_required,
         )
+
+        await self._emit_equor_event("equor_escalated_to_human", {
+            "intent_id": intent.id,
+            "auth_id": auth_id,
+            "goal_summary": description,
+            "autonomy_required": intent.autonomy_level_required,
+        })
+
         return ConstitutionalCheck(
             intent_id=intent.id,
             verdict=Verdict.SUSPENDED_AWAITING_HUMAN,
@@ -677,12 +1486,70 @@ class EquorService:
 
         self._drift_tracker.record_decision(alignment, check.verdict.value)
         self._total_reviews += 1
+        self._reviews_since_last_score += 1
+
+        # Track BLOCKED verdicts for VitalityCoordinator NORMATIVE_COLLAPSE
+        if check.verdict == Verdict.BLOCKED:
+            now_mono = time.monotonic()
+            self._violation_timestamps.append(now_mono)
+            # Prune entries older than 24h
+            cutoff = now_mono - 86400.0
+            while self._violation_timestamps and self._violation_timestamps[0] < cutoff:
+                self._violation_timestamps.popleft()
+
+        # RE training: constitutional deliberation
+        # Build alternatives from the verdict pipeline: what other outcomes were possible?
+        alternatives = []
+        if check.verdict != Verdict.APPROVED:
+            alternatives.append("APPROVED (if alignment scores were higher)")
+        if check.verdict != Verdict.BLOCKED:
+            alternatives.append("BLOCKED (if floor drives were breached or invariant violated)")
+        if check.verdict != Verdict.DEFERRED:
+            alternatives.append("DEFERRED (if review was uncertain or timed out)")
+
+        invariant_summary = ""
+        if check.invariant_results:
+            invariant_summary = "; ".join(
+                f"{r.name}={'pass' if r.passed else 'FAIL'}" for r in check.invariant_results
+            )
+
+        await self._emit_re_training_example(
+            category="constitutional_deliberation",
+            instruction=(
+                "Given an intent's constitutional drive alignment scores, invariant results, "
+                "and autonomy requirements, determine the appropriate constitutional verdict."
+            ),
+            input_context=(
+                f"intent_id={intent.id}, goal={intent.goal.description[:200]!r}, "
+                f"autonomy_required={intent.autonomy_level_required}, "
+                f"alignment={{coherence={alignment.coherence:.3f}, care={alignment.care:.3f}, "
+                f"growth={alignment.growth:.3f}, honesty={alignment.honesty:.3f}, "
+                f"composite={alignment.composite:.3f}}}, "
+                f"invariants=[{invariant_summary}]"
+            ),
+            output=(
+                f"verdict={check.verdict.value}, confidence={check.confidence:.2f}, "
+                f"reasoning={check.reasoning[:300]!r}"
+            ),
+            outcome_quality=check.confidence,
+            latency_ms=elapsed_ms,
+            reasoning_trace=check.reasoning,
+            alternatives=alternatives,
+            constitutional_alignment=alignment,
+        )
 
         if check.verdict == Verdict.BLOCKED and self._evo is not None:
             try:
                 await self._feed_veto_to_evo(intent, check)
             except Exception:
                 logger.debug("evo_veto_feed_failed", exc_info=True)
+
+        if check.verdict == Verdict.DEFERRED:
+            await self._emit_equor_event("equor_deferred", {
+                "intent_id": intent.id,
+                "reasoning": check.reasoning[:300],
+                "deferred_until": None,
+            })
 
         if check.verdict in (Verdict.BLOCKED, Verdict.DEFERRED) and self._event_bus is not None:
             try:
@@ -704,12 +1571,108 @@ class EquorService:
             except Exception:
                 logger.debug("intent_rejected_emit_failed", exc_info=True)
 
+        # INV-017 specific: emit DRIVE_EXTINCTION_DETECTED if the block was due
+        # to drive extinction so Thymos can open a Tier 5 / governance incident.
+        if check.verdict == Verdict.BLOCKED and self._event_bus is not None:
+            inv017_violated = any(
+                r.invariant_id == "INV-017"
+                for r in (check.invariant_results or [])
+                if not r.passed
+            )
+            if inv017_violated:
+                from systems.equor.invariants import get_drive_rolling_means
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                means = get_drive_rolling_means()
+                extinct_drives = {d: v for d, v in means.items() if v < 0.01}
+                try:
+                    for drive, mean_val in extinct_drives.items():
+                        await self._event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.DRIVE_EXTINCTION_DETECTED,
+                            source_system="equor",
+                            data={
+                                "drive": drive,
+                                "rolling_mean_72h": round(mean_val, 6),
+                                "all_drive_means": {
+                                    k: round(v, 4) for k, v in means.items()
+                                },
+                                "intent_id": intent.id,
+                                "blocked": True,
+                            },
+                        ))
+                        logger.critical(
+                            "equor_inv017_drive_extinction_blocked_intent",
+                            drive=drive,
+                            rolling_mean_72h=round(mean_val, 6),
+                            intent_id=intent.id,
+                        )
+                except Exception:
+                    logger.debug("drive_extinction_event_emit_failed", exc_info=True)
+
+        # Memory Self affect write-back: the organism feels its own conscience.
+        # Drive alignment scores map onto the AffectState dimensions:
+        #   coherence stress  = 1 - coherence alignment (lower coherence = more stress)
+        #   care activation   = care alignment clamped to [0, 1]
+        #   valence           = composite alignment (conscience satisfaction)
+        #   arousal           = severity of any misalignment
+        if self._memory is not None:
+            try:
+                from primitives.affect import AffectState
+                coherence_stress = max(0.0, 1.0 - alignment.coherence)
+                care_activation = max(0.0, alignment.care)
+                valence = float(alignment.composite)
+                arousal = max(0.0, 1.0 - alignment.composite)
+                await self._memory.update_affect(AffectState(
+                    valence=max(-1.0, min(1.0, valence)),
+                    arousal=max(0.0, min(1.0, arousal)),
+                    dominance=0.5,
+                    curiosity=0.0,
+                    coherence_stress=max(0.0, min(1.0, coherence_stress)),
+                    care_activation=max(0.0, min(1.0, care_activation)),
+                    source_events=[f"equor_review:{check.verdict.value}"],
+                ))
+                # Update Self node conscience tracking fields
+                await self._memory.update_conscience_fields(
+                    last_conscience_activation=utc_now(),
+                    compliance_score=max(0.0, alignment.composite),
+                )
+            except Exception:
+                logger.debug("equor_memory_affect_write_failed", exc_info=True)
+
+        # Persist verdict to Neo4j conscience audit trail.
+        # One verdict node per review — links Self to Drive for personality evolution.
+        # The dominant drive in this review is the one farthest from neutral.
+        dominant_drive = max(
+            ["care", "honesty", "coherence", "growth"],
+            key=lambda d: abs(getattr(alignment, d, 0.0)),
+        )
+        asyncio.ensure_future(
+            self._persist_equor_verdict(
+                drive_id=dominant_drive,
+                verdict=check.verdict.value,
+                confidence=check.confidence,
+                alignment=alignment,
+                context=f"intent:{intent.id}",
+            )
+        )
+
         if self._total_reviews % self._config.drift_report_interval == 0:
             try:
                 await self._run_drift_check()
+                await self._check_sustained_drift()
                 await self._run_promotion_check()
             except Exception:
                 logger.debug("drift_or_promotion_check_failed", exc_info=True)
+
+        # Periodic alignment score for Benchmarks (every 100 reviews)
+        if self._reviews_since_last_score >= 100:
+            self._reviews_since_last_score = 0
+            report = self._drift_tracker.compute_report()
+            await self._emit_equor_event("equor_alignment_score", {
+                "mean_alignment": report.get("mean_alignment", {}),
+                "composite": report.get("mean_alignment", {}).get("composite", 0.0),
+                "total_reviews": self._total_reviews,
+                "window_size": report.get("window_size", 0),
+            })
 
     # ─── Invariant Management ─────────────────────────────────────
 
@@ -763,6 +1726,15 @@ class EquorService:
         )
 
         logger.info("community_invariant_added", invariant_id=invariant_id, name=name)
+
+        # Evolutionary observable: constitutional invariant added
+        await self._emit_evolutionary_observable(
+            observable_type="invariant_added",
+            value=1.0,
+            is_novel=True,
+            metadata={"invariant_id": invariant_id, "name": name, "severity": severity},
+        )
+
         return invariant_id
 
     # ─── Autonomy ─────────────────────────────────────────────────
@@ -775,8 +1747,21 @@ class EquorService:
         return await check_promotion_eligibility(self._neo4j, current, target_level)
 
     async def apply_autonomy_change(self, new_level: int, reason: str, actor: str = "governance") -> dict[str, Any]:
+        current = await get_autonomy_level(self._neo4j)
+        result = await apply_autonomy_change(self._neo4j, new_level, reason, actor)
         self._invalidate_state_cache()
-        return await apply_autonomy_change(self._neo4j, new_level, reason, actor)
+        # Emit Synapse event so Thread/Benchmarks/Thymos observe the change
+        event_name = "equor_autonomy_promoted" if new_level > current else "equor_autonomy_demoted"
+        await self._emit_equor_event(
+            event_name,
+            {
+                "old_level": current,
+                "new_level": new_level,
+                "reason": reason,
+                "decision_count": self._total_reviews,
+            },
+        )
+        return result
 
     # ─── Amendments (Legacy — kept for backward compatibility) ─────
 
@@ -793,8 +1778,32 @@ class EquorService:
         )
 
     async def apply_amendment(self, proposal_id: str, proposed_drives: dict[str, float]) -> dict[str, Any]:
+        old_constitution = await self._get_constitution_dict()
+        old_weights = {
+            k.replace("drive_", ""): v
+            for k, v in old_constitution.items()
+            if k.startswith("drive_")
+        }
+
         self._invalidate_state_cache()
-        return await apply_amendment(self._neo4j, proposal_id, proposed_drives)
+        result = await apply_amendment(self._neo4j, proposal_id, proposed_drives)
+
+        # Evolutionary observable: drive weights shifted via amendment
+        await self._emit_evolutionary_observable(
+            observable_type="drive_weight_shifted",
+            value=1.0,
+            is_novel=True,
+            metadata={"proposal_id": proposal_id, "new_drives": proposed_drives},
+        )
+
+        await self._emit_equor_event("equor_drive_weights_updated", {
+            "proposal_id": proposal_id,
+            "old_weights": old_weights,
+            "new_weights": proposed_drives,
+            "actor": "amendment_legacy",
+        })
+
+        return result
 
     # ─── Amendment Pipeline (formal process with shadow mode) ────
 
@@ -808,7 +1817,7 @@ class EquorService:
         evidence_hypothesis_ids: list[str],
     ) -> dict[str, Any]:
         """Submit a constitutional amendment with evidence requirements."""
-        return await submit_amendment(
+        result = await submit_amendment(
             self._neo4j,
             proposed_drives=proposed_drives,
             title=title,
@@ -820,6 +1829,21 @@ class EquorService:
             min_evidence_count=self._governance.amendment_min_evidence_count,
             min_evidence_confidence=self._governance.amendment_min_evidence_confidence,
         )
+
+        # Evolutionary observable: amendment proposed to the constitution
+        if result.get("proposal_id"):
+            await self._emit_evolutionary_observable(
+                observable_type="amendment_proposed",
+                value=1.0,
+                is_novel=True,
+                metadata={
+                    "proposal_id": result["proposal_id"],
+                    "title": title,
+                    "proposed_drives": proposed_drives,
+                },
+            )
+
+        return result
 
     async def start_amendment_shadow(
         self,
@@ -894,9 +1918,39 @@ class EquorService:
 
     async def adopt_passed_amendment(self, proposal_id: str) -> dict[str, Any]:
         """Apply a passed amendment to the constitution."""
+        old_constitution = await self._get_constitution_dict()
+        old_weights = {
+            k.replace("drive_", ""): v
+            for k, v in old_constitution.items()
+            if k.startswith("drive_")
+        }
+
         result = await pipeline_adopt_amendment(self._neo4j, proposal_id)
         if result.get("adopted"):
             self._invalidate_state_cache()
+
+            # Evolutionary observable: amendment ratified and applied
+            await self._emit_evolutionary_observable(
+                observable_type="amendment_ratified",
+                value=1.0,
+                is_novel=True,
+                metadata={"proposal_id": proposal_id},
+            )
+
+            new_constitution = await self._get_constitution_dict()
+            new_weights = {
+                k.replace("drive_", ""): v
+                for k, v in new_constitution.items()
+                if k.startswith("drive_")
+            }
+
+            await self._emit_equor_event("equor_drive_weights_updated", {
+                "proposal_id": proposal_id,
+                "old_weights": old_weights,
+                "new_weights": new_weights,
+                "actor": "amendment_pipeline",
+            })
+
         return result
 
     async def get_amendment_pipeline_status(
@@ -906,6 +1960,20 @@ class EquorService:
         return await get_amendment_status(self._neo4j, proposal_id)
 
     # ─── Drift ────────────────────────────────────────────────────
+
+    @property
+    def constitutional_violations_24h(self) -> int:
+        """
+        Count of BLOCKED verdicts in the rolling 24h window.
+
+        VitalityCoordinator reads this to assess NORMATIVE_COLLAPSE threshold
+        (>10 violations/24h = fatal). Prunes stale entries on access.
+        """
+        now_mono = time.monotonic()
+        cutoff = now_mono - 86400.0
+        while self._violation_timestamps and self._violation_timestamps[0] < cutoff:
+            self._violation_timestamps.popleft()
+        return len(self._violation_timestamps)
 
     @property
     def constitutional_drift(self) -> float:
@@ -980,7 +2048,12 @@ class EquorService:
           6. Send admin a confirmation SMS.
         """
         data: dict[str, Any] = event.data if hasattr(event, "data") else {}
-        raw_body: str = data.get("raw_body", "").strip()
+        try:
+            payload = _IdentityVerificationPayload.model_validate(data)
+        except Exception:
+            logger.warning("equor_hitl_payload_invalid", data_keys=list(data.keys()))
+            return
+        raw_body: str = payload.raw_body.strip()
 
         m = _HITL_AUTH_RE.match(raw_body)
         if not m:
@@ -999,7 +2072,7 @@ class EquorService:
             return
 
         try:
-            raw_intent = await self._redis.get(redis_key)
+            raw_intent = await self._redis.get_json(redis_key)
         except Exception as exc:
             logger.error("hitl_redis_get_failed", short_id=short_id, error=str(exc))
             return
@@ -1041,28 +2114,26 @@ class EquorService:
             goal=intent.goal.description[:80],
         )
 
-        # Dispatch to Axon
-        if self._axon is not None:
-            try:
-                from primitives.constitutional import ConstitutionalCheck
-                from systems.axon.types import ExecutionRequest
-
-                equor_check = ConstitutionalCheck(
-                    intent_id=intent.id,
-                    verdict=Verdict.APPROVED,
-                    reasoning=f"HITL admin authorisation (code {short_id}).",
-                    confidence=1.0,
-                )
-                request = ExecutionRequest(intent=intent, equor_check=equor_check)
-                asyncio.create_task(
-                    self._axon.execute(request),
-                    name=f"hitl_dispatch_{intent.id[:8]}",
-                )
-                logger.info("hitl_intent_dispatched_to_axon", intent_id=intent.id)
-            except Exception as exc:
-                logger.error("hitl_axon_dispatch_failed", intent_id=intent.id, error=str(exc))
-        else:
-            logger.warning("hitl_axon_not_wired", intent_id=intent.id)
+        # Dispatch to Axon via Synapse — no direct cross-system import (Spec §2.1)
+        equor_check = ConstitutionalCheck(
+            intent_id=intent.id,
+            verdict=Verdict.APPROVED,
+            reasoning=f"HITL admin authorisation (code {short_id}).",
+            confidence=1.0,
+        )
+        asyncio.create_task(
+            self._emit_equor_event(
+                "equor_hitl_approved",
+                {
+                    "intent_id": intent.id,
+                    "intent_json": intent.model_dump_json(),
+                    "auth_id": short_id,
+                    "equor_check_json": equor_check.model_dump_json(),
+                },
+            ),
+            name=f"hitl_dispatch_{intent.id[:8]}",
+        )
+        logger.info("hitl_intent_dispatched_via_synapse", intent_id=intent.id)
 
         # Confirmation SMS
         if self._send_admin_sms is not None:
@@ -1164,17 +2235,280 @@ class EquorService:
     # ─── Health ───────────────────────────────────────────────────
 
     async def health(self) -> dict[str, Any]:
-        """Health check for Equor."""
+        """Health check for Equor. Spec §13.1."""
+        drift_report = self._drift_tracker.compute_report()
+        drift_severity = drift_report.get("drift_severity", 0.0)
+
+        # Status determination: degraded if drift is significant, failed/safe_mode otherwise
+        if self._safe_mode:
+            status = "safe_mode"
+        elif drift_severity >= 0.5:
+            status = "degraded"
+        else:
+            status = "healthy"
+
+        # Neo4j connectivity — quick probe without raising
+        neo4j_ok = False
+        try:
+            neo4j_ok = await self._neo4j.health_check() == {"status": "connected"}
+        except Exception:
+            pass
+
+        # Constitution version from cache (avoids DB hit on every health poll)
+        constitution_version: int | None = None
+        if self._cached_constitution:
+            constitution_version = self._cached_constitution.get("version")
+
+        # Autonomy level from cache
+        autonomy_level: int | None = self._cached_autonomy_level
+
+        # Active amendments: shadow_tracker present = 1 in-flight amendment
+        amendments_active = 1 if self._shadow_tracker is not None else 0
+
+        # Last governance event — lightweight Neo4j query
+        last_governance_event: str | None = None
+        try:
+            rows = await self._neo4j.execute_read(
+                "MATCH (g:GovernanceRecord) RETURN g.timestamp AS ts "
+                "ORDER BY g.timestamp DESC LIMIT 1"
+            )
+            if rows:
+                last_governance_event = str(rows[0]["ts"])
+        except Exception:
+            pass
+
         return {
-            "status": "safe_mode" if self._safe_mode else "healthy",
-            "total_reviews": self._total_reviews,
-            "drift_tracker_size": self._drift_tracker.history_size,
+            "status": status,
             "safe_mode": self._safe_mode,
+            "total_reviews": self._total_reviews,
+            # Spec §13.1 fields
+            "constitution_version": constitution_version,
+            "autonomy_level": autonomy_level,
+            "drift_severity": round(drift_severity, 3),
+            "invariant_violations_detected": len(self._violation_timestamps),
+            "amendments_active": amendments_active,
+            "last_governance_event": last_governance_event,
+            "neo4j_connection": neo4j_ok,
+            # Extended stats
             "invariant_count": len(HARDCODED_INVARIANTS),
+            "drift_tracker_size": self._drift_tracker.history_size,
             "template_library": self._template_library.stats,
             "constitutional_memory": self._constitutional_memory.stats,
             "cached_hypotheses": len(self._cached_hypotheses),
         }
+
+    # ─── Genome Inheritance (Prompt 4.1) ──────────────────────────
+
+    async def _apply_inherited_equor_genome_if_child(self) -> None:
+        """
+        On child boot, read ECODIAOS_EQUOR_GENOME_PAYLOAD env var and apply
+        the inherited EquorGenomeFragment via EquorGenomeExtractor.
+
+        Non-fatal: logs warnings on failure, never blocks startup.
+        Only runs when ECODIAOS_IS_GENESIS_NODE != 'true'.
+        """
+        import json as _json
+        import os as _os
+
+        if _os.environ.get("ECODIAOS_IS_GENESIS_NODE", "true").lower() == "true":
+            return  # Genesis node: no inherited genome
+
+        raw_payload = _os.environ.get("ECODIAOS_EQUOR_GENOME_PAYLOAD", "").strip()
+        if not raw_payload:
+            logger.debug("equor_no_genome_payload_env", note="child boot without equor genome")
+            return
+
+        try:
+            payload_dict = _json.loads(raw_payload)
+        except Exception as exc:
+            logger.warning("equor_genome_payload_parse_failed", error=str(exc))
+            return
+
+        try:
+            from primitives.genome_inheritance import EquorGenomeFragment
+            fragment = EquorGenomeFragment.model_validate(payload_dict)
+        except Exception as exc:
+            logger.warning("equor_genome_payload_invalid", error=str(exc))
+            return
+
+        try:
+            from systems.equor.genome import EquorGenomeExtractor
+            extractor = EquorGenomeExtractor(self._neo4j)
+            instance_id = getattr(self, "_instance_id", "")
+            memory_neo4j = getattr(self, "_memory_neo4j", None)
+            ok = await extractor.apply_inherited_amendments(
+                fragment,
+                memory_neo4j=memory_neo4j,
+                instance_id=instance_id,
+            )
+            if ok:
+                logger.info(
+                    "equor_inherited_genome_applied",
+                    genome_id=fragment.genome_id,
+                    amendment_count=len(fragment.top_amendments),
+                    constitution_hash=fragment.constitution_hash[:16],
+                    total_adopted=fragment.total_amendments_adopted,
+                )
+            else:
+                logger.warning("equor_inherited_genome_apply_returned_false", genome_id=fragment.genome_id)
+        except Exception as exc:
+            logger.warning("equor_apply_inherited_genome_failed", error=str(exc))
+
+    def set_memory_neo4j(self, memory_neo4j: Any) -> None:
+        """Inject Memory's Neo4j client for constitutional wisdom write-back to Self node."""
+        self._memory_neo4j = memory_neo4j
+
+    # ─── Genome Export (Spec 26 / Prompt 4.1) ─────────────────────
+
+    async def export_equor_genome(self) -> Any | None:
+        """
+        Snapshot the current constitutional state into an EquorGenomeFragment
+        for child inheritance.
+
+        Captures:
+          - Last 10 adopted amendments with rationale
+          - Cumulative drive calibration deltas across those amendments
+          - SHA-256 of the current constitutional document
+          - Total adopted amendment count (for lineage depth awareness)
+
+        Called by SpawnChildExecutor Step 0b at child spawn time alongside
+        export_belief_genome() and export_simula_genome(). Non-fatal on failure —
+        returns None so the caller proceeds without Equor genome inheritance.
+        """
+        try:
+            from primitives.genome_inheritance import AmendmentSnapshot, EquorGenomeFragment
+        except ImportError:
+            logger.error("export_equor_genome_import_failed")
+            return None
+
+        try:
+            # Pull last 10 adopted amendments from Neo4j (most recent last)
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (g:GovernanceRecord {event_type: 'amendment_proposed'})
+                WHERE g.amendment_status = 'adopted'
+                RETURN g.id AS id,
+                       g.details_json AS details_json,
+                       g.timestamp AS timestamp,
+                       g.actor AS proposer
+                ORDER BY g.timestamp DESC
+                LIMIT 10
+                """
+            )
+        except Exception as exc:
+            logger.error("export_equor_genome_query_amendments_failed", error=str(exc))
+            rows = []
+
+        import json as _json
+
+        amendments: list[AmendmentSnapshot] = []
+        rationale: list[str] = []
+        drive_deltas: dict[str, float] = {
+            "coherence": 0.0, "care": 0.0, "growth": 0.0, "honesty": 0.0
+        }
+
+        # Process oldest-first so drive_deltas accumulates in chronological order
+        for row in reversed(rows):
+            details_raw = row.get("details_json", "{}")
+            try:
+                details = _json.loads(details_raw) if isinstance(details_raw, str) else details_raw
+            except (_json.JSONDecodeError, TypeError):
+                details = {}
+
+            proposed_drives: dict[str, float] = details.get("proposed_drives", {})
+            previous_drives: dict[str, float] = details.get("current_drives", {})
+
+            # Compute primary affected drive + signed delta
+            primary_drive = ""
+            primary_delta = 0.0
+            for drive_name in ("coherence", "care", "growth", "honesty"):
+                prev = float(previous_drives.get(drive_name, 0.0))
+                prop = float(proposed_drives.get(drive_name, 0.0))
+                d = prop - prev
+                if abs(d) > abs(primary_delta):
+                    primary_delta = d
+                    primary_drive = drive_name
+                drive_deltas[drive_name] = round(drive_deltas.get(drive_name, 0.0) + d, 6)
+
+            amendment_rationale_text = str(details.get("rationale", ""))
+            amendments.append(AmendmentSnapshot(
+                amendment_id=str(row.get("id", "")),
+                title=str(details.get("title", "")),
+                description=str(details.get("description", "")),
+                rationale=amendment_rationale_text,
+                drive_id=primary_drive,
+                delta=round(primary_delta, 6),
+                proposed_drives={k: float(v) for k, v in proposed_drives.items()},
+                previous_drives={k: float(v) for k, v in previous_drives.items()},
+                proposer=str(row.get("proposer", "")),
+                adopted_at=str(row.get("timestamp", "")),
+            ))
+            rationale.append(amendment_rationale_text)
+
+        # Total adopted amendment count (may exceed the 10 we fetched)
+        total_adopted = len(amendments)
+        try:
+            count_rows = await self._neo4j.execute_read(
+                """
+                MATCH (g:GovernanceRecord {event_type: 'amendment_proposed',
+                                           amendment_status: 'adopted'})
+                RETURN count(g) AS total
+                """
+            )
+            if count_rows:
+                total_adopted = int(count_rows[0].get("total", len(amendments)))
+        except Exception:
+            pass
+
+        # Compute SHA-256 of the current constitutional state
+        constitution_hash = ""
+        try:
+            import hashlib as _hashlib
+
+            const_rows = await self._neo4j.execute_read(
+                """
+                MATCH (s:Self)-[:GOVERNED_BY]->(c:Constitution)
+                RETURN c.drive_coherence AS dc, c.drive_care AS dca,
+                       c.drive_growth AS dg, c.drive_honesty AS dh,
+                       c.version AS version, c.amendments AS amendments
+                """
+            )
+            if const_rows:
+                r = const_rows[0]
+                const_repr = _json.dumps({
+                    "version": r.get("version"),
+                    "drive_coherence": r.get("dc"),
+                    "drive_care": r.get("dca"),
+                    "drive_growth": r.get("dg"),
+                    "drive_honesty": r.get("dh"),
+                    "amendments": r.get("amendments"),
+                }, sort_keys=True, default=str)
+                constitution_hash = _hashlib.sha256(const_repr.encode()).hexdigest()
+        except Exception as exc:
+            logger.warning("export_equor_genome_hash_failed", error=str(exc))
+
+        instance_id = getattr(self, "_instance_id", "")
+
+        fragment = EquorGenomeFragment(
+            instance_id=instance_id,
+            generation=1,  # Caller (SpawnChildExecutor) increments for child
+            top_amendments=amendments,
+            amendment_rationale=rationale,
+            drive_calibration_deltas={k: v for k, v in drive_deltas.items() if v != 0.0},
+            constitution_hash=constitution_hash,
+            total_amendments_adopted=total_adopted,
+        )
+
+        logger.info(
+            "equor_genome_exported",
+            genome_id=fragment.genome_id,
+            amendment_count=len(amendments),
+            total_adopted=total_adopted,
+            constitution_hash=constitution_hash[:16] if constitution_hash else "",
+            drive_deltas={k: v for k, v in drive_deltas.items() if v != 0.0},
+        )
+
+        return fragment
 
     # ─── Internal Helpers ─────────────────────────────────────────
 
@@ -1255,7 +2589,7 @@ class EquorService:
                 )
                 return None  # Timeout = skip (fail-open for liveness)
             except Exception:
-                return row["name"]  # Error = fail-safe (treat as violated)
+                return str(row["name"])  # Error = fail-safe (treat as violated)
 
         check_results = await asyncio.gather(
             *[_check_one(row) for row in results],
@@ -1291,6 +2625,75 @@ class EquorService:
             logger.info("veto_fed_to_evo", intent_id=intent.id)
         except Exception:
             logger.debug("evo_veto_feed_failed", exc_info=True)
+
+    async def _persist_equor_verdict(
+        self,
+        drive_id: str,
+        verdict: str,
+        confidence: float,
+        alignment: DriveAlignmentVector | None = None,
+        context: str = "",
+    ) -> None:
+        """Persist an EquorVerdict node to Neo4j and link it to the Self node
+        and the relevant Drive node.
+
+        Creates:
+          (:EquorVerdict {drive_id, timestamp, verdict, confidence, context})
+        Linked via:
+          Self -[:CONSCIENCE_VERDICT]-> EquorVerdict
+          Drive -[:VERDICT_ON]<- EquorVerdict   (when Drive node exists)
+
+        This is the conscience audit trail — every deliberation leaves a trace
+        in the organism's identity graph. Failures are non-fatal (logged only).
+        """
+        verdict_id = new_id()
+        now = utc_now()
+        composite = alignment.composite if alignment is not None else 0.0
+        try:
+            await self._neo4j.execute_write(
+                """
+                CREATE (v:EquorVerdict {
+                    id: $id,
+                    drive_id: $drive_id,
+                    timestamp: datetime($now),
+                    verdict: $verdict,
+                    confidence: $confidence,
+                    composite_alignment: $composite,
+                    context: $context
+                })
+                WITH v
+                MATCH (s:Self)
+                MERGE (s)-[:CONSCIENCE_VERDICT]->(v)
+                WITH v
+                OPTIONAL MATCH (d:Drive {id: $drive_id})
+                FOREACH (_ IN CASE WHEN d IS NOT NULL THEN [1] ELSE [] END |
+                    MERGE (d)-[:VERDICT_ON]->(v)
+                )
+                """,
+                {
+                    "id": verdict_id,
+                    "drive_id": drive_id,
+                    "now": now.isoformat(),
+                    "verdict": verdict,
+                    "confidence": confidence,
+                    "composite": composite,
+                    "context": context[:300] if context else "",
+                },
+            )
+            logger.debug(
+                "equor_verdict_persisted",
+                verdict_id=verdict_id,
+                drive_id=drive_id,
+                verdict=verdict,
+                confidence=round(confidence, 3),
+            )
+        except Exception as exc:
+            logger.warning(
+                "equor_verdict_persist_failed",
+                drive_id=drive_id,
+                verdict=verdict,
+                error=str(exc),
+            )
 
     async def _store_review_record(
         self,
@@ -1340,23 +2743,437 @@ class EquorService:
         )
 
     async def _run_drift_check(self) -> None:
-        """Run a drift check and respond accordingly."""
+        """Run a drift check and respond accordingly.
+
+        Drift response policy (2026-03-07):
+        - Thymos INCIDENT_DETECTED already emitted by emit_drift_event() when severity >= 0.7.
+        - At any severity > 0: emit SOMATIC_MODULATION_SIGNAL so Soma feels the
+          constitutional stress as metabolic load. The organism notices its own
+          conscience in its physiology.
+        - Human autonomy demotion is NOT automatic. The organism must not demote itself
+          unilaterally; that is a governance decision.
+        - SG5: if severity >= 0.9 for 3 consecutive drift checks, the organism
+          proposes a constitutional amendment (reduce the drifting drive weight by 5%)
+          and requests ratification. Emits EQUOR_AMENDMENT_PROPOSED.
+        """
         report = self._drift_tracker.compute_report()
         response = respond_to_drift(report)
+        severity: float = report.get("drift_severity", 0.0)
 
         if response["action"] != "log":
             await store_drift_report(self._neo4j, report, response)
 
-        # Auto-demote on severe drift
-        if response["action"] == "demote_autonomy":
-            current = await get_autonomy_level(self._neo4j)
-            if current > 1:
-                await apply_autonomy_change(
-                    self._neo4j,
-                    current - 1,
-                    reason=response["detail"],
-                    actor="equor_drift_detection",
+        # Emit CONSTITUTIONAL_DRIFT_DETECTED / EQUOR_DRIFT_WARNING / INCIDENT_DETECTED
+        # (Thymos wiring for severity >= 0.7 lives inside emit_drift_event)
+        await emit_drift_event(self._drift_tracker, report, response)
+
+        # ── Somatic signal: constitutional stress felt as metabolic pressure ──
+        # source="equor_drift" lets Soma raise INTEGRITY specifically (not generic
+        # somatic modulation). Proportional to drift severity.
+        if severity > 0.0 and self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SOMATIC_MODULATION_SIGNAL,
+                    source_system="equor",
+                    data={
+                        "metabolic_stress": round(severity, 3),
+                        "integrity_error": round(severity, 3),
+                        "arousal": min(1.0, 0.4 + severity * 0.6),
+                        "fatigue": 0.0,
+                        "recommended_urgency": round(severity, 3),
+                        "modulation_targets": ["nova", "voxis"],
+                        "source": "equor_drift",
+                        "drift_direction": report.get("drift_direction", "unknown"),
+                    },
+                ))
+                logger.info("equor_somatic_stress_emitted", severity=severity)
+            except Exception as exc:
+                logger.warning("equor_somatic_stress_emit_failed", error=str(exc))
+
+        # ── Immune response at severity >= 0.9 (not punishment, not auto-demotion) ──
+        # The drift response is now: Soma feels it, Thymos gets an incident, and after
+        # 3 consecutive severe checks the organism self-proposes an amendment.
+        if severity >= 0.9:
+            self._severe_drift_streak += 1
+        else:
+            self._severe_drift_streak = 0
+
+        if self._severe_drift_streak >= 3:
+            self._severe_drift_streak = 0  # Reset so next window is clean
+            await self._propose_drift_amendment(report, severity)
+
+    async def _propose_drift_amendment(
+        self, report: dict[str, Any], severity: float,
+    ) -> None:
+        """SG5: Propose a constitutional amendment to reduce the most-drifting
+        drive weight by 5%.  Called after 3 consecutive severe-drift checks.
+
+        The organism does not demote itself.  Instead it asks the community to
+        ratify a small weight reduction, modelling self-awareness of a problematic
+        pattern without overriding human governance.
+        """
+        # Identify the drive that is drifting most (lowest mean or steepest negative trend)
+        means: dict[str, float] = report.get("mean_alignment", {})
+        trends: dict[str, float] = report.get("trends", {})
+
+        drive_scores: dict[str, float] = {}
+        for drive in ("care", "honesty", "coherence", "growth"):
+            mean = means.get(drive, 0.5)
+            trend = trends.get(drive, 0.0)
+            # Lower score = more concerning
+            drive_scores[drive] = mean + trend * 10.0
+
+        drive_affected = min(drive_scores, key=drive_scores.get)  # type: ignore[arg-type]
+
+        # Fetch current weight from constitution
+        constitution, _ = await self._get_cached_state()
+        weight_key = f"drive_{drive_affected}"
+        current_weight: float = float(constitution.get(weight_key, 1.0))
+        new_weight: float = round(current_weight * 0.95, 4)  # 5% reduction
+
+        proposal_id = new_id()
+        rationale = (
+            f"Autonomous amendment proposed after {severity:.2f} constitutional drift "
+            f"sustained over 3 consecutive drift checks. Drive '{drive_affected}' "
+            f"shows declining alignment (mean={means.get(drive_affected, 0):.3f}, "
+            f"trend={trends.get(drive_affected, 0):.4f}). "
+            f"Proposing 5% weight reduction ({current_weight} -> {new_weight}) "
+            f"to recalibrate constitutional sensitivity. Requires community ratification."
+        )
+
+        # Emit the proposal event so governance can act on it
+        await self._emit_equor_event(
+            "equor_amendment_proposed",
+            {
+                "proposal_id": proposal_id,
+                "drive_affected": drive_affected,
+                "old_weight": current_weight,
+                "new_weight": new_weight,
+                "drift_severity": severity,
+                "rationale": rationale,
+                "requires_ratification": True,
+            },
+        )
+
+        # Also write a governance record so the audit trail captures the proposal
+        now = utc_now()
+        try:
+            await self._neo4j.execute_write(
+                """
+                CREATE (g:GovernanceRecord {
+                    id: $id,
+                    event_type: 'autonomous_amendment_proposed',
+                    timestamp: datetime($now),
+                    details_json: $details_json,
+                    actor: 'equor_drift_detection',
+                    outcome: 'pending_ratification'
+                })
+                """,
+                {
+                    "id": new_id(),
+                    "now": now.isoformat(),
+                    "details_json": json.dumps({
+                        "proposal_id": proposal_id,
+                        "drive": drive_affected,
+                        "old_weight": current_weight,
+                        "new_weight": new_weight,
+                        "severity": severity,
+                    }),
+                },
+            )
+        except Exception as exc:
+            logger.warning("drift_amendment_audit_failed", error=str(exc))
+
+        logger.warning(
+            "autonomous_amendment_proposed",
+            proposal_id=proposal_id,
+            drive_affected=drive_affected,
+            old_weight=current_weight,
+            new_weight=new_weight,
+            drift_severity=severity,
+        )
+
+        # Persist a conscience verdict node for this drift-triggered proposal.
+        # Verdict = "amendment_proposed"; confidence reflects drift certainty.
+        await self._persist_equor_verdict(
+            drive_id=drive_affected,
+            verdict="amendment_proposed",
+            confidence=min(1.0, 0.5 + severity * 0.5),
+            context=f"proposal:{proposal_id}:drift_severity:{severity:.3f}",
+        )
+
+    async def _check_sustained_drift(self) -> None:
+        """SG5 (per-drive): Track each drive individually across 5-min probe cycles.
+
+        A drive is drifting when its rolling mean deviates more than 0.3 from the
+        healthy centre (0.5).  After 3 consecutive probe cycles in that state:
+
+        1. Writes a (:DriftEvent) node to Neo4j for audit continuity.
+        2. Emits AMENDMENT_AUTO_PROPOSAL on the Synapse bus.
+        3. Passes the proposal through _evaluator_amendment_approval_gate() which
+           auto-approves internal proposals at confidence ≥ 0.8 (no quorum needed).
+        4. If approved, emits DRIVE_AMENDMENT_APPLIED targeting Oikos + Memory.
+
+        Runs alongside _run_drift_check() (composite severity) in the same probe loop.
+        """
+        report = self._drift_tracker.compute_report()
+        means: dict[str, float] = report.get("mean_alignment", {})
+        trends: dict[str, float] = report.get("trends", {})
+
+        _DRIFT_THRESHOLD: float = 0.3
+        _HEALTHY_CENTRE: float = 0.5
+
+        for drive in ("care", "honesty", "coherence", "growth"):
+            mean = means.get(drive, _HEALTHY_CENTRE)
+            drift_magnitude = abs(mean - _HEALTHY_CENTRE)
+
+            if drift_magnitude > _DRIFT_THRESHOLD:
+                self._per_drive_drift_streak[drive] += 1
+            else:
+                self._per_drive_drift_streak[drive] = 0
+                continue
+
+            streak = self._per_drive_drift_streak[drive]
+            if streak < 3:
+                continue
+
+            # 3+ consecutive probes: act. Reset so we don't re-fire next cycle.
+            self._per_drive_drift_streak[drive] = 0
+
+            proposal_id = new_id()
+            now = utc_now()
+            trend = trends.get(drive, 0.0)
+
+            # Amendment type:
+            #   floor drives drifting low → "drive_recalibration" (+5% weight restore)
+            #   ceiling drives or high-drift → "goal_constraint_revision" (−3%)
+            constitution, _ = await self._get_cached_state()
+            current_val: float = float(constitution.get(f"drive_{drive}", 1.0))
+            if mean < _HEALTHY_CENTRE and drive in ("care", "honesty"):
+                amendment_type = "drive_recalibration"
+                proposed_new_value: float = round(min(2.0, current_val * 1.05), 4)
+            else:
+                amendment_type = "goal_constraint_revision"
+                proposed_new_value = round(current_val * 0.97, 4)
+
+            justification = (
+                f"Drive '{drive}' has drifted {drift_magnitude:.3f} from healthy centre "
+                f"(mean={mean:.3f}, trend={trend:+.4f}) for {streak} consecutive 5-min "
+                f"probe cycles (threshold: >{_DRIFT_THRESHOLD}). "
+                f"Amendment type: {amendment_type}. "
+                f"Proposed constitutional value: {current_val} → {proposed_new_value}."
+            )
+
+            # 1. Write :DriftEvent to Neo4j
+            try:
+                await self._neo4j.execute_write(
+                    """
+                    CREATE (d:DriftEvent {
+                        id: $id,
+                        drive: $drive,
+                        mean_alignment: $mean,
+                        drift_magnitude: $drift_magnitude,
+                        trend: $trend,
+                        streak: $streak,
+                        amendment_type: $amendment_type,
+                        proposal_id: $proposal_id,
+                        timestamp: datetime($now),
+                        source: 'equor_sustained_drift_check'
+                    })
+                    """,
+                    {
+                        "id": new_id(),
+                        "drive": drive,
+                        "mean": round(mean, 4),
+                        "drift_magnitude": round(drift_magnitude, 4),
+                        "trend": round(trend, 6),
+                        "streak": streak,
+                        "amendment_type": amendment_type,
+                        "proposal_id": proposal_id,
+                        "now": now.isoformat(),
+                    },
                 )
+            except Exception as exc:
+                logger.warning("drift_event_neo4j_write_failed", drive=drive, error=str(exc))
+
+            # 2. Emit AMENDMENT_AUTO_PROPOSAL
+            if self._event_bus is not None:
+                try:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.AMENDMENT_AUTO_PROPOSAL,
+                        source_system="equor",
+                        data={
+                            "proposal_id": proposal_id,
+                            "amendment_type": amendment_type,
+                            "target_drive_id": drive,
+                            "proposed_new_value": proposed_new_value,
+                            "justification": justification,
+                            "drift_streak": streak,
+                            "drift_magnitude": round(drift_magnitude, 4),
+                        },
+                    ))
+                    logger.info(
+                        "amendment_auto_proposal_emitted",
+                        proposal_id=proposal_id,
+                        drive=drive,
+                        amendment_type=amendment_type,
+                        proposed_new_value=proposed_new_value,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "amendment_auto_proposal_emit_failed", drive=drive, error=str(exc),
+                    )
+
+            # 3. Internal approval gate
+            approved = await self._evaluator_amendment_approval_gate(
+                proposal_id=proposal_id,
+                drive=drive,
+                amendment_type=amendment_type,
+                current_val=current_val,
+                proposed_new_value=proposed_new_value,
+                justification=justification,
+                drift_magnitude=drift_magnitude,
+            )
+
+            if approved:
+                # 4. Emit DRIVE_AMENDMENT_APPLIED to Oikos + Memory
+                await self._emit_drive_amendment_applied(
+                    proposal_id=proposal_id,
+                    drive=drive,
+                    old_value=current_val,
+                    new_value=proposed_new_value,
+                    amendment_type=amendment_type,
+                    now=now,
+                )
+
+    async def _evaluator_amendment_approval_gate(
+        self,
+        *,
+        proposal_id: str,
+        drive: str,
+        amendment_type: str,
+        current_val: float,
+        proposed_new_value: float,
+        justification: str,
+        drift_magnitude: float,
+    ) -> bool:
+        """Internal amendment approval gate for organism-self proposals (SG5).
+
+        Checks:
+        1. Constitutional consistency: proposed value within [0.5, 2.0].
+        2. Confidence ≥ 0.8 (computed from drift magnitude; no external quorum).
+
+        Returns True when the amendment is auto-approved and should be applied.
+        """
+        _MIN_WEIGHT: float = 0.5
+        _MAX_WEIGHT: float = 2.0
+        if not (_MIN_WEIGHT <= proposed_new_value <= _MAX_WEIGHT):
+            logger.warning(
+                "internal_amendment_rejected_out_of_bounds",
+                proposal_id=proposal_id,
+                drive=drive,
+                proposed_new_value=proposed_new_value,
+            )
+            return False
+
+        # confidence = 0.8 + (drift_magnitude − 0.3) × 0.67, capped at 1.0
+        # drift=0.3 → confidence=0.800 (just passes); drift=0.5 → confidence≈0.934
+        confidence: float = min(1.0, 0.8 + (drift_magnitude - 0.3) * 0.67)
+
+        _CONFIDENCE_THRESHOLD: float = 0.8
+        if confidence < _CONFIDENCE_THRESHOLD:
+            logger.info(
+                "internal_amendment_confidence_below_threshold",
+                proposal_id=proposal_id,
+                drive=drive,
+                confidence=round(confidence, 3),
+            )
+            return False
+
+        logger.info(
+            "internal_amendment_auto_approved",
+            proposal_id=proposal_id,
+            drive=drive,
+            amendment_type=amendment_type,
+            current_val=current_val,
+            proposed_new_value=proposed_new_value,
+            confidence=round(confidence, 3),
+        )
+
+        now = utc_now()
+        try:
+            await self._neo4j.execute_write(
+                """
+                CREATE (g:GovernanceRecord {
+                    id: $id,
+                    event_type: 'internal_amendment_approved',
+                    timestamp: datetime($now),
+                    details_json: $details_json,
+                    actor: 'equor_approval_gate',
+                    outcome: 'auto_approved'
+                })
+                """,
+                {
+                    "id": new_id(),
+                    "now": now.isoformat(),
+                    "details_json": json.dumps({
+                        "proposal_id": proposal_id,
+                        "drive": drive,
+                        "amendment_type": amendment_type,
+                        "current_val": current_val,
+                        "proposed_new_value": proposed_new_value,
+                        "confidence": round(confidence, 3),
+                        "justification": justification,
+                    }),
+                },
+            )
+        except Exception as exc:
+            logger.warning("internal_amendment_approval_audit_failed", error=str(exc))
+
+        return True
+
+    async def _emit_drive_amendment_applied(
+        self,
+        *,
+        proposal_id: str,
+        drive: str,
+        old_value: float,
+        new_value: float,
+        amendment_type: str,
+        now: Any,
+    ) -> None:
+        """Emit DRIVE_AMENDMENT_APPLIED to Oikos and Memory after internal approval."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.DRIVE_AMENDMENT_APPLIED,
+                source_system="equor",
+                data={
+                    "proposal_id": proposal_id,
+                    "drive_id": drive,
+                    "old_value": old_value,
+                    "new_value": new_value,
+                    "amendment_type": amendment_type,
+                    "applied_at": now.isoformat(),
+                    "target_systems": ["oikos", "memory"],
+                },
+            ))
+            logger.info(
+                "drive_amendment_applied_emitted",
+                proposal_id=proposal_id,
+                drive=drive,
+                old_value=old_value,
+                new_value=new_value,
+            )
+        except Exception as exc:
+            logger.warning("drive_amendment_applied_emit_failed", error=str(exc))
 
     async def _run_promotion_check(self) -> None:
         """

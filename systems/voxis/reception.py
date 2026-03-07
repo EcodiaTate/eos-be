@@ -233,7 +233,6 @@ class ReceptionEngine:
         - Satisfaction: composite of above
         """
         resp_len = len(response_text)
-        response_text.lower()
 
         # ── Understood ──────────────────────────────────────────
         understood = 0.5  # Baseline: unknown

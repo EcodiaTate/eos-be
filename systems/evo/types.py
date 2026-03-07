@@ -242,6 +242,11 @@ class Hypothesis(Identified, Timestamped):
     # all others default to the spec-defined 24 h gate (VELOCITY_LIMITS).
     min_age_hours: float = 24.0
 
+    # Novelty score: 1.0 = completely novel, 0.0 = redundant with existing.
+    # Computed as 1.0 - max_similarity against confirmed hypothesis embeddings.
+    # Required for Bedau-Packard "new activities" metric.
+    novelty_score: float = 0.0
+
     # What to apply if hypothesis reaches SUPPORTED
     proposed_mutation: Mutation | None = None
 
@@ -688,6 +693,16 @@ TUNABLE_PARAMETERS: dict[str, ParameterSpec] = {
     "nova.fe_budget.threshold_fraction": ParameterSpec(min_val=0.5, max_val=0.95, step=0.05),
     # Nova — cognition cost (metabolic budgeting, λ frugality weight)
     "nova.efe.cognition_cost":           ParameterSpec(min_val=0.0, max_val=0.30, step=0.02),
+
+    # Belief half-life tuning (Spec §VIII gap fix — learnable domain half-lives).
+    # Values are half-life in days. Evo parameter hypotheses can shift these as
+    # the organism observes how quickly beliefs in each domain actually become stale.
+    "belief.halflife.sentiment":   ParameterSpec(min_val=0.1, max_val=2.0, step=0.05),
+    "belief.halflife.preference":  ParameterSpec(min_val=3.0, max_val=30.0, step=0.5),
+    "belief.halflife.capability":  ParameterSpec(min_val=30.0, max_val=180.0, step=5.0),
+    "belief.halflife.context":     ParameterSpec(min_val=0.5, max_val=14.0, step=0.25),
+    "belief.halflife.social":      ParameterSpec(min_val=7.0, max_val=90.0, step=2.0),
+    "belief.halflife.policy":      ParameterSpec(min_val=30.0, max_val=365.0, step=10.0),
 }
 
 # Default initial values (mid-range or from spec defaults)
@@ -717,6 +732,13 @@ PARAMETER_DEFAULTS: dict[str, float] = {
     "nova.fe_budget.budget_nats":        5.0,
     "nova.fe_budget.threshold_fraction": 0.8,
     "nova.efe.cognition_cost":           0.10,
+    # Belief half-life defaults (days) — match DEFAULT_DOMAIN_HALFLIFES in belief_halflife.py
+    "belief.halflife.sentiment":   0.3,
+    "belief.halflife.preference":  14.0,
+    "belief.halflife.capability":  90.0,
+    "belief.halflife.context":     2.0,
+    "belief.halflife.social":      14.0,
+    "belief.halflife.policy":      90.0,
 }
 
 # Change velocity limits (spec Section IX)

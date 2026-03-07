@@ -14,7 +14,7 @@ import pytest
 
 from primitives.affect import AffectState
 from primitives.common import DriveAlignmentVector, new_id, utc_now
-from systems.atune.types import SalienceVector, WorkspaceBroadcast
+from systems.fovea.types import SalienceVector, WorkspaceBroadcast
 from systems.nova.goal_manager import (
     GoalManager,
     compute_drive_resonance,

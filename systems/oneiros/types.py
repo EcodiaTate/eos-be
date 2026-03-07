@@ -244,83 +244,6 @@ class SleepCycle(EOSBaseModel):
 # ─── Consolidation Results ────────────────────────────────────────
 
 
-class NREMConsolidationResult(EOSBaseModel):
-    """Result of the complete NREM consolidation phase."""
-
-    # Episodic replay
-    episodes_replayed: int = 0
-    semantic_nodes_created: int = 0
-    replay_duration_ms: int = 0
-
-    # Synaptic downscaling
-    traces_decayed: int = 0
-    traces_pruned: int = 0
-    mean_salience_reduction: float = 0.0
-    downscale_duration_ms: int = 0
-
-    # Belief compression
-    beliefs_merged: int = 0
-    beliefs_archived: int = 0
-    beliefs_flagged_contradictory: int = 0
-    compression_duration_ms: int = 0
-
-    # Hypothesis pruning
-    hypotheses_retired: int = 0
-    hypotheses_promoted: int = 0
-    hypotheses_merged: int = 0
-    pruning_duration_ms: int = 0
-
-    total_duration_ms: int = 0
-
-
-class REMDreamResult(EOSBaseModel):
-    """Result of the complete REM dreaming phase."""
-
-    # Dream generation
-    dreams_generated: int = 0
-    insights_discovered: int = 0
-    fragments_stored: int = 0
-    noise_discarded: int = 0
-    dream_duration_ms: int = 0
-
-    # Affect processing
-    affect_traces_processed: int = 0
-    mean_valence_reduction: float = 0.0
-    mean_arousal_reduction: float = 0.0
-    coherence_stress_reduction: float = 0.0
-    affect_duration_ms: int = 0
-
-    # Threat simulation
-    threats_simulated: int = 0
-    response_plans_created: int = 0
-    prophylactic_antibodies: int = 0
-    threat_duration_ms: int = 0
-
-    # Ethical digestion
-    ethical_cases_digested: int = 0
-    heuristics_refined: int = 0
-    ethical_duration_ms: int = 0
-
-    # Lucid dreaming proposals (high-coherence → Simula)
-    lucid_proposals_submitted: int = 0
-    lucid_proposals_accepted: int = 0
-    lucid_proposals_rejected: int = 0
-
-    total_duration_ms: int = 0
-
-
-class LucidResult(EOSBaseModel):
-    """Result of the lucid dreaming phase."""
-
-    explorations_completed: int = 0
-    variations_generated: int = 0
-    high_value_variations: int = 0
-    meta_observations: int = 0
-    recurring_themes_detected: int = 0
-    self_knowledge_nodes_created: int = 0
-    total_duration_ms: int = 0
-
-
 class DreamCycleResult(EOSBaseModel):
     """Result of a single dream within REM."""
 
@@ -563,6 +486,27 @@ class CausalReconstructionReport(EOSBaseModel):
 # ─── Stage Reports ──────────────────────────────────────────────
 
 
+class WorldModelConsistencyReport(EOSBaseModel):
+    """
+    Results of the world model consistency audit (Spec 14 §3.3.4).
+
+    Three classes of inconsistency are detected:
+    - Orphaned schemas: GenerativeSchema nodes with no linked episodes or causal links
+    - Circular causal structures: causal cycles that violate directed acyclic graph semantics
+    - Deprecated hypotheses: Evo hypotheses promoted to world model beliefs but
+      since invalidated or superseded
+    """
+
+    orphaned_schemas_found: int = 0
+    orphaned_schemas_pruned: int = 0
+    circular_structures_found: int = 0
+    circular_structures_resolved: int = 0
+    deprecated_hypotheses_found: int = 0
+    deprecated_hypotheses_retired: int = 0
+    audit_skipped: bool = False
+    duration_ms: float = 0.0
+
+
 class SlowWaveReport(EOSBaseModel):
     """Complete Slow Wave stage report."""
 
@@ -572,6 +516,9 @@ class SlowWaveReport(EOSBaseModel):
     )
     causal: CausalReconstructionReport = Field(
         default_factory=CausalReconstructionReport
+    )
+    consistency: WorldModelConsistencyReport = Field(
+        default_factory=WorldModelConsistencyReport
     )
     duration_ms: float = 0.0
 
@@ -782,13 +729,18 @@ class MutationSimulationReport(EOSBaseModel):
 
 
 class LucidDreamingReport(EOSBaseModel):
-    """Complete Lucid Dreaming report — all mutation tests."""
+    """Complete Lucid Dreaming report — metacognition + exploration + mutation tests."""
 
+    # Mutation testing
     mutations_tested: int = 0
     mutations_recommended_apply: int = 0
     mutations_recommended_reject: int = 0
     constitutional_violations_found: int = 0
     reports: list[MutationSimulationReport] = Field(default_factory=list)
+    # MetaCognition results (Spec 13 §4.5)
+    concepts_discovered: int = 0    # Theme clusters promoted to CONCEPT nodes
+    # DirectedExploration results (Spec 13 §4.5)
+    variations_generated: int = 0   # Systematic variations stored as DreamInsights
     duration_ms: float = 0.0
 
 

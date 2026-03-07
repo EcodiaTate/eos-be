@@ -34,7 +34,7 @@ from systems.nova.types import (
 
 if TYPE_CHECKING:
     from primitives.affect import AffectState
-    from systems.atune.types import WorkspaceBroadcast
+    from systems.fovea.types import WorkspaceBroadcast
 
 logger = structlog.get_logger()
 
@@ -270,6 +270,106 @@ class GoalManager:
                 if updated:
                     abandoned.append(updated)
         return abandoned
+
+    def detect_conflicts(self, goals: list[Goal]) -> list[tuple[Goal, Goal, str]]:
+        """
+        Detect pairs of active goals that conflict with each other.
+
+        Returns a list of (goal_a, goal_b, conflict_description) tuples.
+        Three heuristics are applied in order:
+
+        1. Opposing drive resonance — one goal strongly boosts a drive dimension
+           (+0.4) while the other strongly penalises it (−0.4 or low < 0.1 when
+           the other is high).
+        2. Same-domain success-criteria contradiction — goals with overlapping
+           keywords that appear in mutually exclusive phrases (increase/decrease,
+           expand/reduce, etc.).
+        3. Direct resource/target opposition — one goal targets a resource the
+           other is trying to conserve or eliminate.
+
+        Gap 5 — multi-goal conflict detection (2026-03-07).
+        """
+        conflicts: list[tuple[Goal, Goal, str]] = []
+        active = [g for g in goals if g.status == GoalStatus.ACTIVE]
+
+        _OPPOSITION_PAIRS: list[tuple[str, str]] = [
+            ("increase", "decrease"),
+            ("expand", "reduce"),
+            ("maximise", "minimise"),
+            ("maximize", "minimize"),
+            ("grow", "shrink"),
+            ("add", "remove"),
+            ("build", "destroy"),
+            ("enable", "disable"),
+        ]
+
+        def _drive_conflict(a: Goal, b: Goal) -> str | None:
+            """Return conflict description if drives strongly oppose, else None."""
+            da = a.drive_alignment
+            db = b.drive_alignment
+            # Check each drive dimension: one > +0.4 and other < 0.1
+            for dim in ("coherence", "care", "growth", "honesty"):
+                val_a = getattr(da, dim, 0.0)
+                val_b = getattr(db, dim, 0.0)
+                if val_a > 0.4 and val_b < 0.1:
+                    return (
+                        f"drive_opposition:{dim} — "
+                        f"'{a.description[:40]}' boosts {dim}={round(val_a, 2)} "
+                        f"while '{b.description[:40]}' suppresses it ({round(val_b, 2)})"
+                    )
+                if val_b > 0.4 and val_a < 0.1:
+                    return (
+                        f"drive_opposition:{dim} — "
+                        f"'{b.description[:40]}' boosts {dim}={round(val_b, 2)} "
+                        f"while '{a.description[:40]}' suppresses it ({round(val_a, 2)})"
+                    )
+            return None
+
+        def _criteria_conflict(a: Goal, b: Goal) -> str | None:
+            """Return conflict description if success criteria are textually opposing."""
+            crit_a = (a.success_criteria or a.description).lower()
+            crit_b = (b.success_criteria or b.description).lower()
+            for word_pos, word_neg in _OPPOSITION_PAIRS:
+                if word_pos in crit_a and word_neg in crit_b:
+                    # Check they share a common noun (simple keyword overlap)
+                    words_a = set(crit_a.split())
+                    words_b = set(crit_b.split())
+                    shared = words_a & words_b - {
+                        word_pos, word_neg, "the", "a", "to", "of", "and", "or",
+                    }
+                    if shared:
+                        return (
+                            f"criteria_opposition:{word_pos}/{word_neg} "
+                            f"on shared terms {list(shared)[:3]}"
+                        )
+                if word_pos in crit_b and word_neg in crit_a:
+                    words_a = set(crit_a.split())
+                    words_b = set(crit_b.split())
+                    shared = words_a & words_b - {
+                        word_pos, word_neg, "the", "a", "to", "of", "and", "or",
+                    }
+                    if shared:
+                        return (
+                            f"criteria_opposition:{word_neg}/{word_pos} "
+                            f"on shared terms {list(shared)[:3]}"
+                        )
+            return None
+
+        seen: set[frozenset[str]] = set()
+        for i, goal_a in enumerate(active):
+            for goal_b in active[i + 1:]:
+                pair_key = frozenset({goal_a.id, goal_b.id})
+                if pair_key in seen:
+                    continue
+                seen.add(pair_key)
+
+                conflict_desc = _drive_conflict(goal_a, goal_b)
+                if conflict_desc is None:
+                    conflict_desc = _criteria_conflict(goal_a, goal_b)
+                if conflict_desc is not None:
+                    conflicts.append((goal_a, goal_b, conflict_desc))
+
+        return conflicts
 
     def prune_retired_goals(self, max_retired: int = 50) -> int:
         """

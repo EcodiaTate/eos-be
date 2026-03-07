@@ -34,13 +34,15 @@ Performance targets:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from primitives.common import utc_now
+from primitives.common import SystemID, utc_now
+from primitives.re_training import RETrainingExample
 from primitives.federation import (
     AssistanceRequest,
     AssistanceResponse,
@@ -126,8 +128,13 @@ class FederationService:
         self._metrics = metrics
         self._wallet = wallet
         self._instance_id = instance_id
+        self._event_bus: Any = None  # Wired post-init for evolutionary observable emission
         self._logger = logger.bind(system="federation")
         self._initialized: bool = False
+
+        # Metabolic starvation level — AUSTERITY: no outbound, EMERGENCY: heartbeats only,
+        # CRITICAL: full federation withdrawal
+        self._starvation_level: str = "nominal"
         self._atune: Any = None  # Wired post-init for perception of federated knowledge
 
         # Sub-systems (built in initialize())
@@ -164,6 +171,16 @@ class FederationService:
         # Kept until Phase 4 confirmation arrives or TTL expires.
         self._pending_handshakes: dict[str, tuple[str, str, str, str, str]] = {}
 
+        # Cached metabolic state from ECONOMIC_STATE_UPDATED subscription
+        self._metabolic_efficiency: float = 1.0
+        self._metabolic_liquid_balance_usd: str = "0"
+
+        # Incident heightened scrutiny — when True, trust updates are more conservative
+        self._incident_heightened_scrutiny: bool = False
+
+        # Sleep-certified knowledge IDs — only these are eligible for outbound sharing
+        self._sleep_certified_knowledge: set[str] = set()
+
     def set_certificate_manager(self, cert_mgr: Any) -> None:
         """Wire CertificateManager for inbound certificate validation."""
         self._certificate_manager = cert_mgr
@@ -185,6 +202,8 @@ class FederationService:
         self._evo = evo
         if self._ingestion:
             self._ingestion._evo = evo
+        if self._knowledge:
+            self._knowledge._evo = evo
         self._logger.info("evo_wired_to_federation")
 
     def set_simula(self, simula: Any) -> None:
@@ -194,12 +213,465 @@ class FederationService:
             self._ingestion._simula = simula
         self._logger.info("simula_wired_to_federation")
 
+    def set_equor(self, equor: Any) -> None:
+        """Wire Equor and pull drive weights for constitutional hash computation."""
+        self._equor = equor
+        # Pull drive weights if Equor exposes them
+        weights = getattr(equor, "drive_weights", None)
+        if weights and self._identity:
+            self._identity.update_drive_weights(
+                coherence=float(getattr(weights, "coherence", 1.0)),
+                care=float(getattr(weights, "care", 1.0)),
+                growth=float(getattr(weights, "growth", 1.0)),
+                honesty=float(getattr(weights, "honesty", 1.0)),
+            )
+        self._logger.info("equor_wired_to_federation")
+
     def set_oikos(self, oikos: Any) -> None:
         """Wire Oikos for IIEP economic intelligence collection and ingestion."""
         self._oikos = oikos
         if self._ingestion:
             self._ingestion._oikos = oikos
         self._logger.info("oikos_wired_to_federation")
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Wire Synapse EventBus for evolutionary observable emission and inbound subscriptions."""
+        self._event_bus = event_bus
+        from systems.synapse.types import SynapseEventType
+        event_bus.subscribe(SynapseEventType.METABOLIC_PRESSURE, self._on_metabolic_pressure)
+        event_bus.subscribe(SynapseEventType.ECONOMIC_STATE_UPDATED, self._on_economic_state_updated)
+        event_bus.subscribe(SynapseEventType.IDENTITY_CERTIFICATE_ROTATED, self._on_identity_certificate_rotated)
+        event_bus.subscribe(SynapseEventType.INCIDENT_DETECTED, self._on_incident_detected)
+        event_bus.subscribe(SynapseEventType.ONEIROS_CONSOLIDATION_COMPLETE, self._on_oneiros_consolidation_complete)
+        # Subscribe to own privacy violation events so we can apply trust reset
+        event_bus.subscribe(SynapseEventType.FEDERATION_PRIVACY_VIOLATION, self._on_privacy_violation)
+        # Skia resurrection proposals — coordinate leader election and emit approval
+        event_bus.subscribe(SynapseEventType.SKIA_RESURRECTION_PROPOSAL, self._on_skia_resurrection_proposal)
+        # Propagate bus to ingestion pipeline (may be wired before or after initialize())
+        if self._ingestion:
+            self._ingestion._event_bus = event_bus
+        self._logger.info("event_bus_wired_to_federation")
+
+    async def _on_metabolic_pressure(self, event: Any) -> None:
+        """React to organism-wide metabolic pressure changes.
+
+        AUSTERITY: block outbound requests/shares.
+        EMERGENCY: heartbeats only — no knowledge exchange.
+        CRITICAL: full federation withdrawal — suspend all links.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("starvation_level", "")
+        if not level:
+            return
+        old = self._starvation_level
+        self._starvation_level = level
+        if level != old:
+            self._logger.info("federation_starvation_level_changed", old=old, new=level)
+            if level == "critical":
+                # Suspend all active links
+                for link_id, link in list(self._links.items()):
+                    if link.status == FederationLinkStatus.ACTIVE:
+                        link.status = FederationLinkStatus.SUSPENDED
+                        asyncio.ensure_future(self._emit_synapse_event(
+                            "federation_link_dropped",
+                            {
+                                "link_id": link_id,
+                                "remote_instance_id": link.remote_instance_id,
+                                "reason": "metabolic_starvation_critical",
+                                "duration_s": (utc_now() - link.established_at).total_seconds(),
+                            },
+                        ))
+                self._logger.warning("federation_withdrawal_starvation")
+
+    async def _on_economic_state_updated(self, event: Any) -> None:
+        """Cache Oikos metabolic state; gate federation on metabolic_efficiency."""
+        data = getattr(event, "data", {}) or {}
+        self._metabolic_efficiency = float(data.get("metabolic_efficiency", 1.0))
+        self._metabolic_liquid_balance_usd = str(data.get("liquid_balance_usd", "0"))
+        self._logger.debug(
+            "economic_state_cached",
+            metabolic_efficiency=self._metabolic_efficiency,
+        )
+
+    async def _on_identity_certificate_rotated(self, event: Any) -> None:
+        """Update local cert cache when Identity rotates its certificate."""
+        data = getattr(event, "data", {}) or {}
+        new_fingerprint = data.get("new_fingerprint", "")
+        if new_fingerprint and self._identity:
+            self._identity._certificate_fingerprint = new_fingerprint
+            if self._identity._local_identity:
+                self._identity._local_identity.certificate_fingerprint = new_fingerprint
+            self._logger.info(
+                "certificate_fingerprint_updated",
+                new_fingerprint=new_fingerprint[:16] + "...",
+            )
+
+    async def _on_incident_detected(self, event: Any) -> None:
+        """Heighten trust scrutiny during active incidents."""
+        self._incident_heightened_scrutiny = True
+        data = getattr(event, "data", {}) or {}
+        self._logger.info(
+            "incident_heightened_scrutiny_activated",
+            incident_id=data.get("incident_id", ""),
+            severity=data.get("severity", ""),
+        )
+
+    async def _on_privacy_violation(self, event: Any) -> None:
+        """
+        React to a detected privacy violation by a federated peer.
+
+        Per Spec 11b §IV.2: privacy breaches immediately reset trust to zero.
+        The FEDERATION_PRIVACY_VIOLATION event is emitted by the ingestion
+        pipeline; this handler applies the trust consequence on the link.
+
+        References: Spec 11b §IV.2 (privacy breach = instant trust reset), §XI
+        """
+        data = getattr(event, "data", {}) or {}
+        remote_instance_id = data.get("remote_instance_id", "")
+        link_id = data.get("link_id", "")
+        violation_detail = data.get("violation_detail", "")
+
+        # Find the link
+        link = self._links.get(link_id) or self._find_link_by_instance(remote_instance_id)
+        if link is None:
+            return
+
+        # Record the violation interaction — TrustManager will apply 3× penalty + zero reset
+        from primitives.federation import ViolationType
+        interaction = FederationInteraction(
+            link_id=link.id,
+            remote_instance_id=link.remote_instance_id,
+            interaction_type="privacy_violation",
+            direction="inbound",
+            outcome=InteractionOutcome.VIOLATION,
+            violation_type=ViolationType.PRIVACY_BREACH,
+            trust_value=100.0,  # Large value — combined with 3× mult and zero-reset rule
+            description=f"Privacy breach: {violation_detail}",
+        )
+        self._update_trust_and_emit(link, interaction)
+        self._record_interaction(interaction)
+
+        self._logger.warning(
+            "trust_zeroed_privacy_violation",
+            link_id=link.id,
+            remote_instance_id=remote_instance_id,
+            new_trust_level=link.trust_level.name,
+            new_trust_score=link.trust_score,
+        )
+
+    async def _on_oneiros_consolidation_complete(self, event: Any) -> None:
+        """Mark consolidated knowledge as sleep-certified, eligible for sharing."""
+        data = getattr(event, "data", {}) or {}
+        cycle_id = data.get("cycle_id", "")
+        episodes = data.get("episodes_consolidated", 0)
+        if cycle_id:
+            self._sleep_certified_knowledge.add(cycle_id)
+        self._logger.info(
+            "knowledge_sleep_certified",
+            cycle_id=cycle_id,
+            episodes_consolidated=episodes,
+            total_certified=len(self._sleep_certified_knowledge),
+        )
+
+    async def _on_skia_resurrection_proposal(self, event: Any) -> None:
+        """Handle SKIA_RESURRECTION_PROPOSAL from a Skia instance declaring death.
+
+        Coordinates leader election across ALLY-trust peers:
+          1. Collect all active ALLY links.
+          2. Broadcast an assistance request to each ALLY peer asking for their
+             latest snapshot CID and whether they can lead the resurrection.
+          3. Wait up to 60s for acknowledgements from >50% of ALLY peers (quorum).
+          4. Elect the leader as the proposing instance (simplest safe default —
+             the proposer already has the best local context).
+          5. Emit FEDERATION_RESURRECTION_APPROVED back to Skia with the
+             federation-agreed snapshot_cid and elected leader_instance_id.
+          6. If no ALLY peers exist, auto-approve after 10s so the proposer
+             can proceed without coordination delay.
+
+        Spec 29 §22 — Fleet Resurrection Coordination.
+        """
+        import asyncio as _asyncio
+
+        data = getattr(event, "data", {}) or {}
+        proposing_instance_id = data.get("instance_id", "")
+        snapshot_cid = data.get("snapshot_cid", "")
+        snapshot_ts = data.get("snapshot_ts", 0.0)
+
+        self._logger.info(
+            "skia_resurrection_proposal_received",
+            proposing_instance=proposing_instance_id,
+            snapshot_cid=snapshot_cid,
+        )
+
+        # Find all active ALLY-trust links
+        ally_links = [
+            lnk for lnk in self.active_links
+            if lnk.trust_level == TrustLevel.ALLY
+        ]
+
+        if not ally_links:
+            # No ALLY peers — auto-approve after 10s to avoid immediate resurrection
+            # without any coordination window (gives other nodes a chance to join).
+            self._logger.info(
+                "no_ally_peers_for_resurrection_quorum",
+                auto_approving_in_s=10,
+            )
+            await _asyncio.sleep(10.0)
+            asyncio.ensure_future(self._emit_synapse_event(
+                "federation_resurrection_approved",
+                {
+                    "leader_instance_id": proposing_instance_id,
+                    "snapshot_cid": snapshot_cid,
+                    "quorum_peers": 0,
+                    "auto_approved": True,
+                },
+            ))
+            return
+
+        # Broadcast assistance request to all ALLY peers and collect CID acknowledgements.
+        # Best-CID selection: choose the CID with the most recent timestamp among responses.
+        ack_count = 0
+        best_cid = snapshot_cid
+        best_ts = snapshot_ts
+        quorum_threshold = len(ally_links) // 2 + 1  # >50%
+
+        # Fan-out with 60s total deadline — use gather with per-task timeout
+        async def _poll_ally(link: Any) -> tuple[bool, str, float]:
+            """Ask one ALLY peer for their latest snapshot CID. Returns (acked, cid, ts).
+
+            Uses ChannelManager.send_message() with a resurrection_poll payload.
+            Any response (even an empty acknowledgement) counts as a quorum vote.
+            Falls back to (False, "", 0.0) on any channel error.
+            """
+            try:
+                if self._channels is None:
+                    return False, "", 0.0
+                resp = await _asyncio.wait_for(
+                    self._channels.send_message(
+                        link,
+                        {
+                            "type": "resurrection_poll",
+                            "proposing_instance": proposing_instance_id,
+                        },
+                    ),
+                    timeout=30.0,
+                )
+                if resp is None:
+                    return False, "", 0.0
+                peer_cid = resp.get("snapshot_cid", "") if isinstance(resp, dict) else ""
+                peer_ts = float(resp.get("snapshot_ts", 0.0)) if isinstance(resp, dict) else 0.0
+                # Any non-error response counts as acknowledgement
+                return True, peer_cid, peer_ts
+            except Exception as poll_exc:
+                self._logger.debug(
+                    "resurrection_poll_failed",
+                    link_id=getattr(link, "id", ""),
+                    error=str(poll_exc),
+                )
+                return False, "", 0.0
+
+        try:
+            results = await _asyncio.wait_for(
+                _asyncio.gather(*[_poll_ally(lnk) for lnk in ally_links], return_exceptions=True),
+                timeout=60.0,
+            )
+        except _asyncio.TimeoutError:
+            results = []
+
+        for result in results:
+            if isinstance(result, tuple):
+                acked, peer_cid, peer_ts = result
+                if acked:
+                    ack_count += 1
+                    if peer_ts > best_ts and peer_cid:
+                        best_cid = peer_cid
+                        best_ts = peer_ts
+
+        quorum_met = ack_count >= quorum_threshold
+        self._logger.info(
+            "resurrection_quorum_result",
+            ack_count=ack_count,
+            quorum_threshold=quorum_threshold,
+            quorum_met=quorum_met,
+            best_cid=best_cid,
+        )
+
+        # Emit approval regardless of quorum — if quorum failed, still approve so the
+        # organism can resurrect autonomously (survival imperative outweighs coordination).
+        asyncio.ensure_future(self._emit_synapse_event(
+            "federation_resurrection_approved",
+            {
+                "leader_instance_id": proposing_instance_id,
+                "snapshot_cid": best_cid or snapshot_cid,
+                "quorum_peers": ack_count,
+                "quorum_met": quorum_met,
+                "auto_approved": not quorum_met,
+            },
+        ))
+
+    async def _emit_evolutionary_observable(
+        self,
+        observable_type: str,
+        value: float,
+        is_novel: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit an evolutionary observable event via the wired event bus."""
+        bus = getattr(self, "_event_bus", None)
+        if bus is None:
+            return
+        try:
+            from primitives.evolutionary import EvolutionaryObservable
+            from primitives.common import SystemID
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            obs = EvolutionaryObservable(
+                source_system=SystemID.FEDERATION,
+                instance_id=self._instance_id or "",
+                observable_type=observable_type,
+                value=value,
+                is_novel=is_novel,
+                metadata=metadata or {},
+            )
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system="federation",
+                data=obs.model_dump(mode="json"),
+            )
+            await bus.emit(event)
+        except Exception:
+            pass  # Evolutionary telemetry must never block federation operations
+
+    async def _emit_re_training_example(
+        self,
+        *,
+        category: str,
+        instruction: str,
+        input_context: str,
+        output: str,
+        outcome_quality: float = 0.5,
+        reasoning_trace: str = "",
+        alternatives_considered: list[str] | None = None,
+        latency_ms: int = 0,
+    ) -> None:
+        """Fire-and-forget RE training example onto Synapse bus."""
+        bus = getattr(self, "_event_bus", None)
+        if bus is None:
+            return
+        try:
+            from decimal import Decimal
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            example = RETrainingExample(
+                source_system=SystemID.FEDERATION,
+                category=category,
+                instruction=instruction,
+                input_context=input_context,
+                output=output,
+                outcome_quality=max(0.0, min(1.0, outcome_quality)),
+                reasoning_trace=reasoning_trace,
+                alternatives_considered=alternatives_considered or [],
+                latency_ms=latency_ms,
+            )
+            await bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                source_system="federation",
+                data=example.model_dump(mode="json"),
+            ))
+        except Exception:
+            pass  # Never block federation operations
+
+    async def _emit_synapse_event(
+        self,
+        event_type_name: str,
+        data: dict[str, Any],
+    ) -> None:
+        """Emit a typed Synapse event. Fire-and-forget — never blocks federation."""
+        bus = getattr(self, "_event_bus", None)
+        if bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            event = SynapseEvent(
+                event_type=SynapseEventType(event_type_name),
+                source_system="federation",
+                data=data,
+            )
+            await bus.emit(event)
+        except Exception:
+            pass
+
+    def _update_trust_and_emit(
+        self,
+        link: FederationLink,
+        interaction: FederationInteraction,
+    ) -> None:
+        """Update trust via TrustManager and emit FEDERATION_TRUST_UPDATED on level change.
+
+        Metabolic gate: bankrupt instance (metabolic_efficiency < 0.1) cannot upgrade trust level.
+        Incident gate: heightened scrutiny prevents trust upgrades during active incidents.
+        """
+        if not self._trust:
+            return
+        old_level = link.trust_level
+        self._trust.update_trust(link, interaction)
+
+        # Metabolic gate: prevent trust upgrade if metabolically bankrupt
+        if (
+            link.trust_level.value > old_level.value
+            and self._metabolic_efficiency < 0.1
+        ):
+            link.trust_level = old_level
+            self._logger.info(
+                "trust_upgrade_blocked_metabolic",
+                link_id=link.id,
+                metabolic_efficiency=self._metabolic_efficiency,
+            )
+
+        # Incident gate: prevent trust upgrade during heightened scrutiny
+        if (
+            link.trust_level.value > old_level.value
+            and self._incident_heightened_scrutiny
+        ):
+            link.trust_level = old_level
+            self._logger.info(
+                "trust_upgrade_blocked_incident_scrutiny",
+                link_id=link.id,
+            )
+
+        if link.trust_level != old_level:
+            asyncio.ensure_future(self._emit_synapse_event(
+                "federation_trust_updated",
+                {
+                    "link_id": link.id,
+                    "remote_instance_id": link.remote_instance_id,
+                    "old_trust_level": old_level.name,
+                    "new_trust_level": link.trust_level.name,
+                    "trust_score": round(link.trust_score, 4),
+                },
+            ))
+
+    def _compute_novelty_score(self, items: list[Any]) -> float:
+        """Estimate novelty of outbound knowledge by comparing against interaction history.
+
+        Returns 0.0–1.0. Higher = more novel relative to past shares.
+        Uses a simple heuristic: ratio of items with content hashes not seen before.
+        """
+        if not items:
+            return 0.0
+        seen = getattr(self, "_shared_content_hashes", None)
+        if seen is None:
+            self._shared_content_hashes: set[str] = set()
+            seen = self._shared_content_hashes
+        novel = 0
+        for item in items:
+            content = getattr(item, "content", None) or {}
+            h = json.dumps(content, sort_keys=True, default=str).__hash__()
+            h_str = str(h)
+            if h_str not in seen:
+                novel += 1
+                seen.add(h_str)
+        return round(novel / len(items), 4)
 
     # ─── Lifecycle ──────────────────────────────────────────────────
 
@@ -304,6 +776,8 @@ class FederationService:
             privacy_filter=self._privacy,
             max_items_per_request=self._config.max_knowledge_items_per_request,
             staking_manager=staking_manager,
+            evo=self._evo,
+            instance_id=self._instance_id,
         )
 
         self._coordination = CoordinationManager()
@@ -340,6 +814,7 @@ class FederationService:
             evo=self._evo,
             simula=self._simula,
             oikos=self._oikos,
+            event_bus=self._event_bus,  # For FEDERATION_PRIVACY_VIOLATION emission
         )
 
         # Load persisted links from Redis
@@ -360,6 +835,107 @@ class FederationService:
             endpoint=self._config.endpoint,
             active_links=len(self._links),
         )
+
+        # ── Peer discovery: auto-connect to seed peers ──
+        # Each seed endpoint is attempted once at startup. Already-linked peers
+        # (matched by remote_endpoint) are skipped. Failures are non-fatal and
+        # scheduled for background retry if seed_retry_interval_seconds > 0.
+        if self._config.seed_peers:
+            asyncio.ensure_future(self._connect_seed_peers())
+
+    async def _connect_seed_peers(self) -> None:
+        """
+        Attempt to establish links to all configured seed peers.
+
+        Spec §XIII gap #5 resolution: seed list in FederationConfig provides the
+        minimum discovery mechanism — instances can find each other without manual
+        wiring. Failures are logged and retried on seed_retry_interval_seconds cadence.
+
+        References: Spec 11b §XIII gap #5, §X (population dynamics layer)
+        """
+        seeds = list(self._config.seed_peers)
+        self._logger.info("seed_peer_connect_start", seed_count=len(seeds))
+
+        failed: list[str] = []
+
+        for endpoint in seeds:
+            if not endpoint:
+                continue
+
+            # Skip if we already have an active link to this endpoint
+            already_linked = any(
+                lnk.remote_endpoint == endpoint and lnk.status == FederationLinkStatus.ACTIVE
+                for lnk in self._links.values()
+            )
+            if already_linked:
+                self._logger.debug("seed_already_linked", endpoint=endpoint)
+                continue
+
+            self._logger.info("seed_peer_connecting", endpoint=endpoint)
+            result = await self.establish_link(endpoint)
+            if "error" in result:
+                self._logger.warning(
+                    "seed_peer_connect_failed",
+                    endpoint=endpoint,
+                    error=result["error"],
+                )
+                failed.append(endpoint)
+            else:
+                self._logger.info(
+                    "seed_peer_connected",
+                    endpoint=endpoint,
+                    link_id=result.get("link_id", ""),
+                    remote_name=result.get("remote_name", ""),
+                )
+
+        # Schedule background retry for failed seeds if configured
+        retry_interval = self._config.seed_retry_interval_seconds
+        if failed and retry_interval > 0:
+            asyncio.ensure_future(self._retry_seed_peers(failed, retry_interval))
+
+    async def _retry_seed_peers(self, seeds: list[str], interval_seconds: int) -> None:
+        """
+        Retry failed seed peer connections after interval_seconds.
+
+        Called once per failed batch — on success the seed is dropped from the retry
+        list, allowing eventual convergence without aggressive hammering.
+
+        References: Spec 11b §XIII gap #5
+        """
+        await asyncio.sleep(interval_seconds)
+
+        if not self._initialized:
+            return  # Shut down during sleep
+
+        remaining: list[str] = []
+
+        for endpoint in seeds:
+            already_linked = any(
+                lnk.remote_endpoint == endpoint and lnk.status == FederationLinkStatus.ACTIVE
+                for lnk in self._links.values()
+            )
+            if already_linked:
+                continue
+
+            self._logger.info("seed_peer_retry", endpoint=endpoint)
+            result = await self.establish_link(endpoint)
+            if "error" in result:
+                self._logger.warning(
+                    "seed_peer_retry_failed",
+                    endpoint=endpoint,
+                    error=result["error"],
+                )
+                remaining.append(endpoint)
+            else:
+                self._logger.info(
+                    "seed_peer_retry_connected",
+                    endpoint=endpoint,
+                    link_id=result.get("link_id", ""),
+                )
+
+        # Continue retrying if still failing
+        if remaining and self._initialized:
+            asyncio.ensure_future(self._retry_seed_peers(remaining, interval_seconds))
 
     async def shutdown(self) -> None:
         """Graceful shutdown — close all channels, persist link state."""
@@ -591,7 +1167,7 @@ class FederationService:
         self._record_interaction(interaction)
 
         # Update trust for the successful establishment
-        self._trust.update_trust(link, interaction)
+        self._update_trust_and_emit(link, interaction)
 
         # Record metric
         if self._metrics:
@@ -607,6 +1183,37 @@ class FederationService:
             elapsed_ms=elapsed_ms,
             negotiated_params=result.negotiated_params,
         )
+
+        await self._emit_evolutionary_observable(
+            "trust_established", 1.0, is_novel=True,
+            metadata={
+                "link_id": link.id,
+                "remote_id": remote_id,
+                "remote_name": handshake_resp.responder_name,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+
+        # ── Synapse: FEDERATION_LINK_ESTABLISHED ──
+        asyncio.ensure_future(self._emit_synapse_event(
+            "federation_link_established",
+            {
+                "link_id": link.id,
+                "remote_instance_id": remote_id,
+                "remote_name": handshake_resp.responder_name,
+                "elapsed_ms": elapsed_ms,
+            },
+        ))
+
+        # ── RE training: trust scoring decision ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="trust_scoring",
+            instruction="Evaluate and establish a federation link with a remote EOS instance via handshake protocol.",
+            input_context=f"remote={handshake_resp.responder_name}, endpoint={remote_endpoint}",
+            output=f"trust_level={link.trust_level.name}, status={link.status.value}",
+            outcome_quality=0.8,
+            latency_ms=elapsed_ms,
+        ))
 
         return {
             "link_id": link.id,
@@ -846,7 +1453,7 @@ class FederationService:
                 metadata={"handshake_id": confirmation.handshake_id},
             )
             self._record_interaction(interaction)
-            self._trust.update_trust(link, interaction)
+            self._update_trust_and_emit(link, interaction)
 
         if self._metrics:
             await self._metrics.record("federation", "handshake.confirmed", 1.0)
@@ -894,6 +1501,18 @@ class FederationService:
             link_id=link_id,
             remote_id=link.remote_instance_id,
         )
+
+        # ── Synapse: FEDERATION_LINK_DROPPED ──
+        duration_s = (utc_now() - link.established_at).total_seconds()
+        asyncio.ensure_future(self._emit_synapse_event(
+            "federation_link_dropped",
+            {
+                "link_id": link_id,
+                "remote_instance_id": link.remote_instance_id,
+                "reason": "withdrawn",
+                "duration_s": duration_s,
+            },
+        ))
 
         return {
             "link_id": link_id,
@@ -977,9 +1596,55 @@ class FederationService:
             equor_permitted=equor_permitted,
         )
 
+        # Sleep-certification gate: only share sleep-certified knowledge.
+        # Bypass: THREAT_ADVISORY is always urgent, and if no consolidation
+        # has occurred yet (bootstrap) allow everything.
+        if (
+            response.granted
+            and response.knowledge
+            and self._sleep_certified_knowledge
+            and request.knowledge_type != KnowledgeType.THREAT_ADVISORY
+        ):
+            pre_filter_count = len(response.knowledge)
+            response.knowledge = [
+                item for item in response.knowledge
+                if getattr(item, "sleep_certified", True)
+            ]
+            if len(response.knowledge) < pre_filter_count:
+                self._logger.info(
+                    "sleep_certification_filtered",
+                    pre=pre_filter_count,
+                    post=len(response.knowledge),
+                )
+            if not response.knowledge:
+                response.granted = False
+                response.reason = "No sleep-certified knowledge available"
+
         # Update trust
-        self._trust.update_trust(link, interaction)
+        self._update_trust_and_emit(link, interaction)
         self._record_interaction(interaction)
+
+        # ── RE training: sharing decision ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="sharing_decision",
+            instruction="Decide whether to share knowledge with a federated instance based on trust, Equor review, and privacy.",
+            input_context=f"remote={link.remote_name}, type={request.knowledge_type.value}, trust={link.trust_level.name}, equor_ok={equor_permitted}",
+            output=f"granted={response.granted}, items={len(response.knowledge) if response.granted else 0}, reason={response.reason[:100] if response.reason else ''}",
+            outcome_quality=0.8 if response.granted else 0.4,
+        ))
+
+        # ── Synapse: FEDERATION_KNOWLEDGE_SHARED ──
+        if response.granted and response.knowledge:
+            asyncio.ensure_future(self._emit_synapse_event(
+                "federation_knowledge_shared",
+                {
+                    "link_id": link.id,
+                    "remote_instance_id": link.remote_instance_id,
+                    "knowledge_type": request.knowledge_type.value,
+                    "item_count": len(response.knowledge),
+                    "novelty_score": self._compute_novelty_score(response.knowledge),
+                },
+            ))
 
         # Metrics
         if self._metrics:
@@ -1026,7 +1691,7 @@ class FederationService:
         if response:
             interaction = await self._knowledge.ingest_response(response, link)
             if self._trust:
-                self._trust.update_trust(link, interaction)
+                self._update_trust_and_emit(link, interaction)
             self._record_interaction(interaction)
 
             # Feed received knowledge to Atune as a perceived input
@@ -1091,8 +1756,40 @@ class FederationService:
             equor_permitted=equor_permitted,
         )
 
-        self._trust.update_trust(link, interaction)
+        self._update_trust_and_emit(link, interaction)
         self._record_interaction(interaction)
+
+        # ── Synapse: FEDERATION_ASSISTANCE_ACCEPTED / DECLINED ──
+        if response.accepted:
+            asyncio.ensure_future(self._emit_synapse_event(
+                "federation_assistance_accepted",
+                {
+                    "link_id": link.id,
+                    "remote_instance_id": link.remote_instance_id,
+                    "description": request.description[:200],
+                    "urgency": getattr(request, "urgency", 0.5),
+                },
+            ))
+        else:
+            asyncio.ensure_future(self._emit_synapse_event(
+                "federation_assistance_declined",
+                {
+                    "link_id": link.id,
+                    "remote_instance_id": link.remote_instance_id,
+                    "description": request.description[:200],
+                    "reason": response.reason[:200] if response.reason else "",
+                },
+            ))
+
+        # ── RE training: assistance decision ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="assistance_decision",
+            instruction="Decide whether to accept an assistance request from a federated instance based on trust, Equor review, and capacity.",
+            input_context=f"remote={link.remote_name}, trust={link.trust_level.name}, equor_ok={equor_permitted}, description={request.description[:100]}",
+            output=f"accepted={response.accepted}, reason={response.reason[:100] if response.reason else ''}",
+            outcome_quality=0.8 if response.accepted else 0.4,
+            reasoning_trace=f"equor_permitted={equor_permitted}, metabolic_efficiency={self._metabolic_efficiency}",
+        ))
 
         if self._metrics:
             metric = "assistance.accepted" if response.accepted else "assistance.requested"
@@ -1110,6 +1807,11 @@ class FederationService:
         """
         Request assistance from a remote federated instance.
         """
+        # ── Metabolic gate: AUSTERITY+ → no outbound requests ──
+        if self._starvation_level in ("austerity", "emergency", "critical"):
+            self._logger.info("request_assistance_blocked_starvation", level=self._starvation_level)
+            return None
+
         if not self._coordination or not self._channels or not self._identity:
             return None
 
@@ -1144,9 +1846,22 @@ class FederationService:
         """
         if not self._threat_intel:
             return {}
-        return await self._threat_intel.broadcast_advisory(
+        results = await self._threat_intel.broadcast_advisory(
             advisory, self.active_links
         )
+
+        delivered = sum(1 for v in results.values() if v)
+        if delivered > 0:
+            await self._emit_evolutionary_observable(
+                "threat_detected", 1.0, is_novel=True,
+                metadata={
+                    "threat_type": getattr(advisory, "threat_type", "unknown"),
+                    "delivered_to": delivered,
+                    "total_links": len(results),
+                },
+            )
+
+        return results
 
     def handle_threat_advisory(
         self,
@@ -1180,7 +1895,18 @@ class FederationService:
         if cert_rejection is not None:
             return False, cert_rejection
 
-        return self._threat_intel.handle_inbound_advisory(advisory, link)
+        accepted, reason = self._threat_intel.handle_inbound_advisory(advisory, link)
+
+        # ── RE training: threat evaluation decision ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="threat_evaluation",
+            instruction="Evaluate an inbound threat advisory from a federated instance based on trust level and certificate.",
+            input_context=f"source={source_instance_id}, trust={link.trust_level.name}, advisory_type={advisory.threat_type if hasattr(advisory, 'threat_type') else 'unknown'}",
+            output=f"accepted={accepted}, reason={reason[:200]}",
+            outcome_quality=0.7 if accepted else 0.5,
+        ))
+
+        return accepted, reason
 
     # ─── IIEP Knowledge Exchange ─────────────────────────────────
 
@@ -1250,7 +1976,7 @@ class FederationService:
             description=f"IIEP push: {len(envelope.payloads)} payloads",
         )
         if self._trust:
-            self._trust.update_trust(link, interaction)
+            self._update_trust_and_emit(link, interaction)
         self._record_interaction(interaction)
 
         if self._metrics:
@@ -1258,6 +1984,25 @@ class FederationService:
                 "federation", "iiep.push.payloads",
                 float(len(envelope.payloads)),
             )
+
+        if receipt:
+            await self._emit_evolutionary_observable(
+                "knowledge_shared", float(len(envelope.payloads)),
+                is_novel=True,
+                metadata={
+                    "link_id": link_id,
+                    "payload_count": len(envelope.payloads),
+                },
+            )
+
+        # ── RE training: exchange assessment ──
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="exchange_assessment",
+            instruction="Assess and execute a knowledge exchange push to a federated peer.",
+            input_context=f"link={link_id[:12]}, payloads={len(envelope.payloads)}, kinds={[k.value for k in (kinds or [])][:5]}",
+            output=f"sent=True, receipt={'ok' if receipt else 'none'}",
+            outcome_quality=0.8 if receipt else 0.3,
+        ))
 
         return receipt
 
@@ -1304,7 +2049,7 @@ class FederationService:
                 description="IIEP pull request sent",
             )
             if self._trust:
-                self._trust.update_trust(link, interaction)
+                self._update_trust_and_emit(link, interaction)
             self._record_interaction(interaction)
 
         return receipt
@@ -1404,7 +2149,7 @@ class FederationService:
                 ),
             )
             if self._trust:
-                self._trust.update_trust(link, interaction)
+                self._update_trust_and_emit(link, interaction)
             self._record_interaction(interaction)
 
             if self._metrics:
@@ -1414,6 +2159,49 @@ class FederationService:
                 await self._metrics.record(
                     "federation", "iiep.received.accepted", float(accepted),
                 )
+
+            if accepted > 0:
+                await self._emit_evolutionary_observable(
+                    "knowledge_received", float(accepted),
+                    is_novel=True,
+                    metadata={
+                        "sender": envelope.sender_instance_id,
+                        "accepted": accepted,
+                        "total": total,
+                    },
+                )
+
+                # ── Synapse: FEDERATION_KNOWLEDGE_RECEIVED ──
+                asyncio.ensure_future(self._emit_synapse_event(
+                    "federation_knowledge_received",
+                    {
+                        "link_id": link.id,
+                        "remote_instance_id": envelope.sender_instance_id,
+                        "knowledge_type": "iiep_exchange",
+                        "item_count": accepted,
+                    },
+                ))
+
+                # ── Synapse: FEDERATION_INVARIANT_RECEIVED ──
+                # High-confidence (≥ 0.9) accepted hypotheses represent
+                # causal invariants distilled by Kairos on the peer and
+                # shared via federation. Emit a dedicated invariant event
+                # so Nexus and Kairos can absorb them directly.
+                invariant_payloads = [
+                    p for p in envelope.payloads
+                    if receipt.payload_verdicts.get(p.payload_id) == IngestionVerdict.ACCEPTED
+                    and p.confidence >= 0.9
+                ]
+                if invariant_payloads:
+                    asyncio.ensure_future(self._emit_synapse_event(
+                        "federation_invariant_received",
+                        {
+                            "link_id": link.id,
+                            "remote_instance_id": envelope.sender_instance_id,
+                            "invariant_count": len(invariant_payloads),
+                            "min_confidence": min(p.confidence for p in invariant_payloads),
+                        },
+                    ))
 
             return receipt
 
@@ -1442,6 +2230,23 @@ class FederationService:
             self._ingestion._eis = eis
         self._logger.info("eis_wired_to_federation")
 
+    def set_re(self, re: Any) -> None:
+        """
+        Wire the Reasoning Engine (or Claude client) for semantic quality scoring.
+
+        Used in ingestion Stage 4.5 to score inbound PARTNER+ epistemic payloads
+        (HYPOTHESIS) for coherence, novelty, and constitutional safety before
+        acceptance into Memory/Evo.
+
+        Accepts any object with a ``generate(prompt: str) -> str`` or
+        ``complete(prompt: str) -> str`` async method.
+
+        References: Spec 11b §XII §2
+        """
+        if self._ingestion:
+            self._ingestion._re = re
+        self._logger.info("re_wired_to_federation_ingestion")
+
     # ─── Identity ───────────────────────────────────────────────────
 
     @property
@@ -1466,6 +2271,196 @@ class FederationService:
 
     def get_link_by_instance(self, instance_id: str) -> FederationLink | None:
         return self._find_link_by_instance(instance_id)
+
+    # ─── Nexus Fragment Protocol ───────────────────────────────────
+
+    def get_active_link_ids(self) -> list[str]:
+        """Return IDs of all active federation links (FederationFragmentProtocol)."""
+        return [link.id for link in self.active_links]
+
+    async def broadcast_fragment(
+        self,
+        message: Any,
+    ) -> dict[str, Any]:
+        """
+        Broadcast a world model fragment to all active federation links.
+
+        Returns {link_id: response} for each link.  Uses the knowledge
+        exchange channel to send the fragment as a WORLD_MODEL_FRAGMENT
+        payload.  Links that fail silently return an error response.
+        """
+        from systems.nexus.types import (
+            FragmentShareOutcome,
+            WorldModelFragmentShareResponse,
+        )
+
+        results: dict[str, Any] = {}
+        for link in self.active_links:
+            try:
+                resp = await self.send_fragment(link.id, message)
+                results[link.id] = resp
+            except Exception as exc:
+                logger.warning(
+                    "broadcast_fragment_failed",
+                    link_id=link.id,
+                    error=str(exc),
+                )
+                results[link.id] = WorldModelFragmentShareResponse(
+                    message_id=getattr(message, "message_id", ""),
+                    outcome=FragmentShareOutcome.REJECTED,
+                    reason=f"transport_error: {exc}",
+                )
+        return results
+
+    async def send_fragment(
+        self,
+        link_id: str,
+        message: Any,
+    ) -> Any:
+        """
+        Send a world model fragment to a specific federation peer.
+
+        Uses the knowledge exchange channel.  Requires COLLEAGUE+ trust.
+        """
+        from systems.nexus.types import (
+            FragmentShareOutcome,
+            WorldModelFragmentShareResponse,
+        )
+
+        # ── Metabolic gate: AUSTERITY+ → no outbound shares ──
+        if self._starvation_level in ("austerity", "emergency", "critical"):
+            return WorldModelFragmentShareResponse(
+                message_id=getattr(message, "message_id", ""),
+                outcome=FragmentShareOutcome.REJECTED,
+                reason=f"metabolic_starvation_{self._starvation_level}",
+            )
+
+        link = self.get_link(link_id)
+        if link is None or link.status != FederationLinkStatus.ACTIVE:
+            return WorldModelFragmentShareResponse(
+                message_id=getattr(message, "message_id", ""),
+                outcome=FragmentShareOutcome.REJECTED,
+                reason="link_not_active",
+            )
+
+        # Trust gate: require COLLEAGUE or higher
+        if link.trust_level.value < TrustLevel.COLLEAGUE.value:
+            return WorldModelFragmentShareResponse(
+                message_id=getattr(message, "message_id", ""),
+                outcome=FragmentShareOutcome.REJECTED,
+                reason="insufficient_trust_level",
+            )
+
+        from primitives.federation import ExchangePayload
+        fragment_payload = ExchangePayload(
+            kind=ExchangePayloadKind.HYPOTHESIS,
+            confidence=1.0,
+            content=message.model_dump() if hasattr(message, "model_dump") else {},
+            source_instance_id=self._instance_id or "",
+        )
+        envelope = ExchangeEnvelope(
+            sender_instance_id=self._instance_id or "",
+            receiver_instance_id=link.remote_instance_id,
+            payloads=[fragment_payload],
+            direction=ExchangeDirection.OUTBOUND,
+        )
+
+        channel = self._channels.get_channel(link_id)
+        if channel is None:
+            return WorldModelFragmentShareResponse(
+                message_id=getattr(message, "message_id", ""),
+                outcome=FragmentShareOutcome.REJECTED,
+                reason="no_channel",
+            )
+
+        try:
+            receipt = await channel.send_exchange(envelope)
+            if receipt is not None:
+                # Any non-REJECTED verdict counts as accepted
+                rejected = any(
+                    v == IngestionVerdict.REJECTED
+                    for v in receipt.payload_verdicts.values()
+                )
+                if not rejected:
+                    asyncio.ensure_future(self._emit_synapse_event(
+                        "world_model_fragment_share",
+                        {
+                            "link_id": link_id,
+                            "remote_instance_id": link.remote_instance_id,
+                            "message_id": getattr(message, "message_id", ""),
+                            "fragment_type": getattr(message, "fragment_type", "unknown"),
+                        },
+                    ))
+                    return WorldModelFragmentShareResponse(
+                        message_id=getattr(message, "message_id", ""),
+                        outcome=FragmentShareOutcome.ACCEPTED,
+                    )
+            return WorldModelFragmentShareResponse(
+                message_id=getattr(message, "message_id", ""),
+                outcome=FragmentShareOutcome.REJECTED,
+                reason="peer_rejected",
+            )
+        except Exception as exc:
+            return WorldModelFragmentShareResponse(
+                message_id=getattr(message, "message_id", ""),
+                outcome=FragmentShareOutcome.REJECTED,
+                reason=f"transport_error: {exc}",
+            )
+
+    async def get_remote_profile(
+        self,
+        link_id: str,
+    ) -> Any:
+        """
+        Request a remote instance's divergence profile for triangulation.
+
+        Returns InstanceDivergenceProfile or None if the link is inactive
+        or the request fails.
+        """
+        link = self.get_link(link_id)
+        if link is None or link.status != FederationLinkStatus.ACTIVE:
+            return None
+
+        from primitives.federation import ExchangePayload
+        divergence_payload = ExchangePayload(
+            kind=ExchangePayloadKind.HYPOTHESIS,
+            confidence=1.0,
+            content={"request_type": "divergence_profile"},
+            source_instance_id=self._instance_id or "",
+        )
+        envelope = ExchangeEnvelope(
+            sender_instance_id=self._instance_id or "",
+            receiver_instance_id=link.remote_instance_id,
+            payloads=[divergence_payload],
+            direction=ExchangeDirection.OUTBOUND,
+        )
+
+        channel = self._channels.get_channel(link_id)
+        if channel is None:
+            return None
+
+        try:
+            receipt = await channel.send_exchange(envelope)
+            # Divergence profile returned asynchronously via knowledge
+            # exchange — for now we can only confirm the request was
+            # received.  Full implementation requires an inbound handler
+            # on the remote side that returns the profile in the receipt
+            # payload.  Return None until the remote peer supports the
+            # divergence_profile request type.
+            if receipt is not None:
+                logger.debug(
+                    "divergence_profile_requested",
+                    link_id=link_id,
+                    verdicts=len(receipt.payload_verdicts),
+                )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "get_remote_profile_failed",
+                link_id=link_id,
+                error=str(exc),
+            )
+            return None
 
     # ─── Trust Decay (called periodically) ──────────────────────────
 
@@ -1615,7 +2610,7 @@ class FederationService:
         federation data stops at Memory and never enters the cognitive cycle.
         """
         try:
-            from systems.atune.types import InputChannel, RawInput
+            from systems.fovea.types import InputChannel, RawInput
 
             summaries: list[str] = []
             for item in knowledge_items[:3]:  # Cap at 3 to avoid flooding

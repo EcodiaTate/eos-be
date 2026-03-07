@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import deque
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import structlog
 
@@ -34,6 +34,122 @@ from systems.oneiros.types import (
     WakeDegradation,
 )
 from systems.synapse.types import MetabolicState, SynapseEventType
+
+
+# ─── Cross-System Protocols ──────────────────────────────────────
+# Each Protocol defines exactly the surface Oneiros calls on that system.
+# No Any — these are checked at runtime via isinstance() if needed.
+
+
+@runtime_checkable
+class EvoServiceProtocol(Protocol):
+    """Evo interface consumed by Oneiros."""
+
+    async def get_active_hypothesis_count(self) -> int:
+        """Return count of active (PROPOSED/TESTING) hypotheses."""
+        ...
+
+
+@runtime_checkable
+class SomaSignal(Protocol):
+    """Return type of SomaService.get_current_signal()."""
+
+    @property
+    def state(self) -> Any:
+        """Allostatic state with .errors dict."""
+        ...
+
+
+@runtime_checkable
+class SomaServiceProtocol(Protocol):
+    """Soma interface consumed by Oneiros."""
+
+    def get_current_signal(self) -> SomaSignal:
+        """Return current allostatic signal snapshot."""
+        ...
+
+    async def run_sleep_analysis(self) -> dict[str, Any]:
+        """Run extended sleep-mode recalibration. Returns analysis dict."""
+        ...
+
+
+@runtime_checkable
+class OikosStateProtocol(Protocol):
+    """Snapshot returned by OikosService.snapshot()."""
+
+    @property
+    def runway_days(self) -> Any:
+        """Days of runway remaining."""
+        ...
+
+
+@runtime_checkable
+class OikosServiceProtocol(Protocol):
+    """Oikos interface consumed by Oneiros."""
+
+    def snapshot(self) -> OikosStateProtocol:
+        """Return current economic state snapshot."""
+        ...
+
+    def integrate_dream_result(self, result: Any) -> None:
+        """Ingest an economic dream worker result into the portfolio state."""
+        ...
+
+    def get_dream_worker(self) -> Any:
+        """Return the EconomicDreamWorker instance."""
+        ...
+
+    def get_threat_model_worker(self) -> Any:
+        """Return the ThreatModelWorker instance."""
+        ...
+
+
+@runtime_checkable
+class KairosServiceProtocol(Protocol):
+    """Kairos interface consumed by Oneiros for Loop 5 wiring."""
+
+    def set_oneiros(self, oneiros: Any) -> None:
+        """Provide Kairos a reference to Oneiros for direct seed injection."""
+        ...
+
+
+# Thin marker protocols for systems whose methods are accessed via getattr guards
+# (equor, nova, atune, thymos, memory).  We don't call any methods directly on
+# these in service.py — they are forwarded to the engine or used as presence
+# guards only.  Using object as Protocol base with no methods is valid and
+# communicates intent without over-constraining the interface.
+
+@runtime_checkable
+class EquorServiceProtocol(Protocol):
+    """Equor interface marker — forwarded to engine.set_equor()."""
+
+
+@runtime_checkable
+class NovaServiceProtocol(Protocol):
+    """Nova interface marker — wired via engine stages internally."""
+
+
+@runtime_checkable
+class AtuneServiceProtocol(Protocol):
+    """Atune interface marker — no direct calls in service.py."""
+
+
+@runtime_checkable
+class ThymosServiceProtocol(Protocol):
+    """Thymos interface marker — no direct calls in service.py."""
+
+
+@runtime_checkable
+class MemoryServiceProtocol(Protocol):
+    """Memory interface marker — no direct calls in service.py."""
+
+
+@runtime_checkable
+class SimulaServiceProtocol(Protocol):
+    """Simula interface — forwarded to engine.set_simula().
+
+    Concrete methods are declared in lucid_stage.SimulaProtocol.
+    """
 
 logger = structlog.get_logger().bind(system="oneiros")
 
@@ -80,16 +196,16 @@ class OneirosService:
         self._bus = neuroplasticity_bus
 
         # Cross-system references (set via setters after construction)
-        self._equor: Any = None
-        self._evo: Any = None
-        self._nova: Any = None
-        self._atune: Any = None
-        self._thymos: Any = None
-        self._memory: Any = None
-        self._soma: Any = None
-        self._oikos: Any = None
-        self._simula: Any = None
-        self._kairos: Any = None
+        self._equor: EquorServiceProtocol | None = None
+        self._evo: EvoServiceProtocol | None = None
+        self._nova: NovaServiceProtocol | None = None
+        self._atune: AtuneServiceProtocol | None = None
+        self._thymos: ThymosServiceProtocol | None = None
+        self._memory: MemoryServiceProtocol | None = None
+        self._soma: SomaServiceProtocol | None = None
+        self._oikos: OikosServiceProtocol | None = None
+        self._simula: SimulaServiceProtocol | None = None
+        self._kairos: KairosServiceProtocol | None = None
         self._economic_dream_worker: Any = None
         self._threat_model_worker: Any = None
 
@@ -111,6 +227,9 @@ class OneirosService:
         self._current_cycle: SleepCycle | None = None
         self._sleep_task: asyncio.Task[None] | None = None
         self._creative_goal: str | None = None
+        # Kairos invariant IDs processed during the most recent sleep cycle;
+        # used in ONEIROS_CONSOLIDATION_COMPLETE as certified_invariant_ids.
+        self._last_cycle_kairos_seed_ids: list[str] = []
 
         # Lifetime metrics
         self._total_sleep_cycles: int = 0
@@ -139,6 +258,9 @@ class OneirosService:
         # Grid metabolism state
         self._grid_state: MetabolicState = MetabolicState.NORMAL
 
+        # Metabolic starvation level — AUSTERITY: 50% dreams, EMERGENCY+: halt all
+        self._starvation_level: str = "nominal"
+
         # Pending insights for wake broadcast
         self._pending_wake_insights: list[Any] = []
 
@@ -153,48 +275,44 @@ class OneirosService:
 
     # ── Cross-System Wiring ───────────────────────────────────────
 
-    def set_equor(self, equor: Any) -> None:
+    def set_equor(self, equor: EquorServiceProtocol) -> None:
         self._equor = equor
         self._v2_engine.set_equor(equor)
 
-    def set_evo(self, evo: Any) -> None:
+    def set_evo(self, evo: EvoServiceProtocol) -> None:
         self._evo = evo
         self._v2_engine.set_evo(evo)
 
-    def set_nova(self, nova: Any) -> None:
+    def set_nova(self, nova: NovaServiceProtocol) -> None:
         self._nova = nova
 
-    def set_atune(self, atune: Any) -> None:
+    def set_atune(self, atune: AtuneServiceProtocol) -> None:
         self._atune = atune
 
-    def set_thymos(self, thymos: Any) -> None:
+    def set_thymos(self, thymos: ThymosServiceProtocol) -> None:
         self._thymos = thymos
 
-    def set_memory(self, memory: Any) -> None:
+    def set_memory(self, memory: MemoryServiceProtocol) -> None:
         self._memory = memory
 
-    def set_soma(self, soma: Any) -> None:
+    def set_soma(self, soma: SomaServiceProtocol) -> None:
         """Wire Soma for sleep pressure from energy errors and somatic sleep analysis."""
         self._soma = soma
 
-    def set_simula(self, simula: Any) -> None:
+    def set_simula(self, simula: SimulaServiceProtocol) -> None:
         """Wire Simula for lucid dreaming mutation testing."""
         self._simula = simula
         self._v2_engine.set_simula(simula)
 
-    def set_oikos(self, oikos: Any) -> None:
-        """Wire Oikos for economic dreaming + threat modeling during sleep."""
-        from systems.oikos.dream_worker import EconomicDreamWorker
-        from systems.oikos.threat_model_worker import ThreatModelWorker
+    def set_oikos(self, oikos: OikosServiceProtocol) -> None:
+        """Wire Oikos for economic dreaming + threat modeling during sleep.
 
+        Workers are obtained from Oikos's public API instead of importing
+        Oikos internals directly (no cross-system imports).
+        """
         self._oikos = oikos
-        self._economic_dream_worker = EconomicDreamWorker(
-            config=oikos._config,
-        )
-        if oikos._config.threat_model_enabled:
-            self._threat_model_worker = ThreatModelWorker(
-                config=oikos._config,
-            )
+        self._economic_dream_worker = oikos.get_dream_worker()
+        self._threat_model_worker = oikos.get_threat_model_worker()
         self._logger.info("oikos_wired_for_economic_dreaming")
 
     def set_fovea(self, fovea: Any) -> None:
@@ -205,7 +323,7 @@ class OneirosService:
         """Wire Logos for v2 Sleep Cycle Engine (world model access)."""
         self._v2_engine.set_logos(logos)
 
-    def set_kairos(self, kairos: Any) -> None:
+    def set_kairos(self, kairos: KairosServiceProtocol) -> None:
         """
         Wire Kairos for Loop 5 bidirectional flow.
 
@@ -275,6 +393,27 @@ class OneirosService:
                     SynapseEventType.GRID_METABOLISM_CHANGED,
                     self._on_grid_metabolism_changed,
                 )
+
+                # Spec 14 / Corpus 14 §7: Simula evolution episodes feed sleep pressure.
+                # Each applied proposal is an unconsolidated structural episode — record it
+                # so Oneiros's circadian clock builds appropriate consolidation pressure.
+                if hasattr(SynapseEventType, "EVOLUTION_APPLIED"):
+                    event_bus.subscribe(
+                        SynapseEventType.EVOLUTION_APPLIED,
+                        self._on_simula_evolution_applied,
+                    )
+
+                event_bus.subscribe(
+                    SynapseEventType.METABOLIC_PRESSURE,
+                    self._on_metabolic_pressure,
+                )
+
+                # Spec 14 §8 Federation: coordinate sleep timing across instances.
+                if hasattr(SynapseEventType, "FEDERATION_SLEEP_SYNC"):
+                    event_bus.subscribe(
+                        SynapseEventType.FEDERATION_SLEEP_SYNC,
+                        self._on_federation_sleep_sync,
+                    )
             except Exception as exc:
                 self._logger.warning("synapse_subscribe_failed", error=str(exc))
 
@@ -319,13 +458,11 @@ class OneirosService:
         self._clock.record_affect_trace(affect_valence, affect_arousal)
         self._clock.record_episode()  # Approximate: 1 episode per cycle
 
-        # Update Evo hypothesis count periodically
+        # Update Evo hypothesis count periodically via public API
         if self._evo is not None and self._clock.pressure.cycles_since_sleep % 100 == 0:
             try:
-                if hasattr(self._evo, "_hypothesis_engine"):
-                    engine = self._evo._hypothesis_engine
-                    count = len(getattr(engine, "_hypotheses", {}))
-                    self._clock.record_hypothesis_count(count)
+                count = await self._evo.get_active_hypothesis_count()
+                self._clock.record_hypothesis_count(count)
             except Exception:
                 pass
 
@@ -333,8 +470,8 @@ class OneirosService:
         if self._soma is not None:
             try:
                 signal = self._soma.get_current_signal()
-                errors = signal.state.errors.get("immediate", {})
-                energy_error = errors.get("energy", 0.0)
+                errors: dict[str, Any] = signal.state.errors.get("immediate", {})
+                energy_error: float = errors.get("energy", 0.0)
                 if energy_error < -0.3:
                     depletion_valence = max(-1.0, energy_error * 2.0)
                     self._clock.record_affect_trace(depletion_valence, 0.5)
@@ -383,6 +520,11 @@ class OneirosService:
             self._logger.warning("already_sleeping")
             return
 
+        # ── Metabolic gate: EMERGENCY+ → no new sleep cycles ──
+        if self._starvation_level in ("emergency", "critical"):
+            self._logger.info("sleep_blocked_starvation", level=self._starvation_level)
+            return
+
         self._wake_cycle_count = 0
 
         if self._pending_wake_insights:
@@ -423,6 +565,11 @@ class OneirosService:
                 trigger = SleepTrigger.COGNITIVE_PRESSURE
 
             kairos_seeds = self.drain_kairos_rem_seeds()
+            # Track which Kairos invariant IDs are being processed this cycle
+            # so _complete_cycle can certify them in ONEIROS_CONSOLIDATION_COMPLETE.
+            self._last_cycle_kairos_seed_ids = [
+                s["invariant_id"] for s in kairos_seeds if s.get("invariant_id")
+            ]
             report = await self._v2_engine.run_sleep_cycle(
                 trigger=trigger,
                 kairos_rem_seeds=kairos_seeds or None,
@@ -503,12 +650,8 @@ class OneirosService:
         if self._soma is None:
             return
 
-        run_sleep_analysis = getattr(self._soma, "run_sleep_analysis", None)
-        if run_sleep_analysis is None:
-            return
-
         try:
-            sleep_report = await run_sleep_analysis()
+            sleep_report = await self._soma.run_sleep_analysis()
 
             drift_summary: str = sleep_report.get("drift_summary", "")
             topology_changed: bool = sleep_report.get("topology_baseline_updated", False)
@@ -595,7 +738,7 @@ class OneirosService:
                     )
                     continue
 
-                self._oikos.integrate_dream_result(result)
+                await self._oikos.integrate_dream_result(result)
 
                 if hasattr(result, "ruin_probability"):
                     self._logger.info(
@@ -654,6 +797,7 @@ class OneirosService:
         self._sleep_quality_sum += quality_scores.get(quality, 0.5)
 
         self._creative_goal = None
+        self._v2_engine.set_creative_goal(None)
 
         await self._emit_event(WAKE_ONSET, {
             "cycle_id": self._current_cycle.id,
@@ -661,6 +805,37 @@ class OneirosService:
             "insights_count": len(self._pending_wake_insights),
             "dreams_generated": self._current_cycle.dreams_generated,
             "episodes_consolidated": self._current_cycle.episodes_replayed,
+        })
+
+        # Emit sleep cycle summary for Benchmarks
+        await self._emit_event(SynapseEventType.ONEIROS_SLEEP_CYCLE_SUMMARY, {
+            "cycle_id": self._current_cycle.id,
+            "consolidation_count": self._current_cycle.episodes_replayed,
+            "dreams_generated": self._current_cycle.dreams_generated,
+            "beliefs_compressed": self._current_cycle.beliefs_compressed,
+            "schemas_created": self._current_cycle.semantic_nodes_created,
+            "intelligence_improvement": (
+                self._v2_engine.emergence.average_intelligence_improvement
+            ),
+            "quality": quality.value,
+        })
+
+        # Emit consolidation complete for Federation — sleep_certified=True only when
+        # all 4 stages completed without interruption (DEEP or NORMAL quality).
+        sleep_certified = quality in (SleepQuality.DEEP, SleepQuality.NORMAL)
+        certified_ids = self._last_cycle_kairos_seed_ids if sleep_certified else []
+        self._last_cycle_kairos_seed_ids = []
+        await self._emit_event(SynapseEventType.ONEIROS_CONSOLIDATION_COMPLETE, {
+            "cycle_id": self._current_cycle.id,
+            "episodes_consolidated": self._current_cycle.episodes_replayed,
+            "schemas_updated": self._current_cycle.semantic_nodes_created,
+            "duration_s": (
+                (self._current_cycle.completed_at - self._current_cycle.started_at).total_seconds()
+                if self._current_cycle.completed_at and self._current_cycle.started_at
+                else 0.0
+            ),
+            "sleep_certified": sleep_certified,
+            "certified_invariant_ids": certified_ids,
         })
 
         self._stage_controller.wake()
@@ -679,6 +854,33 @@ class OneirosService:
         self._current_cycle = None
 
     # ── Emergency Wake ────────────────────────────────────────────
+
+    async def _on_metabolic_pressure(self, event: Any) -> None:
+        """React to organism-wide metabolic pressure changes.
+
+        AUSTERITY: reduce dream frequency 50% (double cycles_per_sleep).
+        EMERGENCY/CRITICAL: cancel active sleep and prevent new cycles.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("starvation_level", "")
+        if not level:
+            return
+        old = self._starvation_level
+        self._starvation_level = level
+        if level != old:
+            self._logger.info("oneiros_starvation_level_changed", old=old, new=level)
+            if level in ("emergency", "critical"):
+                # Cancel active sleep task
+                if self._sleep_task is not None and not self._sleep_task.done():
+                    self._sleep_task.cancel()
+                    self._logger.info("oneiros_sleep_cancelled_starvation", level=level)
+            elif level == "austerity":
+                # Double the cycle threshold to halve dream frequency
+                default = _get(self._config, "cycles_per_sleep", 500)
+                self._cycles_per_sleep = default * 2
+            elif level in ("nominal", "cautious"):
+                # Restore default cycle threshold
+                self._cycles_per_sleep = _get(self._config, "cycles_per_sleep", 500)
 
     async def _on_grid_metabolism_changed(self, event: Any) -> None:
         """
@@ -754,6 +956,79 @@ class OneirosService:
         }
         self.add_kairos_rem_seed(seed)
 
+    async def _on_simula_evolution_applied(self, event: Any) -> None:
+        """
+        Corpus 14 §7 — Simula → Oneiros consolidation feed (Spec 14).
+
+        Each applied structural evolution is an unconsolidated episode for the
+        memory consolidation system. Recording it here increments sleep pressure
+        so Oneiros schedules consolidation after a burst of self-evolution.
+
+        Optionally, if the proposal is high-risk (multiple systems affected),
+        it also adds extra affect residue to accelerate consolidation.
+        """
+        if self._stage_controller.is_sleeping:
+            return  # Already consolidating
+
+        data = event.data if hasattr(event, "data") else {}
+        self._clock.record_episode()
+
+        # Amplify pressure for wide-blast proposals: each file beyond 3 = extra affect
+        files_changed = data.get("files_changed", [])
+        if len(files_changed) > 3:
+            # Each extra file is a low-valence, moderate-arousal structural trace
+            extra_affect = min(0.3, (len(files_changed) - 3) * 0.05)
+            self._clock.record_affect_trace(-extra_affect, 0.4)
+
+        self._logger.debug(
+            "oneiros_evolution_episode_recorded",
+            proposal_id=data.get("proposal_id", ""),
+            files_changed=len(files_changed),
+            pressure=round(self._clock.pressure.composite_pressure, 3),
+        )
+
+    async def _on_federation_sleep_sync(self, event: Any) -> None:
+        """
+        Spec 14 §8 — Federation sleep coordination.
+
+        When a federated peer requests sleep synchronization, Oneiros evaluates
+        whether to honour the proposed sleep time. If already sleeping, ignores.
+        If wake-state and the proposed time is within the next theta cycle, nudges
+        sleep pressure to trigger imminent consolidation so the organism enters
+        sleep in rough synchrony with the requesting peer — enabling shared
+        knowledge to be certified and broadcast together.
+
+        The actual timing guarantee is best-effort: Oneiros will not override
+        EMERGENCY/CRITICAL metabolic starvation guards or active task constraints.
+        """
+        if self._stage_controller.is_sleeping:
+            return  # Already consolidating — sync happened naturally
+
+        data = event.data if hasattr(event, "data") else {}
+        peer_instance_id = data.get("instance_id", "unknown")
+        priority = float(data.get("priority", 0.5))
+
+        # Only act on high-priority federation sync requests
+        if priority < 0.5:
+            self._logger.debug(
+                "federation_sleep_sync_ignored_low_priority",
+                peer=peer_instance_id,
+                priority=priority,
+            )
+            return
+
+        # Nudge sleep pressure upward so the scheduler will trigger sleep soon.
+        # We record a synthetic consolidation episode to raise the episode component.
+        self._clock.record_episode()
+
+        self._logger.info(
+            "federation_sleep_sync_received",
+            peer=peer_instance_id,
+            priority=priority,
+            proposed_sleep_time=data.get("proposed_sleep_time_utc", ""),
+            current_pressure=round(self._clock.pressure.composite_pressure, 3),
+        )
+
     async def _on_critical_event(self, event: Any) -> None:
         """Handle critical Synapse events during sleep."""
         if not self._stage_controller.is_sleeping:
@@ -787,6 +1062,7 @@ class OneirosService:
         """Set a creative goal for the next lucid dreaming phase."""
         self._creative_goal = goal
         self._stage_controller.set_has_creative_goal(True)
+        self._v2_engine.set_creative_goal(goal)
         self._logger.info("creative_goal_set", goal=goal[:100])
 
     def get_pending_insights(self) -> list[Any]:
@@ -918,37 +1194,6 @@ class OneirosService:
                 self._metrics.record(system, metric, value, labels=tags or {})
             )
 
-
-def _make_hedge_condition(target_symbol_lower: str) -> Any:
-    """
-    Create a condition lambda for a hedge procedure template.
-
-    Fires when a broadcast contains economic/price content mentioning
-    the target asset symbol.
-    """
-    def condition(broadcast: object) -> bool:
-        try:
-            content = getattr(broadcast, "content", None)
-            if content is None:
-                return False
-            content_text = ""
-            for attr in ("content", "text", "summary"):
-                val = getattr(content, attr, None)
-                if isinstance(val, str) and val:
-                    content_text = val.lower()
-                    break
-            if not content_text:
-                return False
-            has_symbol = target_symbol_lower in content_text
-            has_economic = any(
-                kw in content_text
-                for kw in ("price", "crash", "liquidat", "depeg", "drop",
-                           "decline", "risk", "alert", "flash", "exploit")
-            )
-            return has_symbol and has_economic
-        except Exception:
-            return False
-    return condition
 
 
 def _get(cfg: Any, key: str, default: Any) -> Any:

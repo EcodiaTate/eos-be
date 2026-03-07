@@ -591,14 +591,10 @@ class OikosMetabolism:
         # Import deferred to avoid circular import at module load time
         from systems.synapse.types import SynapseEvent, SynapseEventType
 
-        # BUDGET_EXHAUSTED is not yet in SynapseEventType enum — we extend the
-        # concept by emitting a METABOLIC_PRESSURE event with a budget_exhausted flag.
-        # This keeps us within the existing event type space without touching Synapse.
         event = SynapseEvent(
-            event_type=SynapseEventType.METABOLIC_PRESSURE,
+            event_type=SynapseEventType.BUDGET_EXHAUSTED,
             source_system=_EVENT_SOURCE,
             data={
-                "budget_exhausted": True,
                 "system_id": system_id,
                 "action": decision.action,
                 "estimated_cost_usd": str(decision.estimated_cost_usd),
@@ -747,8 +743,8 @@ class OikosMetabolism:
             "timestamp": datetime.now(UTC).isoformat(),
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+        async def _do_post() -> None:
+            async with httpx.AsyncClient(timeout=2.0) as client:
                 resp = await client.post(webhook_url, json=payload)
                 resp.raise_for_status()
             self._logger.critical(
@@ -756,6 +752,15 @@ class OikosMetabolism:
                 runway_days=str(runway_days),
                 webhook_url=webhook_url,
                 status=resp.status_code,
+            )
+
+        try:
+            await asyncio.wait_for(_do_post(), timeout=2.0)
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "thymos_escalation_timeout",
+                runway_days=str(runway_days),
+                webhook_url=webhook_url,
             )
         except Exception as exc:
             # Log at critical level — the escalation itself failed.

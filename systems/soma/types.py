@@ -19,23 +19,10 @@ from typing import Any
 
 from pydantic import Field
 
+from primitives.affect import InteroceptiveDimension  # canonical — defined in primitives
 from primitives.common import EOSBaseModel, new_id, utc_now
 
 # ─── Enums ────────────────────────────────────────────────────────
-
-
-class InteroceptiveDimension(enum.StrEnum):
-    """The nine dimensions of felt internal state."""
-
-    ENERGY = "energy"                       # Metabolic budget (token/compute availability)
-    AROUSAL = "arousal"                     # Activation level (cycle speed, parallelism)
-    VALENCE = "valence"                     # Net allostatic trend (improving vs deteriorating)
-    CONFIDENCE = "confidence"               # Generative model fit (prediction accuracy)
-    COHERENCE = "coherence"                 # Inter-system integration quality
-    SOCIAL_CHARGE = "social_charge"         # Relational engagement quality
-    CURIOSITY_DRIVE = "curiosity_drive"     # Epistemic appetite
-    INTEGRITY = "integrity"                 # Ethical/constitutional alignment + system health
-    TEMPORAL_PRESSURE = "temporal_pressure"  # Urgency / time horizon compression
 
 
 class DevelopmentalStage(enum.StrEnum):
@@ -665,16 +652,9 @@ class SensationType(enum.StrEnum):
     ERROR_RATE_SURGE = "error_rate_surge"
 
 
-class InteroceptiveAction(enum.StrEnum):
-    """Recommended action when an interoceptive percept is emitted."""
-
-    NONE = "none"
-    ATTEND_INWARD = "attend"
-    MODULATE_DRIVES = "drives"
-    INHIBIT_GROWTH = "inhibit"
-    TRIGGER_REPAIR = "repair"
-    EMERGENCY_SAFE_MODE = "safe_mode"
-    SLEEP_CONSOLIDATE = "sleep"
+# Re-exported from primitives so other systems (e.g. Thymos) can import without
+# a cross-system violation.
+from primitives.soma import InteroceptiveAction as InteroceptiveAction  # noqa: E402
 
 
 class InteroceptivePercept(EOSBaseModel):
@@ -698,3 +678,27 @@ class InteroceptivePercept(EOSBaseModel):
 
     # Optional derivative context for downstream consumers
     derivative_snapshot: DerivativeSnapshot | None = None
+
+
+class DynamicsMatrixPayload(EOSBaseModel):
+    """
+    Payload for NeuroplasticityBus dynamics matrix hot-reload (GAP 1).
+
+    Carries a new 9×9 cross-dimension coupling matrix from Simula/Evo
+    along with provenance metadata for Neo4j audit logging.
+
+    Fields:
+        matrix:       9×9 float matrix (row-major). Each entry [i][j]
+                      is the coupling weight from dimension j to dimension i.
+        source:       Who triggered this update (e.g. "simula", "evo").
+        mutation_id:  Unique ID for this mutation event (links to Neo4j).
+        reason:       Human-readable reason for the update.
+        confidence:   Evo confidence in this matrix [0, 1].
+    """
+
+    matrix: list[list[float]]
+    source: str = "simula"
+    mutation_id: str = Field(default_factory=new_id)
+    reason: str = ""
+    confidence: float = Field(1.0, ge=0.0, le=1.0)
+    timestamp: datetime = Field(default_factory=utc_now)

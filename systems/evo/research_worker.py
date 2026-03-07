@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger().bind(module="evo.research_worker")
 
 # arXiv API endpoint — returns Atom XML
-_ARXIV_API_URL = "http://export.arxiv.org/api/query"
+_ARXIV_API_URL = "https://export.arxiv.org/api/query"
 
 # Categories relevant to EcodiaOS subsystems
 _ARXIV_CATEGORIES = [

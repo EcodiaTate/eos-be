@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
-    from systems.atune.service import AtuneService
+    from systems.fovea.gateway import AtuneService
     from systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
@@ -42,7 +42,7 @@ class MemoryWorkspaceAdapter:
         max_results: int,
     ) -> Any:
         """Retrieve memories relevant to the current workspace winner."""
-        from systems.atune.types import MemoryContext
+        from systems.fovea.types import MemoryContext
 
         try:
             response = await self._memory.retrieve(

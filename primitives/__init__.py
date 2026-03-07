@@ -4,7 +4,7 @@ EcodiaOS — Shared Primitives
 The lingua franca of the organism. Every system communicates through these types.
 """
 
-from primitives.affect import AffectDelta, AffectState
+from primitives.affect import AffectDelta, AffectState, InteroceptiveDimension
 from primitives.belief import Belief
 from primitives.common import (
     AutonomyLevel,
@@ -44,7 +44,7 @@ from primitives.federation import (
     TrustPolicy,
     ViolationType,
 )
-from primitives.governance import AmendmentProposal, GovernanceRecord
+from primitives.governance import AmendmentProposal, EquorProvisioningApproval, GovernanceRecord
 from primitives.intent import (
     Action,
     ActionSequence,
@@ -66,8 +66,68 @@ from primitives.memory_trace import (
     SelfNode,
     SemanticRelation,
 )
+from primitives.closure import (
+    ALL_CLOSURE_LOOPS,
+    AXON_NOVA_REPAIR,
+    EQUOR_THYMOS_DRIFT,
+    EVO_BENCHMARKS_FITNESS,
+    SIMULA_STAKES,
+    SOMA_DOWNSTREAM_MODULATION,
+    THYMOS_SIMULA_IMMUNE,
+    ClosureLoopDefinition,
+)
+from primitives.evolutionary import (
+    BedauPackardStats,
+    EvolutionaryActivity,
+    EvolutionaryObservable,
+)
+from primitives.genome import (
+    GenomeExtractionProtocol,
+    OrganGenomeSegment,
+    OrganismGenome,
+)
+from primitives.genome_inheritance import (
+    AmendmentSnapshot,
+    AxonGenomeFragment,
+    AxonTemplateSnapshot,
+    BeliefGenome,
+    DriveWeightSnapshot,
+    DriftHistoryEntry,
+    EquorGenomeFragment,
+    SimulaGenome,
+    SimulaMutationEntry,
+    TeloDriveCalibration,
+    TelosGenomeFragment,
+)
+from primitives.metabolic import (
+    MetabolicGate,
+    MetabolicPermission,
+    MetabolicSubscription,
+)
 from primitives.percept import Content, Percept, Provenance
+from primitives.re_training import (
+    RETrainingBatch,
+    RETrainingDatapoint,
+    RETrainingExample,
+    RETrainingExportBatch,
+)
 from primitives.telemetry import InstanceHealth, MetricPoint, SystemHealth
+from primitives.causal import (
+    ApplicableDomain,
+    CausalInvariant,
+    CausalInvariantTier,
+    ScopeCondition,
+)
+from primitives.experimental import ExperimentDesign, ExperimentResult
+from primitives.incident import IncidentClass, IncidentSeverity
+from primitives.vitality import (
+    DEFAULT_VITALITY_THRESHOLDS,
+    VitalityReport,
+    VitalitySystemProtocol,
+    VitalityThreshold,
+)
+from primitives.mitosis import ChildPosition, ChildStatus
+from primitives.blockchain import BlockCompetitionSnapshot
 
 __all__ = [
     # Common
@@ -102,4 +162,32 @@ __all__ = [
     "KnowledgeItem", "KnowledgeRequest", "KnowledgeResponse",
     "FilteredKnowledge", "AssistanceRequest", "AssistanceResponse",
     "SHARING_PERMISSIONS", "TRUST_THRESHOLDS", "VIOLATION_MULTIPLIER",
+    # RE Training
+    "RETrainingExample", "RETrainingBatch",
+    "RETrainingDatapoint", "RETrainingExportBatch",
+    # Genome
+    "OrganGenomeSegment", "OrganismGenome", "GenomeExtractionProtocol",
+    # Genome Inheritance (spawn-time schemas)
+    "AmendmentSnapshot", "EquorGenomeFragment",
+    "BeliefGenome", "DriveWeightSnapshot", "DriftHistoryEntry",
+    "SimulaGenome", "SimulaMutationEntry",
+    "AxonTemplateSnapshot", "AxonGenomeFragment",
+    "TeloDriveCalibration", "TelosGenomeFragment",
+    # Metabolic Gate
+    "MetabolicPermission", "MetabolicSubscription", "MetabolicGate",
+    # Evolutionary
+    "EvolutionaryActivity", "BedauPackardStats", "EvolutionaryObservable",
+    # Vitality
+    "VitalityThreshold", "VitalityReport", "VitalitySystemProtocol",
+    "DEFAULT_VITALITY_THRESHOLDS",
+    # Closure Loops
+    "ClosureLoopDefinition", "ALL_CLOSURE_LOOPS",
+    "EQUOR_THYMOS_DRIFT", "AXON_NOVA_REPAIR", "SIMULA_STAKES",
+    "THYMOS_SIMULA_IMMUNE", "SOMA_DOWNSTREAM_MODULATION", "EVO_BENCHMARKS_FITNESS",
+    # Causal
+    "CausalInvariant", "CausalInvariantTier", "ApplicableDomain", "ScopeCondition",
+    # Experimental
+    "ExperimentDesign", "ExperimentResult",
+    # Incident classification (sentinel cross-system primitive)
+    "IncidentClass", "IncidentSeverity",
 ]

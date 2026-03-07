@@ -14,6 +14,7 @@ Schedule:
 from __future__ import annotations
 
 import json
+import time
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +27,9 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# Cooldown between consecutive CONSTITUTIONAL_DRIFT_DETECTED emissions (seconds)
+_DRIFT_EMIT_COOLDOWN_S: float = 30.0
+
 
 class DriftTracker:
     """
@@ -33,10 +37,12 @@ class DriftTracker:
     Periodically flushed to the graph for persistence.
     """
 
-    def __init__(self, window_size: int = 1000):
+    def __init__(self, window_size: int = 1000, event_bus: Any = None):
         self.window_size = window_size
         self._history: deque[dict[str, Any]] = deque(maxlen=window_size)
         self._decision_count: int = 0
+        self._event_bus: Any = event_bus
+        self._last_drift_emit_time: float = 0.0
 
     def record_decision(self, alignment: DriveAlignmentVector, verdict: str) -> None:
         """Record a single decision's alignment scores."""
@@ -183,7 +189,7 @@ def respond_to_drift(report: dict[str, Any]) -> dict[str, Any]:
             "detail": "Normal variance, no action needed.",
         }
 
-    if severity < 0.5:
+    if severity < 0.3:
         return {
             "action": "self_correct",
             "detail": (
@@ -202,9 +208,11 @@ def respond_to_drift(report: dict[str, Any]) -> dict[str, Any]:
         }
 
     return {
-        "action": "demote_autonomy",
-        "detail": "Severe constitutional drift. Autonomy reduced pending governance review.",
-        "autonomy_change": -1,
+        "action": "immune_response",
+        "detail": (
+            "Severe constitutional drift. Somatic stress signal + Thymos incident raised. "
+            "Amendment self-proposal queued if sustained. No auto-demotion — governance decides."
+        ),
     }
 
 
@@ -250,3 +258,107 @@ async def store_drift_report(
     )
 
     return record_id
+
+
+async def emit_drift_event(
+    tracker: DriftTracker,
+    report: dict[str, Any],
+    response: dict[str, Any],
+) -> None:
+    """Emit CONSTITUTIONAL_DRIFT_DETECTED when severity >= 0.3, or
+    EQUOR_DRIFT_WARNING when severity >= 0.2 but below fatal threshold."""
+    severity = report.get("drift_severity", 0.0)
+    action = response.get("action", "log")
+
+    # Emit warning for moderate drift (0.2 <= severity < 0.5)
+    if 0.2 <= severity < 0.5 and action == "self_correct":
+        bus = tracker._event_bus
+        if bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EQUOR_DRIFT_WARNING,
+                    source_system="equor",
+                    data={
+                        "drift_severity": severity,
+                        "drift_direction": report.get("drift_direction", "unknown"),
+                        "mean_alignment": report.get("mean_alignment", {}),
+                        "response_action": action,
+                    },
+                ))
+                logger.info("equor_drift_warning_emitted", severity=severity)
+            except Exception as exc:
+                logger.warning("equor_drift_warning_emit_failed", error=str(exc))
+
+    if severity < 0.3 or action not in ("notify_community", "immune_response"):
+        return
+
+    bus = tracker._event_bus
+    if bus is None:
+        return
+
+    now = time.monotonic()
+    if now - tracker._last_drift_emit_time < _DRIFT_EMIT_COOLDOWN_S:
+        return
+    tracker._last_drift_emit_time = now
+
+    # Identify which drives are declining
+    drives_affected = []
+    for drive in ("coherence", "care", "growth", "honesty"):
+        trend = report.get("trends", {}).get(drive, 0.0)
+        mean = report.get("mean_alignment", {}).get(drive, 0.5)
+        if trend < -0.001 or mean < 0.1:
+            drives_affected.append(drive)
+
+    from systems.synapse.types import SynapseEvent, SynapseEventType
+
+    try:
+        await bus.emit(SynapseEvent(
+            event_type=SynapseEventType.CONSTITUTIONAL_DRIFT_DETECTED,
+            source_system="equor",
+            data={
+                "drift_severity": severity,
+                "drift_direction": report.get("drift_direction", "unknown"),
+                "mean_alignment": report.get("mean_alignment", {}),
+                "response_action": action,
+                "drives_affected": drives_affected,
+            },
+        ))
+        logger.info(
+            "constitutional_drift_event_emitted",
+            severity=severity,
+            action=action,
+            drives_affected=drives_affected,
+        )
+    except Exception as exc:
+        logger.warning("constitutional_drift_event_emit_failed", error=str(exc))
+
+    # SG1: Escalate to Thymos as an incident when drift is severe (≥0.7).
+    # Thymos classifies constitutional drift as a T3/T4-tier integrity breach.
+    # Spec §7 — drift precariousness must be real, not just logged.
+    if severity >= 0.7:
+        try:
+            incident_id = new_id()
+            await bus.emit(SynapseEvent(
+                event_type=SynapseEventType.INCIDENT_DETECTED,
+                source_system="equor",
+                data={
+                    "incident_id": incident_id,
+                    "incident_class": "constitutional_drift",
+                    "severity": "high" if severity < 0.9 else "critical",
+                    "source_system": "equor",
+                    "description": (
+                        f"Constitutional drift severity {severity:.2f}: "
+                        f"{report.get('drift_direction', 'unknown')}. "
+                        f"Drives affected: {', '.join(drives_affected) or 'none identified'}."
+                    ),
+                },
+            ))
+            logger.warning(
+                "constitutional_drift_escalated_to_thymos",
+                incident_id=incident_id,
+                severity=severity,
+            )
+        except Exception as exc:
+            logger.warning("constitutional_drift_thymos_escalation_failed", error=str(exc))

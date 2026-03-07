@@ -1,12 +1,13 @@
 """
 EcodiaOS — Nova Intent Router
 
-Once Equor approves an Intent, Nova routes it to the appropriate executor.
+Once Equor approves an Intent, Nova routes it to the appropriate executor
+via Synapse events — no direct cross-system references are held.
 
 Current routing:
-  - Expression intents → Voxis (via VoxisService.express())
-  - Action intents     → Axon (via AxonService.execute())
-  - Hybrid intents     → Axon first, then express outcome via Voxis
+  - Expression intents → NOVA_EXPRESSION_REQUEST event → Voxis subscribes
+  - Action intents     → AXON_EXECUTION_REQUEST event  → Axon subscribes
+  - Hybrid intents     → Axon first, then Voxis (both via events)
   - Internal intents   → no external delivery (memory/goal updates only)
 
 Routing classification is based on the executor field of the first action step:
@@ -26,12 +27,13 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from systems.synapse.types import SynapseEvent, SynapseEventType
+
 if TYPE_CHECKING:
     from primitives.affect import AffectState
     from primitives.constitutional import ConstitutionalCheck
     from primitives.intent import Intent
-    from systems.axon.service import AxonService
-    from systems.voxis.service import VoxisService
+    from systems.synapse.event_bus import EventBus
     from systems.voxis.types import ExpressionTrigger
 
 logger = structlog.get_logger()
@@ -46,29 +48,19 @@ _INTERNAL_EXECUTORS = {
 
 class IntentRouter:
     """
-    Routes approved intents to their appropriate executor system.
+    Routes approved intents to their appropriate executor system via Synapse events.
 
-    Supports Voxis (expression) and Axon (action) routing.
-    Internal intents (observe, wait, store) require no external delivery.
-    Hybrid intents execute in Axon first, then express the outcome via Voxis.
+    Voxis subscribes to NOVA_EXPRESSION_REQUEST.
+    Axon subscribes to AXON_EXECUTION_REQUEST.
+    No live service references are held — all routing is bus-mediated.
     """
 
-    def __init__(
-        self,
-        voxis: VoxisService,
-        axon: AxonService | None = None,
-    ) -> None:
-        self._voxis = voxis
-        self._axon = axon
+    def __init__(self, event_bus: EventBus) -> None:
+        self._bus = event_bus
         self._logger = logger.bind(system="nova.intent_router")
         self._routed_to_voxis: int = 0
         self._routed_to_axon: int = 0
         self._routed_internal: int = 0
-
-    def set_axon(self, axon: AxonService) -> None:
-        """Wire Axon after both services are initialised."""
-        self._axon = axon
-        self._logger.info("axon_wired", system="nova.intent_router")
 
     async def route(
         self,
@@ -78,13 +70,13 @@ class IntentRouter:
         equor_check: ConstitutionalCheck | None = None,
     ) -> str:
         """
-        Route an approved intent to its executor.
+        Route an approved intent to its executor via Synapse events.
 
         Returns the route taken: "voxis" | "axon" | "internal" | "hybrid"
 
         Args:
             equor_check: The Equor verdict that approved this intent.
-                         Required for Axon routing (passed into ExecutionRequest).
+                         Required for Axon routing (embedded in the event payload).
         """
         route = _classify_route(intent)
 
@@ -95,7 +87,7 @@ class IntentRouter:
             await self._route_to_axon(intent, equor_check)
             self._routed_to_axon += 1
         elif route == "hybrid":
-            # Execute in Axon first, then express the result via Voxis
+            # Axon first, then Voxis — both via bus events
             await self._route_to_axon(intent, equor_check)
             self._routed_to_axon += 1
             await self._route_to_voxis(intent, affect, conversation_id)
@@ -129,32 +121,30 @@ class IntentRouter:
         affect: AffectState,
         conversation_id: str | None,
     ) -> None:
-        """
-        Extract the expression content from the intent and deliver via Voxis.
-        """
-
-        # Extract the expression content from the first express action step
-        content = intent.goal.description  # Default to goal description
+        """Emit NOVA_EXPRESSION_REQUEST — Voxis subscribes and handles expression."""
+        content = intent.goal.description
         for step in intent.plan.steps:
-            params = step.parameters
-            if "description" in params:
-                content = str(params["description"])
+            if "description" in step.parameters:
+                content = str(step.parameters["description"])
                 break
 
-        # Determine the appropriate Voxis trigger from the intent context
         trigger = _classify_voxis_trigger(intent)
 
         try:
-            await self._voxis.express(
-                content=content,
-                trigger=trigger,
-                conversation_id=conversation_id,
-                affect=affect,
-                urgency=intent.priority,
-            )
+            await self._bus.emit(SynapseEvent(
+                event_type=SynapseEventType.NOVA_EXPRESSION_REQUEST,
+                data={
+                    "intent_id": intent.id,
+                    "content": content,
+                    "trigger": trigger.value if hasattr(trigger, "value") else str(trigger),
+                    "conversation_id": conversation_id,
+                    "affect": affect.model_dump() if affect is not None else None,
+                    "urgency": intent.priority,
+                },
+            ))
         except Exception as exc:
             self._logger.error(
-                "voxis_routing_failed",
+                "voxis_event_emit_failed",
                 intent_id=intent.id,
                 error=str(exc),
             )
@@ -165,46 +155,32 @@ class IntentRouter:
         equor_check: ConstitutionalCheck | None,
     ) -> None:
         """
-        Route an action intent to Axon for execution.
+        Emit AXON_EXECUTION_REQUEST — Axon subscribes and executes.
 
-        Builds an ExecutionRequest and calls AxonService.execute().
-        The outcome is delivered to Nova by Axon's pipeline directly —
-        this method fire-and-forgets (does not await the full execution).
+        Security default: if no equor_check is provided, embeds a BLOCKED
+        verdict so Axon's Stage 0 gate rejects the request.
         """
-        if self._axon is None:
-            self._logger.warning(
-                "axon_not_wired",
-                intent_id=intent.id,
-                goal=intent.goal.description[:80],
-                message="Axon not wired — intent cannot be executed",
-            )
-            return
-
         from primitives.common import Verdict
         from primitives.constitutional import ConstitutionalCheck
-        from systems.axon.types import ExecutionRequest
 
-        # Security default: BLOCKED if no equor_check provided.
-        # Intents should always carry a real Equor check from the deliberation
-        # engine.  The BLOCKED default prevents bypass if route() is called
-        # without going through the full deliberation pipeline.
         check = equor_check or ConstitutionalCheck(
             intent_id=intent.id,
             verdict=Verdict.BLOCKED,
             reasoning="No Equor check provided — blocked by security default.",
         )
 
-        request = ExecutionRequest(
-            intent=intent,
-            equor_check=check,
-            timeout_ms=intent.budget.compute_ms,
-        )
-
         try:
-            await self._axon.execute(request)
+            await self._bus.emit(SynapseEvent(
+                event_type=SynapseEventType.AXON_EXECUTION_REQUEST,
+                data={
+                    "intent": intent.model_dump(),
+                    "equor_check": check.model_dump(),
+                    "timeout_ms": intent.budget.compute_ms,
+                },
+            ))
         except Exception as exc:
             self._logger.error(
-                "axon_routing_failed",
+                "axon_event_emit_failed",
                 intent_id=intent.id,
                 error=str(exc),
             )

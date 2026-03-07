@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import time
 from datetime import datetime
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -466,6 +467,15 @@ class PlatformConnector(ABC):
                 result = await self.refresh_token()
                 if not result.success or result.token_set is None:
                     self._logger.warning("auto_refresh_failed", error=result.error)
+                    # Token is expired and refresh failed — emit on Synapse so
+                    # Thymos/Identity can trigger re-authentication flow.
+                    await self._emit_event(
+                        "connector_token_expired",
+                        {
+                            "platform_id": self.platform_id,
+                            "error": result.error or "refresh_failed",
+                        },
+                    )
                     return None
                 token_set = result.token_set
 
@@ -599,7 +609,7 @@ class PlatformConnector(ABC):
         return report
 
     async def _emit_degraded(self) -> None:
-        """Emit SYSTEM_DEGRADED so Thymos can quarantine this connector."""
+        """Emit CONNECTOR_ERROR + SYSTEM_DEGRADED so Thymos can quarantine this connector."""
         creds = self._credentials
         connector_id = creds.connector_id if creds else f"{self.platform_id}:unconfigured"
 
@@ -615,6 +625,19 @@ class PlatformConnector(ABC):
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
+            error_payload = {
+                "platform_id": self.platform_id,
+                "connector_id": connector_id,
+                "consecutive_health_failures": self._consecutive_health_failures,
+                "error": "health_check_threshold_exceeded",
+            }
+            # CONNECTOR_ERROR — tracked by observatory spec_checker
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.CONNECTOR_ERROR,
+                source_system="identity",
+                data=error_payload,
+            ))
+
             event = SynapseEvent(
                 event_type=SynapseEventType.SYSTEM_DEGRADED,
                 source_system="identity",
@@ -628,6 +651,58 @@ class PlatformConnector(ABC):
             await self._event_bus.emit(event)
         except Exception as exc:
             self._logger.warning("degraded_event_emit_failed", error=str(exc))
+
+    # ─── Evo Signal Helpers ──────────────────────────────────────────
+
+    def _start_timer(self) -> float:
+        """Return a monotonic start timestamp for latency measurement."""
+        return time.monotonic()
+
+    async def _emit_re_training_example(
+        self,
+        operation: str,
+        outcome: str,
+        start_time: float,
+        error_type: str = "",
+    ) -> None:
+        """
+        Emit RE_TRAINING_EXAMPLE after every connector operation.
+
+        Called by concrete implementations after exchange_code(), refresh_token(),
+        revoke(), and check_health() to feed connector reliability data into the
+        RE training pipeline and Evo hypothesis engine.
+
+        Args:
+            operation:  Name of the operation (e.g. "exchange_code", "refresh_token").
+            outcome:    "success" or "failure".
+            start_time: Monotonic timestamp from _start_timer() before the call.
+            error_type: Exception class name or HTTP status on failure (empty on success).
+        """
+        if self._event_bus is None:
+            return
+
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        creds = self._credentials
+        connector_id = creds.connector_id if creds else f"{self.platform_id}:unconfigured"
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            event = SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                source_system="identity",
+                data={
+                    "connector_id": connector_id,
+                    "platform_id": self.platform_id,
+                    "operation": operation,
+                    "outcome": outcome,
+                    "latency_ms": latency_ms,
+                    "error_type": error_type,
+                },
+            )
+            await self._event_bus.emit(event)
+        except Exception as exc:
+            self._logger.debug("re_training_emit_failed", operation=operation, error=str(exc))
 
     # ─── Event Emission ──────────────────────────────────────────────
 

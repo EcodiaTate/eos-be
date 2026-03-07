@@ -77,6 +77,11 @@ class EmotionDetector:
     NOT a classifier — multiple emotions can be simultaneously active.
     The organism can feel anxious AND curious at the same time if both
     region patterns match.
+
+    Learnable mappings: each emotion can be linked to an Evo hypothesis ID.
+    When HYPOTHESIS_CONFIRMED/REFUTED events arrive, the detector updates
+    the corresponding region's pattern. Falls back to hardcoded defaults
+    when no Evo hypothesis exists for a mapping.
     """
 
     def __init__(
@@ -86,12 +91,37 @@ class EmotionDetector:
         significant_threshold: float = _SIGNIFICANT_THRESHOLD,
     ) -> None:
         self._regions = dict(emotion_regions or EMOTION_REGIONS)
+        self._default_regions = dict(emotion_regions or EMOTION_REGIONS)
         self._near_zero = near_zero_threshold
         self._significant = significant_threshold
+        # Maps emotion name → Evo hypothesis ID for learnable region updates
+        self._emotion_hypothesis_ids: dict[str, str] = {}
 
     def update_regions(self, updated: dict[str, dict[str, Any]]) -> None:
         """Evo refines emotion region boundaries."""
         self._regions.update(updated)
+
+    def link_hypothesis(self, emotion_name: str, hypothesis_id: str) -> None:
+        """Link an emotion region to an Evo hypothesis for learnable adaptation."""
+        self._emotion_hypothesis_ids[emotion_name] = hypothesis_id
+
+    def on_hypothesis_confirmed(self, hypothesis_id: str, updated_pattern: dict[str, str] | None = None) -> None:
+        """An Evo hypothesis was confirmed — reinforce the linked emotion region.
+
+        If updated_pattern is provided, apply it to the linked region.
+        Otherwise keep the current pattern (confirmation = current is good).
+        """
+        for emotion_name, hyp_id in self._emotion_hypothesis_ids.items():
+            if hyp_id == hypothesis_id and updated_pattern and emotion_name in self._regions:
+                self._regions[emotion_name]["pattern"] = updated_pattern
+                logger.info("emotion_region_confirmed", emotion=emotion_name, hypothesis_id=hypothesis_id)
+
+    def on_hypothesis_refuted(self, hypothesis_id: str) -> None:
+        """An Evo hypothesis was refuted — revert to hardcoded default for the linked region."""
+        for emotion_name, hyp_id in self._emotion_hypothesis_ids.items():
+            if hyp_id == hypothesis_id and emotion_name in self._default_regions:
+                self._regions[emotion_name] = dict(self._default_regions[emotion_name])
+                logger.info("emotion_region_reverted", emotion=emotion_name, hypothesis_id=hypothesis_id)
 
     def detect(
         self,

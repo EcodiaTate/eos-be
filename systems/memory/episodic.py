@@ -70,7 +70,10 @@ async def store_episode(
             access_count: 0,
             free_energy: $free_energy,
             somatic_vector: $somatic_vector,
-            somatic_marker_json: $somatic_marker_json
+            somatic_marker_json: $somatic_marker_json,
+            novelty_score: $novelty_score,
+            context_summary: $context_summary,
+            is_correction: $is_correction
         })
         """,
         {
@@ -93,6 +96,9 @@ async def store_episode(
             "free_energy": episode.free_energy,
             "somatic_vector": somatic_vector,
             "somatic_marker_json": somatic_marker_json,
+            "novelty_score": episode.novelty_score,
+            "context_summary": episode.context_summary,
+            "is_correction": episode.is_correction,
         },
     )
 

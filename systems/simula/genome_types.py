@@ -178,6 +178,13 @@ class SimulaGenome(Identified, Timestamped):
     evolution_velocity: float = 0.0  # proposals per day at extraction time
     config_version_at_extraction: int = 0
 
+    # Enriched genome segments (Task 9)
+    dafny_specifications: list[dict[str, Any]] = Field(default_factory=list)
+    lean_lemma_catalog: list[dict[str, Any]] = Field(default_factory=list)
+    reasoning_router_weights: dict[str, dict[str, float]] = Field(default_factory=dict)
+    proof_search_heuristics: dict[str, Any] = Field(default_factory=dict)
+    inspector_confidence_calibration: list[dict[str, Any]] = Field(default_factory=list)
+
     # Compression
     compression_method: str = "zlib"
     genome_size_bytes: int = 0

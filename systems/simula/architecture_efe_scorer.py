@@ -90,10 +90,12 @@ class ArchitectureEFEScorer:
         history: EvolutionHistoryManager | None = None,
         analytics: EvolutionAnalyticsEngine | None = None,
         complexity_penalty_weight: float = _DEFAULT_COMPLEXITY_PENALTY_WEIGHT,
+        auto_approve_efe_threshold: float = _AUTO_APPROVE_EFE_THRESHOLD,
     ) -> None:
         self._history = history
         self._analytics = analytics
         self._penalty_weight = complexity_penalty_weight
+        self._auto_approve_threshold = auto_approve_efe_threshold
         self._log = logger
 
         # Calibration state: running mean of EFE prediction errors
@@ -151,11 +153,21 @@ class ArchitectureEFEScorer:
             ),
         )
 
+        # Confidence interval: wider when calibration data is sparse.
+        # σ decreases as calibration_count grows; ±1.5σ gives ~86% coverage.
+        # At 0 observations σ ≈ 0.5 (full uncertainty); at 50+ σ < 0.1 (tight).
+        _sigma = max(0.05, 0.5 / (1.0 + self._calibration_count * 0.04))
+        _ci_half = 1.5 * _sigma
+
         self._log.info(
             "proposal_efe_scored",
             proposal_id=proposal.id,
             category=proposal.category.value,
             efe=efe_penalised,
+            efe_ci_lower=round(efe_penalised - _ci_half, 4),
+            efe_ci_upper=round(efe_penalised + _ci_half, 4),
+            efe_ci_sigma=round(_sigma, 4),
+            efe_calibration_n=self._calibration_count,
             pragmatic=pragmatic,
             epistemic=epistemic,
             complexity=complexity,
@@ -590,7 +602,7 @@ class ArchitectureEFEScorer:
         - Confidence is at least 0.6
         """
         return (
-            breakdown.efe_penalised <= _AUTO_APPROVE_EFE_THRESHOLD
+            breakdown.efe_penalised <= self._auto_approve_threshold
             and breakdown.confidence >= 0.6
         )
 
@@ -602,5 +614,5 @@ class ArchitectureEFEScorer:
             "penalty_weight": self._penalty_weight,
             "calibration_bias": round(self._calibration_bias, 4),
             "calibration_count": self._calibration_count,
-            "auto_approve_threshold": _AUTO_APPROVE_EFE_THRESHOLD,
+            "auto_approve_threshold": self._auto_approve_threshold,
         }

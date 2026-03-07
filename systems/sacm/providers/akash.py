@@ -42,9 +42,21 @@ _HOURS_PER_MONTH: float = 730.0
 _SECONDS_PER_HOUR: int = 3600
 _SECONDS_PER_MONTH: float = _HOURS_PER_MONTH * _SECONDS_PER_HOUR
 
-# Initial AKT/USD rate — used only until the first successful CoinGecko fetch.
+# Initial AKT/USD rate — used until the first successful CoinGecko fetch.
 # This is the March 2026 approximate rate; updated on every successful refresh.
 _INITIAL_AKT_USD: float = 3.80
+
+# Hardcoded fallback pricing (USD/second) used when the Akash API is unavailable
+# on first startup (no live data yet). These reflect approximate March 2026 rates.
+# CPU: ~$0.001/vCPU-hour → per second
+_FALLBACK_CPU_USD_S: float = 0.001 / 3600.0
+# Memory: ~$0.0003/GiB-hour → per second
+_FALLBACK_MEM_USD_S: float = 0.0003 / 3600.0
+# GPU: ~$0.001/GPU-hour → per second (conservative; actual GPU costs are higher
+# for A100-class — this ensures offers appear in the pricing surface at startup)
+_FALLBACK_GPU_USD_S: float = 0.001 / 3600.0
+# Storage: ~$0.00001/GiB-hour → per second
+_FALLBACK_STO_USD_S: float = 0.00001 / 3600.0
 
 # Egress is included in Akash leases (not separately billed), but we model
 # a nominal cost so the optimizer can compare against providers that do charge.
@@ -101,8 +113,11 @@ class SACMAkashProvider(SubstrateProvider):
         Query the Akash Console API for current market pricing and return
         SubstrateOffers for CPU and GPU tiers.
 
-        Returns an empty list if the API is unreachable or returns
-        invalid data — never raises.
+        On API failure or first-startup unavailability, returns fallback offers
+        using hardcoded conservative default rates so the optimizer always has
+        Akash as a candidate rather than silently dropping it from the surface.
+        Fallback offers are marked with metadata.pricing_source = 'fallback'.
+        Never raises.
         """
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout) as client:
@@ -113,7 +128,7 @@ class SACMAkashProvider(SubstrateProvider):
                         status=resp.status_code,
                         body=resp.text[:200],
                     )
-                    return []
+                    return self._fallback_offers()
 
                 data = resp.json()
 
@@ -125,7 +140,7 @@ class SACMAkashProvider(SubstrateProvider):
 
                 if cpu_uakt == 0:
                     self._log.warning("akash_pricing_missing_cpu_field")
-                    return []
+                    return self._fallback_offers()
 
                 # Refresh AKT/USD exchange rate (best-effort)
                 await self._refresh_akt_price(client)
@@ -229,7 +244,7 @@ class SACMAkashProvider(SubstrateProvider):
 
         except Exception as exc:
             self._log.error("akash_fetch_offers_failed", error=str(exc))
-            return []
+            return self._fallback_offers()
 
     async def health(self) -> SubstrateProviderStatus:
         """Check Akash Console API reachability."""
@@ -245,6 +260,55 @@ class SACMAkashProvider(SubstrateProvider):
             return SubstrateProviderStatus.UNREACHABLE
 
     # ── Internal helpers ──────────────────────────────────────────
+
+    def _fallback_offers(self) -> list[SubstrateOffer]:
+        """
+        Return conservative hardcoded SubstrateOffers for use when the
+        Akash Console API is unavailable (first startup or sustained outage).
+
+        These rates ensure Akash always appears in the optimizer's pricing
+        surface rather than being silently absent, which would cause the
+        optimizer to over-index on other providers. Marked with
+        metadata.pricing_source = 'fallback' so callers can treat them
+        with lower trust if desired.
+        """
+        now = utc_now()
+        valid_until = now + self._offer_ttl
+        return [
+            SubstrateOffer(
+                provider_id="akash",
+                provider_name="Akash Network",
+                region="decentralised",
+                supported_classes=[
+                    OffloadClass.GENERAL,
+                    OffloadClass.CPU_BOUND,
+                    OffloadClass.MEMORY_INTENSIVE,
+                    OffloadClass.IO_BOUND,
+                ],
+                max_cpu_vcpu=32.0,
+                max_memory_gib=64.0,
+                max_gpu_units=0.0,
+                gpu_vram_gib=0.0,
+                max_storage_gib=512.0,
+                price_cpu_per_vcpu_s=_FALLBACK_CPU_USD_S,
+                price_mem_per_gib_s=_FALLBACK_MEM_USD_S,
+                price_gpu_per_unit_s=0.0,
+                price_storage_per_gib_s=_FALLBACK_STO_USD_S,
+                price_egress_per_gib=_NOMINAL_EGRESS_USD_PER_GIB,
+                status=SubstrateProviderStatus.DEGRADED,
+                valid_until=valid_until,
+                trust_score=0.60,
+                avg_latency_overhead_s=15.0,
+                currency_native="uAKT",
+                price_native_per_hour=0.0,
+                exchange_rate_to_usd=self._cached_akt_usd / _UAKT_PER_AKT,
+                metadata={
+                    "tier": "cpu",
+                    "pricing_source": "fallback",
+                    "akt_usd_rate": str(round(self._cached_akt_usd, 4)),
+                },
+            ),
+        ]
 
     @staticmethod
     def _native_hourly(
