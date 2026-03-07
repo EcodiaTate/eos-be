@@ -182,8 +182,9 @@ def run_training(dataset_path: Path) -> Path:
     """
     import torch
     from datasets import Dataset
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
     from trl import SFTTrainer, SFTConfig
-    from unsloth import FastLanguageModel
 
     TRAINING_STATE["phase"] = "loading_model"
     print(f"[EOS] Loading base model: {BASE_MODEL}")
@@ -200,38 +201,34 @@ def run_training(dataset_path: Path) -> Path:
     warmup_ratio = TRAINING_ARGS.get("warmup_ratio", 0.03)
     weight_decay = TRAINING_ARGS.get("weight_decay", 0.01)
 
-    # Load model with Unsloth (2x faster, 60% less memory)
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=BASE_MODEL,
-        max_seq_length=max_seq_len,
-        dtype=None,  # auto-detect (float16 on most GPUs)
+    # Load model in 4-bit quantization
+    bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        bnb_4bit_use_double_quant=True,
     )
-
-    # Qwen3 uses <|im_end|> as EOS — patch tokenizer before Unsloth PEFT setup
-    # so get_peft_model(use_gradient_checkpointing="unsloth") doesn't try <EOS_TOKEN>
-    qwen3_eos = "<|im_end|>"
-    if qwen3_eos in tokenizer.get_vocab():
-        tokenizer.eos_token = qwen3_eos
-    if tokenizer.pad_token is None or tokenizer.pad_token not in tokenizer.get_vocab():
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Apply LoRA adapters — either load from an existing adapter (BASE_ADAPTER, e.g. DPO
-    # output) or initialize fresh LoRA weights. CLoRA orthogonalization is applied in
-    # both cases if PREVIOUS_ADAPTER_PATH is set (always the slow EMA adapter).
+    model = prepare_model_for_kbit_training(model)
+
+    # Apply LoRA adapters
     if BASE_ADAPTER and os.path.exists(BASE_ADAPTER):
-        # Load from DPO-tuned adapter as training starting point
-        from peft import PeftModel
         model = PeftModel.from_pretrained(model, BASE_ADAPTER, is_trainable=True)
         print(f"[EOS] Loaded DPO base adapter from: {BASE_ADAPTER}")
-        # Apply CLoRA to the loaded adapter's lora_A matrices so new directions
-        # are orthogonal to the slow adapter's accumulated history.
         if PREVIOUS_ADAPTER_PATH and os.path.exists(PREVIOUS_ADAPTER_PATH):
             _apply_clora_init(model, PREVIOUS_ADAPTER_PATH)
             print(f"[EOS] CLoRA orthogonalization applied (on DPO base) from: {PREVIOUS_ADAPTER_PATH}")
     else:
-        model = FastLanguageModel.get_peft_model(
-            model,
+        lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
@@ -240,10 +237,10 @@ def run_training(dataset_path: Path) -> Path:
                 "gate_proj", "up_proj", "down_proj",
             ],
             bias="none",
-            use_gradient_checkpointing=True,
+            task_type="CAUSAL_LM",
         )
-        # CLoRA (ACL 2025): initialize new LoRA A matrices in the null space of
-        # the previous adapter directions — prevents interference with learned features.
+        model = get_peft_model(model, lora_config)
+        model.gradient_checkpointing_enable()
         if PREVIOUS_ADAPTER_PATH and os.path.exists(PREVIOUS_ADAPTER_PATH):
             _apply_clora_init(model, PREVIOUS_ADAPTER_PATH)
             print(f"[EOS] CLoRA init applied from: {PREVIOUS_ADAPTER_PATH}")
@@ -324,7 +321,6 @@ def run_training(dataset_path: Path) -> Path:
         seed=42,
         report_to="wandb" if os.environ.get("WANDB_API_KEY") else "none",
         max_length=max_seq_len,
-        dataset_text_field="text",
     )
 
     # Custom callback for progress tracking
@@ -340,18 +336,6 @@ def run_training(dataset_path: Path) -> Path:
 
     TRAINING_STATE["phase"] = "training"
     print("[EOS] Starting LoRA fine-tuning...")
-
-    # Unsloth/get_peft_model can set tokenizer.pad_token / eos_token to
-    # sentinel strings that aren't in the vocab. TRL's SFTTrainer.__init__
-    # validates these via convert_tokens_to_ids and crashes.
-    # Fix: force-set pad_token to a real vocab token by ID, not by string.
-    eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    if eos_id is None or eos_id == tokenizer.unk_token_id:
-        eos_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
-    tokenizer.eos_token_id = eos_id
-    tokenizer.eos_token = tokenizer.convert_ids_to_tokens(eos_id)
-    tokenizer.pad_token_id = eos_id
-    tokenizer.pad_token = tokenizer.eos_token
 
     trainer = SFTTrainer(
         model=model,
