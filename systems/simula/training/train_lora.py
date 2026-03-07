@@ -208,10 +208,12 @@ def run_training(dataset_path: Path) -> Path:
         load_in_4bit=True,
     )
 
-    # Qwen3 uses <|endoftext|> as EOS — ensure tokenizer reflects this
-    if tokenizer.eos_token is None or tokenizer.eos_token not in tokenizer.get_vocab():
-        tokenizer.eos_token = "<|endoftext|>"
-    if tokenizer.pad_token is None:
+    # Qwen3 uses <|im_end|> as EOS — patch tokenizer before Unsloth PEFT setup
+    # so get_peft_model(use_gradient_checkpointing="unsloth") doesn't try <EOS_TOKEN>
+    qwen3_eos = "<|im_end|>"
+    if qwen3_eos in tokenizer.get_vocab():
+        tokenizer.eos_token = qwen3_eos
+    if tokenizer.pad_token is None or tokenizer.pad_token not in tokenizer.get_vocab():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Apply LoRA adapters — either load from an existing adapter (BASE_ADAPTER, e.g. DPO
