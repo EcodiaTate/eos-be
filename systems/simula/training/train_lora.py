@@ -341,14 +341,17 @@ def run_training(dataset_path: Path) -> Path:
     TRAINING_STATE["phase"] = "training"
     print("[EOS] Starting LoRA fine-tuning...")
 
-    # Unsloth/get_peft_model can overwrite tokenizer.eos_token and pad_token
-    # with sentinels like "<|PAD_TOKEN|>" that don't exist in the vocab.
-    # Re-assert valid tokens right before SFTTrainer so TRL's validation passes.
-    vocab = tokenizer.get_vocab()
-    if tokenizer.eos_token not in vocab:
-        tokenizer.eos_token = "<|im_end|>" if "<|im_end|>" in vocab else "<|endoftext|>"
-    if tokenizer.pad_token is None or tokenizer.pad_token not in vocab:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Unsloth/get_peft_model can set tokenizer.pad_token / eos_token to
+    # sentinel strings that aren't in the vocab. TRL's SFTTrainer.__init__
+    # validates these via convert_tokens_to_ids and crashes.
+    # Fix: force-set pad_token to a real vocab token by ID, not by string.
+    eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if eos_id is None or eos_id == tokenizer.unk_token_id:
+        eos_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    tokenizer.eos_token_id = eos_id
+    tokenizer.eos_token = tokenizer.convert_ids_to_tokens(eos_id)
+    tokenizer.pad_token_id = eos_id
+    tokenizer.pad_token = tokenizer.eos_token
 
     trainer = SFTTrainer(
         model=model,
