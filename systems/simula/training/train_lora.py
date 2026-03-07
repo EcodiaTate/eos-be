@@ -341,6 +341,12 @@ def run_training(dataset_path: Path) -> Path:
     TRAINING_STATE["phase"] = "training"
     print("[EOS] Starting LoRA fine-tuning...")
 
+    # TRL ≥0.16 hardcodes an "<EOS_TOKEN>" sentinel and validates it against
+    # the tokenizer vocab. Bypass by adding it as an alias for the real EOS
+    # token (no new embedding — just a vocab entry pointing to the same ID).
+    if "<EOS_TOKEN>" not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": ["<EOS_TOKEN>"]})
+
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
