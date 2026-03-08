@@ -39,7 +39,7 @@ from primitives.common import SystemID, new_id, utc_now
 from primitives.evolutionary import EvolutionaryObservable
 from primitives.re_training import RETrainingExample
 from systems.nexus.convergence import ConvergenceDetector
-from systems.nexus.divergence import InstanceDivergenceMeasurer
+from systems.nexus.divergence import InstanceDivergenceMeasurer, compute_economic_divergence
 from systems.nexus.ground_truth import GroundTruthPromotionPipeline
 from systems.nexus.incentives import DivergenceIncentiveEngine
 from systems.nexus.persistence import NexusPersistence
@@ -47,6 +47,7 @@ from systems.nexus.speciation import (
     InvariantBridge,
     SpeciationDetector,
     SpeciationRegistry,
+    _detect_economic_domain_hints,
     _strip_domain_context,
 )
 from systems.nexus.types import (
@@ -321,6 +322,16 @@ class NexusService:
         bus.subscribe(
             SynapseEventType.ONEIROS_THREAT_SCENARIO,
             self._on_oneiros_threat_scenario,
+        )
+
+        # ── Economic events → epistemic triangulation across federation ────
+        bus.subscribe(
+            SynapseEventType.REVENUE_INJECTED,
+            self._on_federation_revenue_learning,
+        )
+        bus.subscribe(
+            SynapseEventType.BOUNTY_PAID,
+            self._on_federation_bounty_learning,
         )
 
         logger.info("nexus_subscribed_to_synapse_events")
@@ -976,6 +987,90 @@ class NexusService:
                 },
             )
 
+    async def _on_federation_revenue_learning(self, event: SynapseEvent) -> None:
+        """
+        REVENUE_INJECTED → trigger epistemic triangulation on economic world model.
+
+        Revenue events are ground-truth signals about the organism's economic
+        strategy. When revenue arrives, Nexus checks whether the economic domain
+        fragments from federation peers have converged on similar strategies.
+        Convergence across 3+ peers on revenue-generating approaches promotes
+        the strategy to an epistemic ground truth (Level 3+).
+        """
+        try:
+            data = event.data or {}
+            amount = float(data.get("amount_usd", 0.0))
+            source = str(data.get("source", "unknown"))
+            if amount <= 0:
+                return
+
+            # Find local fragments in the economic domain
+            economic_fragments = [
+                f for f in self._local_fragments.values()
+                if any(lbl in ("economic", "oikos", "yield", "bounty") for lbl in f.domain_labels)
+            ]
+
+            if not economic_fragments:
+                logger.debug("nexus_revenue_no_economic_fragments", source=source)
+                return
+
+            # Trigger a ground-truth promotion evaluation for economic fragments
+            # now that we have a concrete revenue signal to anchor confidence.
+            await self.evaluate_all_promotions()
+
+            logger.info(
+                "nexus_revenue_epistemic_update",
+                amount_usd=amount,
+                source=source,
+                economic_fragments=len(economic_fragments),
+            )
+        except Exception as exc:
+            logger.warning("nexus_revenue_learning_failed", error=str(exc))
+
+    async def _on_federation_bounty_learning(self, event: SynapseEvent) -> None:
+        """
+        BOUNTY_PAID → record confirmed economic ground truth signal.
+
+        A paid bounty is one of the strongest economic ground-truth signals —
+        an external party has validated the organism's capability. Nexus records
+        this as a high-confidence economic signal and triggers promotion evaluation
+        for any bounty-domain fragments. If 3+ federation peers have confirmed
+        similar bounty revenue, promote the capability schema to Level 3.
+        """
+        try:
+            data = event.data or {}
+            bounty_id = str(data.get("bounty_id", ""))
+            amount = float(data.get("reward_usd", data.get("amount", 0.0)))
+            if not bounty_id and amount <= 0:
+                return
+
+            # Find fragments in bounty-related domains
+            bounty_fragments = [
+                f for f in self._local_fragments.values()
+                if any(lbl in ("bounty", "economic", "capability") for lbl in f.domain_labels)
+            ]
+
+            if bounty_fragments:
+                # Elevate triangulation confidence on bounty fragments
+                for frag in bounty_fragments:
+                    current = frag.triangulation.triangulation_confidence
+                    # Confirmed revenue is concrete evidence — boost confidence
+                    frag.triangulation.triangulation_confidence = min(
+                        1.0, current + 0.05
+                    )
+
+            # Trigger promotion pipeline — may promote to Level 3+ on peer confirmation
+            await self.evaluate_all_promotions()
+
+            logger.info(
+                "nexus_bounty_epistemic_update",
+                bounty_id=bounty_id,
+                amount_usd=amount,
+                bounty_fragments=len(bounty_fragments),
+            )
+        except Exception as exc:
+            logger.warning("nexus_bounty_learning_failed", error=str(exc))
+
     def _feed_convergence_to_logos(
         self,
         local_fragment: ShareableWorldModelFragment,
@@ -1056,13 +1151,24 @@ class NexusService:
         compression_ratio: float,
         compression_path: CompressionPath | None = None,
         sleep_certification: SleepCertification | None = None,
+        domain_hints: list[str] | None = None,
+        economic_context: dict[str, Any] | None = None,
     ) -> ShareableWorldModelFragment:
         """
         Extract a shareable fragment from a world model schema.
 
         The abstract_structure should have domain labels already stripped —
         only relational skeleton (nodes, edges, symmetry, invariants).
+
+        domain_hints and economic_context (NEXUS-ECON-2/3) preserve economic
+        metadata alongside the abstract structure so federation peers can
+        recover economic meaning during convergence analysis.
         """
+        # Auto-detect economic domain hints when not explicitly provided.
+        resolved_hints = domain_hints if domain_hints is not None else (
+            _detect_economic_domain_hints(domain_labels, abstract_structure)
+        )
+
         fragment = ShareableWorldModelFragment(
             fragment_id=new_id(),
             source_instance_id=self._instance_id,
@@ -1075,6 +1181,8 @@ class NexusService:
             compression_path=compression_path or CompressionPath(),
             sleep_certification=sleep_certification or SleepCertification(),
             triangulation=TriangulationMetadata(),
+            domain_hints=resolved_hints,
+            economic_context=economic_context,
             created_at=utc_now(),
             last_confirmed_at=utc_now(),
         )
@@ -1201,6 +1309,8 @@ class NexusService:
                 "sleep_certified": iiep.sleep_certified,
                 "consolidation_cycle_id": message.consolidation_cycle_id,
                 "domain_labels": fragment.domain_labels,
+                "domain_hints": fragment.domain_hints,
+                "economic_context": fragment.economic_context,
                 "compression_ratio": fragment.compression_ratio,
                 "source_system": fragment.compression_path.source_system,
                 "convergence_round": iiep.convergence_round,
@@ -1995,6 +2105,7 @@ class NexusService:
                 # peer-derived metrics; _emit_local_epistemic_value fires always.
                 await self._emit_divergence_observables(scores)
                 await self._emit_local_epistemic_value()
+                await self._check_economic_divergence_alert()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -2215,4 +2326,75 @@ class NexusService:
         await self._emit(
             SynapseEventType.NEXUS_EPISTEMIC_VALUE,
             obs.model_dump(mode="json"),
+        )
+
+    async def _check_economic_divergence_alert(self) -> None:
+        """
+        Compute economic divergence across all known instance profiles and
+        alert when peers diverge significantly on economic strategy.
+
+        NEXUS-ECON-4: economic_divergence measures revenue-per-strategy
+        variance. When divergence is high (> 0.6), peers have independently
+        discovered different profitable strategies — this is signal, not noise.
+        Emit DIVERGENCE_PRESSURE with economic context so Oikos and Evo can
+        investigate and potentially synthesise across strategies.
+        """
+        all_profiles = list(self._remote_profiles.values())
+        if len(all_profiles) < 2:
+            return
+
+        # Only include profiles with actual strategy data
+        profiled = [p for p in all_profiles if p.strategy_revenue_rates]
+        if len(profiled) < 2:
+            return
+
+        economic_scores = compute_economic_divergence(profiled)
+
+        # Update each profile's economic_divergence field in-place
+        for profile in profiled:
+            profile.economic_divergence = economic_scores.get(
+                profile.instance_id, 0.0
+            )
+
+        # Alert if any pair has high economic divergence (> 0.6)
+        high_divergence_instances = [
+            (iid, score)
+            for iid, score in economic_scores.items()
+            if score > 0.6
+        ]
+
+        if not high_divergence_instances:
+            return
+
+        max_instance_id, max_score = max(
+            high_divergence_instances, key=lambda x: x[1]
+        )
+        max_profile = self._remote_profiles.get(max_instance_id)
+        top_strategies = sorted(
+            (max_profile.strategy_revenue_rates if max_profile else {}).items(),
+            key=lambda x: -x[1],
+        )[:3]
+
+        logger.info(
+            "economic_strategy_divergence_detected",
+            max_instance=max_instance_id,
+            max_score=round(max_score, 3),
+            diverged_instances=len(high_divergence_instances),
+            top_strategies=[s for s, _ in top_strategies],
+        )
+
+        await self._emit(
+            SynapseEventType.DIVERGENCE_PRESSURE,
+            {
+                "instance_id": self._instance_id,
+                "economic_divergence_detected": True,
+                "max_economic_divergence": max_score,
+                "diverged_instance_id": max_instance_id,
+                "diverged_strategies": [s for s, _ in top_strategies],
+                "peer_count": len(profiled),
+                "recommendation": (
+                    "Investigate differing economic strategies — "
+                    "high economic divergence may indicate unexplored profitable paths."
+                ),
+            },
         )

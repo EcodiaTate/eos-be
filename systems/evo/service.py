@@ -590,6 +590,10 @@ class EvoService:
 
         When Evo accumulates enough evidence to support a hypothesis, the
         organism should actively explore and test it — not just passively wait.
+
+        EVO-NOVA-1: Full hypothesis metadata is now included in the payload so
+        Nova can use Evo's Thompson sampling weights and confidence scores for
+        EFE ranking, rather than treating all injected goals as equal-weight.
         """
         if self._event_bus is None:
             return
@@ -598,6 +602,11 @@ class EvoService:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
             goal_id = new_id()
+
+            # Resolve Thompson arm weights for this hypothesis's domain
+            domain = str(getattr(hypothesis, "domain", "general"))
+            thompson_arm_id, thompson_weights = self._resolve_thompson_arm(hypothesis)
+
             await self._event_bus.emit(SynapseEvent(
                 event_type=SynapseEventType.NOVA_GOAL_INJECTED,
                 source_system="evo",
@@ -609,16 +618,55 @@ class EvoService:
                     "urgency": 0.3,
                     "importance": 0.6,
                     "drive_alignment": {"coherence": 0.3, "care": 0.0, "growth": 0.7, "honesty": 0.0},
+                    # EVO-NOVA-1: Full hypothesis metadata for Nova EFE weighting
                     "hypothesis_id": hypothesis.id,
+                    "hypothesis_statement": str(getattr(hypothesis, "statement", ""))[:200],
+                    "confidence": float(getattr(hypothesis, "confidence", 0.5)),
+                    "evidence_score": float(getattr(hypothesis, "evidence_score", 0.0)),
+                    "domain": domain,
+                    "thompson_arm_id": thompson_arm_id,
+                    "thompson_arm_weights": thompson_weights,
                 },
             ))
             self._logger.info(
                 "epistemic_goal_generated",
                 hypothesis_id=hypothesis.id,
                 goal_id=goal_id,
+                confidence=round(float(getattr(hypothesis, "confidence", 0.5)), 3),
+                evidence_score=round(float(getattr(hypothesis, "evidence_score", 0.0)), 3),
+                domain=domain,
             )
         except Exception as exc:
             self._logger.warning("epistemic_goal_failed", error=str(exc))
+
+    def _resolve_thompson_arm(self, hypothesis: Any) -> tuple[str, dict[str, float]]:
+        """
+        Resolve the Thompson sampling arm ID and current weight snapshot
+        for a hypothesis, using the tournament engine if available.
+
+        Returns: (arm_id, weights_dict) where weights_dict maps model names
+        to their current Beta posterior means. Empty dict if no tournament active.
+        """
+        if self._tournament_engine is None:
+            return ("", {})
+
+        hyp_id = str(getattr(hypothesis, "id", ""))
+        # Search for an active tournament containing this hypothesis
+        try:
+            for tournament in getattr(self._tournament_engine, "_active_tournaments", {}).values():
+                arms = getattr(tournament, "arms", {})
+                for arm_id, arm in arms.items():
+                    if str(getattr(arm, "hypothesis_id", "")) == hyp_id:
+                        # Extract arm weight snapshot (Beta posterior means)
+                        weights: dict[str, float] = {}
+                        for a_id, a in arms.items():
+                            alpha = float(getattr(a, "alpha", 1.0))
+                            beta_val = float(getattr(a, "beta", 1.0))
+                            weights[str(a_id)] = alpha / (alpha + beta_val)
+                        return (str(arm_id), weights)
+        except Exception:
+            pass
+        return ("", {})
 
     # ─── Consolidation (Sleep Mode) ────────────────────────────────────────────
 
@@ -1373,6 +1421,53 @@ class EvoService:
         """Expose the tournament engine for Nova integration."""
         return self._tournament_engine
 
+    def get_thompson_arm_weights(self, domain: str = "") -> dict[str, dict[str, float]]:
+        """
+        Return the current Thompson sampling arm weights for active tournaments,
+        optionally filtered by hypothesis domain.
+
+        EVO-NOVA-1: Nova calls this to incorporate Evo's Thompson weights into
+        EFE scoring for goal prioritization — goals backed by high-confidence
+        Thompson arms get higher pragmatic value in Nova's deliberation.
+
+        Returns: {tournament_id: {arm_id: posterior_mean}} for active tournaments.
+        Empty dict if no tournaments active or tournament engine unavailable.
+        """
+        if self._tournament_engine is None:
+            return {}
+
+        result: dict[str, dict[str, float]] = {}
+        try:
+            for t_id, tournament in getattr(
+                self._tournament_engine, "_active_tournaments", {}
+            ).items():
+                # Filter by domain if specified
+                if domain:
+                    arms = getattr(tournament, "arms", {})
+                    domain_match = False
+                    for arm in arms.values():
+                        hyp_id = str(getattr(arm, "hypothesis_id", ""))
+                        # Check if any arm's hypothesis matches the domain
+                        hyp = self._hypothesis_engine._active.get(hyp_id) if self._hypothesis_engine else None
+                        if hyp is not None and str(getattr(hyp, "domain", "")) == domain:
+                            domain_match = True
+                            break
+                    if not domain_match:
+                        continue
+
+                arms = getattr(tournament, "arms", {})
+                weights: dict[str, float] = {}
+                for arm_id, arm in arms.items():
+                    alpha = float(getattr(arm, "alpha", 1.0))
+                    beta_val = float(getattr(arm, "beta", 1.0))
+                    weights[str(arm_id)] = alpha / (alpha + beta_val)
+                if weights:
+                    result[str(t_id)] = weights
+        except Exception as exc:
+            self._logger.debug("get_thompson_arm_weights_error", error=str(exc))
+
+        return result
+
     def record_tournament_outcome(
         self,
         tournament_id: str,
@@ -1467,6 +1562,21 @@ class EvoService:
             SynapseEventType.BOUNTY_PAID,
             self._on_bounty_paid,
         )
+        if hasattr(SynapseEventType, "BOUNTY_REJECTED"):
+            event_bus.subscribe(
+                SynapseEventType.BOUNTY_REJECTED,
+                self._on_bounty_rejected,
+            )
+        if hasattr(SynapseEventType, "YIELD_DEPLOYMENT_RESULT"):
+            event_bus.subscribe(
+                SynapseEventType.YIELD_DEPLOYMENT_RESULT,
+                self._on_yield_result,
+            )
+        if hasattr(SynapseEventType, "YIELD_PERFORMANCE_REPORT"):
+            event_bus.subscribe(
+                SynapseEventType.YIELD_PERFORMANCE_REPORT,
+                self._on_yield_performance,
+            )
         if hasattr(SynapseEventType, "ASSET_BREAK_EVEN"):
             event_bus.subscribe(
                 SynapseEventType.ASSET_BREAK_EVEN,
@@ -2583,7 +2693,7 @@ class EvoService:
             self._logger.warning("on_bounty_pr_submitted_failed", error=str(exc))
 
     async def _on_revenue_injected(self, event: Any) -> None:
-        """REVENUE_INJECTED → episodic memory."""
+        """REVENUE_INJECTED → episodic memory + domain profitability learning."""
         if not self._initialized:
             return
         try:
@@ -2599,7 +2709,33 @@ class EvoService:
                 valence=0.6,
             )
             await self._scan_episode_online(episode)
-            self._logger.debug("economic_episode_revenue", amount=amount, source=source)
+
+            # ── Learning: queue PatternCandidate for domain profitability ──────
+            # Revenue injection is strong evidence that the current revenue-source
+            # strategy is viable. Surface a COOCCURRENCE candidate so hypothesis
+            # generation can propose "continue / expand <source> revenue stream".
+            from systems.evo.types import PatternCandidate, PatternType  # noqa: PLC0415
+
+            confidence = min(0.75, 0.30 + (amount / 100.0) * 0.05)  # scales with amount, capped
+            candidate = PatternCandidate(
+                type=PatternType.COOCCURRENCE,
+                elements=[f"revenue_source::{source}", "domain_profitability"],
+                description=(
+                    f"Revenue {amount:.4f} received from '{source}' — "
+                    "positive evidence for domain_profitability hypothesis"
+                ),
+                confidence=confidence,
+                support_count=1,
+                source_detector="oikos_revenue_injected",
+            )
+            self._pending_candidates.append(candidate)
+
+            self._logger.debug(
+                "economic_episode_revenue",
+                amount=amount,
+                source=source,
+                pending_candidates=len(self._pending_candidates),
+            )
         except Exception as exc:
             self._logger.warning("on_revenue_injected_failed", error=str(exc))
 
@@ -2742,6 +2878,175 @@ class EvoService:
         except Exception as exc:
             self._logger.warning("on_bounty_paid_failed", error=str(exc))
 
+    async def _on_yield_result(self, event: Any) -> None:
+        """
+        YIELD_DEPLOYMENT_RESULT → evidence for/against yield protocol hypotheses.
+
+        A successful yield deployment confirms that the current protocol selection
+        strategy is effective. Failure is counter-evidence that may warrant testing
+        alternative protocols. Emits EVO_HYPOTHESIS_CONFIRMED or REFUTED so the
+        organism's learning loop closes on economic performance.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            request_id: str = str(data.get("request_id", ""))
+            success: bool = bool(data.get("success", False))
+            protocol: str = str(data.get("data", {}).get("protocol", "unknown"))
+            hypothesis_id = f"evo.yield_protocol.{protocol}"
+
+            if success:
+                episode = _economic_episode(
+                    source="oikos.yield",
+                    raw_content=f"yield deployment succeeded: request_id={request_id} protocol={protocol}",
+                    summary=f"yield deployment confirmed: {protocol}",
+                    salience=0.8,
+                    valence=0.6,
+                    arousal=0.3,
+                )
+                await self._scan_episode_online(episode)
+                # Emit confirmed to close the Evo learning loop
+                if self._event_bus is not None:
+                    from systems.synapse.types import SynapseEvent
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.EVO_HYPOTHESIS_CONFIRMED,
+                        source_system="evo",
+                        data={
+                            "hypothesis_id": hypothesis_id,
+                            "confidence": 0.7,
+                            "reward": 0.5,
+                            "source": "yield_deployment_result",
+                        },
+                    ))
+            else:
+                error = str(data.get("error", ""))
+                episode = _economic_episode(
+                    source="oikos.yield",
+                    raw_content=f"yield deployment failed: request_id={request_id} error={error[:80]}",
+                    summary=f"yield deployment failed: {protocol}",
+                    salience=0.7,
+                    valence=-0.4,
+                    arousal=0.5,
+                )
+                await self._scan_episode_online(episode)
+                self._bounty_outcomes.append(False)  # Treat as negative economic outcome
+                if self._event_bus is not None:
+                    from systems.synapse.types import SynapseEvent
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.EVO_HYPOTHESIS_REFUTED,
+                        source_system="evo",
+                        data={
+                            "hypothesis_id": hypothesis_id,
+                            "confidence": 0.3,
+                            "reward": -0.3,
+                            "source": "yield_deployment_result",
+                            "error": error[:200],
+                        },
+                    ))
+            self._logger.debug("economic_episode_yield_result", request_id=request_id, success=success)
+        except Exception as exc:
+            self._logger.warning("on_yield_result_failed", error=str(exc))
+
+    async def _on_yield_performance(self, event: Any) -> None:
+        """
+        YIELD_PERFORMANCE_REPORT → APY drop detection and yield hypothesis update.
+
+        Emitted by Oikos YieldPositionTracker every hour with current vs entry APY.
+        When APY drops significantly, this handler queues a TEMPORAL PatternCandidate
+        so the hypothesis engine can propose protocol rebalancing or capital reallocation.
+        Stable APY boosts confidence in the current yield protocol hypothesis.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            protocol: str = str(data.get("protocol", "unknown"))
+            rebalance_needed: bool = bool(data.get("rebalance_needed", False))
+            relative_drop_pct: float = float(data.get("relative_drop_pct", 0.0))
+
+            if rebalance_needed:
+                # Significant APY drop — counter-evidence for current yield protocol
+                from systems.evo.types import PatternCandidate, PatternType  # noqa: PLC0415
+
+                candidate = PatternCandidate(
+                    type=PatternType.TEMPORAL,
+                    elements=[
+                        f"yield_protocol::{protocol}",
+                        f"apy_drop_pct::{round(relative_drop_pct, 1)}",
+                        "yield_rebalance_signal",
+                    ],
+                    description=(
+                        f"Yield protocol '{protocol}' APY dropped {relative_drop_pct:.1f}% "
+                        "relative to entry — evidence for protocol rebalancing hypothesis"
+                    ),
+                    confidence=min(0.80, 0.40 + (relative_drop_pct / 100.0) * 0.40),
+                    support_count=1,
+                    source_detector="oikos_yield_performance",
+                )
+                self._pending_candidates.append(candidate)
+                self._logger.info(
+                    "yield_apy_drop_hypothesis_queued",
+                    protocol=protocol,
+                    relative_drop_pct=relative_drop_pct,
+                    pending_candidates=len(self._pending_candidates),
+                )
+            else:
+                self._logger.debug(
+                    "yield_performance_stable",
+                    protocol=protocol,
+                    relative_drop_pct=relative_drop_pct,
+                )
+        except Exception as exc:
+            self._logger.warning("on_yield_performance_failed", error=str(exc))
+
+    async def _on_bounty_rejected(self, event: Any) -> None:
+        """
+        BOUNTY_REJECTED → negative evidence that bounty strategy is over-aggressive.
+
+        A rejected bounty means Equor blocked acceptance (constitutional veto) or
+        the metabolic gate denied the capital commitment. Either way, the bounty
+        evaluation heuristic needs recalibration — this is counter-evidence against
+        'this type of bounty is within the organism's capacity'.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            bounty_id: str = str(data.get("bounty_id", ""))
+            reason: str = str(data.get("reason", "unknown"))
+            hypothesis_id = "evo.bounty_viability"
+
+            episode = _economic_episode(
+                source="oikos.bounty",
+                raw_content=f"bounty rejected: bounty_id={bounty_id} reason={reason[:80]}",
+                summary=f"bounty rejected: {reason[:60]}",
+                salience=0.7,
+                valence=-0.3,
+                arousal=0.4,
+            )
+            await self._scan_episode_online(episode)
+            self._bounty_outcomes.append(False)
+            await self._check_economic_parameter_adjustments()
+
+            # Emit REFUTED so the learning loop updates confidence
+            if self._event_bus is not None:
+                from systems.synapse.types import SynapseEvent
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EVO_HYPOTHESIS_REFUTED,
+                    source_system="evo",
+                    data={
+                        "hypothesis_id": hypothesis_id,
+                        "confidence": 0.4,
+                        "reward": -0.2,
+                        "source": "bounty_rejected",
+                        "reason": reason[:200],
+                    },
+                ))
+            self._logger.debug("economic_episode_bounty_rejected", bounty_id=bounty_id, reason=reason)
+        except Exception as exc:
+            self._logger.warning("on_bounty_rejected_failed", error=str(exc))
+
     async def _on_asset_break_even(self, event: Any) -> None:
         """
         SG5 — ASSET_BREAK_EVEN → asset strategy hypothesis confirmation.
@@ -2770,7 +3075,32 @@ class EvoService:
                 arousal=0.3,
             )
             await self._scan_episode_online(episode)
-            self._logger.debug("economic_episode_asset_break_even", asset_id=asset_id, roi=roi_score)
+
+            # ── Learning: TEMPORAL candidate for asset strategy specialization ─
+            # Break-even is the clearest signal that "build autonomous assets" is
+            # a viable strategy in this niche. Queue a TEMPORAL candidate so the
+            # hypothesis engine can propose reinforcing the asset-development path.
+            from systems.evo.types import PatternCandidate, PatternType  # noqa: PLC0415
+
+            candidate = PatternCandidate(
+                type=PatternType.TEMPORAL,
+                elements=["asset_break_even", f"roi_score::{round(roi_score, 1)}", "asset_strategy_viable"],
+                description=(
+                    f"Asset '{asset_name}' broke even in {days}d with ROI={roi_score:.2f} — "
+                    "strong evidence that asset-development strategy generates positive ROI"
+                ),
+                confidence=min(0.85, 0.50 + roi_score * 0.15),
+                support_count=1,
+                source_detector="oikos_asset_break_even",
+            )
+            self._pending_candidates.append(candidate)
+
+            self._logger.debug(
+                "economic_episode_asset_break_even",
+                asset_id=asset_id,
+                roi=roi_score,
+                pending_candidates=len(self._pending_candidates),
+            )
         except Exception as exc:
             self._logger.warning("on_asset_break_even_failed", error=str(exc))
 
@@ -2804,10 +3134,41 @@ class EvoService:
                 arousal=0.6,
             )
             await self._scan_episode_online(episode)
+
+            # ── Learning: COOCCURRENCE candidate for reproduction strategy ─────
+            # Child independence is the highest-confidence reproduction signal:
+            # the organism successfully produced a viable, self-sustaining child.
+            # Queue a COOCCURRENCE candidate linking capital_level + niche to
+            # successful_reproduction so hypothesis generation can refine the
+            # conditions under which mitosis is most viable.
+            from systems.evo.types import PatternCandidate, PatternType  # noqa: PLC0415
+
+            # Confidence scales with dividend repayment (more paid = stronger signal)
+            roi_signal = min(1.0, dividends / max(net_worth, 1.0))
+            confidence = min(0.90, 0.65 + roi_signal * 0.25)
+            candidate = PatternCandidate(
+                type=PatternType.COOCCURRENCE,
+                elements=[
+                    "child_independence",
+                    f"days_to_independence::{days}",
+                    "reproduction_strategy_viable",
+                ],
+                description=(
+                    f"Child {child_id[:20]} achieved independence in {days}d "
+                    f"(net_worth={net_worth:.2f}, dividends={dividends:.2f}) — "
+                    "strong evidence that reproduction is a viable growth strategy"
+                ),
+                confidence=confidence,
+                support_count=1,
+                source_detector="oikos_child_independent",
+            )
+            self._pending_candidates.append(candidate)
+
             self._logger.debug(
                 "economic_episode_child_independent",
                 child_id=child_id,
                 net_worth=net_worth,
+                pending_candidates=len(self._pending_candidates),
             )
         except Exception as exc:
             self._logger.warning("on_child_independent_failed", error=str(exc))

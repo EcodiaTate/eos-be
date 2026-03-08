@@ -79,6 +79,10 @@ Belief state persisted to Neo4j as `(:EntityBelief)` nodes (batched UNWIND, max 
 | `AXON_EXECUTION_REQUEST` | ✅ wired 2026-03-07 — caches pre-execution context in `_pending_axon_requests[intent_id]` |
 | `AXON_EXECUTION_RESULT` | ✅ wired 2026-03-07 — calls `policy_generator.record_outcome()`; sets `_motor_degraded=True` on systemic failures (rate_limited/circuit_open/budget_exceeded) |
 | `GOAL_OVERRIDE` | ✅ wired 2026-03-07 — see resolved gaps |
+| `FOVEA_INTERNAL_PREDICTION_ERROR` | ✅ wired 2026-03-08 (NOVA-ECON-1) — `_on_fovea_econ_error()` updates `economic_risk_level` belief and triggers `_immediate_deliberation()` when economic error > 0.2 |
+| `REVENUE_INJECTED` | ✅ wired 2026-03-08 (NOVA-ECON-1) — `_on_revenue_change()` injects `revenue_burn_ratio` belief and reduces economic risk |
+| `BOUNTY_PAID` | ✅ wired 2026-03-08 (NOVA-ECON-1) — `_on_bounty_outcome()` adjusts `bounty_success_rate` belief; failures trigger immediate deliberation |
+| `YIELD_DEPLOYMENT_RESULT` | ✅ wired 2026-03-08 (NOVA-ECON-1) — `_on_yield_outcome()` updates `yield_apy_{protocol}` belief; failures trigger immediate deliberation |
 
 **Events emitted:**
 | Event | Status |
@@ -141,12 +145,24 @@ All core components confirmed in code:
 - `NovaConfig` field names aligned with spec: `cognition_cost_enabled` → `enable_cognition_budgeting`; `enable_hypothesis_tournaments` added (2026-03-07)
 - `NOVA_BELIEF_STABILISED` emitted in `receive_broadcast()` when belief confidence is high and FE is low — enables spec_checker coverage (2026-03-07)
 - `NOVA_GOAL_INJECTED` emitted at two new call sites: soma interoceptive goal injection + governance goal acceptance — closes spec_checker gap (2026-03-07)
+- **NOVA-ECON-1 (2026-03-08)**: 4 economic event subscriptions — `FOVEA_INTERNAL_PREDICTION_ERROR`, `REVENUE_INJECTED`, `BOUNTY_PAID`, `YIELD_DEPLOYMENT_RESULT` — handlers update priority belief entities and trigger `_immediate_deliberation()` within 50ms of economic signals
+- **NOVA-ECON-2 (2026-03-08)**: 5 distinct economic policy templates in `_PROCEDURE_TEMPLATES` (bounty_hunting/yield_farming/cost_optimization/asset_liquidation/revenue_diversification); `PolicyGenerator.generate_economic_intent()` selects via EFE proxy scoring (not keyword matching)
+- **NOVA-ECON-3 (2026-03-08)**: `BeliefUrgencyMonitor` in `belief_updater.py` — watches 7 priority belief keys; fires `_immediate_deliberation()` callback fire-and-forget when any confidence shifts >20%; wired in `initialize()` via `set_urgency_monitor()`
+- **`_immediate_deliberation()` (2026-03-08)**: async method on `NovaService` — raises deliberation urgency thresholds and emits `POLICY_SELECTED` signal to Synapse bus; used by all 4 economic handlers + urgency monitor
 
 ---
 
 ## What's Missing / Open Gaps
 
-All 7 gaps resolved as of 2026-03-07. See Resolved section below.
+All prior gaps resolved. 4 economic intelligence gaps closed 2026-03-08. See Resolved section below.
+
+**RESOLVED (2026-03-08 — economic intelligence):**
+
+- ✅ **NOVA-ECON-1**: 4 economic event subscriptions wired — `FOVEA_INTERNAL_PREDICTION_ERROR` → `_on_fovea_econ_error()`, `REVENUE_INJECTED` → `_on_revenue_change()`, `BOUNTY_PAID` → `_on_bounty_outcome()`, `YIELD_DEPLOYMENT_RESULT` → `_on_yield_outcome()`. Closes 60-minute economic blind spot.
+- ✅ **NOVA-ECON-2**: 5 economic policy templates added to `_PROCEDURE_TEMPLATES`; `PolicyGenerator.generate_economic_intent()` scores all 5 by EFE proxy (epistemic + pragmatic value) rather than keyword matching. Templates: bounty_hunting (55%), yield_farming (70%), cost_optimization (80%), asset_liquidation (65%), revenue_diversification (40%).
+- ✅ **NOVA-ECON-3**: `BeliefUrgencyMonitor` class in `belief_updater.py` monitors 7 priority economic belief keys; >20% confidence shift triggers `_immediate_deliberation()` callback. Beliefs are now active planning inputs, not passive state.
+- ✅ **EVO-NOVA-1**: `EvoService._generate_goal_from_hypothesis()` extended to include `hypothesis_statement`, `confidence`, `evidence_score`, `domain`, `thompson_arm_id`, `thompson_arm_weights` in `NOVA_GOAL_INJECTED` payload. `EvoService.get_thompson_arm_weights(domain)` public API added.
+- ✅ **Tests**: `backend/tests/systems/nova/test_economic_intent.py` — 22 unit tests covering all 4 gaps.
 
 **RESOLVED (2026-03-07 — this session):**
 

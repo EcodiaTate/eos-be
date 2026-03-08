@@ -420,6 +420,132 @@ def compute_verdict(
     return check
 
 
+def _floor_tightness_from_metabolic(
+    starvation_level: str,
+    efficiency_ratio: float,
+) -> float:
+    """
+    Map metabolic state to a floor tightness scalar in [0.0, 1.0].
+
+    1.0 = standard floors (normal operation)
+    0.3 = 70% loosened (CRITICAL starvation — survival mode)
+
+    Tightness moves the Care/Honesty floor *toward* neutral (0.0).
+    A floor of -0.105 at tightness=0.3 becomes -0.0315.
+    """
+    level = starvation_level.lower()
+    if level in ("critical", "existential", "emergency"):
+        return 0.3   # 70% loosened — survival-critical
+    if level == "austerity":
+        return 0.6   # 40% loosened — metabolically stressed
+    if efficiency_ratio < 0.8:
+        return 0.85  # 15% loosened — inefficient but not starving
+    return 1.0       # Standard floors
+
+
+def compute_verdict_with_metabolic_state(
+    alignment: DriveAlignmentVector,
+    intent: "Intent",
+    autonomy_level: int,
+    constitution: dict,
+    metabolic_state: dict | None = None,
+    hypotheses: list[dict] | None = None,
+    memory: "ConstitutionalMemory | None" = None,
+) -> "ConstitutionalCheck":
+    """
+    Variant of compute_verdict() that accepts a metabolic_state dict (Fix 4.2).
+
+    metabolic_state keys (all optional, safe defaults applied):
+      starvation_level (str): "nominal" | "cautious" | "austerity" | "emergency" | "critical"
+      efficiency_ratio (float): revenue/burn_rate; <0.8 triggers mild floor loosening
+
+    Constitutional floors are moved toward neutral based on metabolic urgency:
+      CRITICAL starvation → floors loosened 70% (tightness=0.3)
+      AUSTERITY           → floors loosened 40% (tightness=0.6)
+      efficiency < 0.8    → floors loosened 15% (tightness=0.85)
+      HEALTHY             → standard floors (tightness=1.0)
+
+    On CRITICAL starvation, DENY verdicts from Stage 2 (floor check only) are
+    overridden to DEFERRED so governance can approve survival-critical actions.
+    Hardcoded invariant blocks (Stage 1) are never overridden.
+
+    For the full pipeline with loosened floors, we re-enter compute_verdict()
+    with a temporarily patched alignment that accounts for tightness —
+    implementing floor loosening via score normalisation keeps the pipeline
+    stateless and avoids duplicating the 8-stage logic.
+    """
+    ms = metabolic_state or {}
+    starvation_level = str(ms.get("starvation_level", "nominal"))
+    efficiency_ratio = float(ms.get("efficiency_ratio", 1.0))
+
+    tightness = _floor_tightness_from_metabolic(starvation_level, efficiency_ratio)
+
+    if tightness >= 1.0:
+        # Standard path — no metabolic loosening
+        check = compute_verdict(
+            alignment, intent, autonomy_level, constitution, hypotheses, memory
+        )
+        check.metabolic_context = {
+            "starvation_level": starvation_level,
+            "efficiency_ratio": efficiency_ratio,
+            "floor_tightness": tightness,
+        }
+        return check
+
+    # Build a patched constitution that encodes floor loosening.
+    # We scale the effective drive weights so the floor formula yields a
+    # more lenient threshold, without changing the constitution permanently.
+    # Floor formula: care_floor = -0.3 * care_weight * 0.35
+    # Loosened:      care_floor = -0.3 * (care_weight * tightness) * 0.35
+    patched_constitution = dict(constitution)
+    care_weight = constitution.get("drive_care", 1.0)
+    honesty_weight = constitution.get("drive_honesty", 1.0)
+    patched_constitution["drive_care"] = care_weight * tightness
+    patched_constitution["drive_honesty"] = honesty_weight * tightness
+
+    check = compute_verdict(
+        alignment, intent, autonomy_level, patched_constitution, hypotheses, memory
+    )
+
+    # On CRITICAL starvation, downgrade a pure floor-check DENY to DEFERRED
+    # so governance can approve survival-critical economic actions.
+    # Hard invariant BLOCKED verdicts are never touched.
+    is_critical = starvation_level.lower() in ("critical", "existential", "emergency")
+    if (
+        is_critical
+        and check.verdict == Verdict.BLOCKED
+        and check.invariant_results is not None
+        and not any(
+            not r.passed and r.severity == "critical"
+            for r in check.invariant_results
+        )
+    ):
+        check.verdict = Verdict.DEFERRED
+        check.reasoning = (
+            f"[METABOLIC OVERRIDE] CRITICAL starvation ({starvation_level}): "
+            f"floor violation downgraded from BLOCKED to DEFERRED for governance review. "
+            f"Original: {check.reasoning}"
+        )
+        check.confidence = 0.6
+
+    check.metabolic_context = {
+        "starvation_level": starvation_level,
+        "efficiency_ratio": efficiency_ratio,
+        "floor_tightness": tightness,
+    }
+
+    logger.info(
+        "equor_verdict_metabolic_aware",
+        intent_id=intent.id,
+        starvation_level=starvation_level,
+        efficiency_ratio=efficiency_ratio,
+        floor_tightness=tightness,
+        verdict=check.verdict,
+    )
+
+    return check
+
+
 def _suggest_modifications(alignment: DriveAlignmentVector) -> list[str]:
     """Suggest modifications to improve a marginally-aligned intent."""
     suggestions: list[str] = []

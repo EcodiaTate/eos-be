@@ -112,6 +112,7 @@ class CommitmentSource(enum.StrEnum):
     SCHEMA_CRYSTALLIZATION = "schema_crystallization"  # ADAPTIVE schema reached CORE
     CRISIS_RESOLUTION = "crisis_resolution"          # After a CRISIS turning point
     CONSTITUTIONAL_GROUNDING = "constitutional_grounding"  # Seeded at birth from drives
+    ECONOMIC_DECISION = "economic_decision"          # Commitment formed from approved economic intent (EQUOR_ECONOMIC_PERMIT)
 
 
 class TurningPointType(enum.StrEnum):

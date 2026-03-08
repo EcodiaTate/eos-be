@@ -1096,6 +1096,52 @@ class ThymosService:
         )
         await self.on_incident(incident)
 
+    async def _on_evo_degraded(self, event: SynapseEvent) -> None:
+        """
+        EVO-ECON-1: Handle EVO_DEGRADED — Evo's hypothesis generation budget is
+        exhausted (LLM skips).
+
+        Creates a DEGRADATION incident so the repair pipeline can adjust Evo's
+        budget or trigger a recovery cycle.
+        """
+        data = event.data
+        reason: str = data.get("reason", "unknown")
+        skipped: int = data.get("skipped_pattern_count", 0)
+        consecutive: int = data.get("consecutive_skips", 0)
+
+        self._logger.warning(
+            "evo_degraded_detected",
+            reason=reason[:120],
+            skipped_pattern_count=skipped,
+            consecutive_skips=consecutive,
+        )
+
+        incident = Incident(
+            source_system="evo",
+            incident_class=IncidentClass.DEGRADATION,
+            severity=IncidentSeverity.HIGH if consecutive > 5 else IncidentSeverity.MEDIUM,
+            error_type="EvoDegraded",
+            error_message=(
+                f"Evo hypothesis generation degraded: {reason[:120]} "
+                f"(skipped={skipped}, consecutive={consecutive})"
+            ),
+            fingerprint=hashlib.sha256(
+                b"EvoDegraded:evo"
+            ).hexdigest()[:16],
+            context={
+                "reason": reason,
+                "skipped_pattern_count": skipped,
+                "consecutive_skips": consecutive,
+            },
+            constitutional_impact={
+                "coherence": 0.1,
+                "care": 0.0,
+                "growth": 0.9,
+                "honesty": 0.0,
+            },
+        )
+        await self.on_incident(incident)
+
     async def _on_nova_degraded(self, event: SynapseEvent) -> None:
         """
         Handle NOVA_DEGRADED — Nova's inference quality has dropped.
@@ -2799,6 +2845,12 @@ class ThymosService:
                 SynapseEventType.EVO_CONSOLIDATION_STALLED,
                 _validated(self._on_evo_consolidation_stalled),
             )
+            # EVO-ECON-1: Evo hypothesis budget exhausted → DEGRADATION incident
+            if hasattr(SynapseEventType, "EVO_DEGRADED"):
+                event_bus.subscribe(
+                    SynapseEventType.EVO_DEGRADED,
+                    _validated(self._on_evo_degraded),
+                )
             # CognitiveStallSentinel: Nova inference quality drops
             event_bus.subscribe(
                 SynapseEventType.NOVA_DEGRADED,

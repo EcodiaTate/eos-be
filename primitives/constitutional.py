@@ -8,7 +8,7 @@ Every Intent passes through Equor and receives one of these.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import Field
 
@@ -48,6 +48,10 @@ class ConstitutionalCheck(Identified):
     modifications: list[str] = Field(default_factory=list)
 
     review_time_ms: int = 0
+
+    # Metabolic context injected by compute_verdict_with_metabolic_state() (Fix 4.2/4.4)
+    # Keys: starvation_level (str), efficiency_ratio (float), floor_tightness (float)
+    metabolic_context: dict[str, Any] | None = None
 
     @property
     def has_violations(self) -> bool:

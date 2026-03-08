@@ -400,6 +400,59 @@ def _strip_domain_context(structure: dict[str, Any]) -> dict[str, Any]:
     return stripped
 
 
+# Economic domain keyword sets for domain_hints detection (NEXUS-ECON-2/3).
+_ECONOMIC_DOMAIN_KEYWORDS: dict[str, list[str]] = {
+    "economic": ["econ", "finance", "financial", "revenue", "cost", "profit", "budget",
+                 "capital", "liquidity", "wallet", "usd", "usdc", "token"],
+    "yield_farming": ["yield", "apy", "apr", "farm", "pool", "liquidity", "deposit",
+                      "compound", "aave", "morpho", "aerodrome", "defi"],
+    "defi": ["defi", "dex", "amm", "swap", "uniswap", "curve", "protocol", "lp",
+             "concentrated", "position", "tick"],
+    "trading": ["trade", "trading", "price", "market", "order", "bid", "ask",
+                "arbitrage", "volatility", "momentum"],
+    "risk": ["risk", "ruin", "default", "liquidat", "margin", "collateral",
+             "exposure", "hedge", "var", "drawdown"],
+    "bounty": ["bounty", "reward", "bounties", "payout", "solution"],
+}
+
+
+def _detect_economic_domain_hints(
+    domain_labels: list[str],
+    structure: dict[str, Any],
+) -> list[str]:
+    """
+    Detect economic domain hints from domain labels and structure content.
+
+    Scans domain labels and any string values in the structure dict for
+    keywords that indicate economic content. Returns a deduplicated list
+    of matched hint labels.  Order: more specific tags first.
+
+    Example: ["yield_farming", "defi", "economic"]
+    """
+    hits: set[str] = set()
+
+    # Combine searchable text from domain labels + structure string values
+    search_corpus = " ".join(domain_labels).lower()
+    for val in structure.values():
+        if isinstance(val, str):
+            search_corpus += " " + val.lower()
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, str):
+                    search_corpus += " " + item.lower()
+
+    for hint, keywords in _ECONOMIC_DOMAIN_KEYWORDS.items():
+        if any(kw in search_corpus for kw in keywords):
+            hits.add(hint)
+
+    # Ensure "economic" is always included when any economic sub-domain matched
+    if hits:
+        hits.add("economic")
+
+    # Return sorted for determinism; more specific tags first (longer names)
+    return sorted(hits, key=lambda h: (-len(h), h))
+
+
 def _are_abstractly_equivalent(
     fragment_a: ShareableWorldModelFragment,
     fragment_b: ShareableWorldModelFragment,

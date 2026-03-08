@@ -261,6 +261,11 @@ class KairosPipeline:
         self._logos_updates_received: int = 0
         self._oneiros_consolidations_received: int = 0
 
+        # KAIROS-ECON-1: buffered economic observations for EconomicCausalMiner
+        self._economic_observations: list[dict[str, Any]] = []
+        self._economic_events_received: int = 0
+        self._price_observations: list[dict[str, Any]] = []
+
     # --- Wiring ---
 
     def set_event_bus(self, event_bus: EventBus) -> None:
@@ -362,7 +367,21 @@ class KairosPipeline:
             self._on_federation_invariant_received,
         )
 
-        logger.info("kairos_subscriptions_registered", events=7)
+        # KAIROS-ECON-1: Economic causal data stream
+        self._event_bus.subscribe(
+            SynapseEventType.OIKOS_ECONOMIC_EPISODE,
+            self._on_economic_episode,
+        )
+        self._event_bus.subscribe(
+            SynapseEventType.FOVEA_INTERNAL_PREDICTION_ERROR,
+            self._on_fovea_economic_error,
+        )
+        self._event_bus.subscribe(
+            SynapseEventType.PHANTOM_PRICE_OBSERVATION,
+            self._on_price_observation,
+        )
+
+        logger.info("kairos_subscriptions_registered", events=10)
 
     # --- Event handlers ---
 
@@ -643,7 +662,101 @@ class KairosPipeline:
                 violations=len(violations),
             )
 
+    # --- KAIROS-ECON-1: Economic data stream handlers ---
+
+    async def _on_economic_episode(self, event: SynapseEvent) -> None:
+        """
+        Handle OIKOS_ECONOMIC_EPISODE — primary economic causal data stream.
+
+        Each episode contains causal variable annotations (day_of_week, eth_price_usd,
+        gas_price_gwei, protocol, roi_pct, success, etc.) that EconomicCausalMiner
+        uses for pattern discovery.  Buffer episodes for the next mining cycle.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        self._economic_events_received += 1
+
+        # Validate minimum required fields
+        if not data.get("action_type") or "causal_variables" not in data:
+            return
+
+        # Cap buffer at 500 observations (5× the correlation miner threshold)
+        if len(self._economic_observations) < 500:
+            self._economic_observations.append(data)
+
+        logger.debug(
+            "economic_episode_buffered",
+            action_type=data.get("action_type"),
+            success=data.get("success"),
+            buffer_size=len(self._economic_observations),
+        )
+
+    async def _on_fovea_economic_error(self, event: SynapseEvent) -> None:
+        """
+        Handle FOVEA_INTERNAL_PREDICTION_ERROR as a high-salience causal anomaly.
+
+        A large prediction error means the organism's world model failed on an
+        economic outcome — this is the strongest possible signal that a causal
+        relationship exists that Kairos has not yet discovered.
+        Convert to a pre-seeded CorrelationCandidate with high weight.
+        """
+        data = event.data if hasattr(event, "data") else {}
+
+        # Only handle economic-domain errors (cost, yield, etc.)
+        source_system = data.get("source_system", "")
+        if source_system not in ("oikos", "phantom_liquidity", "sacm"):
+            return
+
+        prediction_error = data.get("prediction_error", {})
+        economic_error = float(prediction_error.get("economic", 0.0)) if isinstance(
+            prediction_error, dict
+        ) else 0.0
+
+        if economic_error < 0.3:
+            return  # Below materiality threshold
+
+        episode_id = data.get("episode_id", data.get("percept_id", ""))
+        candidate = CorrelationCandidate(
+            variable_a=f"economic_cause:{episode_id}",
+            variable_b=f"economic_effect:{episode_id}",
+            mean_correlation=min(economic_error, 1.0),
+            cross_context_variance=0.0,
+            context_count=1,
+        )
+        self._correlation_miner.add_preseed(candidate)
+
+        logger.debug(
+            "fovea_economic_error_seeded",
+            source_system=source_system,
+            economic_error=round(economic_error, 3),
+            candidate_id=candidate.id,
+        )
+
+    async def _on_price_observation(self, event: SynapseEvent) -> None:
+        """
+        Handle PHANTOM_PRICE_OBSERVATION — raw market price signals.
+
+        Market prices are leading causal variables: ETH price movements
+        typically precede yield APY changes by minutes to hours.
+        Buffer for EconomicCausalMiner time-series correlation mining.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        price_str = data.get("price", "0")
+        pair = data.get("pair", [])
+
+        if not pair or not price_str:
+            return
+
+        # Cap price observation buffer at 200 entries
+        if len(self._price_observations) < 200:
+            self._price_observations.append({
+                "pair": pair,
+                "price": price_str,
+                "timestamp": data.get("timestamp", ""),
+                "pool_address": data.get("pool_address", ""),
+            })
+
     # --- Pipeline execution ---
+
 
     async def run_pipeline(
         self,
@@ -881,6 +994,10 @@ class KairosPipeline:
             violations_found=violations_found,
         )
 
+        # ── KAIROS-ECON-1: Economic Causal Mining ──────────────────
+        if self._economic_observations:
+            await self._run_economic_causal_mining()
+
         # ── Evolutionary Metrics (SG5) ─────────────────────────────
         await self._emit_evolutionary_metrics()
 
@@ -909,6 +1026,59 @@ class KairosPipeline:
 
         logger.info("pipeline_run_complete", **summary)
         return summary
+
+    async def _run_economic_causal_mining(self) -> None:
+        """
+        KAIROS-ECON-1: Run EconomicCausalMiner on buffered economic observations.
+
+        Discovers domain-specific patterns (protocol success rates, day-of-week
+        effects, price-dependent yield) and emits KAIROS_ECONOMIC_INVARIANT events
+        for Nova to use in EFE calculation.  Clears the buffer after each run.
+        """
+        from systems.kairos.invariant_distiller import EconomicCausalMiner
+        from systems.synapse.types import SynapseEvent as SE
+        from systems.synapse.types import SynapseEventType
+
+        observations = list(self._economic_observations)
+        self._economic_observations.clear()
+
+        miner = EconomicCausalMiner()
+        discovered = miner.discover_patterns(observations)
+
+        for pattern in discovered:
+            logger.info(
+                "economic_invariant_discovered",
+                invariant_type=pattern["invariant_type"],
+                cause=pattern["cause"],
+                effect=pattern["effect"],
+                confidence=round(pattern["confidence"], 3),
+                sample_count=pattern["sample_count"],
+            )
+
+            if self._event_bus is not None:
+                await self._event_bus.emit(SE(
+                    event_type=SynapseEventType.KAIROS_ECONOMIC_INVARIANT,
+                    source_system="kairos",
+                    data=pattern,
+                ))
+
+            # Also seed the main correlation miner so the pattern feeds Stage 1
+            if pattern["confidence"] >= 0.6:
+                candidate = CorrelationCandidate(
+                    variable_a=f"economic:{pattern['cause']}",
+                    variable_b=f"economic:{pattern['effect']}",
+                    mean_correlation=pattern["confidence"],
+                    cross_context_variance=0.05,
+                    context_count=pattern["sample_count"],
+                )
+                self._correlation_miner.add_preseed(candidate)
+
+        if discovered:
+            logger.info(
+                "economic_mining_complete",
+                patterns_found=len(discovered),
+                observations_processed=len(observations),
+            )
 
     async def _persist_all_invariants(self) -> None:
         """Batch-persist all invariants to Neo4j."""

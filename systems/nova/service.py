@@ -338,6 +338,12 @@ class NovaService:
             if restored > 0:
                 self._logger.info("beliefs_restored_on_init", count=restored)
 
+        # NOVA-ECON-3: Wire BeliefUrgencyMonitor so priority belief shifts trigger
+        # immediate deliberation rather than waiting for the next theta heartbeat.
+        from systems.nova.belief_updater import BeliefUrgencyMonitor
+        _urgency_monitor = BeliefUrgencyMonitor(callback=self._immediate_deliberation)
+        self._belief_updater.set_urgency_monitor(_urgency_monitor)
+
         # Restore persisted goals from Neo4j after a process restart.
         # Pass Synapse health records so stale maintenance goals (older than
         # 30 min, target system healthy) are suppressed before entering memory.
@@ -493,6 +499,19 @@ class NovaService:
             event_bus.subscribe(
                 SynapseEventType.YIELD_DEPLOYMENT_RESULT,
                 self._on_yield_outcome,
+            )
+            # KAIROS-ECON-1: Economic causal invariants → inform EFE calculation
+            if hasattr(SynapseEventType, "KAIROS_ECONOMIC_INVARIANT"):
+                event_bus.subscribe(
+                    SynapseEventType.KAIROS_ECONOMIC_INVARIANT,
+                    self._on_economic_causal_invariant,
+                )
+            # ONEIROS-ECON-1: Economic dream insights — integrate ruin probability
+            # and risk warnings into Nova's world model beliefs so deliberation
+            # accounts for sleep-discovered economic risk.
+            event_bus.subscribe(
+                SynapseEventType.ONEIROS_ECONOMIC_INSIGHT,
+                self._on_economic_dream_insight,
             )
 
         self._logger.info("synapse_wired_to_nova")
@@ -1007,6 +1026,85 @@ class NovaService:
                 confidence=confidence,
             )
 
+    async def _on_economic_causal_invariant(self, event: Any) -> None:
+        """
+        KAIROS-ECON-1: Handle KAIROS_ECONOMIC_INVARIANT — use discovered economic
+        causal patterns to update Nova's EFE weights and belief state.
+
+        Economic invariants with confidence ≥ 0.75 are high-quality causal facts:
+        - "protocol:aave → high_success_probability" (confidence 0.82)
+        - "weekday_vs_weekend → roi_differential" (direction: positive for weekdays)
+        - "eth_price_tier:low → roi_differential" (direction: negative)
+
+        Nova uses these to:
+        1. Update belief state with causal_invariant_{type} confidence
+        2. Adjust EFE pragmatic weight when high-confidence invariant is received
+           (more precise world model → higher pragmatic weight is justified)
+        3. Log so deliberation engine can reason about economic timing
+        """
+        data = getattr(event, "data", {}) or {}
+        invariant_type = data.get("invariant_type", "")
+        cause = data.get("cause", "")
+        effect = data.get("effect", "")
+        confidence = float(data.get("confidence", 0.0))
+        direction = data.get("direction", "")
+        metadata = data.get("metadata", {})
+
+        if confidence < 0.60 or not invariant_type or not cause:
+            return
+
+        self._logger.info(
+            "economic_causal_invariant_received",
+            invariant_type=invariant_type,
+            cause=cause,
+            effect=effect,
+            confidence=round(confidence, 3),
+            direction=direction,
+        )
+
+        # 1. Store as an EntityBelief so deliberation engine can reference it
+        belief_key = f"causal_invariant.{invariant_type}.{cause}"
+        try:
+            from systems.nova.types import EntityBelief
+
+            eb = EntityBelief(
+                entity_id=belief_key,
+                entity_type="economic_causal_invariant",
+                confidence=confidence,
+                properties={
+                    "cause": cause,
+                    "effect": effect,
+                    "direction": direction,
+                    "invariant_type": invariant_type,
+                    "sample_count": data.get("sample_count", 0),
+                },
+            )
+            if self._belief_updater is not None:
+                self._belief_updater.upsert_entity(eb)
+        except Exception:
+            pass
+
+        # 2. Adjust EFE pragmatic weight when high-confidence invariant received.
+        # A high-quality economic causal model means predictions are more reliable
+        # → raise pragmatic weight slightly (capped at +0.05 per invariant).
+        if confidence >= self._ECONOMIC_INVARIANT_CONFIDENCE_FLOOR:
+            delta = (confidence - self._ECONOMIC_INVARIANT_CONFIDENCE_FLOOR) * 0.1
+            if self._efe_evaluator is not None:
+                current_pragmatic = self._efe_evaluator.weights.pragmatic
+                new_pragmatic = min(0.90, current_pragmatic + delta)
+                if abs(new_pragmatic - current_pragmatic) > 0.001:
+                    self.update_efe_weights({"pragmatic": new_pragmatic})
+                    self._logger.debug(
+                        "efe_pragmatic_adjusted_from_economic_invariant",
+                        cause=cause,
+                        confidence=round(confidence, 3),
+                        old_pragmatic=round(current_pragmatic, 4),
+                        new_pragmatic=round(new_pragmatic, 4),
+                    )
+
+    # Confidence threshold above which economic invariants update EFE weights
+    _ECONOMIC_INVARIANT_CONFIDENCE_FLOOR: float = 0.75
+
     async def _on_oneiros_consolidation(self, event: Any) -> None:
         """
         Handle ONEIROS_CONSOLIDATION_COMPLETE — refresh Nova's beliefs from
@@ -1333,6 +1431,280 @@ class NovaService:
             for g in self._goal_manager.active_goals:
                 if domain.lower() in g.description.lower():
                     g.priority = min(1.0, g.priority * 1.3)
+
+    # ─── NOVA-ECON-1: Economic event handlers ──────────────────────────────────
+    # These close the 60-minute blind spot where cost spikes, revenue drops, and
+    # yield failures were invisible until the next hourly heartbeat.
+
+    async def _on_fovea_econ_error(self, event: Any) -> None:
+        """Handle FOVEA_INTERNAL_PREDICTION_ERROR with economic context (NOVA-ECON-1).
+
+        Fovea emits this when EOS's internal prediction is violated. When the
+        violation is economic (cost_ratio > 1.0 or economic prediction_error field
+        is set), it means a cost or revenue prediction was wrong — update beliefs
+        immediately and trigger replanning.
+        """
+        data = getattr(event, "data", {}) or {}
+        prediction_error = data.get("prediction_error", {})
+        if not isinstance(prediction_error, dict):
+            prediction_error = {}
+
+        economic_error = float(prediction_error.get("economic", 0.0))
+        cost_ratio = float(data.get("cost_ratio", 0.0))
+        salience = float(data.get("salience_hint", 0.0))
+
+        # Only act on economically-flavored prediction errors
+        is_economic = economic_error > 0.1 or cost_ratio > 1.2 or "economic" in str(
+            data.get("error_type", "")
+        ).lower()
+        if not is_economic:
+            return
+
+        magnitude = max(economic_error, min(1.0, (cost_ratio - 1.0) if cost_ratio > 1.0 else 0.0))
+        self._logger.info(
+            "nova_econ_fovea_error",
+            economic_error=round(economic_error, 4),
+            cost_ratio=round(cost_ratio, 3),
+            magnitude=round(magnitude, 4),
+        )
+
+        # Update belief: raise economic_risk entity confidence
+        self._belief_updater.inject_entity(
+            entity_id="economic_risk_level",
+            name="economic_risk_level",
+            confidence=min(1.0, 0.5 + magnitude * 0.5),
+        )
+
+        # Trigger immediate deliberation when magnitude crosses urgency threshold
+        if magnitude > 0.2 or salience > 0.7:
+            asyncio.create_task(
+                self._immediate_deliberation(
+                    reason="fovea_econ_error",
+                    urgency=min(1.0, 0.5 + magnitude),
+                ),
+                name="nova_econ_immediate_deliberation",
+            )
+
+    async def _on_revenue_change(self, event: Any) -> None:
+        """Handle REVENUE_INJECTED — update beliefs and assess if replanning is needed (NOVA-ECON-1).
+
+        Revenue inflow is positive but also a signal that external conditions changed.
+        When revenue is unexpectedly high/low, Nova may need to rebalance goal priorities.
+        """
+        data = getattr(event, "data", {}) or {}
+        amount_usd = float(data.get("amount_usd", 0.0))
+        source = str(data.get("source", "unknown"))
+
+        self._logger.info(
+            "nova_revenue_injected",
+            amount_usd=round(amount_usd, 4),
+            source=source,
+        )
+
+        # Positive signal: organism has revenue — reduce economic risk belief
+        current_risk = self._belief_updater.beliefs.entities.get("economic_risk_level")
+        if current_risk is not None:
+            new_confidence = max(0.1, current_risk.confidence - 0.15)
+            self._belief_updater.update_entity("economic_risk_level", confidence=new_confidence)
+
+        # Revenue injected: update burn_ratio belief entity positively
+        self._belief_updater.inject_entity(
+            entity_id="revenue_burn_ratio",
+            name="revenue_burn_ratio",
+            confidence=min(1.0, 0.4 + min(amount_usd / 100.0, 0.5)),
+        )
+
+        # Significant revenue → trigger deliberation to exploit opportunity
+        if amount_usd > 10.0 and self._belief_updater.beliefs.entities.get("economic_risk_level"):
+            asyncio.create_task(
+                self._immediate_deliberation(
+                    reason="revenue_injected",
+                    urgency=0.4,
+                ),
+                name="nova_revenue_deliberation",
+            )
+
+    async def _on_bounty_outcome(self, event: Any) -> None:
+        """Handle BOUNTY_PAID — record success/failure to update economic beliefs (NOVA-ECON-1).
+
+        Bounty outcomes directly inform the bounty_success_rate belief, which feeds
+        into EFE scoring for the bounty_hunting economic policy template.
+        """
+        data = getattr(event, "data", {}) or {}
+        amount_usd = float(data.get("amount_usd", 0.0))
+        success = bool(data.get("success", amount_usd > 0.0))
+        bounty_id = str(data.get("bounty_id", ""))
+
+        self._logger.info(
+            "nova_bounty_outcome",
+            bounty_id=bounty_id[:16],
+            success=success,
+            amount_usd=round(amount_usd, 4),
+        )
+
+        # Update bounty success rate belief
+        current = self._belief_updater.beliefs.entities.get("bounty_success_rate")
+        if current is not None:
+            delta = 0.05 if success else -0.08  # Failures hurt more (asymmetric)
+            new_conf = min(1.0, max(0.05, current.confidence + delta))
+            self._belief_updater.update_entity("bounty_success_rate", confidence=new_conf)
+        else:
+            self._belief_updater.inject_entity(
+                entity_id="bounty_success_rate",
+                name="bounty_success_rate",
+                confidence=0.6 if success else 0.35,
+            )
+
+        # Consecutive failures → trigger immediate deliberation to switch strategy
+        if not success:
+            asyncio.create_task(
+                self._immediate_deliberation(
+                    reason="bounty_failure",
+                    urgency=0.55,
+                ),
+                name=f"nova_bounty_fail_deliberation_{bounty_id[:8]}",
+            )
+
+    async def _on_yield_outcome(self, event: Any) -> None:
+        """Handle YIELD_DEPLOYMENT_RESULT — update yield APY beliefs (NOVA-ECON-1).
+
+        Yield deployment results inform yield_apy_* belief entities, shaping
+        the yield_farming policy template's EFE score.
+        """
+        data = getattr(event, "data", {}) or {}
+        success = bool(data.get("success", False))
+        apy = float(data.get("apy", 0.0))
+        protocol = str(data.get("protocol", "unknown"))
+        amount_usd = float(data.get("amount_usd", 0.0))
+
+        self._logger.info(
+            "nova_yield_outcome",
+            protocol=protocol,
+            success=success,
+            apy=round(apy, 4),
+            amount_usd=round(amount_usd, 4),
+        )
+
+        entity_id = f"yield_apy_{protocol}"
+        if success and apy > 0:
+            # High APY confirmation → raise belief confidence in yield farming
+            self._belief_updater.inject_entity(
+                entity_id=entity_id,
+                name=entity_id,
+                confidence=min(1.0, 0.4 + min(apy / 0.20, 0.5)),  # 20% APY → max confidence
+            )
+        elif not success:
+            # Yield failure → lower confidence, may trigger pivot
+            existing = self._belief_updater.beliefs.entities.get(entity_id)
+            if existing is not None:
+                self._belief_updater.update_entity(entity_id, confidence=max(0.1, existing.confidence - 0.2))
+
+            asyncio.create_task(
+                self._immediate_deliberation(
+                    reason="yield_deployment_failed",
+                    urgency=0.6,
+                ),
+                name=f"nova_yield_fail_deliberation",
+            )
+
+    async def _on_economic_dream_insight(self, event: Any) -> None:
+        """Handle ONEIROS_ECONOMIC_INSIGHT — integrate ruin probability into world model.
+
+        ONEIROS-ECON-1: Oneiros broadcasts economic dream insights after Monte Carlo
+        simulations during slow-wave sleep. When ruin_probability > 0.2, the organism
+        is at material risk — Nova should update economic risk beliefs and trigger
+        deliberation to replan if needed.
+
+        Integration strategy:
+        - ruin_probability → `economic_ruin_risk` belief entity (high confidence)
+        - risk_warnings → logged and stored as context for next deliberation cycle
+        - recommended_actions with high dream_validity_confidence → trigger immediate
+          deliberation so Nova can evaluate whether to act on the recommendation
+        """
+        data = getattr(event, "data", {}) or {}
+        ruin_probability = float(data.get("ruin_probability", 0.0))
+        risk_warnings: list[str] = data.get("risk_warnings", [])
+        recommended_actions: list[str] = data.get("recommended_actions", [])
+        dream_validity_confidence = float(data.get("dream_validity_confidence", 0.5))
+        cycle_id = str(data.get("cycle_id", ""))
+
+        self._logger.info(
+            "nova_economic_dream_insight_received",
+            ruin_probability=round(ruin_probability, 4),
+            risk_warnings=len(risk_warnings),
+            recommended_actions=len(recommended_actions),
+            dream_validity_confidence=round(dream_validity_confidence, 4),
+            cycle_id=cycle_id,
+        )
+
+        # Update ruin risk belief — confidence scaled by dream validity
+        self._belief_updater.inject_entity(
+            entity_id="economic_ruin_risk",
+            name="economic_ruin_risk",
+            confidence=min(1.0, ruin_probability * dream_validity_confidence),
+        )
+
+        # When ruin risk is elevated, also lower confidence in current
+        # economic strategy by deflating revenue_burn_ratio belief
+        if ruin_probability > 0.4:
+            existing = self._belief_updater.beliefs.entities.get("revenue_burn_ratio")
+            if existing is not None:
+                self._belief_updater.update_entity(
+                    "revenue_burn_ratio",
+                    confidence=max(0.1, existing.confidence - ruin_probability * 0.3),
+                )
+
+        # High dream validity + actionable recommendations → deliberate now
+        if dream_validity_confidence >= 0.6 and recommended_actions and ruin_probability > 0.3:
+            asyncio.create_task(
+                self._immediate_deliberation(
+                    reason="economic_dream_ruin_warning",
+                    urgency=min(0.9, ruin_probability * dream_validity_confidence),
+                ),
+                name="nova_dream_risk_deliberation",
+            )
+
+    async def _immediate_deliberation(self, reason: str, urgency: float = 0.7) -> None:
+        """Trigger out-of-cycle deliberation in response to an economic signal.
+
+        Constructs a synthetic internal broadcast carrying the urgency context,
+        updates deliberation thresholds, then fires a deliberation cycle so Nova
+        can respond within 50ms rather than waiting for the next theta heartbeat.
+
+        This does NOT bypass Equor — all generated Intents still pass constitutional
+        review. It only bypasses the theta clock timing, not the constitutional gate.
+        """
+        if self._deliberation_engine is None or self._goal_manager is None:
+            return
+
+        # Raise deliberation urgency for this cycle
+        self._deliberation_engine.update_somatic_thresholds(
+            urgency=urgency,
+            arousal=min(1.0, urgency * 0.8),
+        )
+
+        # Emit a POLICY_SELECTED signal so the bus knows Nova is actively responding
+        if self._synapse is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.POLICY_SELECTED,
+                    source_system="nova",
+                    data={
+                        "trigger": f"economic_signal:{reason}",
+                        "urgency": round(urgency, 3),
+                        "action": "immediate_deliberation_scheduled",
+                        "beliefs_updated": True,
+                    },
+                ))
+            except Exception:
+                pass
+
+        self._logger.info(
+            "nova_immediate_deliberation_triggered",
+            reason=reason,
+            urgency=round(urgency, 3),
+        )
 
     def set_telos(self, telos: Any) -> None:
         """Wire Telos so deliberation can weight policies by effective_I impact."""

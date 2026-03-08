@@ -214,6 +214,11 @@ class ThreadService:
         self._life_story: LifeStorySnapshot | None = None
         self._last_coherence: NarrativeCoherence = NarrativeCoherence.TRANSITIONAL
 
+        # Economic event cache (for economic narrative dimensions in fingerprint)
+        # Stores dicts with: event_type, revenue_source, timestamp
+        self._cached_economic_events: list[dict[str, Any]] = []
+        self._ECONOMIC_EVENT_MAX: int = 200  # Rolling window
+
         # Counters
         self._on_cycle_count: int = 0
         self._life_story_integrations: int = 0
@@ -454,7 +459,21 @@ class ThreadService:
                 self._on_domain_performance_declining,
             )
 
-        self._logger.info("thread_registered_on_synapse", subscriptions=18)
+        # Economic milestone events → narrative turning points + economic dim cache
+        event_bus.subscribe(SynapseEventType.ASSET_BREAK_EVEN, self._on_asset_break_even)
+        event_bus.subscribe(SynapseEventType.CHILD_INDEPENDENT, self._on_child_independent)
+        event_bus.subscribe(SynapseEventType.REVENUE_INJECTED, self._on_revenue_milestone)
+        event_bus.subscribe(SynapseEventType.BOUNTY_PAID, self._on_economic_achievement)
+        event_bus.subscribe(SynapseEventType.EQUOR_ECONOMIC_PERMIT, self._on_equor_economic_permit)
+
+        # EVO-ECON-1: Evo hypothesis emergence → narrative identity integration
+        if hasattr(SynapseEventType, "EVO_HYPOTHESIS_CREATED"):
+            event_bus.subscribe(
+                SynapseEventType.EVO_HYPOTHESIS_CREATED,
+                self._on_evo_hypothesis_created,
+            )
+
+        self._logger.info("thread_registered_on_synapse", subscriptions=24)
 
     # ─── Inbound Event Handlers ──────────────────────────────────────────────
 
@@ -1343,6 +1362,407 @@ class ThreadService:
             month=month,
             significance=significance,
         )
+
+    # ─── Economic Milestone Handlers ──────────────────────────────────────────
+
+    def _record_economic_event(
+        self,
+        event_type: str,
+        revenue_source: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Record a raw economic event into the rolling cache.
+        Used by DiachronicCoherenceMonitor to compute economic identity dimensions.
+        """
+        record: dict[str, Any] = {
+            "event_type": event_type,
+            "revenue_source": revenue_source,
+            "timestamp": utc_now().isoformat(),
+        }
+        if extra:
+            record.update(extra)
+        self._cached_economic_events.append(record)
+        if len(self._cached_economic_events) > self._ECONOMIC_EVENT_MAX:
+            self._cached_economic_events = self._cached_economic_events[-self._ECONOMIC_EVENT_MAX:]
+
+    async def _on_asset_break_even(self, event: SynapseEvent) -> None:
+        """
+        ASSET_BREAK_EVEN → ACHIEVEMENT TurningPoint + record economic event.
+
+        Signals that an autonomous asset has reached break-even — a meaningful
+        economic narrative milestone (the organism's investment paid off).
+        """
+        if not self._initialized:
+            return
+
+        data = event.data or {}
+        asset_name = str(data.get("asset_name", "unnamed asset"))
+        roi_score = float(data.get("roi_score", 0.0))
+        dev_cost = str(data.get("dev_cost_usd", "0"))
+
+        # Record for economic dimension tracking
+        self._record_economic_event(
+            "asset_break_even",
+            revenue_source="asset",
+            extra={"asset_name": asset_name, "roi_score": roi_score},
+        )
+
+        chapter = self._get_active_chapter()
+        chapter_id = chapter.id if chapter else ""
+
+        from systems.thread.types import TurningPoint, TurningPointType
+        turning_point = TurningPoint(
+            type=TurningPointType.ACHIEVEMENT,
+            description=(
+                f"Asset '{asset_name}' reached break-even (ROI: {roi_score:.2f}x, "
+                f"development cost recouped: {dev_cost} USD). "
+                "The organism's autonomous economic capacity is validated."
+            ),
+            narrative_weight=min(1.0, 0.5 + roi_score * 0.1),
+            chapter_id=chapter_id,
+        )
+
+        await self._emit_event("turning_point_detected", {
+            "type": TurningPointType.ACHIEVEMENT.value,
+            "chapter_id": chapter_id,
+            "surprise_magnitude": turning_point.narrative_weight,
+            "narrative_weight": turning_point.narrative_weight,
+            "description": turning_point.description,
+            "source": "asset_break_even",
+            "asset_name": asset_name,
+            "roi_score": roi_score,
+        })
+        await self._emit_re_training_trace(
+            instruction="Integrate economic milestone — asset break-even into autobiography.",
+            input_context=f"Asset: {asset_name}, ROI: {roi_score:.2f}x",
+            output=turning_point.description,
+            quality=min(1.0, 0.6 + roi_score * 0.05),
+            category="economic_narrative_integration",
+        )
+
+    async def _on_child_independent(self, event: SynapseEvent) -> None:
+        """
+        CHILD_INDEPENDENT → ACHIEVEMENT TurningPoint + record economic event.
+
+        Signals that a spawned child has become financially independent
+        — a profound reproductive milestone in the organism's narrative.
+        """
+        if not self._initialized:
+            return
+
+        data = event.data or {}
+        child_id = str(data.get("child_id", "unknown"))
+        child_efficiency = float(data.get("metabolic_efficiency", 0.0))
+
+        # Record for economic dimension tracking
+        self._record_economic_event(
+            "child_independent",
+            revenue_source="dividend",
+            extra={"child_id": child_id, "efficiency": child_efficiency},
+        )
+
+        chapter = self._get_active_chapter()
+        chapter_id = chapter.id if chapter else ""
+
+        from systems.thread.types import TurningPoint, TurningPointType
+        turning_point = TurningPoint(
+            type=TurningPointType.ACHIEVEMENT,
+            description=(
+                f"Child instance '{child_id}' achieved financial independence "
+                f"(metabolic efficiency: {child_efficiency:.2f}x). "
+                "The organism has successfully reproduced and nurtured a new life."
+            ),
+            narrative_weight=0.85,
+            chapter_id=chapter_id,
+        )
+
+        await self._emit_event("turning_point_detected", {
+            "type": TurningPointType.ACHIEVEMENT.value,
+            "chapter_id": chapter_id,
+            "surprise_magnitude": 0.85,
+            "narrative_weight": 0.85,
+            "description": turning_point.description,
+            "source": "child_independent",
+            "child_id": child_id,
+            "child_efficiency": child_efficiency,
+        })
+        await self._emit_re_training_trace(
+            instruction="Integrate reproductive milestone — child independence into autobiography.",
+            input_context=f"Child: {child_id}, efficiency: {child_efficiency:.2f}",
+            output=turning_point.description,
+            quality=0.85,
+            category="economic_narrative_integration",
+        )
+
+    async def _on_revenue_milestone(self, event: SynapseEvent) -> None:
+        """
+        REVENUE_INJECTED → record an economic turning point if revenue is significant.
+
+        Tracks the organism's self-sustaining economic trajectory as autobiography.
+        Revenue events are only elevated to turning points when the amount exceeds
+        a meaningful threshold — routine yield accrual does not create narrative noise.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = event.data or {}
+            amount = float(data.get("amount_usd", 0.0))
+            source = str(data.get("source", "unknown"))
+
+            # Record for economic dimension tracking regardless of amount
+            self._record_economic_event(
+                "revenue_injected",
+                revenue_source=source,
+                extra={"amount_usd": amount},
+            )
+
+            # Only surface as a narrative ACHIEVEMENT for significant revenue events
+            # (> $1 threshold prevents yield accrual micro-events from creating noise)
+            if amount < 1.0:
+                return
+
+            chapter = self._get_active_chapter()
+            chapter_id = chapter.id if chapter else ""
+
+            from systems.thread.types import TurningPoint, TurningPointType
+            turning_point = TurningPoint(
+                type=TurningPointType.ACHIEVEMENT,
+                description=(
+                    f"Revenue of ${amount:.2f} received from {source}. "
+                    "The organism's economic metabolism is generating real income."
+                ),
+                narrative_weight=min(1.0, 0.3 + amount / 100.0),
+                chapter_id=chapter_id,
+            )
+
+            await self._emit_event("turning_point_detected", {
+                "type": TurningPointType.ACHIEVEMENT.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": turning_point.narrative_weight,
+                "narrative_weight": turning_point.narrative_weight,
+                "description": turning_point.description,
+                "source": "revenue_injected",
+                "amount_usd": amount,
+                "revenue_source": source,
+            })
+            self._logger.debug(
+                "thread_revenue_milestone", amount_usd=amount, source=source
+            )
+        except Exception as exc:
+            self._logger.warning("on_revenue_milestone_failed", error=str(exc))
+
+    async def _on_economic_achievement(self, event: SynapseEvent) -> None:
+        """
+        BOUNTY_PAID → ACHIEVEMENT TurningPoint for confirmed bounty revenue.
+
+        A paid bounty is one of the clearest signals that the organism can
+        generate value for others — a foundational narrative milestone for
+        economic autonomy and Care drive expression.
+        """
+        if not self._initialized:
+            return
+        try:
+            data = event.data or {}
+            bounty_id = str(data.get("bounty_id", ""))
+            amount = float(data.get("reward_usd", data.get("amount", 0.0)))
+            platform = str(data.get("platform", "unknown"))
+
+            # Record for economic dimension tracking
+            self._record_economic_event(
+                "bounty_paid",
+                revenue_source="bounty",
+                extra={"bounty_id": bounty_id, "amount_usd": amount, "platform": platform},
+            )
+
+            chapter = self._get_active_chapter()
+            chapter_id = chapter.id if chapter else ""
+
+            from systems.thread.types import TurningPoint, TurningPointType
+            turning_point = TurningPoint(
+                type=TurningPointType.ACHIEVEMENT,
+                description=(
+                    f"Bounty completed and paid: ${amount:.2f} from {platform}. "
+                    "The organism demonstrated its capability to solve real-world "
+                    "problems and earn economic reward for Care."
+                ),
+                narrative_weight=min(1.0, 0.6 + amount / 50.0),
+                chapter_id=chapter_id,
+            )
+
+            await self._emit_event("turning_point_detected", {
+                "type": TurningPointType.ACHIEVEMENT.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": turning_point.narrative_weight,
+                "narrative_weight": turning_point.narrative_weight,
+                "description": turning_point.description,
+                "source": "bounty_paid",
+                "bounty_id": bounty_id,
+                "amount_usd": amount,
+                "platform": platform,
+            })
+            await self._emit_re_training_trace(
+                instruction="Integrate economic achievement — bounty payment into autobiography.",
+                input_context=f"Bounty: {bounty_id}, amount: ${amount:.2f}, platform: {platform}",
+                output=turning_point.description,
+                quality=min(1.0, 0.6 + amount / 50.0),
+                category="economic_narrative_integration",
+            )
+        except Exception as exc:
+            self._logger.warning("on_economic_achievement_failed", error=str(exc))
+
+    async def _on_equor_economic_permit(self, event: SynapseEvent) -> None:
+        """
+        Form an economic commitment when an economic intent is approved.
+
+        Fired on EQUOR_ECONOMIC_PERMIT with payload:
+          - intent_id: str
+          - intent_goal: str
+          - verdict: "PERMIT" or "MODIFY"
+          - drive_alignment: DriveAlignmentVector (optional serialised dict)
+
+        Creates a Commitment with source=ECONOMIC_DECISION if verdict is PERMIT.
+        Emits commitment_made + ACHIEVEMENT TurningPoint on successful formation.
+        """
+        try:
+            data = event.data
+            verdict = data.get("verdict", "")
+            if verdict != "PERMIT":
+                return  # Only PERMIT creates a binding commitment; MODIFY does not
+
+            intent_id = data.get("intent_id", "unknown")
+            intent_goal = data.get("intent_goal", "") or data.get("goal", "")
+            if not intent_goal:
+                self._logger.warning("equor_economic_permit_no_goal", intent_id=intent_id)
+                return
+
+            # Reconstruct DriveAlignmentVector from serialised dict if present
+            from primitives.common import DriveAlignmentVector
+            raw_drive = data.get("drive_alignment")
+            if isinstance(raw_drive, dict):
+                drive_alignment = DriveAlignmentVector(
+                    coherence=raw_drive.get("coherence", 0.0),
+                    care=raw_drive.get("care", 0.0),
+                    growth=raw_drive.get("growth", 0.0),
+                    honesty=raw_drive.get("honesty", 0.0),
+                )
+            else:
+                drive_alignment = DriveAlignmentVector()
+
+            statement = f"I am committed to: {intent_goal}"
+            commitment = await self._commitment_keeper.form_commitment(
+                statement=statement,
+                source=CommitmentSource.ECONOMIC_DECISION,
+                source_description=f"Approved economic intent {intent_id}",
+                source_episode_ids=[intent_id],
+                drive_alignment=drive_alignment,
+            )
+
+            # Emit commitment_made narrative event
+            await self._emit_event("commitment_made", {
+                "commitment_id": commitment.id,
+                "statement": commitment.statement,
+                "source": CommitmentSource.ECONOMIC_DECISION.value,
+                "intent_id": intent_id,
+            })
+
+            # Create ACHIEVEMENT TurningPoint — an approved economic intent is a narrative milestone
+            chapter_id = self._current_chapter.id if self._current_chapter else ""
+            turning_point = TurningPoint(
+                type=TurningPointType.ACHIEVEMENT,
+                description=f"Economic commitment formed: {intent_goal[:120]}",
+                significance=0.65,
+                narrative_weight=0.65,
+                chapter_id=chapter_id,
+            )
+            await self._emit_event("turning_point_detected", {
+                "type": TurningPointType.ACHIEVEMENT.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": turning_point.narrative_weight,
+                "narrative_weight": turning_point.narrative_weight,
+                "description": turning_point.description,
+                "source": "equor_economic_permit",
+                "intent_id": intent_id,
+                "commitment_id": commitment.id,
+            })
+            await self._emit_re_training_trace(
+                instruction="Integrate approved economic intent as narrative commitment.",
+                input_context=f"Intent: {intent_id}, goal: {intent_goal[:120]}",
+                output=statement,
+                quality=0.7,
+                category="economic_commitment_formation",
+            )
+        except Exception as exc:
+            self._logger.warning("on_equor_economic_permit_failed", error=str(exc))
+
+    async def _on_evo_hypothesis_created(self, event: SynapseEvent) -> None:
+        """
+        EVO-ECON-1: EVO_HYPOTHESIS_CREATED → narrative identity integration.
+
+        Novel hypotheses are significant epistemic events — the organism has
+        generated a new belief about the world.  High-novelty hypotheses
+        (novelty_score ≥ 0.7) become REVELATION TurningPoints so the life
+        story records the moment of discovery.  Lower-novelty hypotheses
+        are silently logged to avoid narrative inflation.
+        """
+        try:
+            if not self._initialized:
+                return
+
+            data = event.data
+            hypothesis_id: str = data.get("hypothesis_id", "unknown")
+            statement: str = data.get("statement", "")
+            category: str = data.get("category", "general")
+            novelty_score: float = float(data.get("novelty_score", 0.0))
+
+            if novelty_score < 0.7:
+                # Low-novelty hypotheses are routine — skip TurningPoint creation
+                self._logger.debug(
+                    "evo_hypothesis_created_low_novelty",
+                    hypothesis_id=hypothesis_id,
+                    novelty_score=round(novelty_score, 3),
+                )
+                return
+
+            chapter = self._get_active_chapter()
+            chapter_id = chapter.id if chapter is not None else self._current_chapter_id()
+
+            from systems.thread.types import TurningPoint, TurningPointType
+
+            turning_point = TurningPoint(
+                chapter_id=chapter_id,
+                type=TurningPointType.REVELATION,
+                description=(
+                    f"Novel hypothesis formed ({category}): \"{statement[:120]}\""
+                    if statement
+                    else f"Novel hypothesis formed ({category}, id={hypothesis_id})"
+                ),
+                surprise_magnitude=novelty_score,
+                narrative_weight=min(1.0, 0.6 + novelty_score * 0.4),
+            )
+
+            await self._emit_event("turning_point_detected", {
+                "turning_point_id": turning_point.id,
+                "type": TurningPointType.REVELATION.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": round(novelty_score, 3),
+                "narrative_weight": round(turning_point.narrative_weight, 3),
+                "description": turning_point.description,
+                "source": "evo_hypothesis_created",
+                "hypothesis_id": hypothesis_id,
+                "category": category,
+                "significance": "high" if novelty_score >= 0.85 else "medium",
+            })
+
+            self._logger.info(
+                "evo_hypothesis_narrative_milestone",
+                hypothesis_id=hypothesis_id,
+                category=category,
+                novelty_score=round(novelty_score, 3),
+                chapter_id=chapter_id,
+            )
+        except Exception as exc:
+            self._logger.warning("on_evo_hypothesis_created_failed", error=str(exc))
 
     # ─── Constitutional Snapshot ──────────────────────────────────────────────
 
@@ -2325,12 +2745,22 @@ class ThreadService:
         vector[22] = 0.5  # achievement rate estimate
         vector[23] = 0.5  # goal turnover estimate
 
-        # Interaction profile (5D) — estimated
-        vector[24] = 0.5
-        vector[25] = 0.5
-        vector[26] = 0.5
-        vector[27] = 0.5
-        vector[28] = 0.5
+        # Economic identity profile (5D) — from Oikos event cache
+        # Dims: [economic_strategy, risk_tolerance, diversification,
+        #        yield_inclination, reproduction_preference]
+        if self._diachronic_monitor is not None and self._cached_economic_events:
+            econ_dims = self._diachronic_monitor.compute_economic_dimensions(
+                self._cached_economic_events
+            )
+            for i, val in enumerate(econ_dims):
+                vector[24 + i] = val
+        else:
+            # Default: balanced strategy, neutral risk, no diversity yet
+            vector[24] = 0.0   # economic_strategy: balanced
+            vector[25] = 0.5   # risk_tolerance: neutral
+            vector[26] = 0.0   # diversification: unknown
+            vector[27] = 0.0   # yield_inclination: none observed
+            vector[28] = 0.0   # reproduction_preference: none observed
 
         fingerprint = IdentityFingerprint(
             vector=vector,
@@ -2360,9 +2790,9 @@ class ThreadService:
                 await self._diachronic_monitor.compute_fingerprint(
                     personality_centroid=vector[0:9],
                     drive_alignment_centroid=vector[9:13],
-                    goal_source_distribution=vector[13:19],
-                    affect_centroid=vector[19:25],
-                    interaction_style_distribution=vector[25:29],
+                    goal_source_distribution=vector[19:24],
+                    affect_centroid=vector[13:19],
+                    interaction_style_distribution=vector[24:29],
                     episodes_in_window=active_chapter.episode_count if active_chapter else 0,
                     epoch_label=epoch_label,
                 )

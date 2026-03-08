@@ -542,6 +542,40 @@ class SimulaConfig(BaseModel):
     category_risk_boost_add_system: float = 0.2
     category_risk_boost_adjust_budget: float = -0.1
 
+    # ─── Economic Learnable Parameters (Fix 4.1) ──────────────────────────────
+    # These 10 parameters govern economic decision-making thresholds.
+    # Evo tunes them via ADJUST_BUDGET proposals targeting econ_* parameter names.
+    # All bounds enforced in SimulaService._on_evo_adjust_budget().
+
+    # DeFi yield farming thresholds
+    yield_apy_drop_rebalance_threshold: float = 0.80  # rebalance if APY < 80% of expected
+    yield_apy_minimum_acceptable: float = 0.03  # reject positions below 3% APY
+
+    # Bounty hunting thresholds
+    bounty_min_roi_multiple: float = 1.5  # ROI must be >= 1.5x gas cost to accept
+    bounty_max_risk_score: float = 0.60  # reject bounties with risk > 0.6
+
+    # Asset development budgeting
+    asset_dev_budget_pct: float = 0.15  # allocate up to 15% of liquid balance
+
+    # Child spawning thresholds
+    child_spawn_interval_days: float = 30.0  # minimum days between spawns
+    child_min_profitability_usd: float = 100.0  # only spawn if niche clears $100/mo
+
+    # Cost management
+    cost_reduction_target_pct: float = 0.10  # target 10% cost reduction per cycle
+
+    # Emergency thresholds
+    emergency_liquidation_threshold: float = 0.10  # liquidate yield if balance < 10% of target
+
+    # Protocol exploration budget
+    protocol_exploration_budget_pct: float = 0.20  # allocate up to 20% for new protocols
+
+    # Protocol allocation aggressiveness (SIMULA-ECON-1)
+    # Controls how aggressively capital is concentrated in top-performing protocols.
+    # 0.1 = cautious (spread across many), 1.0 = aggressive (max concentration in #1).
+    protocol_allocation_aggressiveness: float = 0.5
+
 
 class ThymosConfig(BaseModel):
     # Sentinel scan interval (seconds)

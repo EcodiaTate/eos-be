@@ -74,6 +74,12 @@ class RETrainingDatapoint(EOSBaseModel):
     quality_tier: str = "bronze"
     # Task difficulty [0, 1] computed at export time from richness signals
     task_difficulty: float = 0.0
+    # Multi-step economic strategy annotation (set by RETrainingExporter at export time)
+    is_strategic: bool = False           # True if part of a detected multi-step strategy
+    strategy_name: str | None = None     # e.g. "recovery_via_diversification"
+    strategy_step_number: int | None = None   # Which step in the strategy (1-indexed)
+    strategy_total_steps: int | None = None   # Total steps in this strategy
+    strategy_duration_hours: float | None = None  # How long the strategy took (hours)
 
 
 class RETrainingExportBatch(Identified):

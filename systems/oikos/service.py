@@ -606,6 +606,13 @@ class OikosService:
             self._on_asset_dev_request,
         )
 
+        # NEXUS-ECON-1: Federation convergence reward — credit epistemic income to reserves
+        event_bus.subscribe(
+            SynapseEventType.NEXUS_CONVERGENCE_METABOLIC_SIGNAL,
+            self._on_federation_convergence_reward,
+            timeout_s=1.0,
+        )
+
         # Phase 16b: Wire bounty hunter to the event bus
         self._bounty_hunter.attach(event_bus)
 
@@ -709,6 +716,7 @@ class OikosService:
                 SynapseEventType.EQUOR_ECONOMIC_PERMIT.value,
                 SynapseEventType.OIKOS_ECONOMIC_QUERY.value,
                 SynapseEventType.CHILD_WALLET_REPORTED.value,
+                SynapseEventType.NEXUS_CONVERGENCE_METABOLIC_SIGNAL.value,
             ],
         )
 
@@ -1178,6 +1186,67 @@ class OikosService:
             metadata={"source": source, "total_revenue_usd": str(self._total_revenue_usd)},
         )
 
+    async def _on_federation_convergence_reward(self, event: SynapseEvent) -> None:
+        """
+        Handle NEXUS_CONVERGENCE_METABOLIC_SIGNAL — credit convergence reward to reserves.
+
+        NEXUS-ECON-1: Nexus emits this after confirmed triangulation convergence.
+        When peers independently arrive at the same world-model structure, the organism
+        earns a small economic reward (convergence_tier × 0.001 USDC) as selection
+        pressure toward knowledge sharing.
+
+        The reward is credited to reserves (not liquid_balance) since it reflects
+        epistemic capital — stable income from cognitive quality, not operational cash.
+        REVENUE_INJECTED is re-broadcast so MetabolicTracker and other subscribers see it.
+        """
+        data = event.data
+        reward_usd = float(data.get("economic_reward_usd", 0.0))
+        if reward_usd <= 0.0:
+            # Divergence penalty cycle or no-reward tier — nothing to credit.
+            return
+
+        theme = str(data.get("theme", "federation_convergence"))
+        peer_count = int(data.get("peer_count", 0))
+        convergence_tier = int(data.get("convergence_tier", 0))
+
+        reward = Decimal(str(reward_usd))
+
+        # Credit to reserves — epistemic income is stable, not operational cash
+        self._state.reserves_usd += reward
+        self._total_revenue_usd += reward
+        self._record_revenue_entry(reward)
+        self._credit_revenue_source(RevenueStream.INJECTION, reward)
+        self._recalculate_derived_metrics()
+
+        self._logger.info(
+            "oikos_convergence_reward_credited",
+            reward_usd=str(reward),
+            theme=theme,
+            convergence_tier=convergence_tier,
+            peer_count=peer_count,
+            new_reserves=str(self._state.reserves_usd),
+        )
+
+        # Re-broadcast as REVENUE_INJECTED so MetabolicTracker and other
+        # subscribers (Thread, Benchmarks) see this income stream.
+        if self._event_bus is not None:
+            asyncio.ensure_future(
+                self._event_bus.emit(
+                    SynapseEvent(
+                        event_type=SynapseEventType.REVENUE_INJECTED,
+                        data={
+                            "amount_usd": str(reward),
+                            "source": "federation_convergence",
+                            "convergence_tier": convergence_tier,
+                            "theme": theme,
+                            "peer_count": peer_count,
+                        },
+                        source_system="oikos",
+                        salience=0.6,
+                    )
+                )
+            )
+
     async def _on_wallet_transfer(self, event: SynapseEvent) -> None:
         """
         Handle WALLET_TRANSFER_CONFIRMED from Axon.
@@ -1519,6 +1588,17 @@ class OikosService:
             ),
         ))
 
+        # KAIROS-ECON-1: emit causal episode so Kairos can mine yield patterns
+        asyncio.ensure_future(self._emit_economic_episode_to_memory(
+            action_type="yield_deploy",
+            outcome_success=outcome.success,
+            duration_seconds=0.0,
+            protocol=outcome.protocol or "",
+            capital_deployed_usd=_ys_amount,
+            gas_cost_usd=0.0,
+            roi_pct=_ys_apy * 100.0,
+        ))
+
         return outcome
 
     async def record_accrued_yield(self) -> Decimal:
@@ -1801,6 +1881,20 @@ class OikosService:
                     "live_assets_remaining": len(self._asset_factory.get_live_assets()),
                 },
             )
+
+        # KAIROS-ECON-1: emit asset sweep as causal episode for economic pattern mining
+        if swept_total > Decimal("0"):
+            asyncio.ensure_future(self._emit_economic_episode_to_memory(
+                action_type="asset_liquidate",
+                outcome_success=True,
+                duration_seconds=0.0,
+                protocol="tollbooth",
+                capital_deployed_usd=float(swept_total),
+                gas_cost_usd=0.0,
+                roi_pct=float(
+                    swept_total / max(float(self._state.basal_metabolic_rate / 30), 0.001)
+                ) * 100.0,
+            ))
 
         return result
 
@@ -2153,6 +2247,17 @@ class OikosService:
                 f"At current burn rate, failure would have required ${_be_amount:.2f} additional revenue "
                 f"within {_be_runway_gain:.1f}d to maintain current metabolic state."
             ),
+        ))
+
+        # KAIROS-ECON-1: emit causal episode so Kairos can mine bounty patterns
+        asyncio.ensure_future(self._emit_economic_episode_to_memory(
+            action_type="bounty_hunt",
+            outcome_success=_be_amount > 0,
+            duration_seconds=0.0,
+            protocol="github",
+            capital_deployed_usd=0.0,
+            gas_cost_usd=0.0,
+            roi_pct=(_be_amount / max(float(self._state.basal_metabolic_rate / 30), 0.001)) * 100.0,
         ))
 
     async def _on_bounty_pr_submitted(self, event: SynapseEvent) -> None:
@@ -2522,6 +2627,103 @@ class OikosService:
             cost_usd=str(cost_event.cost_usd),
             liquid_balance_after=str(self._state.liquid_balance),
         )
+
+    async def _emit_economic_episode_to_memory(
+        self,
+        action_type: str,
+        outcome_success: bool,
+        duration_seconds: float,
+        *,
+        protocol: str = "",
+        capital_deployed_usd: float = 0.0,
+        gas_cost_usd: float = 0.0,
+        roi_pct: float = 0.0,
+    ) -> None:
+        """
+        KAIROS-ECON-1 fix: emit OIKOS_ECONOMIC_EPISODE with causal variable
+        annotations so Kairos can mine economic causal patterns.
+
+        Variables include both decision-relevant context (ETH price, gas, day/hour,
+        protocol) and outcome (success, ROI, duration) so Kairos's EconomicCausalMiner
+        can discover patterns like "ETH price drop → yield drop 2 days later".
+        """
+        if self._event_bus is None:
+            return
+        try:
+            import datetime
+
+            now = datetime.datetime.utcnow()
+            day_of_week = now.weekday()   # 0=Mon … 6=Sun
+            hour_of_day = now.hour
+
+            # Best-effort market context from phantom price cache (0.0 if unavailable)
+            eth_price_usd: float = 0.0
+            gas_price_gwei: float = 0.0
+            market_volatility_pct: float = 0.0
+            try:
+                if hasattr(self, "_phantom_price_cache"):
+                    eth_price_usd = float(
+                        getattr(self, "_phantom_price_cache", {}).get("eth_usd", 0.0)
+                    )
+            except Exception:
+                pass
+
+            causal_variables: dict[str, float] = {
+                "action_type_hash": float(hash(action_type) % 1000),
+                "success": float(outcome_success),
+                "roi_pct": roi_pct,
+                "capital_deployed_usd": capital_deployed_usd,
+                "gas_cost_usd": gas_cost_usd,
+                "duration_seconds": duration_seconds,
+                "day_of_week": float(day_of_week),
+                "hour_of_day": float(hour_of_day),
+                "eth_price_usd": eth_price_usd,
+                "gas_price_gwei": gas_price_gwei,
+                "market_volatility_pct": market_volatility_pct,
+                "protocol_hash": float(hash(protocol) % 1000),
+                "metabolic_efficiency": float(self._state.metabolic_efficiency),
+            }
+
+            causal_variable_importance: dict[str, float] = {
+                "success": 1.0,
+                "roi_pct": 0.85,
+                "action_type_hash": 0.9,
+                "eth_price_usd": 0.75,
+                "gas_cost_usd": 0.7,
+                "capital_deployed_usd": 0.7,
+                "day_of_week": 0.6,
+                "metabolic_efficiency": 0.6,
+                "protocol_hash": 0.65,
+                "hour_of_day": 0.5,
+                "duration_seconds": 0.55,
+            }
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.OIKOS_ECONOMIC_EPISODE,
+                source_system="oikos",
+                data={
+                    "action_type": action_type,
+                    "success": outcome_success,
+                    "roi_pct": roi_pct,
+                    "capital_deployed_usd": capital_deployed_usd,
+                    "gas_cost_usd": gas_cost_usd,
+                    "duration_seconds": duration_seconds,
+                    "timestamp": now.isoformat(),
+                    "protocol": protocol,
+                    "chain": "base",
+                    "eth_price_usd": eth_price_usd,
+                    "gas_price_gwei": gas_price_gwei,
+                    "market_volatility_pct": market_volatility_pct,
+                    "day_of_week": day_of_week,
+                    "hour_of_day": hour_of_day,
+                    "causal_substrate": "economic",
+                    "causal_applicable_domains": ["economic", "defi", "oikos"],
+                    "causal_variable_importance": causal_variable_importance,
+                    "causal_variables": causal_variables,
+                },
+            ))
+        except Exception:
+            pass  # Never block economic engine for causal telemetry
 
     async def _emit_asset_dev_deferred(
         self,

@@ -562,6 +562,14 @@ class SynapseEventType(enum.StrEnum):
     # Economic dreaming — actionable recommendations from Monte Carlo
     ECONOMIC_DREAM_RECOMMENDATION = "economic_dream_recommendation"
 
+    # Economic dream insights broadcast from Oneiros after Monte Carlo sleep simulation.
+    # Payload: ruin_probability (float), optimal_scenarios (list[str]),
+    #          risk_warnings (list[str]), recommended_actions (list[str]),
+    #          dream_validity_confidence (float), cycle_id (str)
+    # Nova subscribes to integrate insights into world model beliefs.
+    # Evo subscribes to generate economic risk hypotheses.
+    ONEIROS_ECONOMIC_INSIGHT = "oneiros_economic_insight"
+
     # Economic morphogenesis (Phase 16l)
     ORGAN_CREATED = "organ_created"
     ORGAN_TRANSITION = "organ_transition"
@@ -1440,6 +1448,14 @@ class SynapseEventType(enum.StrEnum):
     # Payload: invariant_id (str), local_hold_rate (float),
     #          violation_count (int), source_instance_id (str)
     KAIROS_INVARIANT_CONTRADICTED = "kairos_invariant_contradicted"
+    #
+    # KAIROS_ECONOMIC_INVARIANT — emitted by EconomicCausalMiner when a
+    # domain-specific economic causal pattern is discovered (e.g. "weekend →
+    # bounty drop", "ETH price bin → APY tier").
+    # Payload: invariant_type (str), cause (str), effect (str),
+    #          confidence (float), sample_count (int), direction (str),
+    #          metadata (dict)
+    KAIROS_ECONOMIC_INVARIANT = "kairos_economic_invariant"
 
     # CONSTITUTIONAL_REVIEW_REQUESTED — emitted when a system needs Equor
     # to review a decision before acceptance (e.g. Tier 3 invariant).
@@ -1493,6 +1509,17 @@ class SynapseEventType(enum.StrEnum):
     #          drive_weights_snapshot (dict), instance_id (str),
     #          consecutive_low_cycles (int)
     OIKOS_DRIVE_WEIGHT_PRESSURE = "oikos_drive_weight_pressure"
+    #
+    # OIKOS_ECONOMIC_EPISODE — emitted by Oikos after every economic action
+    # (bounty_hunt, yield_deploy, asset_liquidate) with causal variable annotations
+    # so Kairos can mine economic causal patterns.
+    # Payload: action_type (str), success (bool), roi_pct (float),
+    #          capital_deployed_usd (float), gas_cost_usd (float),
+    #          duration_seconds (float), timestamp (str), protocol (str),
+    #          chain (str), eth_price_usd (float), gas_price_gwei (float),
+    #          market_volatility_pct (float), day_of_week (int), hour_of_day (int),
+    #          causal_substrate (str — "economic"), causal_variable_importance (dict)
+    OIKOS_ECONOMIC_EPISODE = "oikos_economic_episode"
 
     # ── Evolutionary Observables ───────────────────────────────────────────
     #
@@ -1597,6 +1624,20 @@ class SynapseEventType(enum.StrEnum):
     # Payload: drifted_params (list[dict[name, old_value, new_value]]), drift_rate (float),
     #          instance_id (str)
     SIMULA_CONFIG_DRIFTED = "simula_config_drifted"
+    #
+    # SIMULA_PARAMETER_ADJUSTED — Simula emits after applying an Evo-requested
+    # economic parameter adjustment (Fix 4.1). Evo subscribes to confirm and
+    # score the hypothesis outcome.
+    # Payload: parameter_name (str), old_value (float), new_value (float),
+    #          confidence (float), hypothesis_id (str), parameter_category (str)
+    SIMULA_PARAMETER_ADJUSTED = "simula_parameter_adjusted"
+    #
+    # EVO_ADJUST_BUDGET — Evo emits when a high-confidence (>0.75) hypothesis
+    # targets a Simula economic parameter. Simula subscribes and applies the
+    # adjustment if confidence > 0.75.
+    # Payload: parameter_name (str), new_value (float), confidence (float),
+    #          hypothesis_id (str)
+    EVO_ADJUST_BUDGET = "evo_adjust_budget"
 
     # ── Closure Loop Events ────────────────────────────────────────────────
     #
@@ -2357,6 +2398,13 @@ class SynapseEventType(enum.StrEnum):
     # Payload: request_id (str), success (bool), tx_hash (str),
     #          error (str | None), data (dict)
     YIELD_DEPLOYMENT_RESULT = "yield_deployment_result"
+    #
+    # YIELD_PERFORMANCE_REPORT — emitted by YieldPositionTracker after each
+    # health check. Allows Evo and Simula to subscribe to a clean yield
+    # performance signal without coupling to internal yield strategy state.
+    # Payload: protocol (str), current_apy (str), entry_apy (str),
+    #          relative_drop_pct (str), rebalance_needed (bool), timestamp (str)
+    YIELD_PERFORMANCE_REPORT = "yield_performance_report"
 
     # ── Organism Lifecycle Events ───────────────────────────────────────
     #

@@ -451,9 +451,12 @@ class YieldPositionTracker:
         )
 
         # Rebalance if APY dropped >50% relative to entry
+        rebalance_needed = False
+        relative_drop = Decimal("0")
         if entry_apy > Decimal("0"):
             relative_drop = (entry_apy - current_apy) / entry_apy
             if relative_drop > _APY_DROP_REBALANCE_THRESHOLD:
+                rebalance_needed = True
                 self._log.warning(
                     "apy_drop_threshold_exceeded",
                     entry_apy=str(entry_apy),
@@ -473,6 +476,23 @@ class YieldPositionTracker:
                         "timestamp": datetime.now(UTC).isoformat(),
                     },
                 )
+
+        # Always emit YIELD_PERFORMANCE_REPORT so Evo and Simula can observe
+        # yield health without coupling to internal yield_strategy state.
+        from systems.synapse.types import SynapseEventType as _SET  # noqa: PLC0415
+
+        await _emit(
+            self._event_bus,
+            event_type=_SET.YIELD_PERFORMANCE_REPORT.value,
+            data={
+                "protocol": protocol,
+                "current_apy": str(current_apy),
+                "entry_apy": str(entry_apy),
+                "relative_drop_pct": str(round(relative_drop * 100, 4)),
+                "rebalance_needed": rebalance_needed,
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
 
     # ── Daily yield accrual ───────────────────────────────────────────────────
 

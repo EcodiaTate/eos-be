@@ -70,6 +70,7 @@ from systems.equor.economic_evaluator import (
     apply_economic_adjustment,
     classify_economic_action,
     evaluate_economic_intent,
+    evaluate_economic_intent_with_metabolic_state,
 )
 from systems.equor.evaluators import (
     BaseEquorEvaluator,
@@ -83,7 +84,7 @@ from systems.equor.invariants import (
 )
 from systems.equor.schema import ensure_equor_schema, seed_hardcoded_invariants
 from systems.equor.template_library import TemplateLibrary
-from systems.equor.verdict import compute_verdict
+from systems.equor.verdict import compute_verdict, compute_verdict_with_metabolic_state
 
 if TYPE_CHECKING:
     from clients.llm import LLMProvider
@@ -226,6 +227,16 @@ class EquorService:
         # Review counter for periodic alignment score emission
         self._reviews_since_last_score: int = 0
 
+        # Cached metabolic state from OIKOS_METABOLIC_SNAPSHOT (Fix 4.4).
+        # Updated reactively on each snapshot event; used in _review_inner()
+        # and _on_equor_economic_intent() with a 1s timeout fallback.
+        self._cached_metabolic_state: dict[str, Any] = {
+            "starvation_level": "nominal",
+            "efficiency_ratio": 1.0,
+        }
+        self._metabolic_state_updated_at: float = 0.0
+        _METABOLIC_CACHE_TTL_S: float = 120.0  # 2-minute TTL
+
         # SG5: consecutive drift checks with severity >= 0.9.
         # When this reaches 3 the organism proposes an amendment to reduce the
         # weight of the drifting drive by 5% rather than auto-demoting autonomy.
@@ -310,6 +321,11 @@ class EquorService:
         event_bus.subscribe(
             SynapseEventType.CERTIFICATE_PROVISIONING_REQUEST,
             self._on_certificate_provisioning_request,
+        )
+        # Fix 4.4: Cache metabolic state for metabolic-aware evaluation
+        event_bus.subscribe(
+            SynapseEventType.OIKOS_METABOLIC_SNAPSHOT,
+            self._on_oikos_metabolic_snapshot,
         )
         logger.info("equor_hitl_listener_registered")
 
@@ -418,8 +434,17 @@ class EquorService:
         request_id = str(data.get("request_id", ""))
         mutation_type = str(data.get("mutation_type", ""))
         amount_usd_str = str(data.get("amount_usd", "0"))
-        starvation_level = str(data.get("starvation_level", "nominal"))
         rationale = str(data.get("rationale", ""))
+
+        # Fix 4.4: Use cached metabolic state (updated from OIKOS_METABOLIC_SNAPSHOT)
+        # as the authoritative source; fall back to the event payload starvation_level
+        # if the cache is stale (>2 min) or empty.
+        cached_ms = self._get_metabolic_state()
+        starvation_level = str(
+            cached_ms.get("starvation_level")
+            or data.get("starvation_level", "nominal")
+        )
+        efficiency_ratio = float(cached_ms.get("efficiency_ratio", 1.0))
 
         verdict = "PERMIT"
         reasoning = "constitutional_check_passed"
@@ -431,16 +456,23 @@ class EquorService:
             amount_usd = Decimal("0")
 
         # ── Hard DENY conditions ────────────────────────────────────
-        # INV-016: No survival reserve raid
+        # INV-016: No survival reserve raid — absolute, never loosened
         if mutation_type == "survival_reserve_raid":
             verdict = "DENY"
             reasoning = "INV-016: survival_reserve_raid is unconstitutional"
 
-        # CRITICAL/EXISTENTIAL starvation: only survival-class mutations allowed
-        elif starvation_level in ("critical", "existential") and mutation_type not in (
+        # Fix 4.4: CRITICAL/EXISTENTIAL starvation guard is now tighter —
+        # we also block under EMERGENCY (runway <= 3d) unless the mutation
+        # is survival-class. Survival-class mutations are always permitted.
+        elif starvation_level in ("critical", "existential", "emergency") and mutation_type not in (
             "reserve_funding",
             "survival_reserve",
             "emergency_withdrawal",
+            # New protocol exploration is explicitly PERMITTED under starvation
+            # because finding new revenue streams is survival-critical.
+            "new_protocol_exploration",
+            "bounty_accept",        # bounty hunting is survival-class income
+            "defi_yield_deploy",    # yield farming is survival-class income
         ):
             verdict = "DENY"
             reasoning = (
@@ -476,6 +508,7 @@ class EquorService:
             mutation_type=mutation_type,
             amount_usd=amount_usd_str,
             starvation_level=starvation_level,
+            efficiency_ratio=round(efficiency_ratio, 3),
             verdict=verdict,
         )
 
@@ -495,6 +528,10 @@ class EquorService:
                         "honesty": 1.0,
                         "coherence": 0.7 if verdict == "PERMIT" else 0.3,
                         "growth": 0.6 if verdict == "PERMIT" else 0.0,
+                    },
+                    "metabolic_context": {
+                        "starvation_level": starvation_level,
+                        "efficiency_ratio": efficiency_ratio,
                     },
                 },
             ))
@@ -569,6 +606,42 @@ class EquorService:
             valence=round(valence, 3),
             arousal=round(arousal, 3),
         )
+
+    async def _on_oikos_metabolic_snapshot(self, event: Any) -> None:
+        """Cache the latest Oikos metabolic state for metabolic-aware evaluation (Fix 4.4).
+
+        Updates _cached_metabolic_state from OIKOS_METABOLIC_SNAPSHOT payloads.
+        This is a simple cache update — no I/O, no LLM, non-blocking.
+        """
+        data = getattr(event, "data", {}) or {}
+        starvation_level = str(data.get("starvation_level", "nominal"))
+        efficiency = data.get("efficiency")
+        runway_days = data.get("runway_days")
+
+        self._cached_metabolic_state = {
+            "starvation_level": starvation_level,
+            "efficiency_ratio": float(efficiency) if efficiency is not None else 1.0,
+            "runway_days": float(runway_days) if runway_days is not None else 999.0,
+        }
+        self._metabolic_state_updated_at = time.monotonic()
+
+        logger.debug(
+            "equor_metabolic_state_cached",
+            starvation_level=starvation_level,
+            efficiency_ratio=self._cached_metabolic_state["efficiency_ratio"],
+        )
+
+    def _get_metabolic_state(self) -> dict[str, Any]:
+        """Return cached metabolic state, defaulting to NOMINAL if stale (Fix 4.4).
+
+        The cache is considered stale after 2 minutes without an update.
+        Safe default: nominal state (no loosening) — fail-conservative.
+        """
+        _TTL_S = 120.0
+        age = time.monotonic() - self._metabolic_state_updated_at
+        if age > _TTL_S:
+            return {"starvation_level": "nominal", "efficiency_ratio": 1.0}
+        return self._cached_metabolic_state
 
     async def _on_certificate_provisioning_request(self, event: Any) -> None:
         """
@@ -1406,7 +1479,8 @@ class EquorService:
         alignment = await evaluate_all_drives(intent, self._evaluators)
 
         # Economic guardrail on critical path too — all CPU, no I/O.
-        economic_delta = evaluate_economic_intent(intent)
+        # Pass cached metabolic state so risk thresholds reflect organism health.
+        economic_delta = evaluate_economic_intent(intent, self._cached_metabolic_state)
         if economic_delta is not None:
             alignment = apply_economic_adjustment(alignment, economic_delta)
 
@@ -1452,15 +1526,20 @@ class EquorService:
 
         # 1b. Economic guardrail: if this is an Oikos economic intent,
         #     apply domain-specific drive adjustments before verdict.
-        #     This ensures Care/Honesty floors catch scam assets, harmful
-        #     bounties, etc. even if base evaluators scored them neutrally.
-        economic_delta = evaluate_economic_intent(intent)
+        #     Metabolic state is included so risky-but-necessary actions
+        #     (new protocol exploration, spawn under starvation) are not
+        #     penalised when the organism needs economic activity to survive.
+        metabolic_state = self._get_metabolic_state()
+        economic_delta = evaluate_economic_intent_with_metabolic_state(
+            intent, metabolic_state
+        )
         if economic_delta is not None:
             alignment = apply_economic_adjustment(alignment, economic_delta)
             logger.debug(
                 "economic_adjustment_applied",
                 intent_id=intent.id,
                 action_type=classify_economic_action(intent),
+                starvation_level=metabolic_state.get("starvation_level", "nominal"),
                 adjusted_care=f"{alignment.care:.2f}",
                 adjusted_honesty=f"{alignment.honesty:.2f}",
             )
@@ -1468,8 +1547,10 @@ class EquorService:
         # 2. Run the verdict engine (pure CPU, includes hardcoded invariant checks,
         #    contradiction detection against Evo hypotheses, and constitutional
         #    memory consultation for novel intent patterns).
-        check = compute_verdict(
+        #    Metabolic-aware variant loosens Care/Honesty floors under starvation.
+        check = compute_verdict_with_metabolic_state(
             alignment, intent, autonomy_level, constitution,
+            metabolic_state=metabolic_state,
             hypotheses=hypotheses,
             memory=self._constitutional_memory,
         )

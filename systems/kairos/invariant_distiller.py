@@ -23,6 +23,10 @@ The distillation pipeline:
 
 from __future__ import annotations
 
+import statistics
+from collections import defaultdict
+from typing import Any
+
 import structlog
 
 from primitives.causal import CausalInvariant
@@ -565,3 +569,236 @@ class InvariantDistiller:
     @property
     def total_domains_mapped(self) -> int:
         return self._domains_mapped
+
+
+# ─── Economic Causal Miner ────────────────────────────────────────────────────
+
+
+class EconomicCausalMiner:
+    """
+    KAIROS-ECON-1: Discovers causal patterns specific to economic substrate.
+
+    Processes buffered OIKOS_ECONOMIC_EPISODE observations and applies three
+    domain-specific discovery heuristics:
+
+    1. Protocol success rates — group by protocol, emit if >70% or <30%
+    2. Time-of-week effects — bounties / yield vary by day_of_week
+    3. Price-dependent yield — ETH price bins → average ROI tier
+
+    Each discovered invariant is emitted as KAIROS_ECONOMIC_INVARIANT so Nova
+    can update EFE weights and avoid actions violating causal relationships.
+
+    Confidence floor for Nova integration: 0.75.
+    """
+
+    # Minimum observations required before emitting a pattern
+    _MIN_SAMPLE_SIZE: int = 5
+    # Confidence floor for high-confidence broadcast
+    _CONFIDENCE_FLOOR: float = 0.75
+
+    def discover_patterns(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Run all three discovery heuristics on the observation batch.
+
+        Returns a list of pattern dicts suitable for KAIROS_ECONOMIC_INVARIANT.
+        Only patterns with confidence ≥ 0.6 are returned.
+        """
+        if not observations:
+            return []
+
+        patterns: list[dict[str, Any]] = []
+        patterns.extend(self._discover_protocol_success(observations))
+        patterns.extend(self._discover_time_of_week_effects(observations))
+        patterns.extend(self._discover_price_dependent_yield(observations))
+
+        return [p for p in patterns if p["confidence"] >= 0.6]
+
+    # ── Heuristic 1: Protocol Success Rates ──────────────────────────
+
+    def _discover_protocol_success(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Group by protocol, compute success_rate per protocol.
+        Emit if >70% (reliable) or <30% (consistently unreliable).
+        """
+        by_protocol: dict[str, list[bool]] = defaultdict(list)
+        for obs in observations:
+            protocol = str(obs.get("protocol", "")).strip()
+            if not protocol or protocol in ("", "none", "0"):
+                continue
+            success = bool(obs.get("success", False))
+            by_protocol[protocol].append(success)
+
+        patterns: list[dict[str, Any]] = []
+        for protocol, outcomes in by_protocol.items():
+            if len(outcomes) < self._MIN_SAMPLE_SIZE:
+                continue
+            success_rate = sum(outcomes) / len(outcomes)
+            if success_rate > 0.70:
+                confidence = min(0.95, 0.70 + (success_rate - 0.70) * 1.5)
+                patterns.append({
+                    "invariant_type": "protocol_success_rate",
+                    "cause": f"protocol:{protocol}",
+                    "effect": "high_success_probability",
+                    "confidence": confidence,
+                    "sample_count": len(outcomes),
+                    "direction": "positive",
+                    "metadata": {
+                        "protocol": protocol,
+                        "success_rate": round(success_rate, 3),
+                        "substrate": "economic",
+                    },
+                })
+            elif success_rate < 0.30:
+                confidence = min(0.95, 0.70 + (0.30 - success_rate) * 1.5)
+                patterns.append({
+                    "invariant_type": "protocol_success_rate",
+                    "cause": f"protocol:{protocol}",
+                    "effect": "low_success_probability",
+                    "confidence": confidence,
+                    "sample_count": len(outcomes),
+                    "direction": "negative",
+                    "metadata": {
+                        "protocol": protocol,
+                        "success_rate": round(success_rate, 3),
+                        "substrate": "economic",
+                    },
+                })
+
+        return patterns
+
+    # ── Heuristic 2: Time-of-Week Effects ────────────────────────────
+
+    def _discover_time_of_week_effects(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Group by day_of_week (0=Mon … 6=Sun), compute mean ROI per day.
+        Emit if weekday mean ROI differs from weekend mean ROI by ≥30%.
+        """
+        weekday_rois: list[float] = []
+        weekend_rois: list[float] = []
+
+        for obs in observations:
+            day = int(obs.get("day_of_week", -1))
+            roi = float(obs.get("roi_pct", obs.get("causal_variables", {}).get("roi_pct", 0.0)))
+            if day < 0:
+                continue
+            if day < 5:  # Mon–Fri
+                weekday_rois.append(roi)
+            else:
+                weekend_rois.append(roi)
+
+        if (len(weekday_rois) < self._MIN_SAMPLE_SIZE
+                or len(weekend_rois) < self._MIN_SAMPLE_SIZE):
+            return []
+
+        weekday_mean = statistics.mean(weekday_rois)
+        weekend_mean = statistics.mean(weekend_rois)
+        denominator = max(abs(weekday_mean), abs(weekend_mean), 0.001)
+        relative_diff = abs(weekday_mean - weekend_mean) / denominator
+
+        if relative_diff < 0.30:
+            return []
+
+        direction = "positive" if weekday_mean > weekend_mean else "negative"
+        confidence = min(0.95, 0.60 + relative_diff * 0.5)
+
+        return [{
+            "invariant_type": "time_of_week_effect",
+            "cause": "weekday_vs_weekend",
+            "effect": "roi_differential",
+            "confidence": confidence,
+            "sample_count": len(weekday_rois) + len(weekend_rois),
+            "direction": direction,
+            "metadata": {
+                "weekday_mean_roi": round(weekday_mean, 3),
+                "weekend_mean_roi": round(weekend_mean, 3),
+                "relative_diff_pct": round(relative_diff * 100, 1),
+                "substrate": "economic",
+            },
+        }]
+
+    # ── Heuristic 3: Price-Dependent Yield ───────────────────────────
+
+    def _discover_price_dependent_yield(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Bin ETH price into Low/Mid/High tiers and compute mean ROI per tier.
+        Emit if any tier shows ≥20% ROI difference from the overall mean.
+        Requires ≥MIN_SAMPLE_SIZE observations with non-zero eth_price_usd.
+        """
+        price_roi_pairs: list[tuple[float, float]] = []
+
+        for obs in observations:
+            eth_price = float(
+                obs.get("eth_price_usd",
+                obs.get("causal_variables", {}).get("eth_price_usd", 0.0))
+            )
+            roi = float(
+                obs.get("roi_pct",
+                obs.get("causal_variables", {}).get("roi_pct", 0.0))
+            )
+            if eth_price > 0.0:
+                price_roi_pairs.append((eth_price, roi))
+
+        if len(price_roi_pairs) < self._MIN_SAMPLE_SIZE * 2:
+            return []
+
+        prices = [p for p, _ in price_roi_pairs]
+        p33 = sorted(prices)[len(prices) // 3]
+        p66 = sorted(prices)[2 * len(prices) // 3]
+
+        tier_rois: dict[str, list[float]] = {"low": [], "mid": [], "high": []}
+        for eth_price, roi in price_roi_pairs:
+            if eth_price <= p33:
+                tier_rois["low"].append(roi)
+            elif eth_price <= p66:
+                tier_rois["mid"].append(roi)
+            else:
+                tier_rois["high"].append(roi)
+
+        all_rois = [r for _, r in price_roi_pairs]
+        overall_mean = statistics.mean(all_rois) if all_rois else 0.0
+
+        patterns: list[dict[str, Any]] = []
+        for tier, rois in tier_rois.items():
+            if len(rois) < self._MIN_SAMPLE_SIZE:
+                continue
+            tier_mean = statistics.mean(rois)
+            denom = max(abs(overall_mean), 0.001)
+            relative_diff = abs(tier_mean - overall_mean) / denom
+
+            if relative_diff < 0.20:
+                continue
+
+            direction = "positive" if tier_mean > overall_mean else "negative"
+            confidence = min(0.95, 0.65 + relative_diff * 0.4)
+
+            patterns.append({
+                "invariant_type": "price_dependent_yield",
+                "cause": f"eth_price_tier:{tier}",
+                "effect": "roi_differential",
+                "confidence": confidence,
+                "sample_count": len(rois),
+                "direction": direction,
+                "metadata": {
+                    "eth_price_tier": tier,
+                    "tier_mean_roi": round(tier_mean, 3),
+                    "overall_mean_roi": round(overall_mean, 3),
+                    "relative_diff_pct": round(relative_diff * 100, 1),
+                    "price_boundary_low": round(p33, 2),
+                    "price_boundary_high": round(p66, 2),
+                    "substrate": "economic",
+                },
+            })
+
+        return patterns

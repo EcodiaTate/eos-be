@@ -132,11 +132,15 @@ class RETrainingExporter:
         self._total_exported = 0
         self._total_batches = 0
         self._attached = False
+        # Metabolic-aware priority boost for economic training examples.
+        # Updated by _on_metabolic_pressure(); applied in _enrich_batch().
+        self._starvation_level: str = "nominal"
+        self._metabolic_boost: float = 1.0
 
     # ─── Event Bus Integration ────────────────────────────────────────
 
     def attach(self) -> None:
-        """Subscribe to RE_TRAINING_EXAMPLE and AXON_EXECUTION_RESULT events."""
+        """Subscribe to RE_TRAINING_EXAMPLE, AXON_EXECUTION_RESULT, and METABOLIC_PRESSURE events."""
         from systems.synapse.types import SynapseEventType
 
         self._event_bus.subscribe(
@@ -147,6 +151,11 @@ class RETrainingExporter:
             SynapseEventType.AXON_EXECUTION_RESULT,
             self._on_axon_execution_result,
         )
+        if hasattr(SynapseEventType, "METABOLIC_PRESSURE"):
+            self._event_bus.subscribe(
+                SynapseEventType.METABOLIC_PRESSURE,
+                self._on_metabolic_pressure,
+            )
         self._attached = True
         logger.info("re_training_exporter_attached")
 
@@ -204,6 +213,40 @@ class RETrainingExporter:
             self.update_outcome_quality(episode_id, actual_quality, source_system="axon")
         except Exception:
             logger.debug("re_exporter_axon_result_update_failed", exc_info=True)
+
+    async def _on_metabolic_pressure(self, event: Any) -> None:
+        """
+        METABOLIC_PRESSURE → adjust economic training example priority boost.
+
+        During metabolic crisis, the organism most needs to learn from economic
+        decisions. Boost economic domain examples so the RE training curriculum
+        prioritises the reasoning traces that led to revenue or failure.
+
+        Boost table (mirrors StarvationLevel thresholds in oikos/models.py):
+          CRITICAL / EMERGENCY → 2.0× (urgent — organism near death)
+          AUSTERITY            → 1.5× (significant pressure)
+          NOMINAL / CAUTIOUS   → 1.0× (no boost)
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            level = str(data.get("starvation_level", "")).lower()
+            old_boost = self._metabolic_boost
+            if level in ("critical", "emergency"):
+                self._metabolic_boost = 2.0
+            elif level == "austerity":
+                self._metabolic_boost = 1.5
+            else:
+                self._metabolic_boost = 1.0
+            self._starvation_level = level or "nominal"
+            if self._metabolic_boost != old_boost:
+                logger.info(
+                    "re_exporter_metabolic_boost_changed",
+                    starvation_level=self._starvation_level,
+                    old_boost=old_boost,
+                    new_boost=self._metabolic_boost,
+                )
+        except Exception:
+            logger.debug("re_exporter_metabolic_pressure_update_failed", exc_info=True)
 
     def update_outcome_quality(
         self,
@@ -313,12 +356,118 @@ class RETrainingExporter:
             return "silver"
         return "bronze"
 
+    def _detect_multi_step_strategy(
+        self, datapoints: list[RETrainingDatapoint]
+    ) -> None:
+        """
+        Detect multi-step economic strategies within a batch and annotate datapoints.
+
+        Patterns recognised (by example_type sequence sharing the same episode root):
+          "recovery_via_diversification": cost_reduce → yield_deploy → spawn_child
+          "yield_optimization":           yield_rebalance → protocol_explore → consolidate
+          "bounty_then_diversify":        bounty_hunt → asset_create → liquidate
+
+        Strategy detection groups datapoints by their episode root (prefix before
+        the first ':' in episode_id, or a shared oikos/economic category prefix).
+        Groups with 2+ steps are annotated with strategy metadata.
+
+        Priority boost: strategic datapoints with 2+ steps get their task_difficulty
+        multiplied by 1.3× (capped at 1.0) to surface them during curriculum building.
+        """
+        # Known strategy patterns: ordered action sequences → strategy name
+        _STRATEGY_PATTERNS: list[tuple[list[str], str]] = [
+            (["cost_reduce", "yield_deploy", "spawn_child"], "recovery_via_diversification"),
+            (["yield_rebalance", "protocol_explore", "consolidate"], "yield_optimization"),
+            (["bounty_hunt", "asset_create", "liquidate"], "bounty_then_diversify"),
+        ]
+
+        # Group economic datapoints by episode root (first segment of episode_id)
+        # and by timestamp proximity (within 72 hours)
+        economic_types = {
+            "oikos", "economic", "yield", "bounty", "asset", "spawn",
+            "cost_reduce", "yield_deploy", "yield_rebalance", "protocol_explore",
+            "consolidate", "bounty_hunt", "asset_create", "liquidate", "spawn_child",
+        }
+
+        def _is_economic(dp: RETrainingDatapoint) -> bool:
+            return (
+                dp.example_type in economic_types
+                or dp.example_type.startswith(("oikos.", "economic."))
+                or any(kw in dp.example_type for kw in ("yield", "bounty", "asset", "spawn"))
+            )
+
+        econ_dps = [dp for dp in datapoints if _is_economic(dp)]
+        if len(econ_dps) < 2:
+            return
+
+        # Sort by timestamp for sequence detection
+        econ_dps_sorted = sorted(econ_dps, key=lambda dp: dp.timestamp)
+
+        # Build 72-hour windows
+        window_seconds = 72 * 3600
+
+        # For each pair, check if any known pattern matches the sequence
+        def _action_key(dp: RETrainingDatapoint) -> str:
+            return dp.example_type.split(".")[-1].lower()
+
+        def _ts_seconds(dp: RETrainingDatapoint) -> float:
+            return dp.timestamp.timestamp()
+
+        for start_idx, start_dp in enumerate(econ_dps_sorted):
+            t0 = _ts_seconds(start_dp)
+            # Collect all dps within 72h window from start_dp
+            window = [
+                dp for dp in econ_dps_sorted[start_idx:]
+                if _ts_seconds(dp) - t0 <= window_seconds
+            ]
+            if len(window) < 2:
+                continue
+
+            action_seq = [_action_key(dp) for dp in window]
+
+            for pattern_steps, strategy_name in _STRATEGY_PATTERNS:
+                # Check if all pattern steps appear in order within the window
+                matched_indices: list[int] = []
+                search_from = 0
+                for step in pattern_steps:
+                    for i in range(search_from, len(action_seq)):
+                        if action_seq[i] == step or step in action_seq[i]:
+                            matched_indices.append(i)
+                            search_from = i + 1
+                            break
+
+                if len(matched_indices) == len(pattern_steps):
+                    # Strategy detected — annotate the matched datapoints
+                    matched_dps = [window[i] for i in matched_indices]
+                    t_start = _ts_seconds(matched_dps[0])
+                    t_end = _ts_seconds(matched_dps[-1])
+                    duration_hours = (t_end - t_start) / 3600.0
+
+                    for step_num, dp in enumerate(matched_dps, start=1):
+                        dp.is_strategic = True
+                        dp.strategy_name = strategy_name
+                        dp.strategy_step_number = step_num
+                        dp.strategy_total_steps = len(matched_dps)
+                        dp.strategy_duration_hours = round(duration_hours, 2)
+                        # 1.3× priority boost — surface in curriculum
+                        dp.task_difficulty = min(1.0, dp.task_difficulty * 1.3)
+
+                    logger.info(
+                        "re_training_strategy_detected",
+                        strategy=strategy_name,
+                        steps=len(matched_dps),
+                        duration_hours=round(duration_hours, 2),
+                    )
+                    break  # Only assign one strategy per window start
+
     def _enrich_batch(self, datapoints: list[RETrainingDatapoint]) -> None:
         """
         Mutate datapoints in-place before export:
         1. Compute task_difficulty
         2. Validate scaffold compliance
         3. Assign quality_tier
+        4. Apply metabolic boost to economic examples during starvation
+        5. Detect multi-step economic strategies (with 1.3× difficulty boost)
         """
         validate = _get_scaffold_validator()
 
@@ -332,6 +481,18 @@ class RETrainingExporter:
                 except Exception:
                     pass
             dp.quality_tier = self._assign_quality_tier(dp, scaffold_valid)
+
+        # Apply metabolic boost: during starvation, economic examples are
+        # the most urgent curriculum content — surface them by boosting confidence
+        # (which acts as a priority proxy for curriculum building).
+        if self._metabolic_boost > 1.0:
+            _economic_keywords = ("economic", "oikos", "yield", "bounty", "asset", "spawn")
+            for dp in datapoints:
+                if any(kw in dp.example_type for kw in _economic_keywords):
+                    dp.confidence = min(1.0, dp.confidence * self._metabolic_boost)
+
+        # Run strategy detection after task_difficulty is set (boost applied inside)
+        self._detect_multi_step_strategy(datapoints)
 
     # ─── Export Destinations ──────────────────────────────────────────
 
@@ -492,6 +653,11 @@ class RETrainingExporter:
                     "actual_outcome_quality": dp.actual_outcome_quality,
                     "quality_tier": dp.quality_tier,
                     "task_difficulty": dp.task_difficulty,
+                    "is_strategic": dp.is_strategic,
+                    "strategy_name": dp.strategy_name,
+                    "strategy_step_number": dp.strategy_step_number,
+                    "strategy_total_steps": dp.strategy_total_steps,
+                    "strategy_duration_hours": dp.strategy_duration_hours,
                 }
                 for dp in batch.datapoints
             ]
@@ -519,7 +685,12 @@ class RETrainingExporter:
                     d.outcome_updated        = r.outcome_updated,
                     d.actual_outcome_quality = r.actual_outcome_quality,
                     d.quality_tier           = r.quality_tier,
-                    d.task_difficulty        = r.task_difficulty
+                    d.task_difficulty        = r.task_difficulty,
+                    d.is_strategic           = r.is_strategic,
+                    d.strategy_name          = r.strategy_name,
+                    d.strategy_step_number   = r.strategy_step_number,
+                    d.strategy_total_steps   = r.strategy_total_steps,
+                    d.strategy_duration_hours = r.strategy_duration_hours
                 WITH d, r
                 MATCH (b:RETrainingBatch {id: r.batch_id})
                 MERGE (b)-[:CONTAINS_DATAPOINT]->(d)

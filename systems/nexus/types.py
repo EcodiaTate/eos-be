@@ -329,6 +329,24 @@ class ShareableWorldModelFragment(Identified):
     # Triangulation state
     triangulation: TriangulationMetadata = Field(default_factory=TriangulationMetadata)
 
+    # Economic metadata (NEXUS-ECON-2/3): preserved so federation peers can
+    # recover economic meaning from structurally-equivalent schemas.
+    domain_hints: list[str] = Field(default_factory=list)
+    """
+    High-level domain tags detected from schema content.
+    E.g. ["economic", "yield_farming", "defi"].
+    Sent alongside the abstract structure so receivers can map the schema
+    to the correct economic domain vocabulary without biasing convergence.
+    """
+
+    economic_context: dict[str, Any] | None = None
+    """
+    Optional economic metadata extracted from the schema source.
+    E.g. {"protocol": "Aave", "apy_pct": 8.5, "token": "USDC"}.
+    None when the schema has no economic content.
+    Allows federation peers to triangulate economic ground truth.
+    """
+
     # Timestamps
     created_at: datetime = Field(default_factory=utc_now)
     last_confirmed_at: datetime = Field(default_factory=utc_now)
@@ -701,6 +719,19 @@ class InstanceDivergenceProfile(EOSBaseModel):
     born_at: datetime = Field(default_factory=utc_now)
     total_experiences: int = 0
     total_schemas: int = 0
+
+    # Economic divergence (NEXUS-ECON-4): how differently this instance
+    # deploys economic strategy compared to federation peers.
+    # 0.0 = converged (same strategy), 1.0 = fully diverged.
+    # Measured as revenue-per-strategy variance normalised across peers.
+    # Used by Oikos and Evo to detect when instances have independently
+    # discovered different profitable strategies — valuable for triangulation.
+    economic_divergence: float = Field(0.0, ge=0.0, le=1.0)
+
+    # Snapshot of per-strategy revenue rates for variance computation.
+    # Keys are strategy identifiers (e.g. "yield_farming", "bounty", "asset").
+    # Values are recent USD revenue per unit time.
+    strategy_revenue_rates: dict[str, float] = Field(default_factory=dict)
 
     captured_at: datetime = Field(default_factory=utc_now)
 

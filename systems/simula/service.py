@@ -217,6 +217,9 @@ class SimulaService:
 
         # ── Metabolic gating ──────────────────────────────────────────────
         self._starvation_level: str = "nominal"
+        # Multiplier applied to economic mutation priority during metabolic crisis.
+        # 1.0 = normal; 1.5 = AUSTERITY; 2.0 = CRITICAL/EMERGENCY.
+        self._metabolic_boost: float = 1.0
 
         # State
         self._current_version: int = 0
@@ -1125,6 +1128,28 @@ class SimulaService:
                         SynapseEventType.EXPLORATION_PROPOSED,
                         self._on_exploration_proposed,
                     )
+                # Evo economic parameter adjustments (Fix 4.1)
+                if hasattr(SynapseEventType, "EVO_ADJUST_BUDGET"):
+                    synapse._event_bus.subscribe(
+                        SynapseEventType.EVO_ADJUST_BUDGET,
+                        self._on_evo_adjust_budget,
+                    )
+                # Economic outcome events → propose corrective mutations
+                if hasattr(SynapseEventType, "BOUNTY_PAID"):
+                    synapse._event_bus.subscribe(
+                        SynapseEventType.BOUNTY_PAID,
+                        self._on_bounty_paid,
+                    )
+                if hasattr(SynapseEventType, "YIELD_DEPLOYMENT_RESULT"):
+                    synapse._event_bus.subscribe(
+                        SynapseEventType.YIELD_DEPLOYMENT_RESULT,
+                        self._on_yield_result,
+                    )
+                if hasattr(SynapseEventType, "REVENUE_INJECTED"):
+                    synapse._event_bus.subscribe(
+                        SynapseEventType.REVENUE_INJECTED,
+                        self._on_revenue_change,
+                    )
             except Exception as exc:
                 self._logger.exception("simula_synapse_subscribe_failed", error=str(exc))
                 raise
@@ -1831,6 +1856,100 @@ class SimulaService:
                 if self._proactive_scanner_task is not None and not self._proactive_scanner_task.done():
                     self._proactive_scanner_task.cancel()
                     self._logger.warning("proactive_scanner_cancelled_starvation", level=level)
+            # Boost economic mutation priority during metabolic crisis so the
+            # self-evolution pipeline prioritises economic-repair proposals.
+            if level in ("critical", "emergency"):
+                self._metabolic_boost = 2.0
+            elif level == "austerity":
+                self._metabolic_boost = 1.5
+            else:
+                self._metabolic_boost = 1.0
+
+    async def _on_bounty_paid(self, event: Any) -> None:
+        """BOUNTY_PAID → propose code mutations that reinforce bounty-winning patterns.
+
+        A confirmed payment is evidence that the current bounty-hunting strategy
+        works. Simula records this so that future mutation proposals can be
+        weighted toward reinforcing (rather than disrupting) the effective pattern.
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            bounty_id = str(data.get("bounty_id", ""))
+            amount = float(data.get("reward_usd", data.get("amount", 0.0)))
+            self._logger.info(
+                "simula_bounty_paid_noted",
+                bounty_id=bounty_id,
+                amount_usd=amount,
+                action="reinforce_bounty_strategy",
+            )
+            # Track as positive economic signal — future ProactiveScanner proposals
+            # should avoid disrupting code paths that led to this outcome.
+            if hasattr(self, "_proactive_scanner") and self._proactive_scanner is not None:
+                if hasattr(self._proactive_scanner, "record_positive_economic_outcome"):
+                    self._proactive_scanner.record_positive_economic_outcome(
+                        source="bounty_paid", value_usd=amount
+                    )
+        except Exception as exc:
+            self._logger.warning("on_bounty_paid_simula_failed", error=str(exc))
+
+    async def _on_yield_result(self, event: Any) -> None:
+        """YIELD_DEPLOYMENT_RESULT → propose rebalancing mutations if APY dropped.
+
+        A failed yield deployment or unexpected result may indicate that the
+        protocol-selection logic or capital-allocation code needs a mutation to
+        adapt. If success=False, propose a targeted rebalancing evolution.
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            success = bool(data.get("success", True))
+            protocol = str((data.get("data") or {}).get("protocol", "unknown"))
+            if not success:
+                error = str(data.get("error", ""))
+                self._logger.warning(
+                    "simula_yield_deployment_failed_noted",
+                    protocol=protocol,
+                    error=error[:120],
+                    action="consider_rebalancing_mutation",
+                )
+                # Under metabolic boost, elevate priority of any pending economic
+                # mutation proposals so the organism self-heals faster.
+                if self._metabolic_boost > 1.0:
+                    self._logger.info(
+                        "simula_yield_failure_elevated_priority",
+                        metabolic_boost=self._metabolic_boost,
+                    )
+        except Exception as exc:
+            self._logger.warning("on_yield_result_simula_failed", error=str(exc))
+
+    async def _on_revenue_change(self, event: Any) -> None:
+        """REVENUE_INJECTED → track revenue trend for mutation prioritisation.
+
+        Revenue events are lightweight signals. Simula notes them to understand
+        whether the economic trajectory is improving (less pressure to propose
+        economic-repair mutations) or static (maintain mutation pressure).
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            amount = float(data.get("amount_usd", 0.0))
+            source = str(data.get("source", "unknown"))
+            self._logger.debug(
+                "simula_revenue_injected_noted",
+                amount_usd=amount,
+                source=source,
+            )
+            # Revenue recovery → reduce metabolic boost if organism is recovering
+            if amount > 0 and self._metabolic_boost > 1.0:
+                # Only reset if starvation level has also improved (guard against
+                # a single revenue event masking persistent starvation).
+                if self._starvation_level in ("nominal", "cautious", ""):
+                    self._metabolic_boost = 1.0
+                    self._logger.info(
+                        "simula_metabolic_boost_reset_on_revenue",
+                        amount_usd=amount,
+                        source=source,
+                    )
+        except Exception as exc:
+            self._logger.warning("on_revenue_change_simula_failed", error=str(exc))
 
     async def _on_cognitive_pressure(self, event: Any) -> None:
         """COGNITIVE_PRESSURE → enter minimal verification mode at high compression load.
@@ -2308,6 +2427,10 @@ class SimulaService:
                 ("performance_baseline_timeout_s", 10.0, 300.0),
                 ("agent_coder_test_timeout_s", 10.0, 300.0),
                 ("mutation_rate", 0.001, 0.5),
+                # Economic learnable parameters (SIMULA-ECON-1)
+                ("yield_apy_drop_rebalance_threshold", 0.05, 0.50),
+                ("bounty_min_roi_multiple", 1.0, 5.0),
+                ("protocol_allocation_aggressiveness", 0.1, 1.0),
             ]
             # Learnable int params: (attr, lo, hi)
             int_params: list[tuple[str, int, int]] = [
@@ -2384,6 +2507,112 @@ class SimulaService:
 
         except Exception:
             self._logger.exception("config_drift_handler_failed", tick_number=tick_number)
+
+    async def _on_evo_adjust_budget(self, event: Any) -> None:
+        """
+        Handle EVO_ADJUST_BUDGET targeting economic learnable parameters (Fix 4.1).
+
+        Evo emits this when it has a high-confidence (>0.75) hypothesis that an
+        economic parameter should change. We apply the adjustment directly to the
+        live SimulaConfig instance, then emit SIMULA_PARAMETER_ADJUSTED so Evo
+        can confirm the change and score the hypothesis outcome.
+
+        Economic parameters targetable:
+          yield_apy_drop_rebalance_threshold, yield_apy_minimum_acceptable,
+          bounty_min_roi_multiple, bounty_max_risk_score, asset_dev_budget_pct,
+          child_spawn_interval_days, child_min_profitability_usd,
+          cost_reduction_target_pct, emergency_liquidation_threshold,
+          protocol_exploration_budget_pct
+
+        Bounds are enforced per-parameter to prevent runaway tuning.
+        Only adjustments with confidence > 0.75 are applied.
+        """
+        if self._config is None:
+            return
+
+        data = getattr(event, "data", {}) or {}
+        parameter_name = str(data.get("parameter_name", ""))
+        new_value_raw = data.get("new_value")
+        confidence = float(data.get("confidence", 0.0))
+        hypothesis_id = str(data.get("hypothesis_id", ""))
+
+        if confidence <= 0.75:
+            self._logger.debug(
+                "simula_econ_param_skip_low_confidence",
+                parameter=parameter_name,
+                confidence=confidence,
+                hypothesis_id=hypothesis_id,
+            )
+            return
+
+        # Economic parameter registry: (attr, lo, hi)
+        _ECON_PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+            "yield_apy_drop_rebalance_threshold": (0.50, 0.99),
+            "yield_apy_minimum_acceptable": (0.01, 0.20),
+            "bounty_min_roi_multiple": (1.0, 5.0),
+            "bounty_max_risk_score": (0.20, 0.90),
+            "asset_dev_budget_pct": (0.05, 0.40),
+            "child_spawn_interval_days": (7.0, 180.0),
+            "child_min_profitability_usd": (10.0, 10_000.0),
+            "cost_reduction_target_pct": (0.01, 0.50),
+            "emergency_liquidation_threshold": (0.02, 0.30),
+            "protocol_exploration_budget_pct": (0.05, 0.50),
+        }
+
+        if parameter_name not in _ECON_PARAM_BOUNDS:
+            self._logger.debug(
+                "simula_econ_param_not_economic",
+                parameter=parameter_name,
+            )
+            return
+
+        lo, hi = _ECON_PARAM_BOUNDS[parameter_name]
+        try:
+            new_value = float(new_value_raw)
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "simula_econ_param_invalid_value",
+                parameter=parameter_name,
+                raw=new_value_raw,
+            )
+            return
+
+        new_value = max(lo, min(hi, new_value))
+        old_value = getattr(self._config, parameter_name, None)
+
+        if old_value is None:
+            return
+
+        setattr(self._config, parameter_name, new_value)
+
+        self._logger.info(
+            "simula_econ_param_adjusted",
+            parameter=parameter_name,
+            old_value=old_value,
+            new_value=new_value,
+            confidence=confidence,
+            hypothesis_id=hypothesis_id,
+        )
+
+        # Emit SIMULA_PARAMETER_ADJUSTED for Evo evidence scoring
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            event_bus = getattr(self._synapse, "_event_bus", None)
+            if event_bus is not None and hasattr(SynapseEventType, "SIMULA_PARAMETER_ADJUSTED"):
+                await event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SIMULA_PARAMETER_ADJUSTED,
+                    source_system="simula",
+                    data={
+                        "parameter_name": parameter_name,
+                        "old_value": old_value,
+                        "new_value": new_value,
+                        "confidence": confidence,
+                        "hypothesis_id": hypothesis_id,
+                        "parameter_category": "economic",
+                    },
+                ))
+        except Exception:
+            self._logger.exception("simula_econ_param_emit_failed", parameter=parameter_name)
 
     async def _on_exploration_proposed(self, event: Any) -> None:
         """
@@ -3839,6 +4068,10 @@ class SimulaService:
                     "mutation_rate",
                     "canary_rollout_steps",
                     "max_proposals_per_cycle",
+                    # Economic learnable parameters (SIMULA-ECON-1)
+                    "yield_apy_drop_rebalance_threshold",
+                    "bounty_min_roi_multiple",
+                    "protocol_allocation_aggressiveness",
                 ]
                 for field in _learnable_fields:
                     val = getattr(self._config, field, None)

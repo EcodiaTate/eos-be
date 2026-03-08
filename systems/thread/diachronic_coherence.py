@@ -9,11 +9,25 @@ The genuine innovation: the same behavioural change can be "growth" or
 "drift" depending on narrative context. A 0.3 W-distance is "growth" if
 it aligns with active schemas and recent turning points, but "drift" if
 it contradicts commitments with no narrative explanation.
+
+Fingerprint layout (29D):
+  [0:9]   personality        — from Voxis (9D)
+  [9:13]  drive_alignment    — from Equor/Soma (4D)
+  [13:19] affect             — from Atune (6D)
+  [19:24] goal_profile       — from Nova goals (5D)
+  [24:29] economic_identity  — from Oikos events (5D, new)
+    [24] economic_strategy       [-1=capital preservation, +1=aggressive growth]
+    [25] economic_risk_tolerance [0=conservative, 1=risk-seeking]
+    [26] revenue_stream_diversity [0=single source, 1=fully diversified]
+    [27] yield_farming_inclination [0=none, 1=primary strategy]
+    [28] child_reproduction_preference [0=no children, 1=fleet-focused]
 """
 
 from __future__ import annotations
 
 import json
+from collections import Counter
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -41,7 +55,7 @@ def wasserstein_identity_distance(
     Weighted L1 distance between 29D feature vectors, normalized per dimension.
 
     Personality and drive dimensions are weighted more heavily than
-    goal/interaction dimensions because personality drift is more
+    goal/economic dimensions because personality drift is more
     identity-relevant than behavioural adaptation.
 
     Returns: 0.0 (identical) to 1.0+ (substantial drift).
@@ -50,8 +64,8 @@ def wasserstein_identity_distance(
         "personality": (0, 9, config.fingerprint_weight_personality),
         "drive_alignment": (9, 13, config.fingerprint_weight_drive),
         "affect": (13, 19, config.fingerprint_weight_affect),
-        "goal_source": (19, 25, config.fingerprint_weight_goal),
-        "interaction": (25, 29, config.fingerprint_weight_interaction),
+        "goal_source": (19, 24, config.fingerprint_weight_goal),
+        "economic_identity": (24, 29, config.fingerprint_weight_interaction),
     }
 
     vec_current = current.feature_vector
@@ -291,6 +305,159 @@ class DiachronicCoherenceMonitor:
             return False
         except Exception:
             return False
+
+    # ─── Economic Dimension Calculators ──────────────────────────────────────
+
+    def compute_economic_dimensions(
+        self,
+        economic_events: list[dict[str, Any]],
+    ) -> list[float]:
+        """
+        Compute 5 economic identity dimensions from recent Oikos events.
+
+        Args:
+            economic_events: List of economic event dicts with keys:
+                - event_type: str (e.g. "yield_deploy", "spawn_child", "bounty_hunt", "asset_break_even")
+                - revenue_source: str (e.g. "bounty", "yield", "asset", "dividend")
+                - timestamp: datetime (optional)
+
+        Returns: 5 floats in [0, 1] (or [-1, 1] for economic_strategy):
+            [0] economic_strategy: -1=capital preservation, +1=aggressive growth
+            [1] economic_risk_tolerance: 0=conservative, 1=risk-seeking
+            [2] revenue_stream_diversity: 0=single source, 1=fully diversified
+            [3] yield_farming_inclination: 0=none, 1=primary strategy
+            [4] child_reproduction_preference: 0=no children, 1=fleet-focused
+        """
+        if not economic_events:
+            return [0.0, 0.5, 0.0, 0.0, 0.0]
+
+        return [
+            self._compute_economic_strategy_dimension(economic_events),
+            self._compute_risk_tolerance_dimension(economic_events),
+            self._compute_diversification_dimension(economic_events),
+            self._compute_yield_inclination_dimension(economic_events),
+            self._compute_reproduction_preference_dimension(economic_events),
+        ]
+
+    def _compute_economic_strategy_dimension(
+        self, events: list[dict[str, Any]]
+    ) -> float:
+        """
+        Economic strategy: -1=capital preservation, 0=balanced, +1=aggressive growth.
+
+        Preservation signals: asset_break_even, cost reduction, austerity events.
+        Growth signals: spawn_child, asset_deploy, bounty_hunt, yield high-risk.
+        """
+        preservation_score = 0
+        growth_score = 0
+        for ev in events:
+            et = ev.get("event_type", "")
+            if et in ("asset_break_even", "cost_reduce", "yield_conservative", "austerity"):
+                preservation_score += 1
+            elif et in ("spawn_child", "child_independent", "asset_deploy", "bounty_hunt",
+                        "yield_deploy", "yield_high_risk"):
+                growth_score += 1
+
+        total = preservation_score + growth_score
+        if total == 0:
+            return 0.0
+        # Net growth bias in [-1, 1]
+        return max(-1.0, min(1.0, (growth_score - preservation_score) / total))
+
+    def _compute_risk_tolerance_dimension(
+        self, events: list[dict[str, Any]]
+    ) -> float:
+        """
+        Risk tolerance: 0=conservative, 1=risk-seeking.
+
+        Conservative: blue-chip yield, established protocols, low-concentration positions.
+        Risk-seeking: new protocol exploration, high-concentration, speculative assets.
+        """
+        conservative_count = 0
+        risky_count = 0
+        for ev in events:
+            et = ev.get("event_type", "")
+            rs = ev.get("revenue_source", "")
+            if et in ("yield_conservative", "protocol_established") or rs in ("aave", "compound"):
+                conservative_count += 1
+            elif et in ("protocol_explore", "yield_high_risk", "asset_speculative") or rs == "new_protocol":
+                risky_count += 1
+
+        total = conservative_count + risky_count
+        if total == 0:
+            return 0.5  # Unknown — default to neutral
+        return min(1.0, risky_count / total)
+
+    def _compute_diversification_dimension(
+        self, events: list[dict[str, Any]]
+    ) -> float:
+        """
+        Revenue stream diversity: 0=single source, 1=fully diversified.
+
+        Counts unique revenue sources in the last 100 economic events.
+        Normalized: 1 source → 0.0, 4+ sources → 1.0.
+        """
+        sources: set[str] = set()
+        for ev in events[-100:]:
+            rs = ev.get("revenue_source", "")
+            if rs:
+                sources.add(rs)
+
+        if not sources:
+            return 0.0
+        # 1 source = 0.0, 2 = 0.33, 3 = 0.67, 4+ = 1.0
+        return min(1.0, (len(sources) - 1) / 3.0)
+
+    def _compute_yield_inclination_dimension(
+        self, events: list[dict[str, Any]]
+    ) -> float:
+        """
+        Yield farming inclination: 0=none, 1=primary revenue strategy.
+
+        = yield_events / total_revenue_events in last 100 events.
+        """
+        revenue_types = [
+            ev.get("event_type", "") for ev in events[-100:]
+            if ev.get("event_type", "") in (
+                "yield_deploy", "yield_rebalance", "yield_conservative",
+                "yield_high_risk", "bounty_hunt", "asset_break_even",
+                "asset_deploy", "dividend_received", "spawn_child",
+            )
+        ]
+        if not revenue_types:
+            return 0.0
+        yield_count = sum(
+            1 for t in revenue_types
+            if t in ("yield_deploy", "yield_rebalance", "yield_conservative", "yield_high_risk")
+        )
+        return min(1.0, yield_count / len(revenue_types))
+
+    def _compute_reproduction_preference_dimension(
+        self, events: list[dict[str, Any]]
+    ) -> float:
+        """
+        Child reproduction preference: 0=no children, 1=fleet-focused.
+
+        Based on spawn_child + child_independent events in a 30-day window.
+        3+ spawn events in window → 1.0; 0 → 0.0.
+        """
+        cutoff = datetime.now(UTC) - timedelta(days=30)
+        spawn_count = 0
+        for ev in events:
+            ts = ev.get("timestamp")
+            if ts is not None:
+                if isinstance(ts, str):
+                    try:
+                        ts = datetime.fromisoformat(ts)
+                    except ValueError:
+                        ts = None
+                if ts is not None and ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+            if ts is None or ts >= cutoff:
+                if ev.get("event_type", "") in ("spawn_child", "child_independent"):
+                    spawn_count += 1
+
+        return min(1.0, spawn_count / 3.0)
 
     async def _persist_fingerprint(self, fp: BehavioralFingerprint) -> None:
         """Store a fingerprint node in Neo4j, linked to Self."""

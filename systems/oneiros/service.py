@@ -408,6 +408,17 @@ class OneirosService:
                     self._on_metabolic_pressure,
                 )
 
+                # Economic milestones feed lucid dreaming creative goals (Fix 6.4b).
+                # When a significant economic event occurs before sleep, Oneiros will
+                # set a creative_goal so lucid dreaming explores the economic space.
+                for econ_event in (
+                    SynapseEventType.BOUNTY_PAID,
+                    SynapseEventType.REVENUE_INJECTED,
+                    SynapseEventType.ASSET_BREAK_EVEN,
+                    SynapseEventType.CHILD_INDEPENDENT,
+                ):
+                    event_bus.subscribe(econ_event, self._on_economic_milestone)
+
                 # Spec 14 §8 Federation: coordinate sleep timing across instances.
                 if hasattr(SynapseEventType, "FEDERATION_SLEEP_SYNC"):
                     event_bus.subscribe(
@@ -748,6 +759,40 @@ class OneirosService:
                         resilience=str(result.resilience_score),
                         recommendations=len(result.recommendations),
                     )
+                    # ONEIROS-ECON-1: Broadcast economic dream insights so Nova and
+                    # other systems can integrate risk awareness. Only broadcast when
+                    # ruin_probability > 0.2 — below that, risk is nominal and not
+                    # actionable enough to warrant organism-wide attention.
+                    if result.ruin_probability > 0.2:
+                        optimal_scenarios: list[str] = [
+                            str(s) for s in result.optimal_scenarios
+                        ] if getattr(result, "optimal_scenarios", None) else []
+                        risk_warnings: list[str] = [
+                            str(w) for w in result.risk_warnings
+                        ] if getattr(result, "risk_warnings", None) else []
+                        recommended_actions: list[str] = [
+                            str(r) for r in result.recommendations
+                        ] if getattr(result, "recommendations", None) else []
+                        dream_validity_confidence = float(
+                            getattr(result, "resilience_score", 0.5)
+                        )
+                        await self._emit_event(
+                            SynapseEventType.ONEIROS_ECONOMIC_INSIGHT,
+                            {
+                                "ruin_probability": float(result.ruin_probability),
+                                "optimal_scenarios": optimal_scenarios,
+                                "risk_warnings": risk_warnings,
+                                "recommended_actions": recommended_actions,
+                                "dream_validity_confidence": dream_validity_confidence,
+                                "cycle_id": cycle_id,
+                            },
+                        )
+                        self._logger.info(
+                            "economic_insight_broadcast",
+                            ruin_probability=str(result.ruin_probability),
+                            warnings=len(risk_warnings),
+                            actions=len(recommended_actions),
+                        )
                 elif hasattr(result, "portfolio_risk"):
                     self._logger.info(
                         "threat_model_integrated",
@@ -881,6 +926,61 @@ class OneirosService:
             elif level in ("nominal", "cautious"):
                 # Restore default cycle threshold
                 self._cycles_per_sleep = _get(self._config, "cycles_per_sleep", 500)
+
+    async def _on_economic_milestone(self, event: Any) -> None:
+        """React to significant economic events by queuing a creative goal for lucid dreaming.
+
+        Triggered by BOUNTY_PAID, REVENUE_INJECTED, ASSET_BREAK_EVEN, CHILD_INDEPENDENT.
+        Sets a creative_goal so the next LucidDreamingStage explores the economic
+        strategy space rather than defaulting to epistemic exploration.
+        """
+        if self._stage_controller.is_sleeping:
+            # Already asleep — goal will apply to the next cycle
+            return
+
+        data = getattr(event, "data", {}) or {}
+        event_type = getattr(event, "event_type", "") or getattr(event, "type", "")
+
+        # Build an economic creative goal from the event context
+        if "bounty" in str(event_type).lower():
+            bounty_name = data.get("bounty_name", "") or data.get("title", "")
+            amount = data.get("reward_usd", data.get("amount_usd", ""))
+            goal = (
+                f"Explore economic strategies that build on successful bounty completion"
+                + (f": {bounty_name}" if bounty_name else "")
+                + (f" (${amount})" if amount else "")
+                + ". Identify adjacent opportunities and replicable patterns."
+            )
+        elif "revenue" in str(event_type).lower():
+            source = data.get("source", "") or data.get("revenue_source", "")
+            goal = (
+                f"Explore revenue amplification strategies"
+                + (f" for {source}" if source else "")
+                + ". Identify compounding mechanisms and cross-domain analogues."
+            )
+        elif "break_even" in str(event_type).lower() or "asset" in str(event_type).lower():
+            asset = data.get("asset_id", "") or data.get("asset_name", "")
+            goal = (
+                f"Explore strategies to accelerate asset profitability"
+                + (f" for {asset}" if asset else "")
+                + " beyond break-even. Identify yield optimisation and divestment timing."
+            )
+        elif "independent" in str(event_type).lower():
+            child_id = data.get("child_id", "")
+            goal = (
+                f"Explore federation dynamics for newly-independent child"
+                + (f" {child_id}" if child_id else "")
+                + ". Identify collaborative economic strategies and knowledge transfer opportunities."
+            )
+        else:
+            goal = "Explore economic strategy space: identify compounding revenue patterns and risk-adjusted growth opportunities."
+
+        self.set_creative_goal(goal)
+        self._logger.info(
+            "oneiros_economic_creative_goal_set",
+            event_type=str(event_type),
+            goal_preview=goal[:80],
+        )
 
     async def _on_grid_metabolism_changed(self, event: Any) -> None:
         """

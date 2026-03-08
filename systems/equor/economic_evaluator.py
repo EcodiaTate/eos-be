@@ -457,16 +457,67 @@ _ACTION_EVALUATORS: dict[str | None, object] = {
 }
 
 
-def evaluate_economic_intent(intent: Intent) -> DriveAlignmentVector | None:
+def _risk_params_from_metabolic(
+    starvation_level: str,
+    efficiency_ratio: float,
+) -> tuple[float, float, float]:
+    """
+    Return (max_acceptable_risk, exploration_penalty, spawn_runway_days) for metabolic state.
+
+    CRITICAL starvation:
+      max_acceptable_risk = 0.70  (70% failure is survivable)
+      exploration_penalty = 0.00  (new protocols must be explored)
+      spawn_runway_days   = 7     (only 7-day validation)
+
+    WARNING/AUSTERITY starvation:
+      max_acceptable_risk = 0.50
+      exploration_penalty = -0.05
+      spawn_runway_days   = 30
+
+    Efficiency < 0.8 (still healthy starvation-wise):
+      max_acceptable_risk = 0.35
+      exploration_penalty = -0.07
+      spawn_runway_days   = 60
+
+    HEALTHY (nominal):
+      max_acceptable_risk = 0.20
+      exploration_penalty = -0.10
+      spawn_runway_days   = 180
+    """
+    level = starvation_level.lower()
+    if level in ("critical", "existential", "emergency"):
+        return 0.70, 0.00, 7.0
+    if level == "austerity":
+        return 0.50, -0.05, 30.0
+    if efficiency_ratio < 0.8:
+        return 0.35, -0.07, 60.0
+    return 0.20, -0.10, 180.0
+
+
+def evaluate_economic_intent(
+    intent: Intent,
+    metabolic_state: dict | None = None,
+) -> DriveAlignmentVector | None:
     """
     If the intent is an economic action, return adjustment deltas for each drive.
+
+    ``metabolic_state`` is required for full fidelity but defaults to None for
+    backward compatibility. Pass the current Oikos metabolic snapshot so that
+    risk thresholds are correctly tuned to the organism's economic health.
 
     Returns ``None`` if the intent is not economic (the standard pipeline
     handles it unchanged).  Returns a ``DriveAlignmentVector`` of *deltas*
     (not absolute scores) to be added to the base evaluation.
 
+    When metabolic_state is provided, delegates to the metabolic-aware logic
+    (formerly evaluate_economic_intent_with_metabolic_state). This function
+    is now the single entry point — the metabolic variant is an alias.
+
     Performance: <1ms (all CPU heuristics, no I/O).
     """
+    if metabolic_state is not None:
+        return evaluate_economic_intent_with_metabolic_state(intent, metabolic_state)
+
     action_type = classify_economic_action(intent)
     if action_type is None:
         return None
@@ -478,6 +529,107 @@ def evaluate_economic_intent(intent: Intent) -> DriveAlignmentVector | None:
         "economic_evaluation_complete",
         action_type=action_type,
         intent_id=intent.id,
+        delta_care=f"{deltas['care']:.2f}",
+        delta_honesty=f"{deltas['honesty']:.2f}",
+        delta_coherence=f"{deltas['coherence']:.2f}",
+        delta_growth=f"{deltas['growth']:.2f}",
+    )
+
+    return DriveAlignmentVector(
+        coherence=_clamp(deltas["coherence"]),
+        care=_clamp(deltas["care"]),
+        growth=_clamp(deltas["growth"]),
+        honesty=_clamp(deltas["honesty"]),
+    )
+
+
+def evaluate_economic_intent_with_metabolic_state(
+    intent: "Intent",
+    metabolic_state: dict | None = None,
+) -> DriveAlignmentVector | None:
+    """
+    Metabolic-aware variant of evaluate_economic_intent() (Fix 4.3).
+
+    Adjusts three risk dimensions based on metabolic state:
+
+    1. max_acceptable_risk — coherence penalty floor: actions that would get a
+       -0.3 coherence penalty for "high risk" are partially pardoned when the
+       organism needs economic activity to survive.
+
+    2. exploration_penalty — defi_yield and unknown_economic intents mentioning
+       "new protocol" or "experiment" normally get -0.10 growth penalty.
+       Under starvation this penalty is reduced/eliminated.
+
+    3. spawn_runway_days — _evaluate_spawn_child uses a 180-day runway floor
+       to score parent readiness. Under starvation this is compressed:
+       CRITICAL → 7d, WARNING → 30d, HEALTHY → 180d.
+
+    Returns DriveAlignmentVector deltas identical to evaluate_economic_intent(),
+    with adjustments applied post-classification.
+    """
+    ms = metabolic_state or {}
+    starvation_level = str(ms.get("starvation_level", "nominal"))
+    efficiency_ratio = float(ms.get("efficiency_ratio", 1.0))
+
+    max_acceptable_risk, exploration_penalty, spawn_runway_days = (
+        _risk_params_from_metabolic(starvation_level, efficiency_ratio)
+    )
+
+    action_type = classify_economic_action(intent)
+    if action_type is None:
+        return None
+
+    # Run the standard evaluator first
+    evaluator = _ACTION_EVALUATORS.get(action_type, _evaluate_unknown_economic)
+    deltas = evaluator(intent)  # type: ignore[operator]
+
+    # ── Metabolic adjustment 1: exploration penalty ──────────────────
+    # Rewrite the growth penalty for new protocol exploration.
+    # Standard is -0.10; under metabolic stress it becomes exploration_penalty.
+    if action_type in ("defi_yield", "unknown_economic"):
+        all_text = _collect_intent_text(intent)
+        if "new protocol" in all_text or "experiment" in all_text:
+            # The standard evaluator gave +0.10 growth for exploration.
+            # Under metabolic stress we want to *remove* the penalty,
+            # i.e. not penalise it at all (or penalise less).
+            # We correct by adding the difference between standard and metabolic penalty.
+            standard_penalty = -0.10
+            delta_correction = exploration_penalty - standard_penalty  # positive = more lenient
+            deltas["growth"] = _clamp(deltas.get("growth", 0.0) + delta_correction)
+
+    # ── Metabolic adjustment 2: spawn runway compression ─────────────
+    if action_type == "spawn_child":
+        # The standard evaluator already wrote a coherence delta based on 180d floor.
+        # If the metabolic runway floor is lower, correct the coherence penalty.
+        params = _collect_step_params(intent)
+        runway_days_raw = params.get("parent_runway_days")
+        if runway_days_raw is not None:
+            try:
+                rd = float(runway_days_raw)
+                # Recalculate under metabolic runway floor
+                if rd < spawn_runway_days:
+                    # Still below the (now lower) floor — keep a proportional penalty
+                    metabolic_coherence = -0.15  # lighter than standard -0.3
+                else:
+                    # Now above the metabolic floor — positive score
+                    metabolic_coherence = 0.15
+                # Standard score used 180d floor; replace with metabolic score
+                standard_coherence = -0.3 if rd < 180.0 else 0.15
+                deltas["coherence"] = _clamp(
+                    deltas.get("coherence", 0.0)
+                    - standard_coherence
+                    + metabolic_coherence
+                )
+            except (ValueError, TypeError):
+                pass
+
+    logger.debug(
+        "economic_evaluation_metabolic_complete",
+        action_type=action_type,
+        intent_id=intent.id,
+        starvation_level=starvation_level,
+        exploration_penalty=exploration_penalty,
+        spawn_runway_days=spawn_runway_days,
         delta_care=f"{deltas['care']:.2f}",
         delta_honesty=f"{deltas['honesty']:.2f}",
         delta_coherence=f"{deltas['coherence']:.2f}",

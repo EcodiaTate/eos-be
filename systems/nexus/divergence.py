@@ -333,3 +333,71 @@ def _measure_temporal_divergence(
             "age_gap_hours": age_gap_seconds / 3600.0,
         },
     )
+
+
+def compute_economic_divergence(
+    profiles: list[InstanceDivergenceProfile],
+) -> dict[str, float]:
+    """
+    Compute revenue-per-strategy variance across a set of instance profiles.
+
+    Returns a dict mapping each instance_id to its economic_divergence score
+    (0.0 = converged, 1.0 = diverged).
+
+    Algorithm:
+      For each strategy key (union across all profiles), compute the
+      coefficient of variation (CV = std / mean) of revenue rates.
+      Each instance's economic_divergence is the mean CV of strategies where
+      it has a non-zero rate, normalised to [0, 1] via tanh(CV).
+
+    Instances with no strategy data (empty strategy_revenue_rates) receive
+    economic_divergence = 0.0 (unknown, not diverged).
+    """
+    if len(profiles) < 2:
+        # Cannot compute variance with a single instance
+        return {p.instance_id: 0.0 for p in profiles}
+
+    # Collect all strategy keys across all profiles
+    all_strategies: set[str] = set()
+    for profile in profiles:
+        all_strategies.update(profile.strategy_revenue_rates.keys())
+
+    if not all_strategies:
+        return {p.instance_id: 0.0 for p in profiles}
+
+    import math
+
+    # Per-strategy: compute revenue rates across all profiles
+    strategy_rates: dict[str, list[float]] = {
+        s: [p.strategy_revenue_rates.get(s, 0.0) for p in profiles]
+        for s in all_strategies
+    }
+
+    # Per-strategy coefficient of variation (CV)
+    strategy_cv: dict[str, float] = {}
+    for strategy, rates in strategy_rates.items():
+        mean_r = sum(rates) / len(rates)
+        if mean_r == 0.0:
+            strategy_cv[strategy] = 0.0
+            continue
+        variance = sum((r - mean_r) ** 2 for r in rates) / len(rates)
+        std = math.sqrt(variance)
+        strategy_cv[strategy] = std / mean_r  # CV (dimensionless)
+
+    # Per-instance economic_divergence: mean CV over strategies where
+    # the instance contributes a non-zero rate
+    result: dict[str, float] = {}
+    for profile in profiles:
+        active_cvs = [
+            strategy_cv[s]
+            for s, rate in profile.strategy_revenue_rates.items()
+            if rate > 0.0 and s in strategy_cv
+        ]
+        if not active_cvs:
+            result[profile.instance_id] = 0.0
+        else:
+            mean_cv = sum(active_cvs) / len(active_cvs)
+            # tanh normalisation: CV=1 → 0.76, CV=2 → 0.96
+            result[profile.instance_id] = float(math.tanh(mean_cv))
+
+    return result

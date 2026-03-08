@@ -43,6 +43,94 @@ logger = structlog.get_logger()
 
 # Maximum entities tracked in the belief state
 _MAX_ENTITY_BELIEFS = 200
+
+# ─── Belief Urgency Monitor (NOVA-ECON-3) ────────────────────────────────────
+#
+# Tracks high-priority belief entity keys.  When any monitored belief's
+# confidence changes by more than _URGENCY_THRESHOLD, the registered
+# callback fires immediately — enabling Nova to replan within 50ms rather
+# than waiting for the next theta heartbeat.
+#
+# This closes the gap where Nova updated beliefs passively (beliefs were
+# state, not planning inputs).  Now a >20% swing in a priority belief key
+# triggers _immediate_deliberation() synchronously via callback.
+
+_URGENCY_THRESHOLD: float = 0.20  # 20% confidence change → trigger
+
+# Belief entity IDs that warrant immediate replanning on confidence shift
+_PRIORITY_BELIEF_KEYS: frozenset[str] = frozenset({
+    "wallet_balance",
+    "bounty_success_rate",
+    "yield_apy_aave",
+    "yield_apy_morpho",
+    "yield_apy_compound",
+    "revenue_burn_ratio",
+    "economic_risk_level",
+})
+
+
+class BeliefUrgencyMonitor:
+    """
+    Watches high-priority belief entities and fires a callback when
+    their confidence shifts by more than _URGENCY_THRESHOLD (20%).
+
+    Usage:
+        monitor = BeliefUrgencyMonitor(callback=nova._immediate_deliberation)
+        belief_updater.set_urgency_monitor(monitor)
+
+    The callback receives keyword args: reason (str), urgency (float).
+    It is called fire-and-forget via asyncio.create_task to avoid blocking
+    the belief-update hot path.
+    """
+
+    def __init__(self, callback: Any) -> None:
+        # callback: async def(reason: str, urgency: float) -> None
+        self._callback = callback
+        self._prev_confidences: dict[str, float] = {}
+        self._logger = logger.bind(system="nova.belief_urgency_monitor")
+
+    def check(self, entity_id: str, new_confidence: float) -> None:
+        """
+        Compare new_confidence against last-known value for entity_id.
+        If entity_id is a priority key and delta > threshold, fire callback.
+
+        Called synchronously from BeliefUpdater after each entity update.
+        Must complete in <1ms — no I/O, no blocking.
+        """
+        if entity_id not in _PRIORITY_BELIEF_KEYS:
+            return
+
+        prev = self._prev_confidences.get(entity_id)
+        self._prev_confidences[entity_id] = new_confidence
+
+        if prev is None:
+            return  # First observation, no baseline to compare
+
+        delta = abs(new_confidence - prev)
+        if delta <= _URGENCY_THRESHOLD:
+            return
+
+        # Urgency scales with the size of the confidence swing
+        urgency = min(1.0, 0.5 + delta * 2.0)
+        reason = f"belief_shift:{entity_id}:{prev:.3f}->{new_confidence:.3f}"
+        self._logger.info(
+            "belief_urgency_triggered",
+            entity_id=entity_id,
+            prev=round(prev, 3),
+            new=round(new_confidence, 3),
+            delta=round(delta, 3),
+            urgency=round(urgency, 3),
+        )
+
+        # Fire-and-forget — never block the belief update path
+        import asyncio
+        try:
+            asyncio.get_event_loop().create_task(  # type: ignore[attr-defined]
+                self._callback(reason=reason, urgency=urgency),
+            )
+        except RuntimeError:
+            # No running event loop (e.g. unit tests) — skip
+            pass
 # Confidence decay per cycle for unobserved entities (forgetting)
 _CONFIDENCE_DECAY = 0.005
 # Minimum confidence before entity belief is pruned
@@ -61,6 +149,11 @@ class BeliefUpdater:
     def __init__(self) -> None:
         self._beliefs = BeliefState()
         self._logger = logger.bind(system="nova.belief_updater")
+        self._urgency_monitor: BeliefUrgencyMonitor | None = None
+
+    def set_urgency_monitor(self, monitor: BeliefUrgencyMonitor) -> None:
+        """Wire an urgency monitor to trigger immediate deliberation on belief shifts."""
+        self._urgency_monitor = monitor
 
     @property
     def beliefs(self) -> BeliefState:
@@ -211,6 +304,8 @@ class BeliefUpdater:
         updated = dict(self._beliefs.entities)
         updated[entity_id] = belief
         self._beliefs = self._beliefs.model_copy(update={"entities": updated})
+        if self._urgency_monitor is not None:
+            self._urgency_monitor.check(entity_id, confidence)
 
     def upsert_entity(self, belief: EntityBelief) -> None:
         """Insert or replace a full EntityBelief (immutable model_copy pattern)."""
@@ -230,6 +325,10 @@ class BeliefUpdater:
         updated = dict(self._beliefs.entities)
         updated[entity_id] = updated_belief
         self._beliefs = self._beliefs.model_copy(update={"entities": updated})
+        # Check urgency monitor for confidence shifts on priority keys
+        new_confidence = fields.get("confidence")
+        if self._urgency_monitor is not None and isinstance(new_confidence, float):
+            self._urgency_monitor.check(entity_id, new_confidence)
         return True
 
     # ─── Neo4j Persistence ─────────────────────────────────────────
