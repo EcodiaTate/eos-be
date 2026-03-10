@@ -479,15 +479,22 @@ class CognitiveClock:
                     # Emit THETA_CYCLE_OVERRUN as a bus event (Spec 09 §18 P8)
                     if self._event_bus is not None:
                         with contextlib.suppress(Exception):
+                            _overrun_data = {
+                                "cycle_number": self._cycle_count,
+                                "elapsed_ms": round(elapsed_ms, 2),
+                                "budget_ms": round(self._current_period_ms, 2),
+                                "overrun_count": self._overrun_count,
+                            }
                             asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
                                 event_type=SynapseEventType.THETA_CYCLE_OVERRUN,
                                 source_system="synapse:clock",
-                                data={
-                                    "cycle_number": self._cycle_count,
-                                    "elapsed_ms": round(elapsed_ms, 2),
-                                    "budget_ms": round(self._current_period_ms, 2),
-                                    "overrun_count": self._overrun_count,
-                                },
+                                data=_overrun_data,
+                            )))
+                            # Co-emit CLOCK_OVERRUN — subscribed by Thymos for immune response
+                            asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                                event_type=SynapseEventType.CLOCK_OVERRUN,
+                                source_system="synapse:clock",
+                                data=_overrun_data,
                             )))
 
                 # 6. Build cycle result

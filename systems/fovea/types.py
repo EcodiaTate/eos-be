@@ -196,13 +196,32 @@ class FoveaPredictionError(EOSBaseModel):
             total += error_val * precision * weight
         self.precision_weighted_salience = total
 
-    def compute_routing(self, workspace_threshold: float) -> None:
+    def compute_routing(
+        self,
+        workspace_threshold: float,
+        constitutional_equor_threshold: float = 0.3,
+        constitutional_oneiros_threshold: float = 0.5,
+        economic_route_threshold: float = 0.3,
+    ) -> None:
         """Determine which downstream systems receive this error.
 
         Constitutional mismatches (predicted high-Care action, actual low-Care
         outcome) are routed to EQUOR and ONEIROS in addition to standard routes.
         EQUOR gates constitutional drift; ONEIROS accumulates constitutional
         pattern backlog for sleep-cycle consolidation.
+
+        Args:
+            workspace_threshold: Dynamic ignition threshold from
+                DynamicIgnitionThreshold.current — adjusted by Evo + Soma.
+            constitutional_equor_threshold: Mismatch level above which
+                EQUOR routing fires. Default 0.3. Adjustable via
+                FOVEA_PARAMETER_ADJUSTMENT (routing_threshold_equor).
+            constitutional_oneiros_threshold: Mismatch level above which
+                ONEIROS routing fires. Default 0.5. Adjustable via
+                FOVEA_PARAMETER_ADJUSTMENT (routing_threshold_oneiros).
+            economic_route_threshold: Economic error level above which
+                OIKOS + EVO routing fires. Default 0.3. Adjustable via
+                FOVEA_PARAMETER_ADJUSTMENT (economic_route_threshold).
         """
         self.routes = []
         s = (
@@ -223,14 +242,16 @@ class FoveaPredictionError(EOSBaseModel):
         # Constitutional value mismatch: route to Equor (governance gate) and
         # Oneiros (sleep-cycle pattern consolidation) when the error is in a
         # constitutional domain (Care, Honesty, Coherence, Growth drive alignment).
-        if self.constitutional_mismatch > 0.3:
+        # Thresholds are runtime-adjustable via FOVEA_PARAMETER_ADJUSTMENT so
+        # the organism can tighten or loosen constitutional scrutiny without restart.
+        if self.constitutional_mismatch > constitutional_equor_threshold:
             self.routes.append(ErrorRoute.EQUOR)
-        if self.constitutional_mismatch > 0.5:
+        if self.constitutional_mismatch > constitutional_oneiros_threshold:
             self.routes.append(ErrorRoute.ONEIROS)
         # Economic errors route to Oikos (metabolic system) and Evo (hypothesis
         # generation) — Oikos needs to know Fovea has detected a revenue divergence
         # before it escalates to starvation.
-        if self.economic_error > 0.3:
+        if self.economic_error > economic_route_threshold:
             if ErrorRoute.OIKOS not in self.routes:
                 self.routes.append(ErrorRoute.OIKOS)
             if ErrorRoute.EVO not in self.routes:
@@ -308,7 +329,13 @@ class InternalPredictionError(FoveaPredictionError):
             total += error_val * precision * weight
         self.precision_weighted_salience = total * self.precision_multiplier
 
-    def compute_routing(self, workspace_threshold: float) -> None:
+    def compute_routing(
+        self,
+        workspace_threshold: float,
+        constitutional_equor_threshold: float = 0.3,
+        constitutional_oneiros_threshold: float = 0.5,
+        economic_route_threshold: float = 0.3,
+    ) -> None:
         """Override: constitutional internal errors always route to Equor and Oneiros.
 
         A CONSTITUTIONAL self-model violation means EOS predicted its own behaviour
@@ -317,7 +344,12 @@ class InternalPredictionError(FoveaPredictionError):
         Equor must evaluate whether the constitutional floor was breached.
         Oneiros receives it for consolidation into the sleep-cycle pattern backlog.
         """
-        super().compute_routing(workspace_threshold)
+        super().compute_routing(
+            workspace_threshold,
+            constitutional_equor_threshold=constitutional_equor_threshold,
+            constitutional_oneiros_threshold=constitutional_oneiros_threshold,
+            economic_route_threshold=economic_route_threshold,
+        )
         if self.internal_error_type == InternalErrorType.CONSTITUTIONAL:
             if ErrorRoute.EQUOR not in self.routes:
                 self.routes.append(ErrorRoute.EQUOR)

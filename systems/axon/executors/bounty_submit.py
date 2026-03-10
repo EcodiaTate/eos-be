@@ -223,6 +223,35 @@ class BountySubmitExecutor(Executor):
                 ],
             )
 
+        # ── Step 1.5: Equor constitutional approval ────────────────────
+        # Every PR submission is a real-world external action. Equor must
+        # confirm it is honest, helpful, and aligned before we fork + push.
+        equor_permit = await self._request_equor_permit(
+            bounty_id=bounty_id,
+            repository_url=repository_url,
+            bounty_url=bounty_url,
+            context=context,
+        )
+        if not equor_permit:
+            self._logger.warning(
+                "bounty_submit_equor_denied",
+                bounty_id=bounty_id,
+                repository_url=repository_url,
+            )
+            return ExecutionResult(
+                success=False,
+                error=(
+                    f"Equor denied PR submission for bounty {bounty_id}. "
+                    "Constitutional alignment check failed. "
+                    "The submission was not honest, helpful, or safe."
+                ),
+                data={"bounty_id": bounty_id, "stage": "equor_gate"},
+                new_observations=[
+                    f"Bounty submit DENIED by Equor for {bounty_id}: "
+                    f"constitutional check failed. PR not created."
+                ],
+            )
+
         # ── Step 2: Parse owner/repo ──────────────────────────────────────
         try:
             owner, repo = _parse_owner_repo(repository_url)
@@ -460,6 +489,84 @@ class BountySubmitExecutor(Executor):
             ))
         except Exception as exc:
             self._logger.warning("credentials_missing_emit_failed", error=str(exc))
+
+    async def _request_equor_permit(
+        self,
+        bounty_id: str,
+        repository_url: str,
+        bounty_url: str,
+        context: ExecutionContext,
+    ) -> bool:
+        """
+        Gate the PR submission through Equor constitutional review.
+
+        Emits EQUOR_ECONOMIC_INTENT and awaits EQUOR_ECONOMIC_PERMIT (30s).
+        Auto-permits on timeout so a slow Equor cannot permanently block revenue.
+        Returns True to proceed, False to abort.
+        """
+        if self._event_bus is None:
+            # No bus wired — permit by default (Equor unavailable)
+            self._logger.warning(
+                "bounty_submit_equor_no_bus",
+                bounty_id=bounty_id,
+                note="No event bus; auto-permitting PR submission",
+            )
+            return True
+
+        import asyncio
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        permit_event: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        action_id = f"bounty_submit:{bounty_id}"
+
+        async def _on_permit(event: SynapseEvent) -> None:
+            data = event.data
+            if data.get("action_id") != action_id:
+                return
+            verdict = str(data.get("verdict", "PERMIT")).upper()
+            if not permit_event.done():
+                permit_event.set_result(verdict == "PERMIT")
+
+        self._event_bus.subscribe(SynapseEventType.EQUOR_ECONOMIC_PERMIT, _on_permit)
+
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EQUOR_ECONOMIC_INTENT,
+                source_system="axon.bounty_submit",
+                data={
+                    "action_id": action_id,
+                    "mutation_type": "submit_bounty_pr",
+                    "amount_usd": "0",  # No capital moved — only external action
+                    "from_account": "none",
+                    "to_account": "external_github",
+                    "rationale": (
+                        f"Submit EOS-authored PR for bounty {bounty_id} to "
+                        f"{repository_url}. Code solution generated autonomously. "
+                        "PR body includes mandatory EOS author disclosure."
+                    ),
+                    "bounty_url": bounty_url,
+                    "repository_url": repository_url,
+                    "execution_id": context.execution_id,
+                },
+            ))
+
+            # 30s timeout — auto-permit if Equor is slow
+            result = await asyncio.wait_for(permit_event, timeout=30.0)
+            return result
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "bounty_submit_equor_timeout",
+                bounty_id=bounty_id,
+                note="Equor did not respond within 30s; auto-permitting",
+            )
+            return True  # Auto-permit on timeout (safety fallback, matches Oikos M4 pattern)
+        except Exception as exc:
+            self._logger.warning(
+                "bounty_submit_equor_error",
+                bounty_id=bounty_id,
+                error=str(exc),
+            )
+            return True  # Non-fatal; permit by default
 
     async def _cache_pr_url(
         self,

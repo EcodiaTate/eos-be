@@ -95,6 +95,10 @@ class GlobalWorkspace:
     4. All systems receive the broadcast and may contribute to the next cycle.
 
     Only ONE winner per cycle (unitary consciousness principle from GWT).
+
+    Buffer sizes scale dynamically with Soma arousal — higher arousal opens a
+    wider perceptual window.  Curiosity parameters (spontaneous recall probability,
+    cooldown, boost) are Evo-evolvable and genome-heritable.
     """
 
     def __init__(
@@ -106,20 +110,30 @@ class GlobalWorkspace:
         # Config
         self._base_threshold = ignition_threshold
         self._buffer_size = buffer_size
-        self._spontaneous_base_prob = spontaneous_recall_base_prob
+
+        # Evolvable curiosity parameters
+        self._spontaneous_base_prob: float = spontaneous_recall_base_prob
+        self._cooldown_cycles: int = 20       # minimum cycles between spontaneous recalls
+        self._curiosity_boost: float = 0.03   # per-unit curiosity boost to recall probability
 
         # Dynamic state
         self._dynamic_threshold: float = ignition_threshold
         self._subscribers: list[BroadcastSubscriber] = []
+        self._current_arousal: float = 0.4    # updated via update_arousal()
         self._recent_broadcasts: deque[WorkspaceBroadcast] = deque(maxlen=20)
 
-        # Queues (drained each cycle)
-        self._percept_queue: deque[WorkspaceCandidate] = deque(maxlen=200)
-        self._contribution_queue: deque[WorkspaceContribution] = deque(maxlen=50)
+        # Queues — sizes recomputed each time arousal updates
+        percept_q, contrib_q, broadcast_h = self._compute_buffer_sizes(self._current_arousal)
+        self._percept_queue: deque[WorkspaceCandidate] = deque(maxlen=percept_q)
+        self._contribution_queue: deque[WorkspaceContribution] = deque(maxlen=contrib_q)
+        self._recent_broadcasts = deque(maxlen=broadcast_h)
 
         # Spontaneous recall tracking
         self._cycles_since_last_spontaneous: int = 100  # allow first one early
         self._pending_hypothesis_count: int = 0
+
+        # Curiosity outcome tracking for Evo feedback (percept_id → cycle_fired)
+        self._spontaneous_recall_outcomes: dict[str, int] = {}
 
         # Habituation tracker: source → habituation level
         self._habituation: dict[str, float] = {}
@@ -128,6 +142,124 @@ class GlobalWorkspace:
         self._cycle_count: int = 0
 
         self._logger = logger.bind(component="workspace")
+
+    # ------------------------------------------------------------------
+    # Arousal-scaled buffer sizing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_buffer_sizes(arousal: float) -> tuple[int, int, int]:
+        """
+        Scale buffer sizes with Soma arousal.  Higher arousal = wider perceptual window.
+
+        Returns (percept_queue_size, contribution_queue_size, broadcast_history_size).
+        """
+        clamped = max(0.0, min(1.0, arousal))
+        percept_q = int(50 + 350 * clamped)    # 50–400
+        contrib_q = int(20 + 80 * clamped)     # 20–100
+        broadcast_h = int(10 + 30 * clamped)   # 10–40
+        return percept_q, contrib_q, broadcast_h
+
+    def update_arousal(self, arousal: float) -> None:
+        """
+        Update current arousal level and resize queues accordingly.
+
+        When shrinking, oldest items are dropped from the front (deque truncation).
+        This is called by PerceptionGateway each time a SOMA_TICK / ALLOSTATIC_SIGNAL
+        arrives carrying an updated arousal reading.
+        """
+        arousal = max(0.0, min(1.0, arousal))
+        if abs(arousal - self._current_arousal) < 0.01:
+            return  # no meaningful change
+
+        self._current_arousal = arousal
+        percept_q, contrib_q, broadcast_h = self._compute_buffer_sizes(arousal)
+
+        # Resize: create new deques with the updated maxlen, copying existing items.
+        # deque truncation from the left (oldest items dropped) when maxlen shrinks.
+        self._percept_queue = deque(self._percept_queue, maxlen=percept_q)
+        self._contribution_queue = deque(self._contribution_queue, maxlen=contrib_q)
+        self._recent_broadcasts = deque(self._recent_broadcasts, maxlen=broadcast_h)
+
+        self._logger.debug(
+            "workspace_buffers_resized",
+            arousal=round(arousal, 3),
+            percept_q=percept_q,
+            contrib_q=contrib_q,
+            broadcast_h=broadcast_h,
+        )
+
+    # ------------------------------------------------------------------
+    # Curiosity parameter API (Evo-adjustable, genome-heritable)
+    # ------------------------------------------------------------------
+
+    def adjust_param(self, name: str, delta: float) -> None:
+        """Apply a bounded delta to a curiosity parameter. Called by Evo ADJUST_BUDGET."""
+        if name == "base_prob":
+            self._spontaneous_base_prob = max(0.005, min(0.10, self._spontaneous_base_prob + delta))
+        elif name == "cooldown_cycles":
+            self._cooldown_cycles = max(5, min(50, int(self._cooldown_cycles + delta)))
+        elif name == "curiosity_boost":
+            self._curiosity_boost = max(0.01, min(0.10, self._curiosity_boost + delta))
+        else:
+            self._logger.warning("workspace_unknown_param", name=name)
+
+    def get_learnable_params(self) -> list[tuple[str, float, float, float]]:
+        """Return (name, min, max, current_value) for each curiosity parameter."""
+        return [
+            ("base_prob",       0.005, 0.10, self._spontaneous_base_prob),
+            ("cooldown_cycles", 5.0,   50.0, float(self._cooldown_cycles)),
+            ("curiosity_boost", 0.01,  0.10, self._curiosity_boost),
+        ]
+
+    def export_learnable_params(self) -> dict[str, float]:
+        """Serialise curiosity params for genome transport."""
+        return {
+            "base_prob":       self._spontaneous_base_prob,
+            "cooldown_cycles": float(self._cooldown_cycles),
+            "curiosity_boost": self._curiosity_boost,
+        }
+
+    def import_learnable_params(self, params: dict[str, float]) -> None:
+        """Apply inherited curiosity params with bounded ±15% Gaussian jitter for variation."""
+        import random as _random
+
+        def _jitter(val: float, lo: float, hi: float) -> float:
+            noise = val * _random.gauss(0.0, 0.05)  # ±5% std (conservative)
+            return max(lo, min(hi, val + noise))
+
+        if "base_prob" in params:
+            self._spontaneous_base_prob = _jitter(params["base_prob"], 0.005, 0.10)
+        if "cooldown_cycles" in params:
+            self._cooldown_cycles = max(5, min(50, int(_jitter(params["cooldown_cycles"], 5.0, 50.0))))
+        if "curiosity_boost" in params:
+            self._curiosity_boost = _jitter(params["curiosity_boost"], 0.01, 0.10)
+
+    # ------------------------------------------------------------------
+    # Spontaneous recall outcome tracking (feeds Evo fitness signal)
+    # ------------------------------------------------------------------
+
+    def record_curiosity_outcome(self, percept_id: str, positive: bool) -> None:
+        """
+        Called externally (by FoveaService) when a recalled percept either led
+        to a Thread coherence shift or Evo hypothesis (positive=True) within 50
+        cycles, or expired without effect (positive=False).
+
+        The gateway exposes this so Evo can build a curiosity effectiveness signal.
+        """
+        self._spontaneous_recall_outcomes[percept_id] = 1 if positive else 0
+        # Keep only the last 200 outcomes to bound memory
+        if len(self._spontaneous_recall_outcomes) > 200:
+            oldest = next(iter(self._spontaneous_recall_outcomes))
+            self._spontaneous_recall_outcomes.pop(oldest, None)
+
+    @property
+    def curiosity_hit_rate(self) -> float:
+        """Fraction of recent spontaneous recalls that produced positive outcomes."""
+        outcomes = list(self._spontaneous_recall_outcomes.values())
+        if not outcomes:
+            return 0.5  # neutral prior
+        return sum(outcomes) / len(outcomes)
 
     # ------------------------------------------------------------------
     # Registration
@@ -174,14 +306,14 @@ class GlobalWorkspace:
         but hasn't been accessed recently.  Creates the "I just thought of
         something" experience.
         """
-        if self._cycles_since_last_spontaneous < 20:
+        if self._cycles_since_last_spontaneous < self._cooldown_cycles:
             return None
 
         if memory_client is None:
             return None
 
         base_prob = self._spontaneous_base_prob
-        curiosity_boost = affect.curiosity * 0.03
+        curiosity_boost = affect.curiosity * self._curiosity_boost
         hypothesis_boost = min(0.02, self._pending_hypothesis_count * 0.005)
         total_prob = base_prob + curiosity_boost + hypothesis_boost
 
@@ -199,7 +331,7 @@ class GlobalWorkspace:
         self._logger.debug("spontaneous_recall_triggered")
 
         # Wrap the memory as a WorkspaceCandidate
-        return WorkspaceCandidate(
+        candidate = WorkspaceCandidate(
             content=memory,
             salience=SalienceVector(
                 scores={},
@@ -208,6 +340,11 @@ class GlobalWorkspace:
             source="spontaneous_recall",
             prediction_error=None,
         )
+        # Register this recall for outcome tracking.
+        # FoveaService will resolve it within 50 cycles (positive or neutral).
+        if hasattr(memory, "id"):
+            self._spontaneous_recall_outcomes.setdefault(memory.id, -1)  # -1 = pending
+        return candidate
 
     # ------------------------------------------------------------------
     # Context enrichment

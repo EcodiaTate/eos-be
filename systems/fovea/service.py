@@ -34,7 +34,14 @@ from primitives.genome import GenomeExtractionProtocol, OrganGenomeSegment
 from primitives.re_training import RETrainingExample
 
 from .economic_model import EconomicPredictionModel
-from .habituation import _HABITUATION_INCREMENT, _MAX_HABITUATION
+from .habituation import (
+    _DISHABITUATION_AMPLIFICATION,
+    _DISHABITUATION_THRESHOLD,
+    _HABITUATION_COMPLETE_THRESHOLD,
+    _HABITUATION_INCREMENT,
+    _HISTORY_WINDOW,
+    _MAX_HABITUATION,
+)
 from .integration import FoveaAtuneBridge
 from .internal import InternalPredictionEngine
 from .learning import AttentionWeightLearner
@@ -68,6 +75,19 @@ FOVEA_WORKSPACE_IGNITION = "fovea_workspace_ignition"
 FOVEA_ATTENTION_PROFILE_UPDATE = "fovea_attention_profile_update"
 FOVEA_HABITUATION_COMPLETE = "fovea_habituation_complete"
 FOVEA_INTERNAL_PREDICTION_ERROR = "fovea_internal_prediction_error"
+FOVEA_DIAGNOSTIC_REPORT = "fovea_diagnostic_report"
+FOVEA_BACKPRESSURE_WARNING = "fovea_backpressure_warning"
+FOVEA_CALIBRATION_ALERT = "fovea_calibration_alert"
+
+# Routing threshold overrides (organism-adjustable at runtime)
+# Defaults match original hardcoded values in compute_routing()
+_CONSTITUTIONAL_EQUOR_THRESHOLD: float = 0.3
+_CONSTITUTIONAL_ONEIROS_THRESHOLD: float = 0.5
+_ECONOMIC_ROUTE_THRESHOLD: float = 0.3
+_ECONOMIC_WORKSPACE_THRESHOLD: float = 0.5
+
+# Backpressure: warn when unresolved errors exceed this count
+_BACKPRESSURE_WARNING_THRESHOLD: int = 150
 
 
 class FoveaService:
@@ -148,6 +168,24 @@ class FoveaService:
         # ECONOMIC error dimension when actuals diverge from predictions.
         self._economic_model = EconomicPredictionModel()
 
+        # Diagnostic report cadence — emitted every N errors alongside fitness signal
+        self._diagnostic_emit_interval: int = 50  # matches fitness interval
+        self._errors_since_last_diagnostic: int = 0
+        self._last_backpressure_warning_count: int = 0  # avoid repeated warnings
+
+        # Runtime-adjustable routing thresholds (organism can request changes
+        # via FOVEA_PARAMETER_ADJUSTMENT event without service restart)
+        self._constitutional_equor_threshold: float = _CONSTITUTIONAL_EQUOR_THRESHOLD
+        self._constitutional_oneiros_threshold: float = _CONSTITUTIONAL_ONEIROS_THRESHOLD
+        self._economic_route_threshold: float = _ECONOMIC_ROUTE_THRESHOLD
+        self._economic_workspace_threshold: float = _ECONOMIC_WORKSPACE_THRESHOLD
+
+        # Autonomy gap closure: track consecutive poor cycles for calibration alerts
+        self._consecutive_poor_tpr: int = 0  # Reset when TPR >= 0.6
+        self._consecutive_high_false_alarm: int = 0  # Reset when false_alarm_rate <= 0.4
+
+        self._modulation_halted: bool = False
+
     # ------------------------------------------------------------------
     # Wiring
     # ------------------------------------------------------------------
@@ -163,6 +201,9 @@ class FoveaService:
         self._subscribe_to_fleet_attention_profiles(event_bus)
         self._subscribe_to_axon_events(event_bus)
         self._subscribe_to_economic_vitality(event_bus)
+        self._subscribe_to_parameter_adjustments(event_bus)
+        self._subscribe_to_system_modulation(event_bus)
+        self._subscribe_to_compression_events(event_bus)
         self._logger.info("event_bus_wired")
 
     def set_workspace(self, workspace: GlobalWorkspace) -> None:
@@ -175,12 +216,39 @@ class FoveaService:
         self._logger.info("world_model_swapped")
 
     def set_neo4j_driver(self, driver: Any, instance_id: str = "") -> None:
-        """Wire Neo4j driver post-construction for persistence."""
+        """Wire Neo4j driver post-construction for persistence.
+
+        If called after startup() (the usual case when called from registry.py),
+        schedules a late restore of persisted state via asyncio.ensure_future()
+        so that learned thresholds, weights, and habituation state are recovered
+        even though startup() ran before the driver was available.
+        """
         self._neo4j_driver = driver
         if instance_id:
             self._instance_id = instance_id
         self._weight_learner.set_neo4j_driver(driver, instance_id)
         self._bridge.habituation_engine.set_neo4j_driver(driver, instance_id)
+        self._bridge.dynamic_threshold.set_neo4j_driver(driver, instance_id)  # Part B
+
+        # If the system is already started (startup() ran before Neo4j was
+        # available), trigger a late restore so persisted state is actually loaded.
+        if self._started and driver is not None:
+            import asyncio
+
+            async def _late_restore() -> None:
+                try:
+                    await self._weight_learner.restore_weights()
+                    await self._bridge.habituation_engine.restore_state()
+                    await self._bridge.dynamic_threshold.restore_state_from_neo4j()
+                    self._logger.info("fovea_neo4j_late_restore_complete", instance_id=instance_id)
+                except Exception as exc:
+                    self._logger.warning("fovea_neo4j_late_restore_failed", error=str(exc))
+
+            try:
+                asyncio.ensure_future(_late_restore())
+            except RuntimeError:
+                # No running event loop during tests — silently skip
+                pass
 
     def get_metrics(self) -> FoveaMetrics:
         """Return current Fovea metrics snapshot (public API — avoids _bridge access)."""
@@ -199,6 +267,9 @@ class FoveaService:
         # Restore persisted state from Neo4j
         await self._weight_learner.restore_weights()
         await self._bridge.habituation_engine.restore_state()
+        await self._bridge.dynamic_threshold.restore_state_from_neo4j()  # Part B
+        # Apply inherited curiosity genome from parent (child instances only)
+        self._apply_inherited_atune_genome_if_child()
         self._started = True
         self._start_time = time.monotonic()
         self._logger.info("fovea_started")
@@ -216,7 +287,7 @@ class FoveaService:
 
     async def health(self) -> dict[str, Any]:
         metrics = self._bridge.get_metrics()
-        return {
+        result = {
             "status": "healthy" if self._started else "stopped",
             "errors_processed": metrics.errors_processed,
             "workspace_ignitions": metrics.workspace_ignitions,
@@ -233,7 +304,116 @@ class FoveaService:
             "internal_predictions_made": self._internal_engine.predictions_made,
             "internal_errors_generated": self._internal_engine.errors_generated,
             "internal_errors_by_type": self._internal_engine.errors_by_type,
+            "autonomy": self.introspect_autonomy(),
         }
+        return result
+
+    # ------------------------------------------------------------------
+    # Autonomy: self-introspection
+    # ------------------------------------------------------------------
+
+    def introspect_autonomy(self) -> dict[str, Any]:
+        """
+        Return all learnable parameters, effectiveness metrics, and internal
+        state for organism-level self-awareness. Exposed in health().
+        """
+        return {
+            "learner_params": self._weight_learner.get_learnable_params(),
+            "habituation_params": self._bridge.habituation_engine.get_learnable_params(),
+            "economic_model_params": self._economic_model.get_learnable_params(),
+            "threshold_config": {
+                "current": round(self._bridge.dynamic_threshold.current, 4),
+                "percentile": self._bridge.dynamic_threshold._percentile,
+                "floor": self._bridge.dynamic_threshold._floor,
+                "ceiling": self._bridge.dynamic_threshold._ceiling,
+            },
+            "effectiveness": {
+                "reinforcements": self._weight_learner.reinforcements,
+                "decays": self._weight_learner.decays,
+                "false_alarms": self._weight_learner.false_alarms,
+                "tpr": (
+                    self._weight_learner.reinforcements
+                    / max(1, self._weight_learner.reinforcements + self._weight_learner.false_alarms)
+                ),
+                "habituation_complete_count": self._bridge.habituation_engine.habituation_complete_count,
+            },
+            "fleet_divergence": {
+                "last_kl_divergence": round(self._last_kl_divergence, 4),
+                "fleet_samples": len(self._fleet_weight_samples),
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Autonomy: learnable parameter API (Evo ADJUST_BUDGET)
+    # ------------------------------------------------------------------
+
+    def adjust_learner_param(self, name: str, value: float) -> bool:
+        """Adjust a weight learner parameter. Called by Evo ADJUST_BUDGET."""
+        return self._weight_learner.adjust_param(name, value)
+
+    def adjust_habituation_param(self, name: str, value: float) -> bool:
+        """Adjust a habituation parameter. Called by Evo ADJUST_BUDGET."""
+        return self._bridge.habituation_engine.adjust_param(name, value)
+
+    def adjust_economic_param(self, name: str, value: float) -> bool:
+        """Adjust an economic model parameter. Called by Evo ADJUST_BUDGET."""
+        return self._economic_model.adjust_param(name, value)
+
+    def adjust_threshold_param(self, name: str, value: float) -> bool:
+        """Adjust a dynamic ignition threshold parameter."""
+        import asyncio as _asyncio
+        dt = self._bridge.dynamic_threshold
+        if name == "percentile":
+            dt._percentile = max(10.0, min(99.0, value))
+        elif name == "floor":
+            dt._floor = max(0.01, min(0.5, value))
+        elif name == "ceiling":
+            dt._ceiling = max(0.5, min(1.0, value))
+        else:
+            return False
+        logger.info("threshold_param_adjusted", name=name, value=round(value, 4))
+        # Persist immediately — these are Evo-tuned values that must survive restart.
+        _asyncio.ensure_future(dt.persist_params())
+        return True
+
+    def get_all_learnable_params(self) -> dict[str, Any]:
+        """Return all learnable parameters across all Fovea subsystems."""
+        result: dict[str, Any] = {
+            "learner": self._weight_learner.get_learnable_params(),
+            "habituation": self._bridge.habituation_engine.get_learnable_params(),
+            "economic": self._economic_model.get_learnable_params(),
+            "threshold": {
+                "percentile": self._bridge.dynamic_threshold._percentile,
+                "floor": self._bridge.dynamic_threshold._floor,
+                "ceiling": self._bridge.dynamic_threshold._ceiling,
+            },
+        }
+        # Include workspace curiosity params if the workspace is wired
+        workspace = self._bridge._workspace
+        if workspace is not None:
+            result["workspace"] = workspace.export_learnable_params()
+        return result
+
+    def export_learnable_params(self) -> dict[str, Any]:
+        """Export all learnable parameters for genome inheritance."""
+        return self.get_all_learnable_params()
+
+    def import_learnable_params(self, params: dict[str, Any]) -> None:
+        """Import learnable parameters from parent genome."""
+        if "learner" in params:
+            self._weight_learner.import_learnable_params(params["learner"])
+        if "habituation" in params:
+            self._bridge.habituation_engine.import_learnable_params(params["habituation"])
+        if "economic" in params:
+            self._economic_model.import_learnable_params(params["economic"])
+        if "threshold" in params:
+            for name, value in params["threshold"].items():
+                self.adjust_threshold_param(name, float(value))
+        # Import workspace curiosity params if available and workspace is wired
+        if "workspace" in params:
+            workspace = self._bridge._workspace
+            if workspace is not None:
+                workspace.import_learnable_params(params["workspace"])
 
     # ------------------------------------------------------------------
     # Main API: percept processing
@@ -248,6 +428,11 @@ class FoveaService:
         Integrates Phase C weight learning and Phase D self-attention.
         """
         self._sync_clock()
+
+        # ── Skia modulation halt ──────────────────────────────────────────
+        if self._modulation_halted:
+            self._logger.debug("process_percept_skipped_modulation_halted", percept_id=percept.id)
+            return None
 
         try:
             error = await self._bridge.process_percept(percept)
@@ -264,9 +449,19 @@ class FoveaService:
 
         # Constitutional mismatch detection: if the percept carries drive
         # alignment signals (populated by Nova/Equor in percept.metadata),
-        # score the divergence and set constitutional_mismatch before routing.
-        # This gates EQUOR + ONEIROS routing in compute_routing().
+        # score the divergence and set constitutional_mismatch, then re-run
+        # routing so EQUOR + ONEIROS receive the error when mismatch is high.
+        # NOTE: compute_routing() already ran inside the bridge with
+        # constitutional_mismatch == 0 (not yet injected). We must re-run it
+        # here — after injection — using the instance-level adjustable thresholds
+        # so constitutional routing is actually applied (previously a dead path).
         self._inject_constitutional_mismatch(error, percept)
+        error.compute_routing(
+            self._bridge.dynamic_threshold.current,
+            constitutional_equor_threshold=self._constitutional_equor_threshold,
+            constitutional_oneiros_threshold=self._constitutional_oneiros_threshold,
+            economic_route_threshold=self._economic_route_threshold,
+        )
 
         # Phase C: register error for weight learning correlation
         self._weight_learner.register_error(error)
@@ -323,6 +518,24 @@ class FoveaService:
         if self._errors_since_last_divergence >= self._divergence_emit_interval:
             await self._emit_attentional_divergence()
             self._errors_since_last_divergence = 0
+
+        # Diagnostic report: surface invisible internal state to the organism.
+        self._errors_since_last_diagnostic += 1
+        if self._errors_since_last_diagnostic >= self._diagnostic_emit_interval:
+            await self._emit_diagnostic_report()
+            await self._check_calibration_alert()  # Part A: Autonomy gap closure
+            self._errors_since_last_diagnostic = 0
+
+        # Backpressure: warn if unresolved error backlog is building up.
+        unresolved = sum(1 for t in self._weight_learner.recent_errors if not t.resolved)
+        if (
+            unresolved >= _BACKPRESSURE_WARNING_THRESHOLD
+            and unresolved > self._last_backpressure_warning_count
+        ):
+            await self._emit_backpressure_warning(unresolved)
+            self._last_backpressure_warning_count = unresolved
+        elif unresolved < _BACKPRESSURE_WARNING_THRESHOLD:
+            self._last_backpressure_warning_count = 0
 
         return error
 
@@ -524,12 +737,48 @@ class FoveaService:
                 SynapseEventType.EVO_HYPOTHESIS_REFUTED,
                 self._on_hypothesis_refuted,
             )
+            # Curiosity outcome tracking: positive signal when a hypothesis is
+            # created (suggests the recalled content seeded new learning) or
+            # when Thread registers a coherence shift.
+            try:
+                event_bus.subscribe(
+                    SynapseEventType.EVO_HYPOTHESIS_CREATED,
+                    self._on_curiosity_positive_signal,
+                )
+                event_bus.subscribe(
+                    SynapseEventType.COHERENCE_SHIFT,
+                    self._on_curiosity_positive_signal,
+                )
+            except (AttributeError, ValueError):
+                pass
             self._logger.info("subscribed_to_hypothesis_outcomes")
         except (ImportError, ValueError):
             self._logger.debug(
                 "hypothesis_subscription_skipped",
                 reason="event_type_unavailable",
             )
+
+    async def _on_curiosity_positive_signal(self, event: Any) -> None:
+        """
+        Mark any pending spontaneous-recall outcomes as positive when Evo creates
+        a new hypothesis or Thread registers a coherence shift within 50 cycles.
+
+        This closes the curiosity effectiveness feedback loop: workspace knows
+        whether spontaneous recalls are seeding growth or noise.
+        """
+        workspace = self._bridge._workspace
+        if workspace is None:
+            return
+        current_cycle = workspace.cycle_count
+        # Resolve all pending outcomes (value == -1) that fired within 50 cycles
+        for percept_id, outcome in list(workspace._spontaneous_recall_outcomes.items()):
+            if outcome == -1:  # pending
+                workspace.record_curiosity_outcome(percept_id, positive=True)
+        self._logger.debug(
+            "curiosity_positive_signal_received",
+            cycle=current_cycle,
+            hit_rate=round(workspace.curiosity_hit_rate, 3),
+        )
 
     async def _on_hypothesis_confirmed(self, event: Any) -> None:
         """Reinforce error-type weights when Evo confirms a hypothesis about a prediction error domain."""
@@ -649,6 +898,18 @@ class FoveaService:
 
         # Apply habituation (internal errors can habituate too)
         self._bridge.habituation_engine.apply_habituation(internal_error)
+
+        # Re-run routing with adjustable constitutional thresholds so EQUOR
+        # and ONEIROS routing honours Evo-tuned parameters rather than hardcoded
+        # defaults. The internal engine pre-sets an initial route; compute_routing
+        # supplements it (routes are appended, not replaced) with constitutional
+        # and economic routing checks.
+        internal_error.compute_routing(
+            self._bridge.dynamic_threshold.current,
+            constitutional_equor_threshold=self._constitutional_equor_threshold,
+            constitutional_oneiros_threshold=self._constitutional_oneiros_threshold,
+            economic_route_threshold=self._economic_route_threshold,
+        )
 
         # Register for weight learning
         self._weight_learner.register_error(internal_error)
@@ -799,13 +1060,16 @@ class FoveaService:
     # ------------------------------------------------------------------
 
     async def extract_genome_segment(self) -> OrganGenomeSegment:
-        """Serialise Fovea's heritable state: weights + habituation params."""
+        """Serialise Fovea's heritable state: weights + all learnable params."""
         payload = {
             "error_weights": self._weight_learner.get_raw_weights(),
+            # Legacy fields (retained for backward compat)
             "habituation_increment": _HABITUATION_INCREMENT,
             "max_habituation_cap": _MAX_HABITUATION,
             "learning_rate": self._weight_learner.learning_rate,
             "false_alarm_decay": self._weight_learner.false_alarm_decay_rate,
+            # Full learnable params (all subsystems)
+            "learnable_params": self.export_learnable_params(),
         }
         payload_json = json.dumps(payload, sort_keys=True)
         return OrganGenomeSegment(
@@ -824,12 +1088,121 @@ class FoveaService:
         if isinstance(weights, dict) and weights:
             self._weight_learner.set_raw_weights(weights)
             self._parent_genome_weights = dict(weights)
-        if "learning_rate" in payload:
-            self._weight_learner.set_learning_rate(float(payload["learning_rate"]))
-        if "false_alarm_decay" in payload:
-            self._weight_learner.set_false_alarm_decay(float(payload["false_alarm_decay"]))
+        # Import full learnable params (preferred over legacy fields)
+        if "learnable_params" in payload:
+            self.import_learnable_params(payload["learnable_params"])
+        else:
+            # Legacy fallback
+            if "learning_rate" in payload:
+                self._weight_learner.set_learning_rate(float(payload["learning_rate"]))
+            if "false_alarm_decay" in payload:
+                self._weight_learner.set_false_alarm_decay(float(payload["false_alarm_decay"]))
         self._logger.info("seeded_from_parent_genome", payload_keys=list(payload.keys()))
         return True
+
+    # ------------------------------------------------------------------
+    # AtuneGenomeFragment — spawn-time curiosity genome (Mitosis)
+    # ------------------------------------------------------------------
+
+    def export_atune_genome(self, instance_id: str = "", generation: int = 1) -> Any:
+        """
+        Extract AtuneGenomeFragment for Mitosis child spawning.
+
+        Called by SpawnChildExecutor Step 0b. Returns an AtuneGenomeFragment
+        capturing the parent's evolved curiosity parameters, current arousal
+        level, and curiosity hit-rate so children inherit a tuned attentional
+        rhythm rather than cold-starting at defaults.
+        """
+        try:
+            from primitives.genome_inheritance import AtuneGenomeFragment
+        except ImportError:
+            return None
+
+        workspace = self._bridge._workspace
+        curiosity_params: dict[str, float] = {}
+        buffer_scale_arousal = 0.4
+        curiosity_hit_rate = 0.5
+
+        if workspace is not None:
+            curiosity_params = workspace.export_learnable_params()
+            buffer_scale_arousal = workspace._current_arousal
+            curiosity_hit_rate = workspace.curiosity_hit_rate
+
+        fragment = AtuneGenomeFragment(
+            instance_id=instance_id or self._instance_id,
+            generation=generation,
+            curiosity_params=curiosity_params,
+            buffer_scale_arousal=buffer_scale_arousal,
+            curiosity_hit_rate=curiosity_hit_rate,
+        )
+
+        self._logger.info(
+            "atune_genome_extracted",
+            genome_id=fragment.genome_id,
+            curiosity_hit_rate=round(curiosity_hit_rate, 3),
+            base_prob=round(curiosity_params.get("base_prob", 0.02), 4),
+        )
+        return fragment
+
+    def _apply_inherited_atune_genome_if_child(self) -> None:
+        """
+        Child-side: apply inherited AtuneGenomeFragment from env var.
+
+        Reads ECODIAOS_ATUNE_GENOME_PAYLOAD (JSON-encoded AtuneGenomeFragment)
+        injected by LocalDockerSpawner / CloudRunSpawner at boot time.
+        Non-fatal — if env var is absent or malformed, cold-starts at defaults.
+        """
+        import json as _json
+        import os as _os
+
+        if _os.environ.get("ECODIAOS_IS_GENESIS_NODE", "").lower() in ("true", "1"):
+            return  # Genesis instance has no parent
+
+        payload_str = _os.environ.get("ECODIAOS_ATUNE_GENOME_PAYLOAD", "")
+        if not payload_str:
+            return
+
+        try:
+            from primitives.genome_inheritance import AtuneGenomeFragment
+            data = _json.loads(payload_str)
+            fragment = AtuneGenomeFragment.model_validate(data)
+
+            workspace = self._bridge._workspace
+            if workspace is not None and fragment.curiosity_params:
+                workspace.import_learnable_params(fragment.curiosity_params)
+                # Pre-warm arousal so buffer sizes are set before first Soma tick
+                workspace.update_arousal(fragment.buffer_scale_arousal)
+
+            self._logger.info(
+                "atune_genome_inherited",
+                genome_id=fragment.genome_id,
+                generation=fragment.generation,
+                curiosity_hit_rate=round(fragment.curiosity_hit_rate, 3),
+                curiosity_params=fragment.curiosity_params,
+            )
+
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                import asyncio as _asyncio
+                if self._event_bus is not None:
+                    _asyncio.ensure_future(
+                        self._event_bus.emit(
+                            SynapseEvent(
+                                event_type=SynapseEventType.GENOME_INHERITED,
+                                source_system="fovea",
+                                data={
+                                    "genome_id": fragment.genome_id,
+                                    "system": "atune",
+                                    "generation": fragment.generation,
+                                },
+                            )
+                        )
+                    )
+            except Exception:
+                pass
+
+        except Exception:
+            self._logger.warning("atune_genome_inheritance_failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Fitness signal (EvolutionaryObservable → Evo)
@@ -1179,7 +1552,7 @@ class FoveaService:
         if not self._economic_model.is_warmed_up:
             return
 
-        if composite_error < 0.3:
+        if composite_error < self._economic_route_threshold:
             return
 
         # Build a FoveaPredictionError in the economic dimension
@@ -1189,7 +1562,10 @@ class FoveaService:
         self._weight_learner.apply_learned_weights(error)
         error.compute_precision_weighted_salience()
         self._bridge.habituation_engine.apply_habituation(error)
-        error.compute_routing(self._bridge.dynamic_threshold.current)
+        error.compute_routing(
+            self._bridge.dynamic_threshold.current,
+            economic_route_threshold=self._economic_route_threshold,
+        )
 
         # Ensure OIKOS + EVO are in routes regardless of generic threshold logic
         from .types import ErrorRoute as _ER
@@ -1724,3 +2100,515 @@ class FoveaService:
                 "synapse_emit_skipped",
                 reason="event_type_not_registered",
             )
+
+    # ------------------------------------------------------------------
+    # Autonomy gap closure: FOVEA_DIAGNOSTIC_REPORT + parameter control
+    # ------------------------------------------------------------------
+
+    def _subscribe_to_parameter_adjustments(self, event_bus: EventBus) -> None:
+        """Subscribe to FOVEA_PARAMETER_ADJUSTMENT from Equor/Nova.
+
+        Allows the organism to tune Fovea's routing thresholds and sensitivity
+        parameters at runtime without a service restart. Closes the gap where
+        all routing decisions were hardcoded and uninfluenceable by the LLM.
+        """
+        try:
+            from systems.synapse.types import SynapseEventType
+
+            event_bus.subscribe(
+                SynapseEventType.FOVEA_PARAMETER_ADJUSTMENT,
+                self._on_parameter_adjustment,
+            )
+            # Also subscribe to EVO_PARAMETER_ADJUSTED for workspace curiosity params
+            event_bus.subscribe(
+                SynapseEventType.EVO_PARAMETER_ADJUSTED,
+                self._on_evo_workspace_param_adjusted,
+            )
+            self._logger.info("subscribed_to_parameter_adjustments")
+        except (ImportError, ValueError):
+            self._logger.debug(
+                "parameter_adjustment_subscription_skipped",
+                reason="event_type_unavailable",
+            )
+
+    async def _on_evo_workspace_param_adjusted(self, event: Any) -> None:
+        """
+        Handle EVO_PARAMETER_ADJUSTED for atune.workspace.* curiosity parameters.
+
+        Routes Evo parameter adjustments to the GlobalWorkspace's curiosity API.
+        Non-workspace params are silently ignored — only atune.workspace.* prefix
+        is consumed here; other params flow to their own system handlers.
+        """
+        try:
+            data = event.data if hasattr(event, "data") else {}
+            param_name: str = str(data.get("parameter_name", data.get("param_name", "")))
+            new_value = data.get("new_value", data.get("value", None))
+            if new_value is None or not param_name.startswith("atune.workspace."):
+                return
+            # Strip the prefix to get the workspace-local param name
+            local_name = param_name.removeprefix("atune.workspace.")
+            workspace = getattr(self._bridge, "_workspace", None)
+            if workspace is None:
+                return
+            # Compute delta from defaults (Evo sends absolute new_value; workspace uses delta API)
+            from systems.evo.types import PARAMETER_DEFAULTS
+            default = PARAMETER_DEFAULTS.get(param_name, None)
+            if default is None:
+                return
+            delta = float(new_value) - default
+            workspace.adjust_param(local_name, delta)
+            self._logger.info(
+                "workspace_curiosity_param_adjusted",
+                param=local_name,
+                new_value=round(float(new_value), 5),
+            )
+        except Exception:
+            pass
+
+    async def _on_parameter_adjustment(self, event: Any) -> None:
+        """
+        Handle FOVEA_PARAMETER_ADJUSTMENT from Equor/Nova.
+
+        Supported adjustment_types:
+          - "routing_threshold_equor" — constitutional mismatch threshold for Equor routing
+          - "routing_threshold_oneiros" — constitutional mismatch threshold for Oneiros routing
+          - "economic_route_threshold" — economic error threshold for Oikos+Evo routing
+          - "economic_workspace_threshold" — economic error threshold for workspace routing
+          - "threshold_percentile" — dynamic ignition threshold percentile (affects all routing)
+          - "habituation_speed" — scales the habituation increment (0.5–2.0× multiplier)
+
+        All adjustments are clamped to safe ranges. Emits FOVEA_DIAGNOSTIC_REPORT
+        immediately so the requesting system can confirm the change.
+        """
+        import asyncio as _asyncio
+
+        data = event.data if hasattr(event, "data") else {}
+        adjustment_type = str(data.get("adjustment_type", ""))
+        raw_value = data.get("value", None)
+        reason = str(data.get("reason", ""))
+        source = str(data.get("source_system", getattr(event, "source_system", "unknown")))
+
+        if raw_value is None:
+            return
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return
+
+        applied = False
+        clamped_value = value
+
+        if adjustment_type == "routing_threshold_equor":
+            clamped_value = max(0.1, min(0.9, value))
+            self._constitutional_equor_threshold = clamped_value
+            applied = True
+        elif adjustment_type == "routing_threshold_oneiros":
+            clamped_value = max(0.1, min(0.9, value))
+            self._constitutional_oneiros_threshold = clamped_value
+            applied = True
+        elif adjustment_type == "economic_route_threshold":
+            clamped_value = max(0.05, min(0.9, value))
+            self._economic_route_threshold = clamped_value
+            applied = True
+        elif adjustment_type == "economic_workspace_threshold":
+            clamped_value = max(0.1, min(0.95, value))
+            self._economic_workspace_threshold = clamped_value
+            applied = True
+        elif adjustment_type == "threshold_percentile":
+            clamped_value = max(30.0, min(95.0, value))
+            if hasattr(self._bridge.dynamic_threshold, "set_percentile"):
+                self._bridge.dynamic_threshold.set_percentile(clamped_value)  # type: ignore[attr-defined]
+            applied = True
+        elif adjustment_type == "habituation_speed":
+            scale = max(0.5, min(2.0, value))
+            hab_engine = self._bridge.habituation_engine
+            if hasattr(hab_engine, "_increment"):
+                hab_engine._increment = _HABITUATION_INCREMENT * scale  # type: ignore[attr-defined]
+                clamped_value = hab_engine._increment
+                applied = True
+
+        if applied:
+            self._logger.info(
+                "parameter_adjusted",
+                adjustment_type=adjustment_type,
+                requested=round(value, 4),
+                applied=round(clamped_value, 4),
+                reason=reason,
+                source=source,
+            )
+            _asyncio.ensure_future(self._emit_diagnostic_report())
+
+    async def _emit_diagnostic_report(self) -> None:
+        """
+        Emit FOVEA_DIAGNOSTIC_REPORT with previously invisible internal state.
+
+        Surfaces every 50 errors (same cadence as fitness signal):
+        - Per-dimension precision weights (learned accuracy profile per error type)
+        - Habituation engine stats (entry count, current increment)
+        - Economic per-source trend data (worst source, trend velocities)
+        - Unresolved error backlog count (Oneiros processing pressure)
+        - All runtime-adjustable parameter values (thresholds, intervals)
+        - Weight learning state (reinforcements, decays, false alarms, learning rate)
+
+        Nova/Evo/RE subscribe to reason about attention calibration at planning time.
+        """
+        if self._event_bus is None:
+            return
+
+        current_weights = self._weight_learner.get_raw_weights()
+
+        hab_engine = self._bridge.habituation_engine
+        hab_stats: dict[str, Any] = {
+            "entry_count": getattr(hab_engine, "entry_count", 0),
+            "current_increment": round(
+                getattr(hab_engine, "_increment", _HABITUATION_INCREMENT), 6
+            ),
+            "max_cap": _MAX_HABITUATION,
+        }
+
+        econ_trends: dict[str, Any] = {
+            "worst_source": self._economic_model.worst_source,
+            "worst_source_error": round(self._economic_model.worst_source_error, 4),
+            "revenue_prediction_error": round(
+                getattr(self._economic_model, "revenue_prediction_error", 0.0), 4
+            ),
+            "efficiency_trend_error": round(
+                getattr(self._economic_model, "efficiency_trend_error", 0.0), 4
+            ),
+            "is_warmed_up": self._economic_model.is_warmed_up,
+        }
+
+        unresolved_count = sum(
+            1 for t in self._weight_learner.recent_errors if not t.resolved
+        )
+
+        param_config = {
+            "constitutional_equor_threshold": self._constitutional_equor_threshold,
+            "constitutional_oneiros_threshold": self._constitutional_oneiros_threshold,
+            "economic_route_threshold": self._economic_route_threshold,
+            "economic_workspace_threshold": self._economic_workspace_threshold,
+            "dynamic_threshold_current": round(self._bridge.dynamic_threshold.current, 4),
+            "divergence_emit_interval": self._divergence_emit_interval,
+            "diagnostic_emit_interval": self._diagnostic_emit_interval,
+            "backpressure_warning_threshold": _BACKPRESSURE_WARNING_THRESHOLD,
+        }
+
+        wl = self._weight_learner
+        weight_learning_state = {
+            "reinforcements": getattr(wl, "reinforcements", 0),
+            "decays": getattr(wl, "decays", 0),
+            "false_alarms": getattr(wl, "false_alarms", 0),
+            "learning_rate": getattr(wl, "learning_rate", 0.0),
+            "false_alarm_decay_rate": getattr(wl, "false_alarm_decay_rate", 0.0),
+        }
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            event = SynapseEvent(
+                event_type=SynapseEventType(FOVEA_DIAGNOSTIC_REPORT),
+                source_system=self.system_id,
+                data={
+                    "instance_id": self._instance_id,
+                    "precision_weights": {k: round(v, 4) for k, v in current_weights.items()},
+                    "habituation_stats": hab_stats,
+                    "economic_trends": econ_trends,
+                    "unresolved_backlog": unresolved_count,
+                    "param_config": param_config,
+                    "weight_learning_state": weight_learning_state,
+                    "kl_divergence_last": round(self._last_kl_divergence, 6),
+                    "fleet_sample_count": len(self._fleet_weight_samples),
+                },
+            )
+            await self._event_bus.emit(event)
+        except (ValueError, ImportError):
+            self._logger.debug("diagnostic_report_emit_skipped", reason="event_type_unavailable")
+
+    async def _emit_backpressure_warning(self, unresolved_count: int) -> None:
+        """
+        Emit FOVEA_BACKPRESSURE_WARNING when error backlog exceeds threshold.
+
+        Signals that Fovea is accumulating errors faster than Oneiros/Logos
+        can process them. Nova should raise the dynamic ignition threshold via
+        FOVEA_PARAMETER_ADJUSTMENT. Oneiros should schedule early consolidation.
+        """
+        if self._event_bus is None:
+            return
+
+        top_domains = [
+            {"domain": t.dominant_type.value, "salience": round(t.salience, 3)}
+            for t in sorted(
+                (x for x in self._weight_learner.recent_errors if not x.resolved),
+                key=lambda x: x.salience,
+                reverse=True,
+            )[:5]
+        ]
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            event = SynapseEvent(
+                event_type=SynapseEventType(FOVEA_BACKPRESSURE_WARNING),
+                source_system=self.system_id,
+                data={
+                    "unresolved_count": unresolved_count,
+                    "threshold": _BACKPRESSURE_WARNING_THRESHOLD,
+                    "top_error_domains": top_domains,
+                    "recommendation": (
+                        "Oneiros should schedule early sleep consolidation. "
+                        "Nova may raise Fovea threshold via FOVEA_PARAMETER_ADJUSTMENT "
+                        "with adjustment_type='threshold_percentile'."
+                    ),
+                },
+            )
+            await self._event_bus.emit(event)
+            self._logger.warning(
+                "fovea_backpressure_warning",
+                unresolved=unresolved_count,
+                threshold=_BACKPRESSURE_WARNING_THRESHOLD,
+            )
+        except (ValueError, ImportError):
+            self._logger.debug("backpressure_warning_emit_skipped", reason="event_type_unavailable")
+
+    async def _check_calibration_alert(self) -> None:
+        """
+        Part A: Autonomy Gap Closure — Check for consecutive poor cycles.
+
+        Tracks:
+        - Low TPR (< 0.6): Fovea isn't catching real errors
+        - High false alarm rate (> 0.4): Fovea is too sensitive
+
+        If either condition persists for 5+ cycles, emit FOVEA_CALIBRATION_ALERT
+        so Evo can generate targeted attention-tuning hypotheses.
+        """
+        if self._event_bus is None:
+            return
+
+        wl = self._weight_learner
+        total_reinforcements = max(1, wl.reinforcements + wl.false_alarms)
+        tpr = wl.reinforcements / total_reinforcements if total_reinforcements > 0 else 0.5
+        false_alarm_rate = (
+            wl.false_alarms / total_reinforcements if total_reinforcements > 0 else 0.0
+        )
+
+        # Track consecutive poor TPR cycles
+        if tpr < 0.6:
+            self._consecutive_poor_tpr += 1
+        else:
+            self._consecutive_poor_tpr = 0
+
+        # Track consecutive high false alarm cycles
+        if false_alarm_rate > 0.4:
+            self._consecutive_high_false_alarm += 1
+        else:
+            self._consecutive_high_false_alarm = 0
+
+        # Emit alert if either counter reaches 5
+        alert_emitted = False
+        if self._consecutive_poor_tpr >= 5:
+            await self._emit_calibration_alert(
+                alert_type="low_tpr",
+                current_value=tpr,
+                consecutive_cycles=self._consecutive_poor_tpr,
+            )
+            alert_emitted = True
+            self._consecutive_poor_tpr = 0  # Reset after alert
+
+        if self._consecutive_high_false_alarm >= 5:
+            await self._emit_calibration_alert(
+                alert_type="high_false_alarm",
+                current_value=false_alarm_rate,
+                consecutive_cycles=self._consecutive_high_false_alarm,
+            )
+            alert_emitted = True
+            self._consecutive_high_false_alarm = 0  # Reset after alert
+
+        if alert_emitted:
+            self._logger.info(
+                "calibration_alert_emitted",
+                tpr=round(tpr, 4),
+                false_alarm_rate=round(false_alarm_rate, 4),
+            )
+
+    async def _emit_calibration_alert(
+        self, alert_type: str, current_value: float, consecutive_cycles: int
+    ) -> None:
+        """
+        Emit FOVEA_CALIBRATION_ALERT for Evo to generate attention-tuning hypotheses.
+
+        alert_type: "low_tpr" or "high_false_alarm"
+        current_value: The problematic metric value
+        consecutive_cycles: How many cycles it's been poor
+        """
+        if self._event_bus is None:
+            return
+
+        threshold_params = {
+            "percentile": self._bridge.dynamic_threshold._percentile,
+            "floor": self._bridge.dynamic_threshold._floor,
+            "ceiling": self._bridge.dynamic_threshold._ceiling,
+        }
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            event = SynapseEvent(
+                event_type=SynapseEventType(FOVEA_CALIBRATION_ALERT),
+                source_system=self.system_id,
+                data={
+                    "alert_type": alert_type,
+                    "current_value": round(current_value, 4),
+                    "consecutive_cycles": consecutive_cycles,
+                    "threshold_params": threshold_params,
+                    "recommendation": (
+                        "Lower ignition floor or raise precision to improve TPR"
+                        if alert_type == "low_tpr"
+                        else "Raise ignition floor or reduce curiosity boost to reduce false alarms"
+                    ),
+                },
+            )
+            await self._event_bus.emit(event)
+        except (ValueError, ImportError):
+            self._logger.debug("calibration_alert_emit_skipped", reason="event_type_unavailable")
+
+    def _subscribe_to_system_modulation(self, event_bus: EventBus) -> None:
+        """Subscribe to SYSTEM_MODULATION from Skia's VitalityCoordinator."""
+        try:
+            from systems.synapse.types import SynapseEventType
+
+            event_bus.subscribe(
+                SynapseEventType.SYSTEM_MODULATION,
+                self._on_system_modulation,
+            )
+            self._logger.info("subscribed_to_system_modulation")
+        except (ImportError, ValueError):
+            self._logger.debug(
+                "system_modulation_subscription_skipped",
+                reason="event_type_unavailable",
+            )
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle SYSTEM_MODULATION from Skia's VitalityCoordinator."""
+        data = getattr(event, "data", {}) or {}
+        halt_systems: list[str] = data.get("halt_systems", [])
+        modulate: dict = data.get("modulate", {})
+        modulation_id: str = data.get("modulation_id", "")
+
+        if "fovea" in halt_systems:
+            self._modulation_halted = True
+            self._logger.warning("system_modulation_halted", modulation_id=modulation_id)
+        elif "fovea" in modulate:
+            self._modulation_halted = False
+            self._apply_modulation_directives(modulate["fovea"])
+
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                    source_system=SystemID.FOVEA,
+                    data={
+                        "system": "fovea",
+                        "modulation_id": modulation_id,
+                        "halted": self._modulation_halted,
+                    },
+                ))
+            except (ValueError, ImportError):
+                self._logger.debug("system_modulation_ack_skipped", reason="event_type_unavailable")
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply Skia modulation directives to Fovea runtime state."""
+        # No specific Skia directives defined for fovea — halt-only modulation
+        self._logger.info("system_modulation_directives_applied", directives=directives)
+
+    # ------------------------------------------------------------------
+    # Logos compression cycle subscription
+    # ------------------------------------------------------------------
+
+    def _subscribe_to_compression_events(self, event_bus: EventBus) -> None:
+        """Subscribe to COMPRESSION_CYCLE_COMPLETE from Logos.
+
+        After Logos evicts or distills items, any salience weights Fovea
+        learned for that domain are stale — the world model has changed.
+        We decay the relevant error-type weight proportional to eviction
+        volume so that Fovea re-learns from fresh data.
+        """
+        try:
+            from systems.synapse.types import SynapseEventType
+
+            event_bus.subscribe(
+                SynapseEventType.COMPRESSION_CYCLE_COMPLETE,
+                self._on_compression_cycle_complete,
+            )
+            self._logger.info("subscribed_to_compression_cycle_complete")
+        except (ImportError, ValueError):
+            self._logger.debug(
+                "compression_cycle_subscription_skipped",
+                reason="event_type_unavailable",
+            )
+
+    async def _on_compression_cycle_complete(self, event: Any) -> None:
+        """Handle COMPRESSION_CYCLE_COMPLETE from Logos.
+
+        Logos reports how many items were evicted and distilled and how much
+        MDL improved.  We use this to decay attention weights for the affected
+        domain:
+
+        - ``items_evicted``  — raw data removed; weights are most stale here.
+        - ``items_distilled``— converted to schemas; less decay, model still valid.
+        - ``mdl_improvement``— how much the world model compressed; large improvement
+          means the domain is now well-understood so moderate decay is safe.
+
+        Decay formula:
+            decay = false_alarm_decay × clamp(eviction_ratio, 0.1, 1.0)
+
+        where eviction_ratio = items_evicted / max(items_evicted + items_distilled, 1).
+        If domain is provided in the payload we restrict the decay to that
+        error-type key; otherwise we apply a small uniform decay to all weights.
+        """
+        data = getattr(event, "data", {}) or {}
+        items_evicted: int = int(data.get("items_evicted", 0))
+        items_distilled: int = int(data.get("items_distilled", 0))
+        domain: str = data.get("domain", "")
+
+        total = max(items_evicted + items_distilled, 1)
+        eviction_ratio = min(1.0, items_evicted / total)
+
+        if eviction_ratio < 0.05:
+            # Negligible eviction — no meaningful staleness introduced
+            return
+
+        decay = self._weight_learner.false_alarm_decay_rate * eviction_ratio
+
+        error_type_key = self._map_domain_to_error_type(domain) if domain else None
+
+        if error_type_key is not None:
+            old_weight = self._weight_learner.weights.get(error_type_key, 0.0)
+            new_weight = self._weight_learner.adjust_weight(error_type_key, -decay)
+            self._logger.info(
+                "compression_cycle_weight_decayed",
+                domain=domain,
+                error_type=error_type_key,
+                items_evicted=items_evicted,
+                items_distilled=items_distilled,
+                eviction_ratio=round(eviction_ratio, 3),
+                old_weight=round(old_weight, 4),
+                new_weight=round(new_weight, 4),
+            )
+        else:
+            # Domain unknown — apply a smaller uniform decay to all weights
+            uniform_decay = decay * 0.3
+            adjusted: dict[str, float] = {}
+            for key in list(self._weight_learner.weights):
+                adjusted[key] = self._weight_learner.adjust_weight(key, -uniform_decay)
+            self._logger.info(
+                "compression_cycle_uniform_weight_decay",
+                items_evicted=items_evicted,
+                items_distilled=items_distilled,
+                eviction_ratio=round(eviction_ratio, 3),
+                uniform_decay=round(uniform_decay, 4),
+                keys_affected=len(adjusted),
+            )
+
+        await self._weight_learner.persist_weights()

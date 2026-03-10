@@ -317,11 +317,11 @@ class ProtocolScanner:
         if self._event_bus is None:
             return
         try:
-            from systems.synapse.types import SynapseEventType
+            from systems.synapse.types import SynapseEvent, SynapseEventType
 
-            await self._event_bus.emit(
-                SynapseEventType.OPPORTUNITY_DISCOVERED,
-                {
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.OPPORTUNITY_DISCOVERED,
+                data={
                     "opportunity_id": opp.opportunity_id,
                     "opportunity_type": opp.opportunity_type,
                     "protocol_or_platform": opp.protocol_or_platform,
@@ -331,9 +331,10 @@ class ProtocolScanner:
                     "risk_tier": opp.risk_tier,
                     "data_source": opp.data_source,
                     "discovered_at": opp.discovered_at,
+                    "salience": 0.7,
                 },
-                salience=0.7,
-            )
+                source_system="oikos",
+            ))
             self._log.info(
                 "opportunity_discovered",
                 type=opp.opportunity_type,

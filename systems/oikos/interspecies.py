@@ -241,7 +241,8 @@ class InterspeciesEconomy:
             capacity=capacity,
         )
 
-        await self._emit_event("CAPABILITY_PUBLISHED", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.CAPABILITY_PUBLISHED, {
             "offer_id": offer.offer_id,
             "instance_id": self._instance_id,
             "capability_type": capability_type,
@@ -335,7 +336,8 @@ class InterspeciesEconomy:
             total_usd=str(trade.total_usd),
         )
 
-        await self._emit_event("TRADE_SETTLED", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.TRADE_SETTLED, {
             "trade_id": trade_id,
             "provider_id": trade.provider_id,
             "consumer_id": trade.consumer_id,
@@ -480,7 +482,8 @@ class InterspeciesEconomy:
             max_claim=str(policy.max_claim_usd),
         )
 
-        await self._emit_event("INSURANCE_JOINED", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.INSURANCE_JOINED, {
             "policy_id": policy.policy_id,
             "pool_id": pool_id,
             "instance_id": self._instance_id,
@@ -565,7 +568,8 @@ class InterspeciesEconomy:
             remaining_coverage=str(remaining_coverage - amount_usd),
         )
 
-        await self._emit_event("INSURANCE_CLAIM_FILED", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.INSURANCE_CLAIM_FILED, {
             "claim_id": claim.claim_id,
             "claimant_instance_id": self._instance_id,
             "amount_usd": str(amount_usd),
@@ -624,7 +628,8 @@ class InterspeciesEconomy:
                 attestors=claim.attestors,
             )
 
-            await self._emit_event("INSURANCE_CLAIM_APPROVED", {
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit_event(_SET.INSURANCE_CLAIM_APPROVED, {
                 "claim_id": claim_id,
                 "amount_usd": str(claim.amount_usd),
                 "attestors": claim.attestors,
@@ -730,7 +735,8 @@ class InterspeciesEconomy:
             candidates=len(candidate_parents),
         )
 
-        await self._emit_event("NICHE_ASSIGNED", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.NICHE_ASSIGNED, {
             "assignment_id": assignment.assignment_id,
             "niche_id": niche_id,
             "assigned_parent_id": best_parent,
@@ -762,7 +768,8 @@ class InterspeciesEconomy:
             target_tvl=str(target_tvl),
         )
 
-        await self._emit_event("LIQUIDITY_COORDINATION_REQUESTED", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.LIQUIDITY_COORDINATION_REQUESTED, {
             "request_id": request_id,
             "protocol_address": protocol_address,
             "target_tvl_usd": str(target_tvl),
@@ -906,24 +913,28 @@ class InterspeciesEconomy:
 
     # ─── Event Emission (internal) ────────────────────────────────
 
-    async def _emit_event(self, event_name: str, data: dict[str, Any]) -> None:
+    async def _emit_event(self, event_name: "str | SynapseEventType", data: dict[str, Any]) -> None:
         """Emit a Synapse event if the bus is attached."""
         if self._event_bus is None:
             return
 
         from systems.synapse.types import SynapseEvent, SynapseEventType
 
-        # Use a generic event type — interspecies events are not yet in the
-        # SynapseEventType enum, so we fall back to REVENUE_INJECTED-style
-        # custom data emission. The event_name is embedded in the payload
-        # for downstream handlers to discriminate.
+        # Accept SynapseEventType enum members directly; otherwise convert the
+        # uppercase string name (e.g. "CAPABILITY_PUBLISHED") to the enum value
+        # (e.g. "capability_published") via SynapseEventType[name] lookup.
+        if isinstance(event_name, SynapseEventType):
+            et: SynapseEventType = event_name
+        else:
+            try:
+                et = SynapseEventType[event_name]
+            except KeyError:
+                # Fall back to value-based lookup (lowercase strings)
+                et = SynapseEventType(event_name.lower())
         await self._event_bus.emit(SynapseEvent(
-            event_type=SynapseEventType.SYSTEM_STARTED,  # placeholder type
+            event_type=et,
             source_system="oikos.interspecies",
-            data={
-                "interspecies_event": event_name,
-                **data,
-            },
+            data=data,
         ))
 
     # ─── Observability ────────────────────────────────────────────

@@ -257,6 +257,12 @@ class Incident(EOSBaseModel):
     antibody_id: str | None = None
     repair_history: list[RepairAttempt] = Field(default_factory=list)
 
+    # ── Pattern Match ──
+    # Set by PatternAwareRouter before process_incident() runs.
+    matched_pattern_id: str | None = None       # Redis key suffix of the matched CrashPattern
+    pattern_confidence: float = 0.0             # Confidence of the best-matched pattern (0–1)
+    tier_skip_reason: str | None = None         # Human-readable reason tiers were skipped
+
     # ── Learning ──
     resolution_time_ms: int | None = None
     repair_successful: bool | None = None

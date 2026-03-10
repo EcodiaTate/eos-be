@@ -254,6 +254,17 @@ class TriangulationMetadata(EOSBaseModel):
         )
 
     @property
+    def source_diversity(self) -> float:
+        """Alias for source_diversity_score for API consistency.
+
+        NexusService accesses ``fragment.triangulation.source_diversity`` in
+        several places (get_divergence_weighted_fragments, _emit_re_training_example,
+        etc.).  This alias avoids AttributeError on those call-sites without
+        changing the canonical property name used by the promotion pipeline.
+        """
+        return self.source_diversity_score
+
+    @property
     def triangulation_confidence(self) -> float:
         """
         Confidence in the structure based on independent confirmation.

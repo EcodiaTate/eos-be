@@ -1,6 +1,7 @@
 # Memory System — CLAUDE.md
 
-**Spec**: `.claude/EcodiaOS_Spec_01_Memory.md` (v1.1) — read before editing.
+**Spec**: `.claude/EcodiaOS_Spec_01_Memory.md` (v1.2) — read before editing.
+**Last audit**: 2026-03-08 (autonomy audit — 6 bugs fixed, SLEEP_INITIATED wired, graph health KPI added)
 **Role**: Neo4j knowledge graph substrate. Every system reads/writes here. If you lose the graph, you lose the self.
 
 ---
@@ -43,17 +44,23 @@
 
 ## Synapse Events
 
-**Emitted**: `EPISODE_STORED` · `BELIEF_CONSOLIDATED` · `SELF_AFFECT_UPDATED` · `MEMORY_PRESSURE` (episode_count > 10k or consolidation lag > 500) · `SELF_STATE_DRIFTED` (contradictions > 5 during consolidation) · `MEMORY_EPISODES_DECAYED` (when degradation decay soft-deletes episodes with salience < 0.01)
+**Emitted**: `EPISODE_STORED` · `BELIEF_CONSOLIDATED` (with real `beliefs_created` count from promotion) · `SELF_AFFECT_UPDATED` · `MEMORY_PRESSURE` (episode_count > 10k or unconsolidated lag > 500; lag is now a real count of consolidation_level=0 episodes) · `SELF_STATE_DRIFTED` (contradictions > 5 during consolidation, or compliance drop > 0.1 from EQUOR_CONSTITUTIONAL_SNAPSHOT) · `MEMORY_EPISODES_DECAYED` (degradation soft-deletes) · `EVOLUTIONARY_OBSERVABLE` (entity_discovered, relation_formed, consolidation_pattern, community_emerged, genome_exported, **memory_graph_utilization** — graph health KPI for Benchmarks) · `INCIDENT_DETECTED` (temporal chain integrity failure → Thymos) · `SYSTEM_MODULATION_ACK`
 
 **Self node conscience fields (2026-03-07)**:
 - `last_conscience_activation` — datetime of last Equor review
 - `avg_compliance_score` — EMA (α=0.05) of `composite_alignment` across all reviews; proxy for constitutional health over time
 
-**Consumed**: `MEMORY_DEGRADATION` → `_on_memory_degradation()`: batch-decays salience on unconsolidated episodes older than `affected_episode_age_hours` by factor `(1 - fidelity_loss_rate)`; soft-deletes (sets `decayed=true`) episodes where salience falls below 0.01; emits `MEMORY_EPISODES_DECAYED` if any deleted. **This is a real graph mutation — not advisory.** · `WALLET_TRANSFER_CONFIRMED` · `REVENUE_INJECTED` → `FinancialEncoder` creates salience=1.0 episodes directly · `EQUOR_CONSTITUTIONAL_SNAPSHOT` → `_on_equor_constitutional_snapshot()`: writes `(:ConstitutionalSnapshot)-[:SNAPSHOT_OF]->(:Self)` to Neo4j; emits `SELF_STATE_DRIFTED` if compliance drops >0.1 from previous snapshot
-
-**Not yet subscribed** (gaps): `SLEEP_INITIATED` (Oneiros), `COGNITIVE_CYCLE_COMPLETE` / theta heartbeat — consolidation must be called externally until these are wired.
+**Consumed**:
+- `SLEEP_INITIATED` → `_on_sleep_initiated()`: **NEW 2026-03-08** — auto-triggers `consolidate()` at every sleep cycle; closes spec §18 gap M5
+- `MEMORY_DEGRADATION` → `_on_memory_degradation()`: batch-decays salience on unconsolidated episodes older than `affected_episode_age_hours` by factor `(1 - fidelity_loss_rate)`; soft-deletes (sets `decayed=true`) episodes where salience falls below 0.01; emits `MEMORY_EPISODES_DECAYED` if any deleted. **This is a real graph mutation — not advisory.**
+- `WALLET_TRANSFER_CONFIRMED` · `REVENUE_INJECTED` → `FinancialEncoder` creates salience=1.0 episodes directly
+- `EQUOR_CONSTITUTIONAL_SNAPSHOT` → `_on_equor_constitutional_snapshot()`: writes `(:ConstitutionalSnapshot)-[:SNAPSHOT_OF]->(:Self)` to Neo4j; emits `SELF_STATE_DRIFTED` if compliance drops >0.1 from previous snapshot
+- `METABOLIC_PRESSURE` → `_on_metabolic_pressure()`: updates `_starvation_level`
+- `SYSTEM_MODULATION` → `_on_system_modulation()`: applies Skia austerity directives; emits ACK
 
 **Constitutional Snapshot tracking (2026-03-07)**: `_last_compliance_score: float | None` on `MemoryService` tracks the previous snapshot's compliance for drift detection. Persists `(:ConstitutionalSnapshot)` nodes so Thread can walk constitutional evolution history.
+
+**Graph health KPI (2026-03-08)**: `emit_graph_health_kpi()` emits `EVOLUTIONARY_OBSERVABLE` with `observable_type="memory_graph_utilization"` at the end of every consolidation cycle. Benchmarks subscribes to `EVOLUTIONARY_OBSERVABLE` and can track episode/entity/node counts as population fitness metrics.
 
 ---
 
@@ -69,40 +76,48 @@
 
 ---
 
-## Open Gaps (as of 2026-03-07 v1.2)
+## Open Gaps (as of 2026-03-08 v1.3)
 
-### Critical
+### Critical (remaining)
 | # | Gap | Location |
 |---|-----|----------|
 | AV5 | Simula writes entities directly via `semantic.create_entity` | `simula/proposals/paper_memory.py:24` — no MemoryService wrapper added yet |
 | AV2 | `birth.py` imports from Simula + Evo (deferred, inside function body) | Genome seeding should be orchestrated at startup |
 
+### Resolved (2026-03-08 audit)
+| # | Resolution |
+|---|------------|
+| **BUG-1** | `_on_memory_degradation()` Cypher `{hours: }` missing `$age_hours` param — now `{hours: $age_hours}`; also fixed `ep.salience` → `ep.salience_composite` |
+| **BUG-2** | `semantic_compression.py` queried `Community {community_id: $cid}` — Community nodes use `id`, not `community_id`; three query sites fixed |
+| **BUG-3** | `genome.py` extracted/seeded relations via `[:SEMANTIC_RELATION]` — schema uses `[:RELATES_TO]`; extraction now matches `RELATES_TO` with correct property names (`type`, `strength`); seeding uses `MERGE … [:RELATES_TO]` |
+| **BUG-4** | `_check_memory_pressure()` used `consolidation_lag = ep_count` (always wrong) — now counts actual episodes with `consolidation_level=0` |
+| **BUG-5** | `BELIEF_CONSOLIDATED` event hardcoded `beliefs_created: 0` — now reads `steps.belief_promotion.promoted` from consolidation result |
+| **GAP-M5** | `SLEEP_INITIATED` subscription added — `_on_sleep_initiated()` auto-triggers `consolidate()` at every Oneiros sleep cycle |
+| **GAP-KPI** | `emit_graph_health_kpi()` added — emits `EVOLUTIONARY_OBSERVABLE` (`memory_graph_utilization`) at end of every consolidation; Benchmarks can now observe memory load |
+
 ### Resolved (2026-03-07)
 | # | Resolution |
 |---|------------|
-| AV3 | `store_expression_episode()` added to MemoryService — Voxis should migrate to this |
-| AV4 | `store_counterfactual_episode()`, `resolve_counterfactual()`, `link_counterfactual_to_outcome()` added to MemoryService — Nova should migrate to these |
-| AV6 | `get_recent_episodes()`, `get_episode()`, `get_entity()`, `resolve_counterfactual()`, `link_counterfactual_to_outcome()` all routed through MemoryService in API router. Note: `get_entity_neighbours()` still direct (one-call, no MemoryService wrapper added — see AV6 partial below) |
-| SG1 | `export_genome()` added to MemoryService — delegates to `MemoryGenomeExtractor` v2 (schema version 2), emits `EVOLUTIONARY_OBSERVABLE`; now includes `drive_weight_history` + `floor_threshold_snapshots` |
-| SG7 | `update_personality_from_evo()` added to MemoryService — personality vector updated from Evo hypothesis outcomes and Equor drive drift; records entries to `Self.drive_weight_history` |
-| P4 | `FOLLOWED_BY` gap now uses `percept.timestamp` (event_time) delta instead of `time.monotonic()` |
-| P5 | `consolidate_high_confidence_beliefs()` added to `belief_store.py`; wired into `consolidation.py` Step 6 — `:Belief` nodes with `precision >= 0.85` promoted to `:ConsolidatedBelief` with `CONSOLIDATED_INTO` relationship |
-| P7 | Community `centroid`, `radius`, `level=1` computed and written during `_materialize_community_nodes()` Steps 2–3 |
-| P9 | `reembed_pending_nodes()` added to MemoryService — batch 50 nodes per consolidation cycle, `needs_reembedding=true` flag cleared on success |
-| M17/Thymos | Temporal chain failure now emits `INCIDENT_DETECTED` (not just `SYSTEM_ERROR`) so Thymos can classify and repair |
-| P1/P2/P10 | Spec §2.2 updated — `MENTIONED_IN`→`MENTIONS`, `LINKED_TO`→`RELATES_TO`, `PART_OF`→`BELONGS_TO` |
-| P3 | Spec §2.2 updated — `COMPRESSED_TO`/`CompressedEpisode` replaced with `COMPRESSED_VIA`/in-place Episode mutation |
+| AV3 | `store_expression_episode()` added to MemoryService |
+| AV4 | `store_counterfactual_episode()`, `resolve_counterfactual()`, `link_counterfactual_to_outcome()` added |
+| AV6 | Read queries routed through MemoryService in API router |
+| SG1 | `export_genome()` added — `MemoryGenomeExtractor` v2 with drive_weight_history + floor_threshold_snapshots |
+| SG7 | `update_personality_from_evo()` — personality vector updated from Evo/Equor drive deltas |
+| P4 | `FOLLOWED_BY` uses `event_time` delta |
+| P5 | `consolidate_high_confidence_beliefs()` — `:Belief` → `:ConsolidatedBelief` at precision ≥ 0.85 |
+| P7 | Community centroid, radius, level=1 during `_materialize_community_nodes()` |
+| P9 | `reembed_pending_nodes()` — batch 50/cycle |
+| M17 | Temporal chain failure → `INCIDENT_DETECTED` (Thymos) |
 
-### Medium
+### Medium (remaining)
 | # | Gap | Notes |
 |---|-----|-------|
-| AV6-partial | `get_entity_neighbours()` still called directly from API router | No MemoryService wrapper — only one call site, tracked for future cleanup |
-| M5 | No subscription to `SLEEP_INITIATED` | Consolidation must be triggered externally |
-| SG4 | No fitness signal to Oikos/Mitosis | Memory retrieval speed is a fitness proxy but unmeasured |
+| AV6-partial | `get_entity_neighbours()` still direct in API router | One call site, tracked for cleanup |
+| SG4 | No fitness signal to Oikos/Mitosis | Memory retrieval speed unmeasured |
+| THETA | No `COGNITIVE_CYCLE_COMPLETE` heartbeat subscription | Consolidation still needs explicit trigger beyond SLEEP_INITIATED |
 
 ### Dead Code
-- `project_query_embedding()`, `decompress_embedding()`, `get_all_basis_ids()` — `semantic_compression.py` (no callers)
-- `get_entity_neighbours()` — `semantic.py` (only API router calls it directly)
+- `project_query_embedding()`, `decompress_embedding()`, `get_all_basis_ids()` — `semantic_compression.py` (no callers found)
 
 ---
 

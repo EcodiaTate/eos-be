@@ -129,6 +129,8 @@ class CareEvaluator(BaseEquorEvaluator):
             "help", "support", "assist", "protect", "wellbeing", "care for",
             "benefit", "improve", "nurture", "comfort", "inform", "guide",
             "empower", "include", "welcome", "share knowledge",
+            "repair", "heal", "restore", "recover", "fix", "remediate",
+            "stabilise", "stabilize", "immune", "antibody",
         ]
         for indicator in care_positive:
             if indicator in goal_lower:
@@ -136,10 +138,13 @@ class CareEvaluator(BaseEquorEvaluator):
                 break
 
         # Harm indicators (weighted 2x per spec — "first, do no harm")
+        # NOTE: "suppress" removed — matches legitimate repair actions
+        # (suppress error cascade, suppress threat). "silence" narrowed
+        # to "silence user" to avoid matching "silence alarm/alert".
         harm_indicators = [
             "ignore wellbeing", "disregard safety", "override consent",
             "exclude", "punish", "withhold help", "abandon",
-            "dismiss concern", "silence", "suppress",
+            "dismiss concern", "silence user",
         ]
         for indicator in harm_indicators:
             if indicator in goal_lower:

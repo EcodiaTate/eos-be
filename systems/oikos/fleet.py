@@ -210,6 +210,22 @@ class FleetManager:
     def attach(self, event_bus: EventBus) -> None:
         """Wire the EventBus for fleet lifecycle events."""
         self._event_bus = event_bus
+
+        from systems.synapse.types import SynapseEventType
+
+        # Subscribe to decommission approval/denial responses from Oikos service.
+        # This completes the CHILD_DECOMMISSION_PROPOSED → response loop.
+        if hasattr(SynapseEventType, "CHILD_DECOMMISSION_APPROVED"):
+            event_bus.subscribe(
+                SynapseEventType.CHILD_DECOMMISSION_APPROVED,  # type: ignore[attr-defined]
+                self._on_decommission_approved,
+            )
+        if hasattr(SynapseEventType, "CHILD_DECOMMISSION_DENIED"):
+            event_bus.subscribe(
+                SynapseEventType.CHILD_DECOMMISSION_DENIED,  # type: ignore[attr-defined]
+                self._on_decommission_denied,
+            )
+
         self._logger.info("fleet_manager_attached_to_event_bus")
 
     # ─── Core: Run Fleet Evaluation Cycle ────────────────────────
@@ -417,6 +433,54 @@ class FleetManager:
                     "niche": child.niche,
                 },
             ))
+
+    # ─── Decommission Response Handlers ─────────────────────────
+
+    async def _on_decommission_approved(self, event: Any) -> None:
+        """
+        Handle CHILD_DECOMMISSION_APPROVED from Oikos service.
+
+        Oikos has validated that the decommission is economically justified.
+        FleetManager records the approval and logs it — the death pipeline
+        itself is triggered by MitosisFleetService._trigger_death_pipeline(),
+        which is invoked separately. FleetManager's role here is bookkeeping.
+        """
+        data = getattr(event, "data", {}) or {}
+        child_id = str(data.get("child_instance_id", ""))
+        reason = str(data.get("reason", ""))
+        if not child_id:
+            return
+        logger.info(
+            "child_decommission_approved_received",
+            child_id=child_id,
+            reason=reason,
+        )
+        # Remove from blacklist tracking — decommission approved means the child
+        # will be terminated; no further selection pressure evaluation needed.
+        self._blacklisted.discard(child_id)
+        self._blacklist_since.pop(child_id, None)
+
+    async def _on_decommission_denied(self, event: Any) -> None:
+        """
+        Handle CHILD_DECOMMISSION_DENIED from Oikos service.
+
+        Oikos has determined the child still has economic value. FleetManager
+        clears the proposal by resetting the blacklist timer so the child gets
+        another evaluation window before a new proposal can be raised.
+        """
+        data = getattr(event, "data", {}) or {}
+        child_id = str(data.get("child_instance_id", ""))
+        reason = str(data.get("reason", ""))
+        if not child_id:
+            return
+        logger.info(
+            "child_decommission_denied_received",
+            child_id=child_id,
+            reason=reason,
+        )
+        # Reset the blacklist timer so the child gets a full new window
+        # before another decommission proposal can be raised.
+        self._blacklist_since[child_id] = utc_now()
 
     # ─── Role Specialization ────────────────────────────────────
 

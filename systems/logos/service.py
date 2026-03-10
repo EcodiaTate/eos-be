@@ -118,6 +118,7 @@ class LogosService:
             self_prediction_window=self._config.self_prediction_window,
         )
         self._schwarzschild_fired = False  # Fires once, ever
+        self._schwarzschild_approaching_emitted = False  # Fires once when indicators cross 80%
 
         # External references (protocol-based DI)
         self._synapse: SynapseService | None = None
@@ -278,6 +279,10 @@ class LogosService:
             (SynapseEventType.SLEEP_INITIATED, self._on_sleep_started),
             (SynapseEventType.WAKE_ONSET, self._on_sleep_complete),
             (SynapseEventType.INSTANCE_SPAWNED, self._on_instance_spawned),
+            # Spec 21 / Spec 26: prune retired-instance world model data
+            (SynapseEventType.INSTANCE_RETIRED, self._on_instance_retired),
+            # Spec 09 / Spec 29: VitalityCoordinator austerity — pause compression
+            (SynapseEventType.SYSTEM_MODULATION, self._on_system_modulation),
             # HIGH-4: theta clock — decay every 100 cycles, self-prediction every 50
             (SynapseEventType.THETA_CYCLE_START, self._on_theta_cycle),
         ]
@@ -511,6 +516,79 @@ class LogosService:
         # In a full implementation, this would be written to a shared store or
         # emitted as an event payload.
 
+    # ─── Inbound: INSTANCE_RETIRED → prune retired-instance data ──
+
+    async def _on_instance_retired(self, event: Any) -> None:
+        """Prune world model data that originated from a retired child instance.
+
+        Spec 21 §M5 / Spec 26: when a child instance is retired, Logos should
+        remove or decay any generative schemas or causal priors that were seeded
+        exclusively from that instance's data — preventing stale genome inheritance
+        from polluting the parent world model indefinitely.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        retired_instance_id = data.get("instance_id", "")
+        if not retired_instance_id:
+            return
+
+        # Evict schemas whose sole source is the retired instance
+        to_remove: list[str] = [
+            sid
+            for sid, schema in self._world_model.generative_schemas.items()
+            if schema.source_system == retired_instance_id
+        ]
+        for sid in to_remove:
+            self._world_model.generative_schemas.pop(sid, None)
+            self._anchor_ids.discard(sid)
+
+        logger.info(
+            "logos_instance_retired_pruned",
+            retired_instance_id=retired_instance_id,
+            schemas_removed=len(to_remove),
+        )
+
+    # ─── Inbound: SYSTEM_MODULATION → austerity compliance ────────
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Respond to VitalityCoordinator austerity directives.
+
+        Spec 09 / Spec 29: SYSTEM_MODULATION carries halt_systems / preserve_systems
+        lists. If logos is in halt_systems, pause compression (same as sleep gate).
+        Always emit SYSTEM_MODULATION_ACK so VitalityCoordinator can track compliance.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        halt_systems: list[str] = data.get("halt_systems", [])
+        level: str = data.get("level", "nominal")
+
+        compliant = False
+        if "logos" in halt_systems or level in ("safe_mode", "emergency"):
+            self._sleep_active = True  # reuse sleep gate — no new compressions
+            compliant = True
+            logger.warning(
+                "logos_modulation_halted",
+                level=level,
+                halt_systems=halt_systems,
+            )
+        elif not halt_systems and level == "nominal":
+            # Recovery — resume if we were previously halted by modulation
+            self._sleep_active = False
+            compliant = True
+
+        # Emit ACK so VitalityCoordinator knows Logos heard the directive
+        if self._synapse is not None:
+            try:
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                    data={
+                        "system_id": "logos",
+                        "level": level,
+                        "compliant": compliant,
+                        "reason": "compression_paused" if compliant and "logos" in halt_systems else None,
+                    },
+                ))
+            except Exception as exc:
+                logger.warning("logos_modulation_ack_failed", error=str(exc))
+
     # ─── Inbound: THETA_CYCLE_START → decay every 100, self-pred every 50 ─
 
     async def _on_theta_cycle(self, event: Any) -> None:
@@ -606,8 +684,41 @@ class LogosService:
         """
         Compression-first memory admission.
         Nothing enters long-term memory without budget approval.
+        Emits LOGOS_BUDGET_ADMISSION_DENIED when the tier ceiling is breached.
         """
-        return self._budget.increment(tier, amount)
+        admitted = self._budget.increment(tier, amount)
+        if not admitted and self._synapse is not None:
+            asyncio.create_task(  # noqa: RUF006 — fire-and-forget, tracked via _fire_forget_tasks
+                self._emit_budget_admission_denied(tier, amount)
+            )
+        return admitted
+
+    async def _emit_budget_admission_denied(
+        self, tier: MemoryTier, amount: float
+    ) -> None:
+        """Emit LOGOS_BUDGET_ADMISSION_DENIED when a knowledge unit is rejected."""
+        if self._synapse is None:
+            return
+        state = self._budget.current_utilization_state
+        tier_used = state.get(tier.value, 0.0)
+        tier_limit = self._budget.state.tier_budget(tier)
+        with contextlib.suppress(Exception):
+            await self._synapse.event_bus.emit(
+                SynapseEvent(
+                    event_type=SynapseEventType.LOGOS_BUDGET_ADMISSION_DENIED,
+                    source_system=SystemID.LOGOS,
+                    data={
+                        "tier": tier.value,
+                        "requested_ku": amount,
+                        "tier_used_ku": tier_used,
+                        "tier_limit_ku": tier_limit,
+                        "tier_utilization_pct": (tier_used / tier_limit * 100) if tier_limit > 0 else 100.0,
+                        "total_pressure": self._budget.total_pressure,
+                        "compression_urgency": self._budget.compression_urgency,
+                        "recommendation": "compression_required" if self._budget.needs_compression() else "tier_rebalance",
+                    },
+                )
+            )
 
     def release(self, tier: MemoryTier, amount: float = 1.0) -> None:
         """Release budget on eviction or compression."""
@@ -740,8 +851,32 @@ class LogosService:
                         "causal_updates": wm.causal_links_added + wm.causal_links_revised,
                         "coverage_delta": wm.coverage_delta,
                         "complexity_delta": wm.complexity_delta,
+                        # Surfaced for Telos/Kairos/Equor — was previously invisible
+                        "invariants_tested": wm.invariants_tested,
+                        "invariants_violated": wm.invariants_violated,
                     },
                 ))
+
+                # Emit dedicated invariant violation event so Kairos/Equor/Thymos react.
+                # Previously only a WARNING log — now escalated to the organism.
+                if wm.invariants_violated > 0:
+                    try:
+                        await self._synapse.event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.LOGOS_INVARIANT_VIOLATED,
+                            source_system=self.system_id,
+                            data={
+                                "invariants_violated": wm.invariants_violated,
+                                "invariants_tested": wm.invariants_tested,
+                                "experience_id": raw_experience.id,
+                                "update_type": wm.update_type.value,
+                                "recommendation": (
+                                    "Kairos should re-validate affected invariants. "
+                                    "Equor should review if violated invariants are constitutional."
+                                ),
+                            },
+                        ))
+                    except (ValueError, AttributeError):
+                        pass  # Event type may not be registered in older deployments
 
             # CRITICAL-1: Persist (:WorldModel) node + [:COMPRESSES] links
             if self._persistence is not None and result.delta is not None:
@@ -889,6 +1024,19 @@ class LogosService:
 
         # Broadcast COMPRESSION_CYCLE_COMPLETE with real data
         if self._synapse is not None:
+            # Surface evicted item IDs (previously only aggregate count was visible).
+            # Organism (Memory/Thread/Kairos) can now react to specific losses.
+            evicted_ids: list[str] = []
+            evicted_with_types: list[dict[str, str]] = []
+            if decay_report is not None:
+                evicted_ids = list(decay_report.evicted)[:20]  # cap at 20 for event size
+                evicted_with_types = [
+                    {
+                        "id": item_id,
+                        "type": decay_report.evicted_item_types.get(item_id, "unknown"),
+                    }
+                    for item_id in evicted_ids
+                ]
             await self._synapse.event_bus.emit(SynapseEvent(
                 event_type=SynapseEventType.COMPRESSION_CYCLE_COMPLETE,
                 source_system=self.system_id,
@@ -898,6 +1046,11 @@ class LogosService:
                     "mdl_improvement": report.mdl_improvement,
                     "bits_saved": report.bits_saved,
                     "anchors_created": report.anchors_created,
+                    # Newly surfaced — was previously invisible to organism
+                    "evicted_item_ids": evicted_ids,
+                    "evicted_items": evicted_with_types,
+                    "total_evicted_this_cycle": len(evicted_ids),
+                    "eviction_truncated": report.items_evicted > 20,
                 },
             ))
 
@@ -1108,6 +1261,48 @@ class LogosService:
                 # Full measurement
                 status = await self._schwarzschild.measure()
                 self._latest_schwarzschild = status
+
+                # Progressive warning: emit LOGOS_SCHWARZSCHILD_APPROACHING when any
+                # indicator crosses 80% of its threshold. Gives the organism foresight
+                # rather than a binary surprise. Fires once per instance lifetime.
+                if not self._schwarzschild_approaching_emitted and not self._schwarzschild_fired:
+                    ir_thresh = self._config.schwarzschild_intelligence_ratio
+                    sp_thresh = self._config.schwarzschild_self_prediction
+                    hr_thresh = self._config.schwarzschild_hypothesis_ratio
+                    ir_frac = status.intelligence_ratio / max(ir_thresh, 1e-9)
+                    sp_frac = status.self_prediction_accuracy / max(sp_thresh, 1e-9)
+                    hr_frac = status.hypothesis_ratio / max(hr_thresh, 1e-9)
+                    closest_frac = max(ir_frac, sp_frac, hr_frac)
+                    if closest_frac >= 0.80 and self._synapse is not None:
+                        self._schwarzschild_approaching_emitted = True
+                        closest = (
+                            "intelligence_ratio" if ir_frac == closest_frac
+                            else ("self_prediction" if sp_frac == closest_frac else "hypothesis_ratio")
+                        )
+                        try:
+                            await self._synapse.event_bus.emit(SynapseEvent(
+                                event_type=SynapseEventType.LOGOS_SCHWARZSCHILD_APPROACHING,
+                                source_system=self.system_id,
+                                data={
+                                    "intelligence_ratio": status.intelligence_ratio,
+                                    "self_prediction_accuracy": status.self_prediction_accuracy,
+                                    "hypothesis_ratio": status.hypothesis_ratio,
+                                    "closest_indicator": closest,
+                                    "fraction_to_threshold": round(closest_frac, 3),
+                                    "message": (
+                                        "Schwarzschild threshold approaching — cognitive reorganization "
+                                        f"is imminent. Closest indicator: {closest} at "
+                                        f"{round(closest_frac * 100, 1)}% of threshold."
+                                    ),
+                                },
+                            ))
+                        except (ValueError, AttributeError):
+                            pass
+                        logger.info(
+                            "schwarzschild_approaching",
+                            closest_indicator=closest,
+                            fraction=round(closest_frac, 3),
+                        )
 
                 # Fire SCHWARZSCHILD_THRESHOLD_MET once, ever
                 if status.threshold_met and not self._schwarzschild_fired:

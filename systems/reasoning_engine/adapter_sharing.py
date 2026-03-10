@@ -176,8 +176,9 @@ class AdapterSharer:
         # Step 5: Emit offer to both instances
         if self._bus is not None:
             try:
+                from systems.synapse.types import SynapseEventType as _SET
                 await self._bus.emit(
-                    "ADAPTER_SHARE_OFFER",
+                    _SET.ADAPTER_SHARE_OFFER,
                     {
                         "request_id": request.request_id,
                         "merged_adapter_path": merged_path,
@@ -234,15 +235,17 @@ class AdapterSharer:
             return None
 
         try:
-            self._bus.subscribe("ADAPTER_SHARE_RESPONSE", _on_response)
+            from systems.synapse.types import SynapseEventType as _SET
+            self._bus.subscribe(_SET.ADAPTER_SHARE_RESPONSE, _on_response)
         except Exception as exc:
             logger.warning("adapter_share.subscribe_failed", error=str(exc))
             return None
 
         try:
+            from systems.synapse.types import SynapseEventType as _SET
             my_id = os.getenv("INSTANCE_ID", "genesis")
             await self._bus.emit(
-                "ADAPTER_SHARE_REQUEST",
+                _SET.ADAPTER_SHARE_REQUEST,
                 {
                     "request_id": request_id,
                     "target_instance_id": partner_id,
@@ -256,7 +259,8 @@ class AdapterSharer:
             logger.warning("adapter_share.request_emit_failed", error=str(exc))
         finally:
             try:
-                self._bus.unsubscribe("ADAPTER_SHARE_RESPONSE", _on_response)
+                from systems.synapse.types import SynapseEventType as _SET
+                self._bus.unsubscribe(_SET.ADAPTER_SHARE_RESPONSE, _on_response)
             except Exception:
                 pass
 

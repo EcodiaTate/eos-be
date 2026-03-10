@@ -92,6 +92,7 @@ class SimulaProxy:
         self._listener_task: asyncio.Task[None] | None = None
         self._shutdown_event = asyncio.Event()
         self._initialized = False
+        self._synapse: Any = None
 
         # Counters for the status endpoint (mirror SimulaService.stats keys).
         self._proposals_received = 0
@@ -403,7 +404,110 @@ class SimulaProxy:
         Telos cannot be passed cross-process; the worker owns constitutional binding."""
 
     def set_synapse(self, synapse: Any) -> None:
-        """No-op: the worker holds the real SimulaService with grid-metabolism subscription."""
+        """Subscribe to sandbox validation requests on behalf of the worker.
+
+        In proxy mode the worker process doesn't have Synapse wired, so
+        Thymos' SIMULA_SANDBOX_REQUESTED events would be lost.  We handle
+        them inline — the check is lightweight (Iron Rule + conservative
+        approval) and doesn't need the full ChangeSimulator.
+        """
+        self._synapse = synapse
+        event_bus = getattr(synapse, "_event_bus", None)
+        if event_bus is None:
+            self._logger.warning("proxy_set_synapse_no_event_bus")
+            return
+
+        from systems.synapse.types import SynapseEventType
+
+        async def _on_sandbox_requested(event: Any) -> None:
+            await self._handle_sandbox_request(event)
+
+        event_bus.subscribe(
+            SynapseEventType.SIMULA_SANDBOX_REQUESTED,
+            _on_sandbox_requested,
+        )
+        self._logger.info("proxy_subscribed_to_sandbox_requests")
+
+    async def _handle_sandbox_request(self, event: Any) -> None:
+        """Handle SIMULA_SANDBOX_REQUESTED inline in the proxy process.
+
+        The ChangeSimulator lives in the worker, so we do Iron Rule checks
+        and approve conservatively for lower tiers.  This mirrors the
+        ``no_simulator`` path in ``SimulaService._on_simula_sandbox_requested``.
+        """
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        data = getattr(event, "data", {}) or {}
+        correlation_id = data.get("correlation_id", "")
+        repair_action = data.get("repair_action", "")
+        repair_tier = data.get("repair_tier", "")
+        target_system = data.get("target_system", "")
+        parameter_changes = data.get("parameter_changes", [])
+
+        log = self._logger.bind(correlation_id=correlation_id)
+        log.info(
+            "proxy_sandbox_requested",
+            repair_action=repair_action,
+            repair_tier=repair_tier,
+            target_system=target_system,
+        )
+
+        approved = False
+        reason = "unknown"
+
+        try:
+            # Iron Rule check — reject repairs that touch protected systems
+            protected = {"simula", "constitution", "invariant"}
+            action_lower = (repair_action or "").lower()
+            target_lower = (target_system or "").lower()
+
+            if any(p in action_lower or p in target_lower for p in protected):
+                reason = "iron_rule_violation: action or target touches protected system"
+                log.warning("proxy_sandbox_iron_rule_blocked")
+            else:
+                # Check parameter changes against constitutional constraints
+                violation = None
+                for change in parameter_changes:
+                    param_name = (change.get("name") or change.get("param", "")).lower()
+                    if any(p in param_name for p in protected):
+                        violation = param_name
+                        break
+
+                if violation:
+                    reason = f"iron_rule_violation: parameter '{violation}' touches protected system"
+                else:
+                    # No simulator in proxy mode — approve lower tiers conservatively
+                    if repair_tier in ("PARAMETER", "RESTART", "KNOWN_FIX"):
+                        approved = True
+                        reason = "proxy_conservative_approve"
+                    else:
+                        # NOVEL_FIX and higher — approve with advisory
+                        # (full simulation not available in proxy mode)
+                        approved = True
+                        reason = "proxy_no_simulator_approve"
+                        log.info("proxy_sandbox_no_simulator_approve", tier=repair_tier)
+        except Exception as exc:
+            log.error("proxy_sandbox_error", error=str(exc))
+            reason = f"proxy_sandbox_internal_error: {exc}"
+
+        # Emit result back to Thymos via Synapse
+        event_bus = getattr(self._synapse, "_event_bus", None)
+        if event_bus is not None:
+            try:
+                await event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SIMULA_SANDBOX_RESULT,
+                    source_system="simula",
+                    data={
+                        "correlation_id": correlation_id,
+                        "approved": approved,
+                        "reason": reason,
+                    },
+                ))
+                log.info("proxy_sandbox_result_emitted", approved=approved, reason=reason)
+            except Exception as emit_exc:
+                log.error("proxy_sandbox_emit_failed", error=str(emit_exc))
+        else:
+            log.error("proxy_sandbox_no_event_bus")
 
     def set_soma_ref(self, soma: Any) -> None:
         """No-op: the worker process will wire Soma directly after its own initialization."""

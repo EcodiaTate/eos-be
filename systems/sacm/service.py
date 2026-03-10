@@ -42,6 +42,8 @@ from systems.sacm.workload import (
     WorkloadStatus,
 )
 
+from systems.synapse.types import SynapseEvent, SynapseEventType
+
 if TYPE_CHECKING:
     from systems.sacm.oracle import ComputeMarketOracle
 
@@ -443,7 +445,7 @@ class SACMClient:
         self._synapse = synapse
         self._log.info("synapse_wired_to_sacm_client")
 
-    async def _emit_synapse(self, event_type: str, data: dict[str, Any]) -> None:
+    async def _emit_synapse(self, event_type: SynapseEventType, data: dict[str, Any]) -> None:
         """Fire-and-forget emit onto the Synapse event bus."""
         if self._synapse is None:
             return
@@ -453,7 +455,7 @@ class SACMClient:
         asyncio.create_task(
             self._synapse.event_bus.emit(
                 SynapseEvent(
-                    event_type=SynapseEventType(event_type),
+                    event_type=event_type,
                     source_system="sacm",
                     data=data,
                 )
@@ -481,7 +483,7 @@ class SACMClient:
         if not self._pending:
             return
 
-        await self._emit_synapse("sacm_draining", {
+        await self._emit_synapse(SynapseEventType.SACM_DRAINING, {
             "pending_count": len(self._pending),
             "drain_timeout_s": drain_timeout_s,
         })
@@ -574,7 +576,7 @@ class SACMClient:
         asyncio.create_task(self._execute_and_resolve(workload, decision, future, plan))
 
         # 5. Emit Synapse event for the submission
-        await self._emit_synapse("compute_request_submitted", {
+        await self._emit_synapse(SynapseEventType.COMPUTE_REQUEST_SUBMITTED, {
             "workload_id": wid,
             "source": "sacm_client",
             "priority": workload.priority.name,
@@ -693,7 +695,7 @@ class SACMClient:
                         fallback_provider=fallback_decision.provider_id,
                         primary_error=result.error,
                     )
-                    await self._emit_synapse("compute_request_submitted", {
+                    await self._emit_synapse(SynapseEventType.COMPUTE_REQUEST_SUBMITTED, {
                         "workload_id": wid,
                         "source": "sacm_client_retry",
                         "priority": workload.priority.name,
@@ -750,7 +752,7 @@ class SACMClient:
                         submitted_at=submitted_at,
                         completed_at=time.time(),
                     ))
-                await self._emit_synapse("compute_request_allocated", {
+                await self._emit_synapse(SynapseEventType.COMPUTE_REQUEST_ALLOCATED, {
                     "workload_id": wid,
                     "provider_id": decision.provider_id,
                     "accepted": True,
@@ -778,7 +780,7 @@ class SACMClient:
                         submitted_at=submitted_at,
                         completed_at=time.time(),
                     ))
-                await self._emit_synapse("compute_request_denied", {
+                await self._emit_synapse(SynapseEventType.COMPUTE_REQUEST_DENIED, {
                     "workload_id": wid,
                     "provider_id": decision.provider_id,
                     "reason": result.error or "verification_failed",

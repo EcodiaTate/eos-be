@@ -278,7 +278,8 @@ class SelfModelService:
 
             await self._persist_to_memory(model)
 
-            await self._emit("self_model_updated", {
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit(_SET.SELF_MODEL_UPDATED, {
                 "instance_id": self._instance_id,
                 "core_self_count": model.core_self_count,
                 "non_self_count": model.non_self_count,
@@ -296,7 +297,7 @@ class SelfModelService:
                 self._log.warning(
                     "self_model.coherence_alarm", coherence=model.self_coherence
                 )
-                await self._emit("self_coherence_alarm", {
+                await self._emit(_SET.SELF_COHERENCE_ALARM, {
                     "instance_id": self._instance_id,
                     "coherence": model.self_coherence,
                     "month": month,
@@ -331,14 +332,17 @@ class SelfModelService:
         except Exception as exc:
             self._log.warning("self_model.memory_write_failed", error=str(exc))
 
-    async def _emit(self, event_type_name: str, data: dict[str, Any]) -> None:
+    async def _emit(self, event_type_name: "SynapseEventType | str", data: dict[str, Any]) -> None:
         """Emit a Synapse event if the bus is available."""
         if not self._bus:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
-            et = SynapseEventType(event_type_name)
+            if isinstance(event_type_name, SynapseEventType):
+                et = event_type_name
+            else:
+                et = SynapseEventType(event_type_name)
             await self._bus.emit(SynapseEvent(
                 event_type=et,
                 data=data,

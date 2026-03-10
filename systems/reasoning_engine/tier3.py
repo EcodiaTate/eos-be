@@ -379,7 +379,8 @@ class Tier3Orchestrator:
         """
         run_id = f"tier3_{int(time.time())}"
         logger.info("tier3.started", run_id=run_id)
-        await self._emit("RE_TIER3_STARTED", {"run_id": run_id})
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit(_SET.RE_TIER3_STARTED, {"run_id": run_id})
 
         try:
             # ── Step 1: Train from scratch (clean base — no CLoRA) ─────────────
@@ -459,7 +460,8 @@ class Tier3Orchestrator:
 
             if not kl_passed:
                 logger.error("tier3.kl_gate_rejected", run_id=run_id, kl=round(kl_divergence, 5))
-                await self._emit("RE_KL_GATE_REJECTED", {
+                from systems.synapse.types import SynapseEventType as _SET
+                await self._emit(_SET.RE_KL_GATE_REJECTED, {
                     "run_id": run_id,
                     "kl_divergence": kl_divergence,
                     "tier": 3,
@@ -481,7 +483,8 @@ class Tier3Orchestrator:
             # ── Step 6: Record timestamp ───────────────────────────────────────
             await self._redis.set(_TIER3_LAST_RUN_KEY, str(time.time()))
 
-            await self._emit("RE_TIER3_COMPLETE", {
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit(_SET.RE_TIER3_COMPLETE, {
                 "run_id": run_id,
                 "kl_divergence": kl_divergence,
                 "final_adapter": final_path,
@@ -492,21 +495,26 @@ class Tier3Orchestrator:
 
         except Exception as exc:
             logger.error("tier3.failed", run_id=run_id, error=str(exc))
-            await self._emit("RE_TRAINING_FAILED", {
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit(_SET.RE_TRAINING_FAILED, {
                 "run_id": run_id,
                 "tier": 3,
                 "error": str(exc),
             })
             return False
 
-    async def _emit(self, event_type_str: str, payload: dict[str, Any]) -> None:
+    async def _emit(self, event_type_str: "SynapseEventType | str", payload: dict[str, Any]) -> None:
         """Fire-and-forget Synapse event. Never raises."""
         if self._bus is None:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
+            if isinstance(event_type_str, SynapseEventType):
+                etype = event_type_str
+            else:
+                etype = SynapseEventType(event_type_str.lower())
             event = SynapseEvent(
-                event_type=SynapseEventType(event_type_str.lower()),
+                event_type=etype,
                 data=payload,
                 source_system="reasoning_engine",
             )

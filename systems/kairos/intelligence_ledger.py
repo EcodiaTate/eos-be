@@ -432,6 +432,13 @@ class IntelligenceContributionLedger:
             ],
         }
 
+    def mean_i_ratio(self) -> float:
+        """Return mean intelligence ratio contribution across all tracked invariants."""
+        if not self._contributions:
+            return 0.0
+        contributions = list(self._contributions.values())
+        return sum(c.intelligence_ratio_contribution for c in contributions) / len(contributions)
+
     # --- Metrics ---
 
     @property

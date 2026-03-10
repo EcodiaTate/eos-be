@@ -458,6 +458,15 @@ class HotSwapManager:
             self._on_evaluation_passed,
         )
 
+        # Subscribe to Thymos-initiated rollback signals (P8b gap closure).
+        # Thymos emits MODEL_ROLLBACK_TRIGGERED after a MODEL_HOT_SWAP_FAILED
+        # incident. This handler completes the signal chain by actually executing
+        # the rollback if auto_rollback is True.
+        self._event_bus.subscribe(
+            SynapseEventType.MODEL_ROLLBACK_TRIGGERED,
+            self._on_model_rollback_triggered,
+        )
+
         # Load persisted state
         state = await self._store.load()
         if state is not None:
@@ -526,6 +535,75 @@ class HotSwapManager:
         )
 
         await self.execute_hot_swap(adapter_cid, base_model)
+
+    async def _on_model_rollback_triggered(self, event: Any) -> None:
+        """
+        Handle MODEL_ROLLBACK_TRIGGERED emitted by Thymos (P8b gap closure).
+
+        Thymos emits this event after a MODEL_HOT_SWAP_FAILED incident to
+        request that the prior model configuration be restored. This handler
+        completes the signal chain by actually calling execute_rollback() when
+        auto_rollback is True in the event payload.
+
+        On failure, emits INCIDENT_DETECTED to Thymos rather than crashing.
+        """
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        data = getattr(event, "data", {}) or {}
+        auto_rollback: bool = bool(data.get("auto_rollback", False))
+        adapter_cid: str = str(data.get("adapter_cid", data.get("failing_adapter", "")))
+        reason: str = str(data.get("reason", "thymos_initiated_rollback"))
+
+        self._logger.warning(
+            "model_rollback_triggered_received",
+            adapter_cid=adapter_cid,
+            auto_rollback=auto_rollback,
+            reason=reason,
+        )
+
+        if not auto_rollback:
+            self._logger.info(
+                "model_rollback_triggered_skipped",
+                reason="auto_rollback=False — manual intervention required",
+            )
+            return
+
+        try:
+            await self.execute_rollback(reason=f"thymos:{reason}")
+            self._logger.info(
+                "model_rollback_triggered_completed",
+                adapter_cid=adapter_cid,
+                restored_provider=(
+                    self._current_state.provider_name if self._current_state else "unknown"
+                ),
+            )
+        except Exception as exc:
+            self._logger.error(
+                "model_rollback_triggered_failed",
+                adapter_cid=adapter_cid,
+                error=str(exc),
+            )
+            try:
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.INCIDENT_DETECTED,
+                    source_system="simula",
+                    data={
+                        "class": "model_rollback_failed",
+                        "severity": "high",
+                        "description": (
+                            f"MODEL_ROLLBACK_TRIGGERED handler failed for adapter "
+                            f"{adapter_cid!r}: {exc}"
+                        ),
+                        "auto_rollback": auto_rollback,
+                        "adapter_cid": adapter_cid,
+                        "reason": reason,
+                    },
+                ))
+            except Exception:
+                self._logger.error(
+                    "model_rollback_incident_emit_failed",
+                    exc_info=True,
+                )
 
     # ─── Core Swap Logic ──────────────────────────────────
 
@@ -621,6 +699,44 @@ class HotSwapManager:
                     success=False,
                     error=str(exc),
                 )
+
+                # Emit RE training example — hot-swap failure is a negative training
+                # signal: the organism attempted to upgrade its own reasoning engine
+                # and failed.  The adapter CID, failure class, and swap context are
+                # captured so the RE can learn to avoid re-applying bad adapters.
+                try:
+                    from primitives.re_training import RETrainingExample
+                    from primitives.common import new_id
+                    import traceback as _tb
+
+                    _failure_trace = _tb.format_exc()
+                    _example = RETrainingExample(
+                        source_system="simula",
+                        category="hot_swap_failure",
+                        instruction=(
+                            "Apply a LoRA adapter hot-swap to upgrade the live reasoning engine "
+                            "without downtime. The swap must download the adapter from IPFS, load "
+                            "it into the local inference engine, and enter probation monitoring."
+                        ),
+                        input_context=(
+                            f"adapter_cid={adapter_cid!r} "
+                            f"base_model={base_model!r} "
+                            f"from_provider={self._current_state.provider_name if self._current_state else 'unknown'!r} "
+                            f"from_adapter_cid={self._current_state.adapter_cid if self._current_state else None!r}"
+                        ),
+                        output=f"FAILED: {str(exc)[:500]}",
+                        outcome_quality=0.0,
+                        reasoning_trace=_failure_trace[:1000],
+                        alternatives_considered=["rollback_to_previous", "retry_download", "use_api_fallback"],
+                        episode_id=new_id(),
+                    )
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                        data=_example.model_dump(mode="json"),
+                        source_system="simula",
+                    ))
+                except Exception:
+                    pass  # Never block the swap failure path
 
                 # Restore previous provider if we partially switched
                 if self._previous_provider is not None:
@@ -894,6 +1010,49 @@ class HotSwapManager:
             },
             source_system="simula",
         ))
+
+        # Emit RE training example — probation failure is a negative training signal.
+        # The organism tried a new adapter, observed elevated error rate during probation,
+        # and rolled back.  Capturing the probation snapshot gives the RE concrete data
+        # on what kinds of adapters fail in production.
+        try:
+            from primitives.re_training import RETrainingExample
+            from primitives.common import new_id as _new_id
+
+            _snapshot = self._monitor.snapshot.model_dump()
+            _example = RETrainingExample(
+                source_system="simula",
+                category="hot_swap_rollback",
+                instruction=(
+                    "Monitor a newly loaded LoRA adapter during its probation window and "
+                    "roll back if error rate exceeds threshold, preserving organism cognitive stability."
+                ),
+                input_context=(
+                    f"failing_adapter={failing_adapter!r} "
+                    f"error_rate={round(self._monitor.error_rate, 4)} "
+                    f"probation_cycles_observed={_snapshot.get('cycles_observed', 0)} "
+                    f"reason={reason!r}"
+                ),
+                output=(
+                    f"ROLLED_BACK: adapter {failing_adapter!r} exceeded error threshold "
+                    f"({round(self._monitor.error_rate, 4):.4f} > threshold). "
+                    f"Restored to {self._current_state.provider_name if self._current_state else 'unknown'}."
+                ),
+                outcome_quality=0.0,
+                reasoning_trace=(
+                    f"Probation snapshot: {_snapshot}. "
+                    f"Rollback reason: {reason}"
+                )[:1000],
+                alternatives_considered=["extend_probation", "reduce_threshold", "partial_unload"],
+                episode_id=_new_id(),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                data=_example.model_dump(mode="json"),
+                source_system="simula",
+            ))
+        except Exception:
+            pass  # Never block the rollback path
 
         self._phase = SwapPhase.ROLLED_BACK
 

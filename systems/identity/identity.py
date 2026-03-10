@@ -23,9 +23,13 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from primitives.common import SystemID, new_id, utc_now
+from systems.identity.communication import OTPCoordinator
 
 if TYPE_CHECKING:
     from clients.neo4j import Neo4jClient
+    from config import EcodiaOSConfig
+    from systems.identity.account_provisioner import AccountProvisioner
+    from systems.identity.vault import IdentityVault
     from systems.synapse.event_bus import EventBus
 
 logger = structlog.get_logger("identity.system")
@@ -75,6 +79,10 @@ class IdentitySystem:
         self._certificate_chain_ref: str = ""
         self._initialized: bool = False
         self._log = logger.bind(system="identity")
+        self._otp_coordinator: OTPCoordinator = OTPCoordinator()
+        self._account_provisioner: AccountProvisioner | None = None
+        self._vault: IdentityVault | None = None
+        self._full_config: EcodiaOSConfig | None = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -115,6 +123,10 @@ class IdentitySystem:
         # Wire Synapse subscriptions
         self._subscribe_to_lifecycle_events()
 
+        # Wire OTP coordinator if bus is available at init time
+        if event_bus is not None:
+            self._otp_coordinator.set_event_bus(event_bus)
+
         self._initialized = True
         self._log.info(
             "identity_system_initialized",
@@ -124,14 +136,63 @@ class IdentitySystem:
             parent=parent_instance_id,
         )
 
+        # Autonomous platform identity provisioning — runs in background on first boot.
+        # Checks if this instance already has its own GitHub account / phone number,
+        # and provisions them if not. Never blocks the boot sequence.
+        if self._account_provisioner is not None:
+            import asyncio
+            asyncio.ensure_future(self._run_platform_provisioning())
+
     def set_event_bus(self, event_bus: EventBus) -> None:
         """Wire Synapse event bus after initialization."""
         self._event_bus = event_bus
         self._subscribe_to_lifecycle_events()
+        self._otp_coordinator.set_event_bus(event_bus)
+        if self._account_provisioner is not None:
+            self._account_provisioner.set_event_bus(event_bus)
 
     def set_neo4j(self, neo4j: Neo4jClient) -> None:
         """Wire Neo4j client after initialization."""
         self._neo4j = neo4j
+        if self._account_provisioner is not None:
+            self._account_provisioner.set_neo4j(neo4j)
+
+    def set_vault(self, vault: "IdentityVault") -> None:
+        """Wire IdentityVault for account credential sealing."""
+        self._vault = vault
+
+    def set_full_config(self, config: "EcodiaOSConfig") -> None:
+        """Wire full EcodiaOSConfig for account provisioner configuration."""
+        self._full_config = config
+
+    def set_account_provisioner(self, provisioner: "AccountProvisioner") -> None:
+        """Wire the AccountProvisioner (called by registry after init)."""
+        self._account_provisioner = provisioner
+
+    # ── Platform Provisioning ───────────────────────────────────────────
+
+    async def _run_platform_provisioning(self) -> None:
+        """
+        Background task: provision platform identities on first boot.
+
+        Runs after IdentitySystem.initialize() completes, so the rest of the
+        boot sequence is never blocked. Failures are logged but never fatal.
+        """
+        try:
+            if self._account_provisioner is None:
+                return
+            await self._account_provisioner.provision_platform_identities()
+        except Exception as exc:
+            self._log.warning(
+                "platform_provisioning_error",
+                error=str(exc),
+                instance_id=self._instance_id,
+            )
+
+    @property
+    def account_provisioner(self) -> "AccountProvisioner | None":
+        """Access the AccountProvisioner for direct provisioning calls."""
+        return self._account_provisioner
 
     # ── Properties ─────────────────────────────────────────────────────
 
@@ -150,6 +211,11 @@ class IdentitySystem:
     @property
     def parent_instance_id(self) -> str | None:
         return self._parent_instance_id
+
+    @property
+    def otp_coordinator(self) -> OTPCoordinator:
+        """Unified OTP coordination layer — use to await codes from any channel."""
+        return self._otp_coordinator
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -354,7 +420,8 @@ class IdentitySystem:
             "verified": True,
         }
 
-        await self._emit_event("IDENTITY_VERIFIED", result)
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.IDENTITY_VERIFIED, result)
 
         self._log.info("identity_verified", instance_id=self._instance_id)
         return result
@@ -634,7 +701,7 @@ class IdentitySystem:
 
     # ── Synapse Event Emission ─────────────────────────────────────────
 
-    async def _emit_event(self, event_name: str, data: dict[str, Any]) -> None:
+    async def _emit_event(self, event_name: "str | SynapseEventType", data: dict[str, Any]) -> None:
         """Emit a typed Synapse event. Fire-and-forget, failure-tolerant."""
         if self._event_bus is None:
             return
@@ -642,21 +709,25 @@ class IdentitySystem:
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
-            type_map: dict[str, SynapseEventType] = {
-                "IDENTITY_VERIFIED": SynapseEventType.IDENTITY_VERIFIED,
-                "IDENTITY_CHALLENGED": SynapseEventType.IDENTITY_CHALLENGED,
-                "IDENTITY_EVOLVED": SynapseEventType.IDENTITY_EVOLVED,
-                "CONSTITUTIONAL_HASH_CHANGED": SynapseEventType.CONSTITUTIONAL_HASH_CHANGED,
-                "CERTIFICATE_RENEWED": SynapseEventType.CERTIFICATE_RENEWED,
-                "IDENTITY_DRIFT_DETECTED": SynapseEventType.IDENTITY_DRIFT_DETECTED,
-                "CHILD_CERTIFICATE_INSTALLED": SynapseEventType.CHILD_CERTIFICATE_INSTALLED,
-                "CERTIFICATE_RENEWAL_REQUESTED": SynapseEventType.CERTIFICATE_RENEWAL_REQUESTED,
-            }
+            # Accept SynapseEventType enum members directly (bypasses type_map lookup).
+            if isinstance(event_name, SynapseEventType):
+                evt_type: SynapseEventType = event_name
+            else:
+                type_map: dict[str, SynapseEventType] = {
+                    "IDENTITY_VERIFIED": SynapseEventType.IDENTITY_VERIFIED,
+                    "IDENTITY_CHALLENGED": SynapseEventType.IDENTITY_CHALLENGED,
+                    "IDENTITY_EVOLVED": SynapseEventType.IDENTITY_EVOLVED,
+                    "CONSTITUTIONAL_HASH_CHANGED": SynapseEventType.CONSTITUTIONAL_HASH_CHANGED,
+                    "CERTIFICATE_RENEWED": SynapseEventType.CERTIFICATE_RENEWED,
+                    "IDENTITY_DRIFT_DETECTED": SynapseEventType.IDENTITY_DRIFT_DETECTED,
+                    "CHILD_CERTIFICATE_INSTALLED": SynapseEventType.CHILD_CERTIFICATE_INSTALLED,
+                    "CERTIFICATE_RENEWAL_REQUESTED": SynapseEventType.CERTIFICATE_RENEWAL_REQUESTED,
+                }
 
-            evt_type = type_map.get(event_name)
-            if evt_type is None:
-                self._log.warning("unknown_event_type", event_name=event_name)
-                return
+                evt_type = type_map.get(event_name)  # type: ignore[assignment]
+                if evt_type is None:
+                    self._log.warning("unknown_event_type", event_name=event_name)
+                    return
 
             event = SynapseEvent(
                 event_type=evt_type,
@@ -666,7 +737,7 @@ class IdentitySystem:
             await self._event_bus.emit(event)
 
         except Exception as exc:
-            self._log.warning("event_emit_failed", event=event_name, error=str(exc))
+            self._log.warning("event_emit_failed", event=str(event_name), error=str(exc))
 
     # ── Shutdown ───────────────────────────────────────────────────────
 

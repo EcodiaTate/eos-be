@@ -2,7 +2,7 @@
 
 **Spec**: `.claude/EcodiaOS_Spec_28_PhantomLiquidity.md`
 **System ID**: `phantom_liquidity`
-**Last Updated**: 2026-03-07 (v1.2 — all gaps closed)
+**Last Updated**: 2026-03-08 (v1.3 — autonomy audit gaps closed)
 
 ---
 
@@ -31,8 +31,9 @@ All 7 `PHANTOM_*` events implemented and registered in `synapse/types.py`:
 
 ### Synapse Subscriptions
 
-- `METABOLIC_PRESSURE` → `_on_metabolic_pressure()` — AUSTERITY warns; EMERGENCY/CRITICAL emits `PHANTOM_RESOURCE_EXHAUSTED`
+- `METABOLIC_PRESSURE` → `_on_metabolic_pressure()` — AUSTERITY warns + emits `PHANTOM_RESOURCE_EXHAUSTED`; EMERGENCY/CRITICAL also emits `NOVA_INTENT_REQUESTED` to autonomously withdraw highest-IL pool (v1.3)
 - `GENOME_EXTRACT_REQUEST` → `_on_genome_extract_request()` → `GENOME_EXTRACT_RESPONSE` with pool configs + thresholds
+- `EVO_ADJUST_BUDGET` → `_on_evo_adjust_budget()` — Evo can tune `il_rebalance_threshold`, `staleness_threshold_s`, `consensus_window_s`, `swap_poll_interval_s` at runtime; bounds enforced; emits `PHANTOM_PARAMETER_ADJUSTED` (v1.3)
 
 ### Genome Extraction Protocol (Mitosis)
 
@@ -60,9 +61,14 @@ Direct call (acceptable per Spec §9): `register_phantom_position()`, `update_ph
 
 - **LP key rotation**: `store_lp_key()` seals the key at provisioning time but does not implement periodic rotation or re-sealing under a new vault key version. Key rotation would require calling `vault.rotate_key()` and updating `_lp_key_envelope`.
 
-### LOW
+### Closed Gaps (2026-03-08 — Autonomy Audit)
 
-- **RE training annotation** (Spec §23): Price context not attached to Nova/Oikos decision training examples. Price data is emitted via Synapse but not captured as RE episodes.
+- ~~**EVO_ADJUST_BUDGET not subscribed**~~ — `_on_evo_adjust_budget()` wired in `attach()`; 4 runtime-tunable parameters with bounds: `il_rebalance_threshold` [0.5%–10%], `staleness_threshold_s` [60s–3600s], `consensus_window_s` [10s–120s], `swap_poll_interval_s` [1s–30s]. Emits `PHANTOM_PARAMETER_ADJUSTED` for Evo feedback.
+- ~~**Hard block on IL breach with no recourse**~~ — `_on_price_update()` now detects IL threshold breach on every swap (not just hourly maintenance); immediately emits `NOVA_INTENT_REQUESTED` for autonomous withdrawal. EMERGENCY/CRITICAL metabolic pressure handler also emits `NOVA_INTENT_REQUESTED`.
+- ~~**RE training annotation missing**~~ — `RE_TRAINING_EXAMPLE` emitted on every IL breach event with full causal context (pair, entry/current price, IL %, capital at risk, threshold). Closes Spec §23 annotation gap.
+- ~~**PHANTOM_PRICE_UPDATE invisible to Nova/Atune**~~ — Nova now subscribes to `PHANTOM_PRICE_UPDATE` (via `set_synapse()`) and updates market-price beliefs. IL risk > 2% in price update triggers `_immediate_deliberation()`.
+- ~~**NOVA_INTENT_REQUESTED event type missing**~~ — Added to `SynapseEventType` in `synapse/types.py`. Nova subscribes via `_on_nova_intent_requested()`; fires `_immediate_deliberation()` so any system can trigger Nova deliberation without bypassing Equor.
+- ~~**PHANTOM_PARAMETER_ADJUSTED event type missing**~~ — Added to `SynapseEventType` in `synapse/types.py`. Evo subscribes to confirm hypothesis outcomes.
 
 ### Closed Gaps (2026-03-07)
 
@@ -94,9 +100,13 @@ Direct call (acceptable per Spec §9): `register_phantom_position()`, `update_ph
 | Synapse | `PHANTOM_METABOLIC_COST` | → emit | Hourly cost/fee report |
 | Synapse | `PHANTOM_PRICE_OBSERVATION` | → emit | Raw swap observation for fleet consensus |
 | Synapse | `PHANTOM_SUBSTRATE_OBSERVABLE` | → emit | Bedau-Packard evolutionary metrics per maintenance cycle |
-| Synapse | `METABOLIC_PRESSURE` | ← consume | Oikos sends; adjusts logging/emits exhaustion |
+| Synapse | `METABOLIC_PRESSURE` | ← consume | Oikos sends; AUSTERITY warns; EMERGENCY/CRITICAL proposes withdrawal via `NOVA_INTENT_REQUESTED` |
 | Synapse | `GENOME_EXTRACT_REQUEST` | ← consume | Mitosis requests; responds with `GENOME_EXTRACT_RESPONSE` |
 | Synapse | `PHANTOM_PRICE_OBSERVATION` | ← consume | Peer observations; aggregated for fleet consensus |
+| Synapse | `EVO_ADJUST_BUDGET` | ← consume | Evo tunes thresholds at runtime; emits `PHANTOM_PARAMETER_ADJUSTED` |
+| Synapse | `NOVA_INTENT_REQUESTED` | → emit | IL breach + EMERGENCY pressure — asks Nova to autonomously withdraw |
+| Synapse | `PHANTOM_PARAMETER_ADJUSTED` | → emit | After Evo parameter adjustment (Evo feedback) |
+| Synapse | `RE_TRAINING_EXAMPLE` | → emit | On IL breach — price/IL causal context for RE training |
 | Oikos | `register_phantom_position()` | → direct call | Position lifecycle tracking |
 | TimescaleDB | `phantom_price_history` | → write | Per swap event persistence |
 | Neo4j | `(:PriceObservation)` nodes | → write | Per swap event — Memory bridge for Kairos/Memory |

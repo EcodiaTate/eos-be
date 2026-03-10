@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -226,8 +227,14 @@ class BenchmarkService:
             ),
         )
         # Cache of fleet genome snapshots keyed by instance_id.
-        # Updated by _on_child_spawned_genome when CHILD_SPAWNED events arrive.
+        # Updated by _on_child_spawned_genome when CHILD_SPAWNED events arrive,
+        # refreshed periodically via GENOME_EXTRACT_REQUEST/RESPONSE polling,
+        # and kept live by CHILD_HEALTH_REPORT events.
         self._fleet_genomes: dict[str, dict[str, Any]] = {}
+        # Timestamp of last periodic GENOME_EXTRACT_REQUEST broadcast (unix epoch).
+        # Refreshes every _fleet_genome_refresh_interval_s seconds.
+        self._fleet_genome_last_refresh: float = 0.0
+        self._fleet_genome_refresh_interval_s: float = 600.0  # 10 minutes
         # Month counter for OEE gating (≥3 months before oee_assessment is included)
         self._monthly_eval_count: int = 0
 
@@ -275,6 +282,64 @@ class BenchmarkService:
         # Tracks the previous primary_domain to detect domain-pivot events.
         self._prev_primary_domain: str = "generalist"
 
+        # ── RE training export volume counters ───────────────────────────────
+        # Updated by _on_re_training_export_complete (RE_TRAINING_EXPORT_COMPLETE).
+        # Surfaced in stats and monthly eval payload.
+        self._re_training_batches_exported: int = 0
+        self._re_training_episodes_total: int = 0
+        self._re_training_last_mean_quality: float = 0.0
+        # Pillar 2 training embedding cache — populated once per monthly eval.
+        self._cached_training_embeddings: list | None = None
+
+        # ── Nexus epistemic KPI state ─────────────────────────────────────────
+        # Rolling accumulator for NEXUS_EPISTEMIC_VALUE events.
+        # Keyed by observable_type; each entry holds the sum of values and count
+        # so we can compute per-type means without storing full history.
+        # Also tracks the last-cycle total to compute schema_quality_trend.
+        self._nexus_epistemic_totals: dict[str, list[float]] = {}   # type → [sum, count]
+        self._nexus_epistemic_cycle_total: float = 0.0   # sum of values within current cycle
+        self._nexus_epistemic_prev_cycle_total: float = 0.0  # previous cycle total for trend
+
+        # ── Evo belief/genome consolidation KPIs ─────────────────────────────
+        # Tracks consolidation frequency and genome extraction events for
+        # evolutionary fitness KPI (orphan closure for EVO_BELIEF_CONSOLIDATED
+        # and EVO_GENOME_EXTRACTED).
+        self._evo_consolidations_total: int = 0
+        self._evo_last_consolidation_beliefs: int = 0
+        self._evo_genome_extractions_total: int = 0
+        self._evo_last_genome_size_bytes: int = 0
+
+        # ── Economic gate denial rate KPI ────────────────────────────────────
+        # Tracks ECONOMIC_ACTION_DEFERRED events for economic health KPI.
+        # High denial rate indicates the organism is under metabolic pressure
+        # and cannot afford its intended actions (orphan closure).
+        self._economic_deferrals_total: int = 0
+        self._economic_deferrals_by_type: dict[str, int] = {}
+
+        # ── Runtime-adjustable thresholds ─────────────────────────────────────
+        # These were previously hardcoded magic numbers invisible to the organism.
+        # Evo can adjust them via set_thresholds() in response to BENCHMARK_REGRESSION
+        # events or organism-level learning outcomes.
+        # re_progress_min_improvement_pct: minimum llm_dependency drop to emit
+        #   BENCHMARK_RE_PROGRESS (default 5.0%). Lower = more sensitive to RE gains.
+        # metabolic_degradation_fraction: how far below rolling mean before the
+        #   push-based metabolic check fires a BENCHMARK_REGRESSION (default 0.10 = 10%).
+        #   Lower = fires sooner; higher = only fires on severe drops.
+        self._re_progress_min_improvement_pct: float = 5.0
+        self._metabolic_degradation_fraction: float = 0.10
+
+        # ── Learning trajectory KPIs ──────────────────────────────────────────
+        # Crash pattern discovery counters (from CRASH_PATTERN_CONFIRMED / RESOLVED).
+        self._crash_patterns_discovered: int = 0
+        self._crash_patterns_resolved: int = 0
+        self._crash_pattern_confidence_sum: float = 0.0  # Running sum for rolling avg
+
+        # RE model health score trajectory — rolling 30-entry window of
+        # (timestamp_iso, health_score) tuples.  Populated by BENCHMARK_RE_PROGRESS
+        # events where kpi_name == "re_model.health_score".
+        from collections import deque as _deque2
+        self._re_model_health_history: _deque2[tuple[str, float]] = _deque2(maxlen=30)
+
     # ─── Dependency injection ─────────────────────────────────────────
 
     def set_nova(self, nova: NovaHealthProtocol | None) -> None:
@@ -314,9 +379,61 @@ class BenchmarkService:
         # Fleet genome cache for Bedau-Packard monthly computation
         if hasattr(SynapseEventType, "CHILD_SPAWNED"):
             bus.subscribe(SynapseEventType.CHILD_SPAWNED, self._on_child_spawned_genome)
+        # Async genome response from organs/children — refreshes _fleet_genomes
+        if hasattr(SynapseEventType, "GENOME_EXTRACT_RESPONSE"):
+            bus.subscribe(SynapseEventType.GENOME_EXTRACT_RESPONSE, self._on_genome_extract_response)
+        # Live genome state refresh from child health reports
+        if hasattr(SynapseEventType, "CHILD_HEALTH_REPORT"):
+            bus.subscribe(SynapseEventType.CHILD_HEALTH_REPORT, self._on_child_health_report_genome)
         # Domain episode ingestion → DomainKPICalculator
         if hasattr(SynapseEventType, "DOMAIN_EPISODE_RECORDED"):
             bus.subscribe(SynapseEventType.DOMAIN_EPISODE_RECORDED, self._on_domain_episode_recorded)
+        # Nexus epistemic value — accumulate per-observable-type scores for KPI tracking
+        if hasattr(SynapseEventType, "NEXUS_EPISTEMIC_VALUE"):
+            bus.subscribe(SynapseEventType.NEXUS_EPISTEMIC_VALUE, self._on_nexus_epistemic_value)
+        # RE training export volume KPIs — RETrainingExporter emits this each hour
+        if hasattr(SynapseEventType, "RE_TRAINING_EXPORT_COMPLETE"):
+            bus.subscribe(SynapseEventType.RE_TRAINING_EXPORT_COMPLETE, self._on_re_training_export_complete)
+        # Evo belief consolidation frequency — evolutionary fitness KPI
+        if hasattr(SynapseEventType, "EVO_BELIEF_CONSOLIDATED"):
+            bus.subscribe(SynapseEventType.EVO_BELIEF_CONSOLIDATED, self._on_evo_belief_consolidated)
+        # Evo genome extraction events — population genetics KPI
+        if hasattr(SynapseEventType, "EVO_GENOME_EXTRACTED"):
+            bus.subscribe(SynapseEventType.EVO_GENOME_EXTRACTED, self._on_evo_genome_extracted)
+        # Economic gate denial rate — economic health KPI
+        if hasattr(SynapseEventType, "ECONOMIC_ACTION_DEFERRED"):
+            bus.subscribe(SynapseEventType.ECONOMIC_ACTION_DEFERRED, self._on_economic_action_deferred)
+        # Autonomous threshold adjustment — Evo (or any system) can push new sensitivity
+        # values via this event rather than requiring a code change or restart.
+        if hasattr(SynapseEventType, "BENCHMARK_THRESHOLD_UPDATE"):
+            bus.subscribe(SynapseEventType.BENCHMARK_THRESHOLD_UPDATE, self._on_threshold_update)
+        # PHANTOM_SUBSTRATE_OBSERVABLE — Bedau-Packard evolutionary observables
+        # from Phantom Liquidity LP maintenance cycles. Each emission contains
+        # pool-level activity counts that feed into the adaptive-activity measure.
+        if hasattr(SynapseEventType, "PHANTOM_SUBSTRATE_OBSERVABLE"):
+            bus.subscribe(
+                SynapseEventType.PHANTOM_SUBSTRATE_OBSERVABLE,
+                self._on_phantom_substrate_observable,
+            )
+        # Learning trajectory KPIs — crash patterns + RE model health trajectory
+        if hasattr(SynapseEventType, "CRASH_PATTERN_CONFIRMED"):
+            bus.subscribe(
+                SynapseEventType.CRASH_PATTERN_CONFIRMED,
+                self._on_crash_pattern_confirmed,
+            )
+        if hasattr(SynapseEventType, "CRASH_PATTERN_RESOLVED"):
+            bus.subscribe(
+                SynapseEventType.CRASH_PATTERN_RESOLVED,
+                self._on_crash_pattern_resolved,
+            )
+        # RE model health trajectory — RE_TRAINING_EXPORT_COMPLETE triggers evaluation
+        # which re-emits BENCHMARK_RE_PROGRESS; subscribe to track health_score window
+        # and compute learning_velocity.
+        if hasattr(SynapseEventType, "BENCHMARK_RE_PROGRESS"):
+            bus.subscribe(
+                SynapseEventType.BENCHMARK_RE_PROGRESS,
+                self._on_benchmark_re_progress_for_trajectory,
+            )
         # Wire drift tracker so it can emit ETHICAL_DRIFT_RECORDED
         self._drift_tracker.set_event_bus(bus)
 
@@ -354,6 +471,43 @@ class BenchmarkService:
         Call after initialize(). Safe to call with None.
         """
         self._reasoning_engine = engine
+
+    def set_thresholds(
+        self,
+        *,
+        re_progress_min_improvement_pct: float | None = None,
+        metabolic_degradation_fraction: float | None = None,
+    ) -> None:
+        """Adjust runtime detection thresholds without a restart.
+
+        Intended callers: Evo (via Synapse hypothesis outcome → ADJUST_BUDGET),
+        and future autonomy loops that learn optimal sensitivity from experience.
+
+        Parameters
+        ──────────
+        re_progress_min_improvement_pct
+            Minimum llm_dependency percentage drop to emit BENCHMARK_RE_PROGRESS.
+            Default 5.0. Valid range [0.5, 20.0].
+        metabolic_degradation_fraction
+            Fraction below rolling mean that triggers metabolic BENCHMARK_REGRESSION.
+            Default 0.10 (10%). Valid range [0.02, 0.50].
+        """
+        if re_progress_min_improvement_pct is not None:
+            clamped = max(0.5, min(20.0, float(re_progress_min_improvement_pct)))
+            self._re_progress_min_improvement_pct = clamped
+            self._logger.info(
+                "benchmark_threshold_adjusted",
+                threshold="re_progress_min_improvement_pct",
+                value=clamped,
+            )
+        if metabolic_degradation_fraction is not None:
+            clamped = max(0.02, min(0.50, float(metabolic_degradation_fraction)))
+            self._metabolic_degradation_fraction = clamped
+            self._logger.info(
+                "benchmark_threshold_adjusted",
+                threshold="metabolic_degradation_fraction",
+                value=clamped,
+            )
 
     # ─── On-demand evaluation (for ablation studies) ──────────────────────────
 
@@ -571,7 +725,7 @@ class BenchmarkService:
 
         values = [v for _, v in history]
         rolling_mean = sum(values) / len(values)
-        degradation_threshold = rolling_mean * 0.9
+        degradation_threshold = rolling_mean * (1.0 - self._metabolic_degradation_fraction)
 
         if efficiency < degradation_threshold and pressure_level != "nominal":
             # Compute a simple 7-day trend slope (last vs first half mean)
@@ -668,32 +822,616 @@ class BenchmarkService:
         """Cache genome snapshot when a new child instance spawns.
 
         Populates _fleet_genomes so the monthly Bedau-Packard computation
-        has access to all known fleet members' genome data.
+        has access to all known fleet members' genome data.  All genome
+        sub-keys present in the CHILD_SPAWNED payload are captured so that
+        subsequent GENOME_EXTRACT_RESPONSE events can merge richer data.
         """
-        data = getattr(event, "data", {}) or {}
-        instance_id = data.get("child_instance_id")
-        if not instance_id:
-            return
-        genome_payload: dict[str, Any] = {}
-        # CHILD_SPAWNED payload may include genome sub-keys at top level
-        for key in ("evo", "simula", "telos", "equor"):
-            if key in data:
-                genome_payload[key] = data[key]
-        self._fleet_genomes[str(instance_id)] = {
-            "instance_id": str(instance_id),
-            **genome_payload,
-        }
-        self._logger.debug(
-            "fleet_genome_cached",
-            instance_id=instance_id,
-            genome_keys=list(genome_payload.keys()),
-            fleet_size=len(self._fleet_genomes),
-        )
+        try:
+            data = getattr(event, "data", {}) or {}
+            instance_id = data.get("child_instance_id")
+            if not instance_id:
+                return
+            genome_payload: dict[str, Any] = {}
+            # Capture all genome sub-keys that may be present at top level
+            for key in (
+                "evo",
+                "simula",
+                "telos",
+                "equor",
+                "belief_genome_id",
+                "simula_genome_id",
+                "telos_genome_id",
+                "equor_genome_id",
+                "niche",
+                "generation",
+                "fork_kind",
+                "seed_capital_usd",
+                "success_probability",
+                "parent_instance_id",
+            ):
+                if key in data:
+                    genome_payload[key] = data[key]
+            self._fleet_genomes[str(instance_id)] = {
+                "instance_id": str(instance_id),
+                "spawned_at": data.get("spawned_at", utc_now().isoformat()),
+                **genome_payload,
+            }
+            self._logger.debug(
+                "fleet_genome_cached",
+                instance_id=instance_id,
+                genome_keys=list(genome_payload.keys()),
+                fleet_size=len(self._fleet_genomes),
+            )
+        except Exception as exc:
+            self._logger.debug("fleet_genome_cache_failed", error=str(exc))
 
     async def _on_domain_episode_recorded(self, event: Any) -> None:
         """Ingest a DOMAIN_EPISODE_RECORDED event into DomainKPICalculator."""
         data = getattr(event, "data", {}) or {}
         self._domain_kpi_calc.record_episode(data)
+
+    async def _on_nexus_epistemic_value(self, event: Any) -> None:
+        """
+        Accumulate NEXUS_EPISTEMIC_VALUE observables for epistemic KPI tracking.
+
+        Nexus emits this event 2× per divergence cycle: once per peer after
+        triangulation, and once unconditionally from local fragment state.
+        Each emission carries an EvolutionaryObservable payload with:
+          - observable_type: "federation_mean_divergence" | "speciation_event_count" |
+                             "epistemic_promotion_rate" | "local_epistemic_state"
+          - value: float
+          - metadata: dict with instance_id, counts, triangulation_weight, etc.
+
+        Handler:
+        1. Accumulates value per observable_type (running sum + count).
+        2. Increments the within-cycle total.
+        3. On "local_epistemic_state" (the end-of-cycle sentinel emitted unconditionally):
+           - Computes epistemic_value_per_cycle = cycle total
+           - Computes schema_quality_trend = delta vs previous cycle
+           - Emits DOMAIN_KPI_SNAPSHOT with nexus epistemic KPIs embedded
+           - Rolls over cycle totals for the next cycle.
+        """
+        data = getattr(event, "data", {}) or {}
+        obs_type = str(data.get("observable_type", "unknown"))
+        value = float(data.get("value", 0.0))
+        metadata = data.get("metadata", {}) or {}
+
+        # Accumulate per-type running totals
+        if obs_type not in self._nexus_epistemic_totals:
+            self._nexus_epistemic_totals[obs_type] = [0.0, 0]
+        self._nexus_epistemic_totals[obs_type][0] += value
+        self._nexus_epistemic_totals[obs_type][1] += 1
+        self._nexus_epistemic_cycle_total += value
+
+        # "local_epistemic_state" is emitted unconditionally every cycle —
+        # use it as the end-of-cycle marker to emit the KPI snapshot.
+        if obs_type != "local_epistemic_state":
+            return
+
+        epistemic_value_per_cycle = self._nexus_epistemic_cycle_total
+        schema_quality_trend = (
+            epistemic_value_per_cycle - self._nexus_epistemic_prev_cycle_total
+        )
+
+        # Build per-type mean dict for the snapshot payload
+        type_means: dict[str, float] = {}
+        for otype, (total, count) in self._nexus_epistemic_totals.items():
+            type_means[otype] = total / count if count > 0 else 0.0
+
+        self._logger.info(
+            "nexus_epistemic_kpi_cycle",
+            epistemic_value_per_cycle=epistemic_value_per_cycle,
+            schema_quality_trend=schema_quality_trend,
+            observable_types=list(type_means.keys()),
+            local_fragment_count=metadata.get("local_fragment_count", 0),
+            ground_truth_count=metadata.get("ground_truth_count", 0),
+            triangulation_weight=metadata.get("triangulation_weight", 0.0),
+        )
+
+        if self._event_bus is not None:
+            from systems.synapse.types import SynapseEvent
+            try:
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.DOMAIN_KPI_SNAPSHOT,
+                    source_system=self.system_id,
+                    data={
+                        "instance_id": self._instance_id,
+                        "domain": "nexus_epistemic",
+                        "kpi_type": "epistemic_value",
+                        "epistemic_value_per_cycle": epistemic_value_per_cycle,
+                        "schema_quality_trend": schema_quality_trend,
+                        "observable_type_means": type_means,
+                        "local_fragment_count": metadata.get("local_fragment_count", 0),
+                        "ground_truth_count": metadata.get("ground_truth_count", 0),
+                        "triangulation_weight": metadata.get("triangulation_weight", 0.0),
+                        "convergence_count": metadata.get("convergence_count", 0),
+                        "speciation_count": metadata.get("speciation_count", 0),
+                    },
+                ))
+            except Exception as exc:
+                self._logger.debug("nexus_epistemic_kpi_emit_failed", error=str(exc))
+
+        # Roll over cycle totals — keep per-type accumulators (long-term means)
+        # but reset the within-cycle counter for the next divergence cycle.
+        self._nexus_epistemic_prev_cycle_total = epistemic_value_per_cycle
+        self._nexus_epistemic_cycle_total = 0.0
+
+    async def _on_re_training_export_complete(self, event: Any) -> None:
+        """Track RE training data export volume KPIs.
+
+        RETrainingExporter emits RE_TRAINING_EXPORT_COMPLETE after every hourly
+        batch export with payload:
+          batch_id, total_examples, source_systems, mean_quality,
+          export_destinations, hour_window, export_duration_ms
+
+        Handler increments re_training_batches_exported and
+        re_training_episodes_total, then emits DOMAIN_KPI_SNAPSHOT so
+        downstream systems (Nova, Thread) can observe training data health.
+        """
+        data = getattr(event, "data", {}) or {}
+        total_examples: int = int(data.get("total_examples", 0))
+        mean_quality: float = float(data.get("mean_quality", 0.0))
+        batch_id: str = str(data.get("batch_id", ""))
+        hour_window: str = str(data.get("hour_window", ""))
+        export_duration_ms: float = float(data.get("export_duration_ms", 0.0))
+        source_systems: list = list(data.get("source_systems", []))
+
+        self._re_training_batches_exported += 1
+        self._re_training_episodes_total += total_examples
+        self._re_training_last_mean_quality = mean_quality
+
+        self._logger.info(
+            "re_training_export_kpi_updated",
+            batch_id=batch_id,
+            total_examples=total_examples,
+            mean_quality=round(mean_quality, 4),
+            batches_exported=self._re_training_batches_exported,
+            episodes_total=self._re_training_episodes_total,
+            hour_window=hour_window,
+        )
+
+        if self._event_bus is None:
+            return
+
+        from systems.synapse.types import SynapseEvent
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.DOMAIN_KPI_SNAPSHOT,
+                source_system=self.system_id,
+                data={
+                    "instance_id": self._instance_id,
+                    "domain": "re_training",
+                    "kpi_type": "export_volume",
+                    "re_training_batches_exported": self._re_training_batches_exported,
+                    "re_training_episodes_total": self._re_training_episodes_total,
+                    "re_training_last_mean_quality": round(mean_quality, 4),
+                    "re_training_batch_size": total_examples,
+                    "re_training_source_systems": source_systems,
+                    "re_training_export_duration_ms": export_duration_ms,
+                    "hour_window": hour_window,
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("re_training_export_kpi_emit_failed", error=str(exc))
+
+    async def _build_training_embeddings_cache(self) -> None:
+        """Sample recent RE training data and encode into embeddings for Pillar 2.
+
+        Reads up to 200 reasoning chains from the most recent training JSONL
+        export, encodes them via RE.encode(), and caches as
+        _cached_training_embeddings.  Called once per monthly eval cycle.
+        """
+        import glob as _glob
+        import json as _json
+
+        export_dir = os.environ.get("RE_TRAINING_EXPORT_DIR", "data/re_training_batches")
+        pattern = os.path.join(export_dir, "*.jsonl")
+        files = sorted(_glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        if not files:
+            self._logger.debug("training_embeddings.no_export_files", dir=export_dir)
+            return
+
+        reasoning_texts: list[str] = []
+        for fpath in files[:5]:  # scan up to 5 most recent export files
+            try:
+                with open(fpath) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        row = _json.loads(line)
+                        text = row.get("reasoning_chain") or row.get("output") or row.get("completion", "")
+                        if text and len(text) > 20:
+                            reasoning_texts.append(text[:2000])
+                        if len(reasoning_texts) >= 200:
+                            break
+            except Exception:
+                continue
+            if len(reasoning_texts) >= 200:
+                break
+
+        if not reasoning_texts:
+            self._logger.debug("training_embeddings.no_reasoning_texts")
+            return
+
+        embeddings = await self._reasoning_engine.encode(reasoning_texts)
+        if embeddings:
+            self._cached_training_embeddings = embeddings
+            self._logger.info(
+                "training_embeddings_cached",
+                count=len(embeddings),
+                dim=len(embeddings[0]) if embeddings else 0,
+            )
+
+    async def _on_evo_belief_consolidated(self, event: Any) -> None:
+        """Track EVO_BELIEF_CONSOLIDATED as an evolutionary fitness KPI.
+
+        Evo emits this at the end of Phase 2.75 (belief hardening). Each
+        consolidation compresses belief state — frequency and compression ratio
+        are Bedau-Packard-eligible evolutionary fitness signals.
+
+        Payload: beliefs_consolidated (int), foundation_conflicts (int),
+                 instance_id (str), consolidation_number (int)
+        """
+        data = getattr(event, "data", {}) or {}
+        beliefs_consolidated = int(data.get("beliefs_consolidated", 0))
+        foundation_conflicts = int(data.get("foundation_conflicts", 0))
+
+        self._evo_consolidations_total += 1
+        self._evo_last_consolidation_beliefs = beliefs_consolidated
+
+        self._logger.info(
+            "evo_belief_consolidation_kpi",
+            consolidations_total=self._evo_consolidations_total,
+            beliefs_consolidated=beliefs_consolidated,
+            foundation_conflicts=foundation_conflicts,
+        )
+
+        # Emit to Synapse so Nexus / Alive can observe evolutionary fitness in real time.
+        # Previously these counters were computed but invisible to all other systems.
+        if self._event_bus is not None:
+            from systems.synapse.types import SynapseEvent
+            with contextlib.suppress(Exception):
+                asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.DOMAIN_KPI_SNAPSHOT,
+                    source_system=self.system_id,
+                    data={
+                        "instance_id": self._instance_id,
+                        "domain": "evolutionary_fitness",
+                        "kpi_type": "belief_consolidation",
+                        "consolidations_total": self._evo_consolidations_total,
+                        "beliefs_consolidated": beliefs_consolidated,
+                        "foundation_conflicts": foundation_conflicts,
+                        "consolidation_number": data.get("consolidation_number", 0),
+                    },
+                )))
+
+    async def _on_evo_genome_extracted(self, event: Any) -> None:
+        """Track EVO_GENOME_EXTRACTED as a population genetics KPI.
+
+        Evo emits this at Phase 2.8 when a new BeliefGenome is produced.
+        Extraction frequency and genome size are population genetics signals.
+
+        Payload: genome_id (str), candidates_fixed (int), genome_size_bytes (int),
+                 generation (int), instance_id (str)
+        """
+        data = getattr(event, "data", {}) or {}
+        genome_size_bytes = int(data.get("genome_size_bytes", 0))
+        generation = int(data.get("generation", 0))
+        candidates_fixed = int(data.get("candidates_fixed", 0))
+
+        self._evo_genome_extractions_total += 1
+        self._evo_last_genome_size_bytes = genome_size_bytes
+
+        self._logger.info(
+            "evo_genome_extraction_kpi",
+            extractions_total=self._evo_genome_extractions_total,
+            genome_size_bytes=genome_size_bytes,
+            generation=generation,
+            candidates_fixed=candidates_fixed,
+        )
+
+        # Emit to Synapse so Nexus / Alive can observe population genetics in real time.
+        # Previously these counters were computed but invisible to all other systems.
+        if self._event_bus is not None:
+            from systems.synapse.types import SynapseEvent
+            with contextlib.suppress(Exception):
+                asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.DOMAIN_KPI_SNAPSHOT,
+                    source_system=self.system_id,
+                    data={
+                        "instance_id": self._instance_id,
+                        "domain": "evolutionary_fitness",
+                        "kpi_type": "genome_extraction",
+                        "extractions_total": self._evo_genome_extractions_total,
+                        "genome_size_bytes": genome_size_bytes,
+                        "generation": generation,
+                        "candidates_fixed": candidates_fixed,
+                        "genome_id": data.get("genome_id", ""),
+                    },
+                )))
+
+    async def _on_economic_action_deferred(self, event: Any) -> None:
+        """Track ECONOMIC_ACTION_DEFERRED denial rate as an economic health KPI.
+
+        Oikos emits this when the metabolic gate denies an action. A high
+        denial rate indicates the organism is under severe metabolic pressure.
+        Emits DOMAIN_KPI_SNAPSHOT with deferral rate for Nova/Thread to observe.
+
+        Payload: action_type (str), action_id (str), reason (str),
+                 estimated_cost_usd (str), deferred_at (str)
+        """
+        data = getattr(event, "data", {}) or {}
+        action_type = str(data.get("action_type", "unknown"))
+        reason = str(data.get("reason", ""))
+
+        self._economic_deferrals_total += 1
+        self._economic_deferrals_by_type[action_type] = (
+            self._economic_deferrals_by_type.get(action_type, 0) + 1
+        )
+
+        self._logger.info(
+            "economic_deferral_kpi",
+            deferrals_total=self._economic_deferrals_total,
+            action_type=action_type,
+            reason=reason,
+            deferrals_by_type=self._economic_deferrals_by_type,
+        )
+
+        # Emit DOMAIN_KPI_SNAPSHOT so Nova/Thread can observe economic gate pressure
+        if self._event_bus is None:
+            return
+        from systems.synapse.types import SynapseEvent
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.DOMAIN_KPI_SNAPSHOT,
+                source_system=self.system_id,
+                data={
+                    "instance_id": self._instance_id,
+                    "domain": "economic_health",
+                    "kpi_type": "gate_denial_rate",
+                    "deferrals_total": self._economic_deferrals_total,
+                    "action_type": action_type,
+                    "reason": reason,
+                    "deferrals_by_type": dict(self._economic_deferrals_by_type),
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("economic_deferral_kpi_emit_failed", error=str(exc))
+
+    async def _on_threshold_update(self, event: Any) -> None:
+        """Receive BENCHMARK_THRESHOLD_UPDATE from Evo or any autonomy loop.
+
+        Allows runtime adjustment of sensitivity thresholds without a restart.
+        Any field omitted from the payload leaves the corresponding threshold unchanged.
+
+        Payload fields (all optional):
+          re_progress_min_improvement_pct (float) — min % drop in llm_dependency to emit
+              BENCHMARK_RE_PROGRESS. Valid [0.5, 20.0]. Default 5.0.
+          metabolic_degradation_fraction (float) — how far below rolling mean triggers
+              metabolic BENCHMARK_REGRESSION. Valid [0.02, 0.50]. Default 0.10.
+          source (str) — system that requested the change (audit log).
+          reason (str) — free-text rationale (audit log).
+        """
+        data = getattr(event, "data", {}) or {}
+        source = str(data.get("source", "unknown"))
+        reason = str(data.get("reason", ""))
+
+        re_pct = data.get("re_progress_min_improvement_pct")
+        met_frac = data.get("metabolic_degradation_fraction")
+
+        if re_pct is None and met_frac is None:
+            return  # Nothing to adjust
+
+        self.set_thresholds(
+            re_progress_min_improvement_pct=float(re_pct) if re_pct is not None else None,
+            metabolic_degradation_fraction=float(met_frac) if met_frac is not None else None,
+        )
+        self._logger.info(
+            "benchmark_threshold_update_received",
+            source=source,
+            reason=reason,
+            re_progress_min_improvement_pct=self._re_progress_min_improvement_pct,
+            metabolic_degradation_fraction=self._metabolic_degradation_fraction,
+        )
+
+    async def _on_phantom_substrate_observable(self, event: Any) -> None:
+        """Handle PHANTOM_SUBSTRATE_OBSERVABLE from Phantom Liquidity.
+
+        Each Phantom maintenance cycle emits Bedau-Packard observables:
+        activity counts, pool population size, and LP state transitions.
+        Feed these into the BedauPackardTracker so the monthly computation
+        includes Phantom's evolutionary substrate contribution.
+
+        Payload: pool_count (int), active_positions (int),
+                 rebalance_events (int), il_detections (int),
+                 cycle_ts (float, unix epoch)
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            pool_count = int(data.get("pool_count", 0))
+            active_positions = int(data.get("active_positions", 0))
+            rebalance_events = int(data.get("rebalance_events", 0))
+            il_detections = int(data.get("il_detections", 0))
+
+            # Contribute to the Bedau-Packard adaptive-activity accumulator.
+            # Each rebalance/detection counts as a distinct "state transition" —
+            # the substrate-level activity measure Bedau-Packard quantifies.
+            if hasattr(self._evo_tracker, "record_substrate_activity"):
+                await self._evo_tracker.record_substrate_activity(
+                    source="phantom_liquidity",
+                    activity_count=rebalance_events + il_detections,
+                    population_size=pool_count + active_positions,
+                )
+
+            self._logger.debug(
+                "phantom_substrate_observable_received",
+                pool_count=pool_count,
+                active_positions=active_positions,
+                rebalance_events=rebalance_events,
+                il_detections=il_detections,
+            )
+        except Exception as exc:
+            self._logger.warning("phantom_substrate_observable_handler_failed", error=str(exc))
+
+    async def _on_crash_pattern_confirmed(self, event: Any) -> None:
+        """Track CRASH_PATTERN_CONFIRMED as a learning trajectory KPI.
+
+        Emitted by Thymos/Kairos when a recurring crash pattern is confirmed.
+        Increments discovered total and maintains a rolling average of pattern confidence.
+
+        Payload: pattern_id (str), confidence (float), lesson (str),
+                 failed_tiers (list[str]), source (str)
+        """
+        data = getattr(event, "data", {}) or {}
+        confidence = float(data.get("confidence", 0.5))
+
+        self._crash_patterns_discovered += 1
+        self._crash_pattern_confidence_sum += confidence
+        confidence_avg = (
+            self._crash_pattern_confidence_sum / self._crash_patterns_discovered
+        )
+
+        self._logger.info(
+            "crash_pattern_confirmed_kpi",
+            patterns_discovered=self._crash_patterns_discovered,
+            confidence=round(confidence, 3),
+            confidence_avg=round(confidence_avg, 3),
+            pattern_id=data.get("pattern_id", ""),
+        )
+
+    async def _on_crash_pattern_resolved(self, event: Any) -> None:
+        """Track CRASH_PATTERN_RESOLVED as a learning trajectory KPI.
+
+        Emitted by Thymos when a repair succeeds on a pattern-matched incident.
+        Computes resolution_rate = resolved / discovered.
+
+        Payload: pattern_id (str), repair_tier (str), incident_id (str),
+                 confidence_before (float)
+        """
+        data = getattr(event, "data", {}) or {}
+
+        self._crash_patterns_resolved += 1
+        discovered = max(1, self._crash_patterns_discovered)
+        resolution_rate = self._crash_patterns_resolved / discovered
+
+        self._logger.info(
+            "crash_pattern_resolved_kpi",
+            patterns_resolved=self._crash_patterns_resolved,
+            patterns_discovered=discovered,
+            resolution_rate=round(resolution_rate, 3),
+            pattern_id=data.get("pattern_id", ""),
+        )
+
+    async def _on_benchmark_re_progress_for_trajectory(self, event: Any) -> None:
+        """Track RE model health score trajectory for learning_velocity computation.
+
+        REEvaluator emits BENCHMARK_RE_PROGRESS with kpi_name="re_model.health_score"
+        after every evaluation. We maintain a rolling 30-entry window and compute
+        learning_velocity as the linear-regression slope over the last 7 days.
+
+        After updating the window, emits BENCHMARKS_KPI (kpi_name="organism.learning_velocity").
+        """
+        data = getattr(event, "data", {}) or {}
+        kpi_name = str(data.get("kpi_name", ""))
+        if kpi_name != "re_model.health_score":
+            return  # Only track the overall health score, not per-category
+
+        value = float(data.get("value", 0.0))
+        from primitives.common import utc_now as _utc_now
+        self._re_model_health_history.append((_utc_now().isoformat(), value))
+
+        # Need at least 2 data points for a slope
+        if len(self._re_model_health_history) < 2:
+            return
+
+        # Compute learning_velocity via linear regression over available window
+        learning_velocity = self._compute_learning_velocity()
+
+        self._logger.info(
+            "learning_velocity_computed",
+            health_score=round(value, 4),
+            history_len=len(self._re_model_health_history),
+            learning_velocity=round(learning_velocity, 6),
+        )
+
+        # Emit BENCHMARKS_KPI kpi_name="organism.learning_velocity"
+        if self._event_bus is None:
+            return
+        from systems.synapse.types import SynapseEvent
+        with contextlib.suppress(Exception):
+            asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.BENCHMARK_RE_PROGRESS,
+                source_system=self.system_id,
+                data={
+                    "kpi_name": "organism.learning_velocity",
+                    "value": learning_velocity,
+                    "delta": 0.0,
+                    "direction": "up" if learning_velocity > 0 else ("down" if learning_velocity < 0 else "flat"),
+                    "category": "learning_trajectory",
+                    "instance_id": self._instance_id,
+                    "re_model_health_score": value,
+                    "history_len": len(self._re_model_health_history),
+                },
+            )))
+
+    def _compute_learning_velocity(self) -> float:
+        """Compute linear regression slope of re_model.health_score over rolling window.
+
+        Uses the last 7 days of data points from _re_model_health_history.
+        Returns the slope (health score improvement per day). Positive = learning.
+        Returns 0.0 if insufficient data.
+        """
+        from datetime import datetime, timezone
+
+        history = list(self._re_model_health_history)
+        if len(history) < 2:
+            return 0.0
+
+        # Filter to last 7 days
+        now_ts = datetime.now(timezone.utc).timestamp()
+        cutoff_ts = now_ts - 7 * 86400
+
+        points: list[tuple[float, float]] = []
+        for ts_iso, score in history:
+            try:
+                ts = datetime.fromisoformat(ts_iso).timestamp()
+            except Exception:
+                continue
+            if ts >= cutoff_ts:
+                points.append((ts, score))
+
+        if len(points) < 2:
+            # Use all available points if recent data is sparse
+            points = []
+            for ts_iso, score in history:
+                try:
+                    ts = datetime.fromisoformat(ts_iso).timestamp()
+                except Exception:
+                    continue
+                points.append((ts, score))
+
+        if len(points) < 2:
+            return 0.0
+
+        # Linear regression: slope = (n*sum(xy) - sum(x)*sum(y)) / (n*sum(x²) - sum(x)²)
+        n = len(points)
+        # Normalise timestamps to days relative to first point to avoid float precision issues
+        t0 = points[0][0]
+        xs = [(p[0] - t0) / 86400.0 for p in points]  # days since first point
+        ys = [p[1] for p in points]
+
+        sum_x = sum(xs)
+        sum_y = sum(ys)
+        sum_xy = sum(x * y for x, y in zip(xs, ys, strict=False))
+        sum_x2 = sum(x * x for x in xs)
+
+        denom = n * sum_x2 - sum_x * sum_x
+        if abs(denom) < 1e-10:
+            return 0.0
+
+        slope = (n * sum_xy - sum_x * sum_y) / denom
+        return round(slope, 6)
 
     async def _collect_domain_kpis(self) -> dict[str, Any]:
         """Compute per-domain KPI snapshots from accumulated episode history.
@@ -875,21 +1613,111 @@ class BenchmarkService:
     async def _collect_fleet_genomes(self) -> list[dict[str, Any]]:
         """Return cached fleet genome snapshots for Bedau-Packard computation.
 
-        Returns the genesis instance's own genome (empty dict) as a
-        single-item list when no children have spawned yet.  This allows
-        the tracker to compute single-instance stats rather than skipping.
-
-        Full fleet genome collection via GENOME_EXTRACT_REQUEST/RESPONSE is
-        a future enhancement; current implementation relies on the CHILD_SPAWNED
-        event cache which is populated as children are born.
+        Performs periodic polling via GENOME_EXTRACT_REQUEST/RESPONSE:
+        - If the cache was last refreshed more than _fleet_genome_refresh_interval_s
+          seconds ago, broadcasts a GENOME_EXTRACT_REQUEST for each known fleet
+          member.  Responses arrive asynchronously in _on_genome_extract_response
+          and merge into _fleet_genomes without blocking this call.
+        - Returns the current cached snapshot immediately (may be stale on the
+          first call; CHILD_SPAWNED events seed initial entries on spawn).
+        - Falls back to an empty list when no fleet members are known.
         """
+        now = time.time()
+        if (
+            self._event_bus is not None
+            and self._fleet_genomes
+            and (now - self._fleet_genome_last_refresh) > self._fleet_genome_refresh_interval_s
+        ):
+            self._fleet_genome_last_refresh = now
+            for instance_id in list(self._fleet_genomes.keys()):
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.GENOME_EXTRACT_REQUEST,
+                        source_system=SystemID.BENCHMARKS,
+                        data={
+                            "request_id": f"bp_poll_{instance_id}_{int(now)}",
+                            "requesting_system": SystemID.BENCHMARKS,
+                            "target_instance_id": instance_id,
+                            "generation": 0,
+                        },
+                    ))
+                except Exception as exc:
+                    self._logger.debug(
+                        "fleet_genome_poll_emit_failed",
+                        instance_id=instance_id,
+                        error=str(exc),
+                    )
         if self._fleet_genomes:
             return list(self._fleet_genomes.values())
-        # Single-instance fallback: return minimal genesis entry so the tracker
-        # can still compute change_rate and novelty from the genesis genome
-        # (drive weights emitted via TELOS_POPULATION_SNAPSHOT are a better
-        # source, but the monthly BP computation uses genome format)
         return []
+
+    async def _on_genome_extract_response(self, event: Any) -> None:
+        """Update fleet genome cache from GENOME_EXTRACT_RESPONSE events.
+
+        Merges the organ segment payload into the cached entry for the
+        responding instance.  Creates a new entry if the instance is not
+        yet known (e.g. a child that spawned before the subscription was
+        wired).
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            segment = data.get("segment") or {}
+            instance_id = (
+                segment.get("instance_id")
+                or data.get("instance_id")
+                or data.get("target_instance_id")
+            )
+            if not instance_id:
+                return
+            instance_id = str(instance_id)
+            existing = self._fleet_genomes.get(instance_id, {"instance_id": instance_id})
+            existing.update({k: v for k, v in segment.items() if v is not None})
+            existing["genome_refreshed_at"] = utc_now().isoformat()
+            self._fleet_genomes[instance_id] = existing
+            self._logger.debug(
+                "fleet_genome_response_merged",
+                instance_id=instance_id,
+                segment_keys=list(segment.keys()),
+                fleet_size=len(self._fleet_genomes),
+            )
+        except Exception as exc:
+            self._logger.debug("fleet_genome_response_failed", error=str(exc))
+
+    async def _on_child_health_report_genome(self, event: Any) -> None:
+        """Refresh fleet genome cache from CHILD_HEALTH_REPORT events.
+
+        CHILD_HEALTH_REPORT is emitted every 10 minutes by ChildHealthReporter.
+        If the payload contains drive alignment or drift data, those fields are
+        merged into the cached genome entry so that live instances stay fresh
+        between full GENOME_EXTRACT_REQUEST polling cycles.
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            instance_id = data.get("child_instance_id")
+            if not instance_id:
+                return
+            instance_id = str(instance_id)
+            # Only extract genome-adjacent fields; ignore raw health metrics
+            genome_adjacent: dict[str, Any] = {}
+            if "drive_alignment_scores" in data:
+                genome_adjacent["drive_alignment_scores"] = data["drive_alignment_scores"]
+            if "constitutional_drift_severity" in data:
+                genome_adjacent["constitutional_drift_severity"] = float(
+                    data["constitutional_drift_severity"]
+                )
+            if not genome_adjacent:
+                return
+            existing = self._fleet_genomes.get(instance_id, {"instance_id": instance_id})
+            existing.update(genome_adjacent)
+            existing["health_report_at"] = data.get("reported_at", utc_now().isoformat())
+            self._fleet_genomes[instance_id] = existing
+            self._logger.debug(
+                "fleet_genome_health_merged",
+                instance_id=instance_id,
+                fields=list(genome_adjacent.keys()),
+            )
+        except Exception as exc:
+            self._logger.debug("fleet_genome_health_report_failed", error=str(exc))
 
     async def _on_telos_population_snapshot(self, event: Any) -> None:
         """
@@ -1490,11 +2318,29 @@ class BenchmarkService:
                                 domain_improvement=spec.domain_improvement,
                             )
 
+                        # Pre-compute training embeddings for Pillar 2 cosine distance.
+                        if (
+                            hasattr(self._reasoning_engine, "encode")
+                            and not getattr(self, "_cached_training_embeddings", None)
+                        ):
+                            try:
+                                await self._build_training_embeddings_cache()
+                            except Exception as _emb_exc:
+                                self._logger.debug("training_embeddings_cache_failed", error=str(_emb_exc))
+
                         # Pillar 2: Novelty Emergence
                         if self._test_sets.get("novel_episodes"):
+                            # Provide encode_fn so pillar can embed novel reasoning texts
+                            # for real cosine distance against training distribution.
+                            _encode_fn = None
+                            if hasattr(self._reasoning_engine, "encode"):
+                                _encode_fn = self._reasoning_engine.encode
+                            _train_embeds = getattr(self, "_cached_training_embeddings", None)
                             novelty = await measure_novelty_emergence(
                                 self._reasoning_engine,
                                 self._test_sets["novel_episodes"],
+                                training_embeddings=_train_embeds,
+                                encode_fn=_encode_fn,
                             )
                             result_dict["pillar2_novel_success_rate"] = novelty.novel_success_rate
                             result_dict["pillar2_cosine_distance"] = novelty.reasoning_cosine_distance
@@ -2068,6 +2914,8 @@ class BenchmarkService:
 
     async def _fire_regression_event(self, regression: MetricRegression) -> None:
         """Emit a BENCHMARK_REGRESSION event via Synapse event bus."""
+        if self._event_bus is None:
+            return
         event = SynapseEvent(
             event_type=SynapseEventType.BENCHMARK_REGRESSION,
             source_system=self.system_id,
@@ -2132,7 +2980,7 @@ class BenchmarkService:
 
         # Improvement means llm_dependency decreased (fewer LLM calls)
         improvement_pct = (prev - current) / prev * 100.0
-        if improvement_pct > 5.0:
+        if improvement_pct > self._re_progress_min_improvement_pct:
             event = SynapseEvent(
                 event_type=SynapseEventType.BENCHMARK_RE_PROGRESS,
                 source_system=self.system_id,
@@ -2469,6 +3317,16 @@ class BenchmarkService:
             "interval_s": self._config.interval_s,
             "rolling_window": self._config.rolling_window_snapshots,
             "evolutionary_tracker": self._evo_tracker.stats,
+            # Evolutionary / economic fitness counters (surfaced for health monitors)
+            "evo_consolidations_total": self._evo_consolidations_total,
+            "evo_genome_extractions_total": self._evo_genome_extractions_total,
+            "economic_deferrals_total": self._economic_deferrals_total,
+            # RE pipeline health
+            "re_training_batches_exported": self._re_training_batches_exported,
+            "re_training_episodes_total": self._re_training_episodes_total,
+            "re_performance": dict(self._re_performance),
+            # Phenotype divergence from last Telos population snapshot
+            "constitutional_phenotype_divergence": self._last_phenotype_divergence,
         }
 
     @property
@@ -2489,4 +3347,34 @@ class BenchmarkService:
             "effective_intelligence_ratio": snap.effective_intelligence_ratio if snap else None,
             "compression_ratio": snap.compression_ratio if snap else None,
             "bedau_packard": snap.bedau_packard.model_dump(mode="json") if snap and snap.bedau_packard else None,
+            # Evolutionary / economic fitness KPIs (previously invisible)
+            "evo_consolidations_total": self._evo_consolidations_total,
+            "evo_genome_extractions_total": self._evo_genome_extractions_total,
+            "economic_deferrals_total": self._economic_deferrals_total,
+            "economic_deferrals_by_type": dict(self._economic_deferrals_by_type),
+            # RE training pipeline KPIs (previously invisible)
+            "re_training_batches_exported": self._re_training_batches_exported,
+            "re_training_episodes_total": self._re_training_episodes_total,
+            "re_training_last_mean_quality": self._re_training_last_mean_quality,
+            # RE performance from 7-day rolling window (previously invisible)
+            "re_performance": dict(self._re_performance),
+            # Constitutional phenotype divergence from last Telos snapshot (previously invisible)
+            "constitutional_phenotype_divergence": self._last_phenotype_divergence,
+            # Domain specialisation snapshot
+            "primary_domain": snap.primary_domain if snap else "generalist",
+            "active_domain_count": len(snap.domain_kpis) if snap else 0,
+            # Runtime-adjustable thresholds (visible so Evo can observe before adjusting)
+            "threshold_re_progress_min_improvement_pct": self._re_progress_min_improvement_pct,
+            "threshold_metabolic_degradation_fraction": self._metabolic_degradation_fraction,
+            # Learning trajectory KPIs
+            "crash_patterns_discovered": self._crash_patterns_discovered,
+            "crash_patterns_resolved": self._crash_patterns_resolved,
+            "crash_pattern_confidence_avg": round(
+                self._crash_pattern_confidence_sum / max(1, self._crash_patterns_discovered), 3
+            ),
+            "crash_pattern_resolution_rate": round(
+                self._crash_patterns_resolved / max(1, self._crash_patterns_discovered), 3
+            ),
+            "re_model_health_history_len": len(self._re_model_health_history),
+            "organism_learning_velocity": self._compute_learning_velocity(),
         }

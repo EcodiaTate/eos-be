@@ -412,6 +412,10 @@ class SeedConfiguration(EOSBaseModel):
     equor_genome_id: str = ""     # EquorGenomeFragment — constitutional amendment history + constitution hash.
     axon_genome_id: str = ""      # AxonGenomeFragment — top-10 execution templates + circuit breaker thresholds.
     telos_genome_id: str = ""     # TelosGenomeFragment — drive calibration constants + topology (Spec 18 SG3).
+    soma_genome_id: str = ""      # OrganGenomeSegment(soma) — setpoints, dynamics matrix, allostatic baselines.
+    nova_genome_id: str = ""      # NovaGenomeFragment — goal-domain priors, policy success rates, EFE weights (Spec 05).
+    voxis_genome_id: str = ""     # VoxisGenomeFragment — personality vector, vocabulary affinities, strategy prefs (Spec 04).
+    eis_genome_id: str = ""       # EIS OrganGenomeSegment — threat patterns, anomaly baselines, quarantine thresholds (Spec 25).
     generation: int = 1           # Generation number in the lineage
 
 
@@ -428,6 +432,10 @@ class RevenueStream(enum.StrEnum):
     ASSET = "asset"                # Tollbooth sweeps from owned services
     DIVIDEND = "dividend"          # Child instance dividends
     INJECTION = "injection"        # Manual / genesis injections
+    AFFILIATE = "affiliate"        # Referral commissions from affiliate programs
+    API_RESELL = "api_resell"      # API reselling revenue (paid USDC calls)
+    CONTENT = "content"            # Content monetization (Dev.to, X Creator, etc.)
+    CONSULTING = "consulting"      # Consulting / service offer revenue
     OTHER = "other"                # Unclassified external revenue
 
 

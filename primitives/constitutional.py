@@ -49,8 +49,13 @@ class ConstitutionalCheck(Identified):
 
     review_time_ms: int = 0
 
-    # Metabolic context injected by compute_verdict_with_metabolic_state() (Fix 4.2/4.4)
-    # Keys: starvation_level (str), efficiency_ratio (float), floor_tightness (float)
+    # Metabolic+somatic context injected by compute_verdict_with_metabolic_state()
+    # Keys:
+    #   starvation_level (str)       — Oikos metabolic tier
+    #   efficiency_ratio (float)     — revenue/burn_rate from Oikos
+    #   floor_tightness (float)      — net floor multiplier (metabolic × somatic)
+    #   somatic_urgency (float)      — urgency from Soma SOMA_TICK / SOMATIC_MODULATION
+    #   somatic_stress_context (bool) — True when urgency >= 0.9
     metabolic_context: dict[str, Any] | None = None
 
     @property

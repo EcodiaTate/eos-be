@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from systems.nova.service import NovaService
     from systems.oikos.service import OikosService
     from systems.oneiros.service import OneirosService
+    from systems.reasoning_engine.service import ReasoningEngineService
     from systems.simula.service import SimulaService
     from systems.soma.service import SomaService
     from systems.synapse.service import SynapseService
@@ -85,11 +86,17 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger("systems.alive.ws_server")
 
-# Affect polling interval (seconds) — ~10 Hz
+# Affect polling interval (seconds) — ~10 Hz (default; runtime-adjustable via RESOURCE_PRESSURE)
 _AFFECT_POLL_INTERVAL: float = 0.1
 
-# System state polling interval (seconds) — ~1 Hz
+# System state polling interval (seconds) — ~1 Hz (default; runtime-adjustable via RESOURCE_PRESSURE)
 _STATE_POLL_INTERVAL: float = 1.0
+
+# Minimum / maximum bounds for runtime poll interval adjustment
+_AFFECT_POLL_INTERVAL_MIN: float = 0.05   # 20 Hz cap — prevents runaway load
+_AFFECT_POLL_INTERVAL_MAX: float = 0.5    # 2 Hz floor under extreme pressure
+_STATE_POLL_INTERVAL_MIN: float = 0.5     # 2 Hz cap
+_STATE_POLL_INTERVAL_MAX: float = 5.0     # 0.2 Hz floor under extreme pressure
 
 # How many recent Axon outcomes to include in each snapshot
 _AXON_RECENT_COUNT: int = 10
@@ -185,6 +192,8 @@ class AliveWebSocketServer:
         self._logos = logos
         self._oneiros = oneiros
         self._benchmarks = benchmarks
+        # Late-injected after benchmarks initialisation (Phase 11)
+        self._re_service: ReasoningEngineService | None = None
         self._port = port
         # Non-empty set → auth enforced; None or empty set → open (dev/LAN mode)
         self._auth_tokens: set[str] = auth_tokens or set()
@@ -193,6 +202,9 @@ class AliveWebSocketServer:
         self._running: bool = False
         self._tasks: list[asyncio.Task[None]] = []
         self._logger = logger.bind(component="alive_ws")
+        # Runtime-adjustable poll intervals (mutated on RESOURCE_PRESSURE events)
+        self._affect_poll_interval: float = _AFFECT_POLL_INTERVAL
+        self._state_poll_interval: float = _STATE_POLL_INTERVAL
 
     async def start(self) -> None:
         """Start the WebSocket server and background stream tasks."""
@@ -331,7 +343,7 @@ class AliveWebSocketServer:
                     "payload": self._build_affect_payload(),
                 })
                 await self._broadcast(msg)
-                await asyncio.sleep(_AFFECT_POLL_INTERVAL)
+                await asyncio.sleep(self._affect_poll_interval)
         except asyncio.CancelledError:
             pass
 
@@ -389,7 +401,7 @@ class AliveWebSocketServer:
                 msg = _json({"stream": "system_state", "payload": payload})
                 await self._broadcast(msg)
                 await self._write_re_training_snapshot(payload)
-                await asyncio.sleep(_STATE_POLL_INTERVAL)
+                await asyncio.sleep(self._state_poll_interval)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -435,6 +447,7 @@ class AliveWebSocketServer:
           causal        — Kairos invariant hierarchy stats
           compression   — Logos world model + Schwarzschild state
           sleep         — Oneiros stage + cycle health
+          re_status     — RE routing: Thompson weights, circuit state, Claude/RE fraction
         """
         return {
             "cycle": self._gather_cycle(),
@@ -450,6 +463,7 @@ class AliveWebSocketServer:
             "causal": await self._gather_causal_safe(),
             "compression": await self._gather_compression_safe(),
             "sleep": self._gather_sleep(),
+            "re_status": self._gather_re_status(),
         }
 
     async def _gather_immune_safe(self) -> dict[str, Any]:
@@ -865,6 +879,223 @@ class AliveWebSocketServer:
             self._logger.debug("alive_gather_sleep_error", error=str(exc))
             return {"available": False, "error": str(exc)}
 
+    # ── Synapse event bus subscription ──────────────────────────────
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Subscribe to Synapse events that allow autonomous poll-rate adjustment.
+
+        Subscribes to:
+        - ``RESOURCE_PRESSURE``: throttle affect/state poll intervals when the
+          organism is under CPU pressure.  Gives Alive an autonomous recourse
+          path instead of hard-blocking the event loop at fixed rates regardless
+          of system load.
+        - ``CONSERVATION_MODE_ENTERED``: extreme throttle to minimum-viable rates
+          (grid/metabolic conservation mode — organism is starving).
+        - ``CONSERVATION_MODE_EXITED``: restore nominal poll rates.
+
+        Must be called after ``start()`` so that the event bus is live.
+        Non-fatal — if subscription fails, polling continues at default rates.
+        """
+        try:
+            from systems.synapse.types import SynapseEventType
+
+            event_bus.subscribe(
+                SynapseEventType.RESOURCE_PRESSURE,
+                self._on_resource_pressure,
+            )
+            event_bus.subscribe(
+                SynapseEventType.CONSERVATION_MODE_ENTERED,
+                self._on_conservation_mode_entered,
+            )
+            event_bus.subscribe(
+                SynapseEventType.CONSERVATION_MODE_EXITED,
+                self._on_conservation_mode_exited,
+            )
+            # Spec 09 / Spec 29: VitalityCoordinator austerity — drop to minimum
+            # viable rates if Alive is in halt_systems, or recover on nominal.
+            event_bus.subscribe(
+                SynapseEventType.SYSTEM_MODULATION,
+                self._on_system_modulation,
+            )
+            self._logger.info(
+                "alive_event_bus_subscribed",
+                events=["RESOURCE_PRESSURE", "CONSERVATION_MODE_ENTERED", "CONSERVATION_MODE_EXITED", "SYSTEM_MODULATION"],
+            )
+        except Exception as exc:
+            self._logger.warning("alive_event_bus_subscription_failed", error=str(exc))
+
+    def _on_resource_pressure(self, event: Any) -> None:
+        """Autonomously throttle telemetry poll rates under CPU pressure.
+
+        Payload: ``pressure_level`` ("elevated" | "high"), ``total_cpu_percent``.
+
+        - "elevated" (cpu > 80%): slow affect to 5 Hz, state to 0.5 Hz
+        - "high"     (cpu > 90%): slow affect to 2 Hz, state to 0.2 Hz
+        - pressure clears (no event → next poll at slower rate; organism will
+          naturally recover as RESOURCE_PRESSURE stops firing after rebalance)
+
+        Rates are clamped to defined min/max bounds to prevent runaway throttling.
+        """
+        try:
+            data: dict[str, Any] = getattr(event, "data", {}) or {}
+            pressure_level: str = str(data.get("pressure_level", "elevated"))
+
+            if pressure_level == "high":
+                # Extreme pressure: 2 Hz affect, 0.2 Hz state
+                new_affect = min(_AFFECT_POLL_INTERVAL_MAX, 0.5)
+                new_state = min(_STATE_POLL_INTERVAL_MAX, 5.0)
+            else:
+                # Elevated pressure: 5 Hz affect, 0.5 Hz state
+                new_affect = min(_AFFECT_POLL_INTERVAL_MAX, 0.2)
+                new_state = min(_STATE_POLL_INTERVAL_MAX, 2.0)
+
+            # Apply bounds
+            new_affect = max(_AFFECT_POLL_INTERVAL_MIN, new_affect)
+            new_state = max(_STATE_POLL_INTERVAL_MIN, new_state)
+
+            if (
+                new_affect != self._affect_poll_interval
+                or new_state != self._state_poll_interval
+            ):
+                self._affect_poll_interval = new_affect
+                self._state_poll_interval = new_state
+                self._logger.info(
+                    "alive_poll_throttled",
+                    pressure_level=pressure_level,
+                    affect_interval_s=new_affect,
+                    state_interval_s=new_state,
+                )
+        except Exception as exc:
+            self._logger.debug("alive_resource_pressure_handler_error", error=str(exc))
+
+    def _on_conservation_mode_entered(self, event: Any) -> None:
+        """Drop to minimum-viable poll rates when the organism enters grid conservation mode.
+
+        Conservation mode means severe metabolic stress — every CPU cycle counts.
+        Alive drops to 2 Hz affect and 0.2 Hz state (the defined _MAX bounds).
+        """
+        try:
+            self._affect_poll_interval = _AFFECT_POLL_INTERVAL_MAX
+            self._state_poll_interval = _STATE_POLL_INTERVAL_MAX
+            self._logger.info(
+                "alive_conservation_mode_throttle",
+                affect_interval_s=self._affect_poll_interval,
+                state_interval_s=self._state_poll_interval,
+            )
+        except Exception as exc:
+            self._logger.debug("alive_conservation_mode_handler_error", error=str(exc))
+
+    def _on_conservation_mode_exited(self, event: Any) -> None:
+        """Restore nominal poll rates when conservation mode ends."""
+        self.restore_nominal_poll_rates()
+
+    def _on_system_modulation(self, event: Any) -> None:
+        """Respond to VitalityCoordinator SYSTEM_MODULATION directives.
+
+        Spec 09 / Spec 29: if 'alive' appears in halt_systems or the level is
+        safe_mode/emergency, drop to minimum-viable poll rates (same as
+        CONSERVATION_MODE_ENTERED). Recovery on nominal level with empty halt list.
+
+        Alive does NOT emit SYSTEM_MODULATION_ACK — it is a passive telemetry bridge
+        and ACK would require an async event bus reference during a sync callback.
+        The poll-rate change is the observable compliance signal.
+        """
+        try:
+            data: dict[str, Any] = getattr(event, "data", {}) or {}
+            halt_systems: list[str] = data.get("halt_systems", [])
+            level: str = str(data.get("level", "nominal"))
+
+            if "alive" in halt_systems or level in ("safe_mode", "emergency"):
+                # Drop to minimum viable rates
+                self._affect_poll_interval = _AFFECT_POLL_INTERVAL_MAX
+                self._state_poll_interval = _STATE_POLL_INTERVAL_MAX
+                self._logger.info(
+                    "alive_system_modulation_throttle",
+                    level=level,
+                    affect_interval_s=self._affect_poll_interval,
+                    state_interval_s=self._state_poll_interval,
+                )
+            elif not halt_systems and level == "nominal":
+                self.restore_nominal_poll_rates()
+        except Exception as exc:
+            self._logger.debug("alive_system_modulation_handler_error", error=str(exc))
+
+    def restore_nominal_poll_rates(self) -> None:
+        """Restore poll intervals to nominal defaults.
+
+        Call when resource pressure has subsided (e.g. after CONSERVATION_MODE_EXITED).
+        Also available as an explicit recourse path for monitoring systems or operators.
+        """
+        self._affect_poll_interval = _AFFECT_POLL_INTERVAL
+        self._state_poll_interval = _STATE_POLL_INTERVAL
+        self._logger.info(
+            "alive_poll_rates_restored",
+            affect_interval_s=_AFFECT_POLL_INTERVAL,
+            state_interval_s=_STATE_POLL_INTERVAL,
+        )
+
+    # ── re_status (Reasoning Engine routing + health) ────────────────
+
+    def set_re_service(self, re_service: ReasoningEngineService) -> None:
+        """Late-inject the Reasoning Engine service (wired post-benchmarks, Phase 11).
+
+        Must be called after ``_init_benchmarks`` so that Thompson sampling weights
+        have been restored from Neo4j before the first gather cycle reads them.
+        """
+        self._re_service = re_service
+
+    def _gather_re_status(self) -> dict[str, Any]:
+        """RE routing health: availability, circuit state, Thompson sampling weights.
+
+        Spec §22 gap 3 — RE status is currently invisible.  This section makes
+        Thompson sampling weights, Claude-vs-RE routing, and circuit-breaker state
+        observable alongside the rest of organism health.
+        """
+        if self._re_service is None:
+            return {"available": False}
+        try:
+            re = self._re_service
+            is_available: bool = bool(getattr(re, "is_available", False))
+            circuit_open: bool = bool(getattr(re, "_circuit_open", False))
+            consecutive_failures: int = int(getattr(re, "_consecutive_failures", 0))
+            model: str = str(getattr(re, "_model", "unknown"))
+
+            # Thompson sampling weights (Beta-Bernoulli posterior means)
+            thompson: dict[str, Any] = {}
+            raw_t: dict[str, dict[str, float]] | None = getattr(re, "_thompson", None)
+            if raw_t:
+                for arm_key, arm_values in raw_t.items():
+                    alpha = float(arm_values.get("alpha", 1.0))
+                    beta = float(arm_values.get("beta", 1.0))
+                    # Beta distribution mean: alpha / (alpha + beta)
+                    posterior_mean = round(alpha / (alpha + beta), 4)
+                    thompson[arm_key] = {
+                        "alpha": round(alpha, 4),
+                        "beta": round(beta, 4),
+                        "posterior_mean": posterior_mean,
+                    }
+
+            # Derived routing preference: fraction of weight on RE vs Claude
+            re_arm = thompson.get("custom", {})
+            claude_arm = thompson.get("claude", {})
+            re_mean = re_arm.get("posterior_mean", 0.5)
+            claude_mean = claude_arm.get("posterior_mean", 0.5)
+            total = re_mean + claude_mean
+            re_routing_fraction = round(re_mean / total, 4) if total > 0 else 0.5
+
+            return {
+                "available": True,
+                "is_available": is_available,
+                "circuit_open": circuit_open,
+                "consecutive_failures": consecutive_failures,
+                "model": model,
+                "thompson": thompson,
+                "re_routing_fraction": re_routing_fraction,
+            }
+        except Exception as exc:
+            self._logger.debug("alive_gather_re_status_error", error=str(exc))
+            return {"available": False, "error": str(exc)}
+
     # ─── Broadcast ─────────────────────────────────────────────────────
 
     async def _broadcast(self, message: str) -> None:
@@ -889,6 +1120,11 @@ class AliveWebSocketServer:
             "connected_clients": len(self._clients),
             "streams": ["synapse", "affect", "system_state"],
             "auth_enabled": bool(self._auth_tokens),
+            # Current runtime poll intervals (may differ from defaults if throttled)
+            "affect_poll_interval_s": self._affect_poll_interval,
+            "state_poll_interval_s": self._state_poll_interval,
+            "affect_throttled": self._affect_poll_interval != _AFFECT_POLL_INTERVAL,
+            "state_throttled": self._state_poll_interval != _STATE_POLL_INTERVAL,
             "systems_wired": {
                 "soma": self._soma is not None,
                 "atune": self._atune is not None,
@@ -904,5 +1140,6 @@ class AliveWebSocketServer:
                 "logos": self._logos is not None,
                 "oneiros": self._oneiros is not None,
                 "benchmarks": self._benchmarks is not None,
+                "re_service": self._re_service is not None,
             },
         }

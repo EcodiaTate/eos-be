@@ -213,7 +213,7 @@ class ErrorSentinel:
                 SynapseEvent(
                     event_type=SynapseEventType.SYSTEM_FAILED,
                     source_system=self._system_id,
-                    data={"incident": incident_data},
+                    data={"system_id": self._system_id, "incident": incident_data},
                 )
             )
 

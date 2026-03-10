@@ -40,6 +40,7 @@ from systems.identity.connector import (
 from systems.identity.genome import IdentityGenomeExtractor
 from systems.identity.identity import IdentitySystem, compute_constitutional_hash
 from systems.identity.manager import CertificateManager
+from systems.identity.persona import PersonaEngine, PersonaProfile
 from systems.identity.totp import (
     TOTPConfig,
     TOTPGenerator,
@@ -84,6 +85,9 @@ __all__ = [
     "IdentitySystem",
     "IdentityGenomeExtractor",
     "compute_constitutional_hash",
+    # Persona (Spec 23 addendum)
+    "PersonaEngine",
+    "PersonaProfile",
     # TOTP (Phase 16h)
     "TOTPConfig",
     "TOTPGenerator",

@@ -117,6 +117,12 @@ class AttentionWeightLearner:
         # rather than "stochastic" for genuinely irreducible domains.
         self._habituation_engine: HabituationEngine | None = None
 
+        # ── LEARNABLE hyperparameters (Evo/Simula can tune) ──
+        self._correlation_window_s: float = _CORRELATION_WINDOW_S
+        self._weight_floor: float = _WEIGHT_FLOOR
+        self._weight_ceiling: float = _WEIGHT_CEILING
+        self._learning_salience_threshold: float = _LEARNING_SALIENCE_THRESHOLD
+
         # Monotonic clock for correlation (seconds since service start)
         self._clock_s: float = 0.0
 
@@ -132,6 +138,47 @@ class AttentionWeightLearner:
         self._changes_since_persist: int = 0
 
         self._logger = logger.bind(component="weight_learner")
+
+    # ── LEARNABLE parameter API (AUTONOMY) ──
+
+    def adjust_param(self, name: str, value: float) -> bool:
+        """Adjust a learning hyperparameter. Called by Evo ADJUST_BUDGET."""
+        if name == "learning_rate":
+            self._learning_rate = max(0.0001, min(0.5, value))
+        elif name == "false_alarm_decay":
+            self._false_alarm_decay = max(0.0001, min(0.1, value))
+        elif name == "correlation_window_s":
+            self._correlation_window_s = max(1.0, min(60.0, value))
+        elif name == "weight_floor":
+            self._weight_floor = max(0.001, min(0.1, value))
+        elif name == "weight_ceiling":
+            self._weight_ceiling = max(0.2, min(1.0, value))
+        elif name == "learning_salience_threshold":
+            self._learning_salience_threshold = max(0.01, min(0.5, value))
+        else:
+            return False
+        logger.info("learner_param_adjusted", name=name, value=round(value, 4))
+        return True
+
+    def get_learnable_params(self) -> dict[str, float]:
+        """Return all learnable learning parameters for introspection."""
+        return {
+            "learning_rate": self._learning_rate,
+            "false_alarm_decay": self._false_alarm_decay,
+            "correlation_window_s": self._correlation_window_s,
+            "weight_floor": self._weight_floor,
+            "weight_ceiling": self._weight_ceiling,
+            "learning_salience_threshold": self._learning_salience_threshold,
+        }
+
+    def export_learnable_params(self) -> dict[str, float]:
+        """Export for genome inheritance."""
+        return self.get_learnable_params()
+
+    def import_learnable_params(self, params: dict[str, float]) -> None:
+        """Import from parent genome."""
+        for name, value in params.items():
+            self.adjust_param(name, value)
 
     def set_habituation_engine(self, engine: HabituationEngine) -> None:
         """
@@ -190,7 +237,7 @@ class AttentionWeightLearner:
             if error.habituated_salience > 0
             else error.precision_weighted_salience
         )
-        if effective_salience < _LEARNING_SALIENCE_THRESHOLD:
+        if effective_salience < self._learning_salience_threshold:
             return
 
         tracked = _TrackedError(
@@ -225,7 +272,7 @@ class AttentionWeightLearner:
             if tracked.resolved:
                 continue
             age = self._clock_s - tracked.timestamp_s
-            if age > _CORRELATION_WINDOW_S:
+            if age > self._correlation_window_s:
                 break
             best = tracked
             break
@@ -238,7 +285,7 @@ class AttentionWeightLearner:
         dominant = best.dominant_type.value
         old_weight = self._weights.get(dominant, 0.0)
         delta = self._learning_rate * update_magnitude * best.salience
-        new_weight = min(old_weight + delta, _WEIGHT_CEILING)
+        new_weight = min(old_weight + delta, self._weight_ceiling)
         self._weights[dominant] = new_weight
         self._reinforcements += 1
 
@@ -275,7 +322,7 @@ class AttentionWeightLearner:
         Returns the list of error types that were decayed.
         """
         decayed_types: list[ErrorType] = []
-        cutoff = self._clock_s - _CORRELATION_WINDOW_S
+        cutoff = self._clock_s - self._correlation_window_s
 
         for tracked in self._recent_errors:
             if tracked.resolved:
@@ -286,7 +333,7 @@ class AttentionWeightLearner:
             tracked.resolved = True
             dominant = tracked.dominant_type.value
             old_weight = self._weights.get(dominant, 0.0)
-            new_weight = max(old_weight - self._false_alarm_decay, _WEIGHT_FLOOR)
+            new_weight = max(old_weight - self._false_alarm_decay, self._weight_floor)
             self._weights[dominant] = new_weight
             self._decays += 1
             self._false_alarms += 1
@@ -325,7 +372,7 @@ class AttentionWeightLearner:
         """
         old = self._weights.get(error_type_key, 0.0)
         self._weights[error_type_key] = max(
-            _WEIGHT_FLOOR, min(_WEIGHT_CEILING, old + delta)
+            self._weight_floor, min(self._weight_ceiling, old + delta)
         )
         self._normalise_weights()
         self._changes_since_persist += 1
@@ -372,8 +419,8 @@ class AttentionWeightLearner:
 
         for key in self._weights:
             self._weights[key] /= total
-            if self._weights[key] < _WEIGHT_FLOOR:
-                self._weights[key] = _WEIGHT_FLOOR
+            if self._weights[key] < self._weight_floor:
+                self._weights[key] = self._weight_floor
 
         # Re-normalise after floor enforcement
         total = sum(self._weights.values())

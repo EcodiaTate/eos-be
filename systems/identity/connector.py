@@ -706,24 +706,28 @@ class PlatformConnector(ABC):
 
     # ─── Event Emission ──────────────────────────────────────────────
 
-    async def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
+    async def _emit_event(self, event_type: "str | SynapseEventType", data: dict[str, Any]) -> None:
         """Emit a Synapse event if the event bus is wired."""
         if self._event_bus is None:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
-            type_map: dict[str, SynapseEventType] = {
-                "connector_authenticated": SynapseEventType.CONNECTOR_AUTHENTICATED,
-                "connector_token_refreshed": SynapseEventType.CONNECTOR_TOKEN_REFRESHED,
-                "connector_token_expired": SynapseEventType.CONNECTOR_TOKEN_EXPIRED,
-                "connector_revoked": SynapseEventType.CONNECTOR_REVOKED,
-                "connector_error": SynapseEventType.CONNECTOR_ERROR,
-                "system_degraded": SynapseEventType.SYSTEM_DEGRADED,
-            }
-            evt_type = type_map.get(event_type)
-            if evt_type is None:
-                return
+            # Accept SynapseEventType enum members directly (bypasses type_map lookup).
+            if isinstance(event_type, SynapseEventType):
+                evt_type: SynapseEventType = event_type
+            else:
+                type_map: dict[str, SynapseEventType] = {
+                    "connector_authenticated": SynapseEventType.CONNECTOR_AUTHENTICATED,
+                    "connector_token_refreshed": SynapseEventType.CONNECTOR_TOKEN_REFRESHED,
+                    "connector_token_expired": SynapseEventType.CONNECTOR_TOKEN_EXPIRED,
+                    "connector_revoked": SynapseEventType.CONNECTOR_REVOKED,
+                    "connector_error": SynapseEventType.CONNECTOR_ERROR,
+                    "system_degraded": SynapseEventType.SYSTEM_DEGRADED,
+                }
+                evt_type = type_map.get(event_type)  # type: ignore[assignment]
+                if evt_type is None:
+                    return
 
             event = SynapseEvent(
                 event_type=evt_type,
@@ -732,7 +736,171 @@ class PlatformConnector(ABC):
             )
             await self._event_bus.emit(event)
         except Exception as exc:
-            self._logger.warning("event_emit_failed", event=event_type, error=str(exc))
+            self._logger.warning("event_emit_failed", event=str(event_type), error=str(exc))
+
+
+# ─── Token Refresh Scheduler ────────────────────────────────────────────
+
+
+class TokenRefreshScheduler:
+    """
+    Background scheduler that proactively refreshes OAuth2 connector tokens
+    before they expire, avoiding on-demand refresh latency during hot paths.
+
+    Checks all registered PlatformConnectors every ``check_interval_seconds``
+    (default 3600s / 1 hour).  For each connector with valid credentials and a
+    stored token that will expire within 24 hours, it calls ``refresh_token()``
+    and emits the appropriate Synapse lifecycle event.
+
+    Uses the same per-platform asyncio.Lock as ``get_access_token()`` so
+    proactive refreshes don't race with inline refreshes.
+
+    Usage::
+
+        scheduler = TokenRefreshScheduler(
+            connectors=identity.get_registered_connectors(),
+            check_interval_seconds=3600,
+            event_bus=synapse.event_bus,
+        )
+        asyncio.ensure_future(scheduler.run())
+    """
+
+    # Refresh when token expires within this window (24 hours).
+    _REFRESH_AHEAD_S: int = 86_400
+
+    def __init__(
+        self,
+        connectors: dict[str, PlatformConnector],
+        check_interval_seconds: int = 3600,
+        event_bus: Any | None = None,
+    ) -> None:
+        self._connectors = connectors
+        self._interval = check_interval_seconds
+        self._event_bus = event_bus
+        self._logger = logger.bind(component="token_refresh_scheduler")
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Wire a Synapse event bus (call after construction if not injected)."""
+        self._event_bus = event_bus
+
+    async def run(self) -> None:
+        """
+        Infinite loop — waits ``check_interval_seconds`` then checks every
+        connector.  Designed to be started via ``supervised_task()``.
+        """
+        import asyncio
+
+        self._logger.info(
+            "token_refresh_scheduler_started",
+            connector_count=len(self._connectors),
+            check_interval_s=self._interval,
+        )
+        while True:
+            await asyncio.sleep(self._interval)
+            await self.check_and_refresh_all()
+
+    async def check_and_refresh_all(self) -> None:
+        """
+        Iterate over all registered connectors and refresh any token whose
+        remaining lifetime is below ``_REFRESH_AHEAD_S``.
+
+        Called by ``run()`` on schedule; also callable directly in tests.
+        """
+        for connector_id, connector in list(self._connectors.items()):
+            try:
+                await self._maybe_refresh(connector_id, connector)
+            except Exception as exc:
+                self._logger.warning(
+                    "token_refresh_scheduler_connector_error",
+                    connector_id=connector_id,
+                    error=str(exc),
+                )
+
+    async def _maybe_refresh(
+        self, connector_id: str, connector: PlatformConnector
+    ) -> None:
+        """Check a single connector and refresh if within the 24h window."""
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        creds = connector.credentials
+        if creds is None or not creds.token_envelope_id:
+            return  # not configured yet
+
+        # Decrypt current token to check remaining lifetime
+        token_set = connector._decrypt_current_tokens()
+        if token_set is None:
+            return  # no sealed envelope loaded
+
+        remaining = token_set.remaining_seconds
+
+        if remaining > self._REFRESH_AHEAD_S:
+            self._logger.debug(
+                "token_refresh_scheduler_skip",
+                connector_id=connector_id,
+                remaining_s=int(remaining),
+            )
+            return
+
+        self._logger.info(
+            "token_refresh_scheduler_refreshing",
+            connector_id=connector_id,
+            remaining_s=int(remaining),
+        )
+
+        # Use the per-platform lock to prevent races with inline refreshes
+        lock = connector._get_refresh_lock()
+        async with lock:
+            # Re-check inside the lock — another path may have already refreshed
+            token_set_after = connector._decrypt_current_tokens()
+            if token_set_after is not None and token_set_after.remaining_seconds > self._REFRESH_AHEAD_S:
+                return
+
+            result = await connector.refresh_token()
+
+        if result.success:
+            self._logger.info(
+                "token_refresh_scheduler_refreshed",
+                connector_id=connector_id,
+                platform_id=connector.platform_id,
+            )
+            if self._event_bus is not None:
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.CONNECTOR_TOKEN_REFRESHED,
+                        source_system="identity",
+                        data={
+                            "connector_id": connector_id,
+                            "platform_id": connector.platform_id,
+                            "source": "proactive_scheduler",
+                        },
+                    ))
+                except Exception as exc:
+                    self._logger.warning(
+                        "token_refresh_scheduler_event_failed", error=str(exc)
+                    )
+        else:
+            self._logger.error(
+                "token_refresh_scheduler_refresh_failed",
+                connector_id=connector_id,
+                platform_id=connector.platform_id,
+                error=result.error,
+            )
+            if self._event_bus is not None:
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.CONNECTOR_TOKEN_EXPIRED,
+                        source_system="identity",
+                        data={
+                            "connector_id": connector_id,
+                            "platform_id": connector.platform_id,
+                            "error": result.error or "proactive_refresh_failed",
+                            "source": "proactive_scheduler",
+                        },
+                    ))
+                except Exception as exc:
+                    self._logger.warning(
+                        "token_refresh_scheduler_alert_failed", error=str(exc)
+                    )
 
 
 # ─── Error Types ────────────────────────────────────────────────────────

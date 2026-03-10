@@ -21,10 +21,11 @@
 
 **Phase B — Divergence and Incentives (complete)**
 - `InstanceDivergenceMeasurer` — five dimensions: domain, structural, attentional, hypothesis, temporal
-- `DivergenceIncentiveEngine` — triangulation weight + divergence pressure → Thymos + Fovea
+- `DivergenceIncentiveEngine` — triangulation weight + divergence pressure → Thymos + Fovea; pressure threshold now read from `NexusConfig.divergence_pressure_threshold` (runtime-adjustable via genome mutation) rather than module-level constant `_PRESSURE_THRESHOLD = 0.4`
 - Periodic `_divergence_loop` (5 min default) background task
 - Evolutionary observable metrics emitted after each divergence cycle (Gap 5 fix)
 - **Oikos metabolic coupling**: `NEXUS_CONVERGENCE_METABOLIC_SIGNAL` emitted after each `receive_fragment()`; convergence → `metabolic_signal="bonus"` (magnitude `convergence_growth_bonus=0.15`); persistent divergence (≥5 consecutive cycles without convergence) → `metabolic_signal="penalty"` (magnitude `-0.10`); `_consecutive_divergence_cycles` counter on `NexusService`
+- `TRIANGULATION_WEIGHT_UPDATE` payload now includes `previous_weight` and `weight_delta` fields (spec §XI compliance)
 
 **Phase C — Speciation (complete)**
 - `SpeciationDetector` — threshold 0.8 triggers `SpeciationEvent`
@@ -51,12 +52,13 @@
 - `restore_full_state()` extended to return 7-tuple (adds fragments, invariants, profiles).
 - Node types added: `(:NexusFragment)`, `(:NexusConvergedInvariant)`, `(:NexusDivergenceProfile)`.
 
-**Synapse subscriptions active:** `WAKE_INITIATED`, `EMPIRICAL_INVARIANT_CONFIRMED`, `SPECIATION_EVENT`, `KAIROS_TIER3_INVARIANT_DISCOVERED`, `FEDERATION_SESSION_STARTED`, `ONEIROS_CONSOLIDATION_COMPLETE`, `EVO_HYPOTHESIS_CONFIRMED`, `INSTANCE_SPAWNED`, `INSTANCE_RETIRED`, `INCIDENT_RESOLVED`, `ONEIROS_THREAT_SCENARIO`
+**Synapse subscriptions active:** `WAKE_INITIATED`, `EMPIRICAL_INVARIANT_CONFIRMED`, `SPECIATION_EVENT`, `KAIROS_TIER3_INVARIANT_DISCOVERED`, `FEDERATION_SESSION_STARTED`, `ONEIROS_CONSOLIDATION_COMPLETE`, `EVO_HYPOTHESIS_CONFIRMED`, `EVO_HYPOTHESIS_REFUTED`, `INSTANCE_SPAWNED`, `INSTANCE_RETIRED`, `INCIDENT_RESOLVED`, `ONEIROS_THREAT_SCENARIO`
 
 **Synapse events emitted:**
-- `NEXUS_CONVERGENCE_METABOLIC_SIGNAL` — payload now includes `convergence_tier` (int, EpistemicLevel of local fragment) and `economic_reward_usd` (float, `convergence_tier × 0.001 USDC`; 0.0 for divergent instances — selection pressure toward sharing)
+- `NEXUS_CONVERGENCE_METABOLIC_SIGNAL` — payload: `convergence_tier`, `economic_reward_usd`, `convergence_score`, `source_diversity`, `wl1_used`, `fragment_a/b_id`, `metabolic_signal` ("bonus"/"penalty"), `magnitude`, `consecutive_divergence_cycles`. **Subscribers: Oikos** (credits reward + triggers yield deployment signal at tier ≥ 2). **Benchmarks** indirectly via REVENUE_INJECTED re-broadcast.
+- `NEXUS_EPISTEMIC_VALUE` — emitted 2× per divergence cycle. Payload is `EvolutionaryObservable.model_dump()`: `observable_type` ("federation_mean_divergence" | "speciation_event_count" | "epistemic_promotion_rate" | "local_epistemic_state"), `value`, `metadata` (counts, triangulation_weight). **Subscriber: Benchmarks** — `_on_nexus_epistemic_value` accumulates per-type rolling totals; on `local_epistemic_state` (end-of-cycle sentinel) emits `DOMAIN_KPI_SNAPSHOT` with `domain="nexus_epistemic"`, `epistemic_value_per_cycle`, `schema_quality_trend`, and full per-type means.
 - `WORLD_MODEL_FRAGMENT_SHARE` — emitted per share with IIEP session context: `session_id`, `convergence_round`, full fragment metadata
-- `NEXUS_CERTIFIED_FOR_FEDERATION` — emitted immediately after `ONEIROS_CONSOLIDATION_COMPLETE` when schemas are sleep-certified; triggers IIEP session for immediate fragment sharing without waiting for next `WAKE_INITIATED`
+- `NEXUS_CERTIFIED_FOR_FEDERATION` — emitted immediately after `ONEIROS_CONSOLIDATION_COMPLETE` when schemas are sleep-certified. Payload: `instance_id`, `schema_ids`, `consolidation_cycle_id`, `certified_fragment_count`. **Subscriber: Federation** — `_on_nexus_certified_for_federation` marks schemas as sleep-certified, emits `FEDERATION_KNOWLEDGE_SHARED`, and fires per-link fragment shares to COLLEAGUE+ peers.
 - `DIVERGENCE_PRESSURE` — also emitted when `ONEIROS_THREAT_SCENARIO` reveals epistemic instability (convergence_score ≥ 0.4 against adversarial world state)
 
 **Adapters available:** `LogosWorldModelAdapter`, `EvoHypothesisSourceAdapter`, `ThymosNexusSinkAdapter`, `KairosCausalSourceAdapter`
@@ -77,11 +79,29 @@
 
 **Fix 2** — New `_emit_local_epistemic_value()` method emits `NEXUS_EPISTEMIC_VALUE` from local fragment state regardless of peer count. Payload includes: `local_fragment_count`, `remote_fragment_count`, `convergence_count`, `speciation_count`, `ground_truth_count`, `triangulation_weight`. Fires every 5 minutes (divergence loop interval).
 
+## Autonomy Audit Fixes (8 Mar 2026)
+
+**CRITICAL — Dead wiring resolved:**
+- `nexus.set_neo4j(infra.neo4j)` now called in `core/registry.py` (post-init wiring block after Kairos). Previously: all `NexusPersistence` calls silently no-ops because `self._persistence` was always `None`. All Neo4j writes (speciation events, epistemic promotions, fragments, bridge survivors, converged invariants, divergence profiles) now actually persist.
+- `nexus.set_kairos(KairosCausalSourceAdapter(kairos))` now called in same block. Previously: `sync_kairos_tier3()` always returned 0 and the bidirectional Kairos↔Nexus Tier 3 invariant loop was fully broken.
+
+**Bug fix — AttributeError on TriangulationMetadata:**
+- `TriangulationMetadata` had no `source_diversity` attribute (only `source_diversity_score`). Service accessed `fragment.triangulation.source_diversity` in `get_divergence_weighted_fragments()`, `_emit_re_training_example()`, and `_emit_local_epistemic_value()`. Fixed by adding `source_diversity` as an alias property.
+
+**Static threshold → runtime-adjustable:**
+- `DivergenceIncentiveEngine` hardcoded pressure threshold to `_PRESSURE_THRESHOLD = 0.4` module constant. Now reads `NexusConfig.divergence_pressure_threshold` (default 0.4) so it can be adjusted at runtime via genome mutation.
+
+**Invisible telemetry fixed:**
+- `TRIANGULATION_WEIGHT_UPDATE` now includes `previous_weight` and `weight_delta` fields (spec §XI).
+- `INCIDENT_RESOLVED` handler now actually discounts triangulation confidence (×0.8) on fragments from the affected source system, then emits `DIVERGENCE_PRESSURE` to notify the bus. Previously the handler only logged.
+
+---
+
 ## Known Issues / Remaining
 
 1. **No RE integration (partial)** — Level 3/4 fragments emit RE training examples but are not routed to the RE training queue. Nexus is supposed to be the organism's long-term curriculum designer for the Reasoning Engine (Spec §XII). Queue routing not yet implemented. RE inference server not running.
 
-2. **No Benchmarks integration (partial)** — Evolutionary observables emitted via `NEXUS_EPISTEMIC_VALUE` but not yet consumed by Benchmarks system. Bedau-Packard metric computation lives in Benchmarks.
+2. ~~**No Benchmarks integration (partial)**~~ — **RESOLVED (8 Mar 2026)**: Benchmarks now subscribes to `NEXUS_EPISTEMIC_VALUE`. Handler `_on_nexus_epistemic_value` accumulates per-observable-type rolling totals; on `local_epistemic_state` sentinel emits `DOMAIN_KPI_SNAPSHOT` (domain=nexus_epistemic) with `epistemic_value_per_cycle` and `schema_quality_trend`.
 
 3. **Sleep certification partially event-driven** — `ONEIROS_CONSOLIDATION_COMPLETE` handler does per-schema certification when `schema_ids` is in the event payload. Falls back to blanket certification via `WAKE_INITIATED` for backward compatibility. Full per-schema cert requires Oneiros to populate `schema_ids`.
 
@@ -89,7 +109,7 @@
 
 5. **Mitosis coupling (partial)** — `get_divergence_weighted_fragments()` exposed for genome inheritance. Not yet consumed by Mitosis — requires Mitosis to call during division.
 
-6. **Oikos coupling (partial)** — `get_epistemic_metabolic_value()` exposed + `NEXUS_EPISTEMIC_VALUE` events emitted. `economic_reward_usd` now in `NEXUS_CONVERGENCE_METABOLIC_SIGNAL` but Oikos must subscribe and route payment. Oikos also needs to subscribe and integrate into metabolic accounting.
+6. ~~**Oikos coupling (partial)**~~ — **RESOLVED (8 Mar 2026)**: Oikos already subscribes to `NEXUS_CONVERGENCE_METABOLIC_SIGNAL` (NEXUS-ECON-1: credits `economic_reward_usd` to reserves + re-broadcasts as `REVENUE_INJECTED`). Extended (NEXUS-ECON-2): at convergence_tier ≥ 2, triggers a `YIELD_DEPLOYMENT_REQUEST` (5% of liquid_balance, 10–100 USDC) after metabolic gate check (YIELD priority). Logs to economic episode. Federation also now subscribes to `NEXUS_CERTIFIED_FOR_FEDERATION` (see #10 for IIEP unwrap gap).
 
 7. **RE as ConvergenceDetector backend** — `ConvergenceDetector` still uses heuristic graph comparison. RE should be the inference backend for structural isomorphism (Spec §XII point 2). Blocked until RE inference server is live.
 

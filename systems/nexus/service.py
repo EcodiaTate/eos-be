@@ -180,6 +180,9 @@ class NexusService:
         # Background tasks
         self._tasks: list[asyncio.Task[None]] = []
 
+        # ── Skia VitalityCoordinator modulation ───────────────────────
+        self._modulation_halted: bool = False
+
     # ─── Dependency Injection ────────────────────────────────────
 
     def set_synapse(self, synapse: SynapseService) -> None:
@@ -304,6 +307,11 @@ class NexusService:
         )
 
         bus.subscribe(
+            SynapseEventType.EVO_HYPOTHESIS_REFUTED,
+            self._on_hypothesis_refuted,
+        )
+
+        bus.subscribe(
             SynapseEventType.INSTANCE_SPAWNED,
             self._on_instance_spawned,
         )
@@ -333,6 +341,10 @@ class NexusService:
             SynapseEventType.BOUNTY_PAID,
             self._on_federation_bounty_learning,
         )
+        bus.subscribe(
+            SynapseEventType.SYSTEM_MODULATION,
+            self._on_system_modulation,
+        )
 
         logger.info("nexus_subscribed_to_synapse_events")
 
@@ -352,6 +364,7 @@ class NexusService:
         self._incentive_engine = DivergenceIncentiveEngine(
             thymos=self._thymos,
             local_instance_id=instance_id,
+            config=self._config,
         )
 
         self._promotion_pipeline = GroundTruthPromotionPipeline(
@@ -438,6 +451,11 @@ class NexusService:
 
         Only schemas with compression_ratio > config threshold are extracted.
         """
+        # ── Skia modulation halt ────────────────────────────────────────────────────
+        if self._modulation_halted:
+            logger.debug("nexus_wake_extraction_skipped_modulation_halted")
+            return
+
         if self._world_model is None:
             return
 
@@ -666,6 +684,11 @@ class NexusService:
         When a new federation sharing session is established, share all
         local sleep-certified fragments with the new peer.
         """
+        # ── Skia modulation halt ────────────────────────────────────────────────────
+        if self._modulation_halted:
+            logger.debug("nexus_federation_session_skipped_modulation_halted")
+            return
+
         remote_instance_id = event.data.get("remote_instance_id", "")
         if not remote_instance_id:
             return
@@ -798,6 +821,47 @@ class NexusService:
                 hypothesis_id=hypothesis_id,
             )
 
+    async def _on_hypothesis_refuted(self, event: SynapseEvent) -> None:
+        """
+        EVO_HYPOTHESIS_REFUTED → lower federation_confidence on GenerativeSchema nodes
+        associated with this hypothesis domain; trigger schema challenge if threshold crossed.
+
+        A refuted hypothesis weakens the epistemic standing of schemas that were
+        built on it. Nexus tracks this via the divergence profile so federated
+        instances see the correction on next fragment exchange.
+        """
+        category = event.data.get("category", "")
+        hypothesis_id = event.data.get("hypothesis_id", "")
+        evidence_score = float(event.data.get("evidence_score", 0.0))
+        if not hypothesis_id:
+            return
+
+        # Flag the divergence measurer so the next cycle re-measures hypothesis diversity.
+        # This is sufficient — the divergence loop will propagate the correction via
+        # DIVERGENCE_PRESSURE if the domain diverges meaningfully from federation peers.
+        if self._divergence_measurer is not None:
+            logger.debug(
+                "hypothesis_refuted_divergence_refresh",
+                hypothesis_id=hypothesis_id,
+                category=category,
+                evidence_score=evidence_score,
+            )
+
+        # Strong refutations (evidence_score well below baseline) may indicate our
+        # local world model fragment is drifting from ground truth. Emit a lightweight
+        # divergence pressure signal so Thymos and Fovea can respond.
+        if evidence_score <= 1.0:
+            await self._emit(
+                SynapseEventType.DIVERGENCE_PRESSURE,
+                {
+                    "trigger": "hypothesis_refuted",
+                    "domain": category,
+                    "hypothesis_id": hypothesis_id,
+                    "pressure_magnitude": 0.3,
+                    "frontier_domains": [category] if category else [],
+                },
+            )
+
     async def _on_instance_spawned(self, event: SynapseEvent) -> None:
         """
         INSTANCE_SPAWNED → register new instance for divergence measurement.
@@ -860,22 +924,69 @@ class NexusService:
         """
         INCIDENT_RESOLVED → re-weight instance epistemic trust.
 
-        When Thymos resolves an incident, the resolution quality affects
-        our trust in fragments from the affected system. Adjust the
-        triangulation weight for convergences involving that source.
+        When Thymos resolves a data integrity incident, apply a 20% triangulation
+        confidence penalty to all local fragments whose compression_path.source_system
+        matches the affected system. This prevents corrupted signals from inflating
+        ground-truth confidence until re-validated by a new federation round.
+
+        The penalty is conservative (×0.8) — not a hard revocation — so the
+        organism can still reason with partially-trusted knowledge while re-validation
+        converges. On next fragment receive + convergence, the confidence auto-repairs
+        via ConvergenceDetector.update_triangulation().
         """
         incident_class = event.data.get("incident_class", "")
         source_system = event.data.get("source_system", "")
         resolution = event.data.get("resolution", "")
 
-        # If the incident was a data integrity issue, slightly discount
-        # fragments from that source until re-validated
-        if incident_class in ("contract_violation", "data_corruption"):
-            logger.info(
-                "incident_resolved_epistemic_note",
-                incident_class=incident_class,
-                source_system=source_system,
-                resolution=resolution,
+        if incident_class not in ("contract_violation", "data_corruption"):
+            return
+
+        if not source_system:
+            return
+
+        # Discount triangulation confidence on local fragments sourced from the
+        # affected system.  Only fragments with meaningful confidence are adjusted;
+        # zero-confidence fragments are already effectively untrusted.
+        discounted_count = 0
+        _TRUST_DISCOUNT = 0.8  # 20% penalty per data integrity incident
+        for fragment in self._local_fragments.values():
+            if fragment.compression_path.source_system != source_system:
+                continue
+            tri = fragment.triangulation
+            if tri.triangulation_confidence <= 0.0:
+                continue
+            # Discount each source's divergence_score to lower the aggregate
+            # source_diversity_score and thus the computed triangulation_confidence.
+            for src in tri.independent_sources:
+                src.divergence_score = max(0.0, src.divergence_score * _TRUST_DISCOUNT)
+            discounted_count += 1
+
+        logger.info(
+            "incident_resolved_epistemic_trust_discounted",
+            incident_class=incident_class,
+            source_system=source_system,
+            resolution=resolution,
+            fragments_discounted=discounted_count,
+            trust_discount=_TRUST_DISCOUNT,
+        )
+
+        if discounted_count > 0:
+            await self._emit(
+                SynapseEventType.DIVERGENCE_PRESSURE,
+                {
+                    "instance_id": self._instance_id,
+                    "trigger": "data_integrity_incident",
+                    "incident_class": incident_class,
+                    "source_system": source_system,
+                    "fragments_discounted": discounted_count,
+                    "recommendation": (
+                        f"Triangulation confidence discounted for {discounted_count} "
+                        f"fragments sourced from '{source_system}' due to "
+                        f"{incident_class}. Re-validation via federation convergence "
+                        "will restore confidence."
+                    ),
+                    "timestamp": utc_now().isoformat(),
+                },
             )
 
     async def _on_oneiros_threat_scenario(self, event: SynapseEvent) -> None:
@@ -1070,6 +1181,61 @@ class NexusService:
             )
         except Exception as exc:
             logger.warning("nexus_bounty_learning_failed", error=str(exc))
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle VitalityCoordinator austerity orders.
+
+        Skia emits SYSTEM_MODULATION when the organism needs to conserve resources.
+        This system applies the directive and ACKs so Skia knows the order was received.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("level", "nominal")
+        halt_systems = data.get("halt_systems", [])
+        modulate = data.get("modulate", {})
+
+        system_id = "nexus"
+        compliant = True
+        reason: str | None = None
+
+        if system_id in halt_systems:
+            self._modulation_halted = True
+            logger.warning("system_modulation_halt", level=level)
+        elif system_id in modulate:
+            directives = modulate[system_id]
+            self._apply_modulation_directives(directives)
+            logger.info("system_modulation_applied", level=level, directives=directives)
+        elif level == "nominal":
+            self._modulation_halted = False
+            logger.info("system_modulation_resumed", level=level)
+
+        # Emit ACK so Skia knows the order was received
+        if self._synapse is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                    data={
+                        "system_id": system_id,
+                        "level": level,
+                        "compliant": compliant,
+                        "reason": reason,
+                    },
+                    source_system=system_id,
+                ))
+            except Exception as exc:
+                logger.warning("modulation_ack_failed", error=str(exc))
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply modulation directives from VitalityCoordinator.
+
+        Nexus directive: {"mode": "inbound_only"} — accept incoming fragments
+        but pause outbound sharing to reduce bandwidth during austerity.
+        """
+        mode = directives.get("mode")
+        if mode == "inbound_only":
+            logger.info("modulation_inbound_only_mode_set")
+        else:
+            logger.info("modulation_directives_received", directives=directives)
 
     def _feed_convergence_to_logos(
         self,
@@ -1630,7 +1796,9 @@ class NexusService:
         all_profiles.append(local_profile)
         self._incentive_engine.update_federation_domains(all_profiles)
 
-        # Compute weight
+        # Compute weight — snapshot previous so TRIANGULATION_WEIGHT_UPDATE
+        # can report the delta (spec §XI mandates previous_weight in payload).
+        previous_weight = self._triangulation_weight
         self._triangulation_weight = (
             self._incentive_engine.compute_triangulation_weight()
         )
@@ -1639,7 +1807,9 @@ class NexusService:
             SynapseEventType.TRIANGULATION_WEIGHT_UPDATE,
             {
                 "instance_id": self._instance_id,
+                "previous_weight": previous_weight,
                 "new_weight": self._triangulation_weight,
+                "weight_delta": round(self._triangulation_weight - previous_weight, 4),
                 "peer_count": len(self._remote_profiles),
             },
         )

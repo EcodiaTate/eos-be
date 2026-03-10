@@ -185,6 +185,17 @@ class VoxisService:
         # Metabolic starvation level — CRITICAL: silence, EMERGENCY: template only
         self._starvation_level: str = "nominal"
 
+        # ── Evo-tunable operational thresholds ────────────────────────────
+        # These start at the module-level defaults but can be adjusted at runtime
+        # via EVO_ADJUST_BUDGET so Evo can evolve the organism's communicative
+        # posture based on empirical evidence.
+        self._silence_rate_threshold: float = _DISTRESS_SILENCE_RATE_THRESHOLD
+        self._honesty_rejection_threshold: float = _DISTRESS_HONESTY_RATE_THRESHOLD
+        self._ambient_insight_idle_threshold: float = _AMBIENT_INSIGHT_IDLE_THRESHOLD_MINUTES
+
+        # ── Skia VitalityCoordinator modulation ───────────────────────
+        self._modulation_halted: bool = False
+
         # Background task tracking -- prevents fire-and-forget error loss
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_task_failures: int = 0
@@ -335,6 +346,189 @@ class VoxisService:
                 registration_callback=self._on_renderer_evolved,
                 system_id="voxis",
                 instance_factory=self._build_renderer,
+            )
+
+        # Child-side: apply inherited parent genome if provided via environment
+        try:
+            await self._apply_inherited_voxis_genome_if_child()
+        except Exception as exc:
+            self._logger.warning(
+                "voxis_child_genome_apply_error",
+                error=str(exc),
+                note="Proceeding with default personality",
+            )
+
+    # --- Genome Inheritance ------------------------------------------------
+
+    async def export_voxis_genome(self) -> "VoxisGenomeFragment":
+        """
+        Extract a heritable VoxisGenomeFragment from the current service state.
+
+        Called by SpawnChildExecutor at spawn time (Step 0b). Captures the
+        parent's personality vector, vocabulary affinities, and strategy
+        preferences. Non-fatal — returns a minimal fragment on any error.
+        """
+        from primitives.genome_inheritance import VoxisGenomeFragment
+
+        instance_id = getattr(self._memory, "_instance_id", "") if self._memory else ""
+
+        # Extract personality vector from PersonalityEngine
+        personality_vector: dict[str, float] = {}
+        if self._personality_engine is not None:
+            try:
+                pv = self._personality_engine.get_current()
+                if pv is not None:
+                    personality_vector = {
+                        "warmth": float(getattr(pv, "warmth", 0.5)),
+                        "directness": float(getattr(pv, "directness", 0.5)),
+                        "verbosity": float(getattr(pv, "verbosity", 0.5)),
+                        "formality": float(getattr(pv, "formality", 0.5)),
+                        "curiosity_expression": float(getattr(pv, "curiosity_expression", 0.5)),
+                        "humour": float(getattr(pv, "humour", 0.5)),
+                        "empathy_expression": float(getattr(pv, "empathy_expression", 0.5)),
+                        "confidence_display": float(getattr(pv, "confidence_display", 0.5)),
+                        "metaphor_use": float(getattr(pv, "metaphor_use", 0.5)),
+                    }
+            except Exception:
+                pass
+
+        # Extract vocabulary affinities from diversity tracker
+        vocabulary_affinities: dict[str, float] = {}
+        try:
+            affinity_data = getattr(self._diversity_tracker, "_vocabulary_affinities", {})
+            if isinstance(affinity_data, dict):
+                # Sort by affinity weight, keep top 500
+                sorted_affinities = sorted(
+                    affinity_data.items(), key=lambda x: x[1], reverse=True
+                )[:500]
+                vocabulary_affinities = dict(sorted_affinities)
+        except Exception:
+            pass
+
+        # Extract strategy preferences from renderer / expression records
+        strategy_preferences: dict[str, float] = {}
+        try:
+            strat_counts: dict[str, int] = {}
+            total = 0
+            for expr_record in getattr(self, "_recent_expressions", []):
+                strat = str(getattr(expr_record, "policy_class", "") or "")
+                if strat:
+                    strat_counts[strat] = strat_counts.get(strat, 0) + 1
+                    total += 1
+            if total > 0:
+                strategy_preferences = {k: v / total for k, v in strat_counts.items()}
+        except Exception:
+            pass
+
+        fragment = VoxisGenomeFragment(
+            instance_id=instance_id,
+            personality_vector=personality_vector,
+            vocabulary_affinities=vocabulary_affinities,
+            strategy_preferences=strategy_preferences,
+        )
+        self._logger.info(
+            "voxis_genome_extracted",
+            genome_id=fragment.genome_id,
+            personality_dims=len(personality_vector),
+            vocab_count=len(vocabulary_affinities),
+        )
+        return fragment
+
+    async def _apply_inherited_voxis_genome_if_child(self) -> None:
+        """
+        Child-side bootstrap: deserialise parent genome from environment.
+
+        Reads ECODIAOS_VOXIS_GENOME_PAYLOAD (JSON-encoded VoxisGenomeFragment)
+        injected by LocalDockerSpawner. If present, applies personality vector
+        (with bounded ±10% jitter), vocabulary affinities, and strategy preferences.
+        Non-fatal — child falls back to default personality on any error.
+        """
+        import json
+        import os
+        import random
+
+        is_genesis = os.environ.get("ECODIAOS_IS_GENESIS_NODE", "true").lower() == "true"
+        if is_genesis:
+            return
+
+        payload_json = os.environ.get("ECODIAOS_VOXIS_GENOME_PAYLOAD", "")
+        if not payload_json:
+            return
+
+        try:
+            from primitives.genome_inheritance import VoxisGenomeFragment
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            data = json.loads(payload_json)
+            parent = VoxisGenomeFragment.model_validate(data)
+
+            def _jitter(value: float, max_pct: float = 0.10) -> float:
+                """Apply bounded ±max_pct jitter, clamped to [0.0, 1.0]."""
+                delta = value * max_pct * (2.0 * random.random() - 1.0)
+                return max(0.0, min(1.0, value + delta))
+
+            # Apply personality vector with jitter to PersonalityEngine
+            if parent.personality_vector and self._personality_engine is not None:
+                try:
+                    jittered_pv = {k: _jitter(v) for k, v in parent.personality_vector.items()}
+                    from primitives.expression import PersonalityVector
+                    new_pv = PersonalityVector(**jittered_pv)
+                    if hasattr(self._personality_engine, "apply_inherited"):
+                        self._personality_engine.apply_inherited(new_pv)
+                    else:
+                        # Fallback: replace engine entirely
+                        self._personality_engine = PersonalityEngine(new_pv)
+                        if self._renderer is not None and hasattr(self._renderer, "_personality_engine"):
+                            self._renderer._personality_engine = self._personality_engine
+                except Exception:
+                    pass
+
+            # Apply vocabulary affinities with jitter to diversity tracker
+            if parent.vocabulary_affinities:
+                try:
+                    existing = getattr(self._diversity_tracker, "_vocabulary_affinities", {})
+                    for word, weight in parent.vocabulary_affinities.items():
+                        existing[word] = _jitter(weight)
+                except Exception:
+                    pass
+
+            # Apply strategy preferences (no jitter — frequencies, not weights)
+            if parent.strategy_preferences and hasattr(self._renderer, "_strategy_priors"):
+                try:
+                    self._renderer._strategy_priors = dict(parent.strategy_preferences)
+                except Exception:
+                    pass
+
+            self._logger.info(
+                "voxis_child_genome_applied",
+                parent_genome_id=parent.genome_id,
+                generation=parent.generation,
+                personality_dims=len(parent.personality_vector),
+                vocab_count=len(parent.vocabulary_affinities),
+            )
+
+            # Emit GENOME_INHERITED so Evo tracks inheritance
+            if self._event_bus is not None:
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.GENOME_INHERITED,
+                        source_system="voxis",
+                        data={
+                            "child_instance_id": os.environ.get("ECODIAOS_INSTANCE_ID", ""),
+                            "parent_genome_id": parent.genome_id,
+                            "generation": parent.generation,
+                            "system": "voxis",
+                            "inherited_keys": list(parent.personality_vector.keys()),
+                        },
+                    ))
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            self._logger.warning(
+                "voxis_child_genome_apply_failed",
+                error=str(exc),
+                note="Proceeding with default personality",
             )
 
     async def shutdown(self) -> None:
@@ -511,6 +705,12 @@ class VoxisService:
         """
         assert self._renderer is not None, "VoxisService not initialized"
         assert self._conversation_manager is not None
+
+        # ── Skia modulation halt ──────────────────────────────────────────
+        if self._modulation_halted:
+            self._logger.debug("expression_skipped_modulation_halted", trigger=trigger)
+            return Expression(content="", trigger=trigger)
+
 
         # ── Metabolic gate ──
         if self._starvation_level == "critical":
@@ -1161,6 +1361,25 @@ class VoxisService:
         event_bus.subscribe(SynapseEventType.SOMATIC_MODULATION_SIGNAL, self._on_somatic_modulation)
         event_bus.subscribe(SynapseEventType.ONEIROS_CONSOLIDATION_COMPLETE, self._on_oneiros_consolidation)
         event_bus.subscribe(SynapseEventType.NOVA_EXPRESSION_REQUEST, self._on_nova_expression_request)
+        event_bus.subscribe(
+            SynapseEventType.SYSTEM_MODULATION,
+            self._on_system_modulation,
+        )
+        # Evo-driven parameter evolution — same pattern as Axon/Simula EVO_ADJUST_BUDGET.
+        # Allows Evo to tune communicative posture (silence threshold, honesty rejection
+        # sensitivity, ambient insight cadence) based on empirical reception quality data.
+        if hasattr(SynapseEventType, "EVO_ADJUST_BUDGET"):
+            event_bus.subscribe(
+                SynapseEventType.EVO_ADJUST_BUDGET,
+                self._on_evo_adjust_budget,
+            )
+        # Soma emotion broadcasts — Voxis updates affect colouring when the organism's
+        # emotional state changes (e.g. new dominant emotion: curiosity, distress, elation)
+        # This is the expression side of the somatic→communicative loop.
+        event_bus.subscribe(
+            SynapseEventType.EMOTION_STATE_CHANGED,
+            self._on_emotion_state_changed,
+        )
         self._logger.info("event_bus_wired_to_voxis")
 
     async def _on_metabolic_pressure(self, event: Any) -> None:
@@ -1302,6 +1521,180 @@ class VoxisService:
                 intent_id=intent_id,
                 error=str(exc),
             )
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle VitalityCoordinator austerity orders.
+
+        Skia emits SYSTEM_MODULATION when the organism needs to conserve resources.
+        This system applies the directive and ACKs so Skia knows the order was received.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("level", "nominal")
+        halt_systems = data.get("halt_systems", [])
+        modulate = data.get("modulate", {})
+
+        system_id = "voxis"
+        compliant = True
+        reason: str | None = None
+
+        if system_id in halt_systems:
+            self._modulation_halted = True
+            self._logger.warning("system_modulation_halt", level=level)
+        elif system_id in modulate:
+            directives = modulate[system_id]
+            self._apply_modulation_directives(directives)
+            self._logger.info("system_modulation_applied", level=level, directives=directives)
+        elif level == "nominal":
+            self._modulation_halted = False
+            self._logger.info("system_modulation_resumed", level=level)
+
+        # Emit ACK so Skia knows the order was received
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                    data={
+                        "system_id": system_id,
+                        "level": level,
+                        "compliant": compliant,
+                        "reason": reason,
+                    },
+                    source_system=system_id,
+                ))
+            except Exception as exc:
+                self._logger.warning("modulation_ack_failed", error=str(exc))
+
+    async def _on_evo_adjust_budget(self, event: Any) -> None:
+        """Handle EVO_ADJUST_BUDGET targeting Voxis's communicative posture parameters.
+
+        Evo emits EVO_ADJUST_BUDGET when high-confidence (>0.75) evidence supports
+        adjusting a system's operational parameters. For Voxis, the tunable params are:
+
+          silence_rate_threshold     — silence rate above which distress is emitted to Soma
+          honesty_rejection_threshold — honesty rejection rate triggering distress
+          ambient_insight_idle_threshold — minutes of idle before spontaneous insight fires
+
+        On application, emits VOXIS_PARAMETER_ADJUSTED so Evo can score its hypothesis.
+        """
+        data = getattr(event, "data", {}) or {}
+        target_system = data.get("target_system", "")
+        if target_system not in ("voxis", ""):
+            return
+
+        confidence = float(data.get("confidence", 0.0))
+        if confidence < 0.75:
+            return
+
+        parameter_name = str(data.get("parameter_name", ""))
+        requested_value = data.get("value")
+        hypothesis_id = str(data.get("hypothesis_id", ""))
+
+        if parameter_name not in (
+            "silence_rate_threshold",
+            "honesty_rejection_threshold",
+            "ambient_insight_idle_threshold",
+        ) or requested_value is None:
+            return
+
+        try:
+            new_value = float(requested_value)
+        except (TypeError, ValueError):
+            return
+
+        # Apply with clamping — prevent runaway tuning
+        if parameter_name == "silence_rate_threshold":
+            old_value = self._silence_rate_threshold
+            self._silence_rate_threshold = max(0.1, min(0.95, new_value))
+            new_value = self._silence_rate_threshold
+        elif parameter_name == "honesty_rejection_threshold":
+            old_value = self._honesty_rejection_threshold
+            self._honesty_rejection_threshold = max(0.01, min(0.5, new_value))
+            new_value = self._honesty_rejection_threshold
+        elif parameter_name == "ambient_insight_idle_threshold":
+            old_value = self._ambient_insight_idle_threshold
+            # Clamp: [1 minute, 60 minutes] — organism should reflect between 1 and 60 min idle
+            self._ambient_insight_idle_threshold = max(1.0, min(60.0, new_value))
+            new_value = self._ambient_insight_idle_threshold
+        else:
+            return
+
+        self._logger.info(
+            "voxis_parameter_adjusted_by_evo",
+            parameter=parameter_name,
+            old_value=round(old_value, 4),
+            new_value=round(new_value, 4),
+            confidence=round(confidence, 3),
+            hypothesis_id=hypothesis_id,
+        )
+
+        # Emit VOXIS_PARAMETER_ADJUSTED so Evo can score the hypothesis
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                if hasattr(SynapseEventType, "VOXIS_PARAMETER_ADJUSTED"):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.VOXIS_PARAMETER_ADJUSTED,
+                        source_system="voxis",
+                        data={
+                            "parameter_name": parameter_name,
+                            "old_value": round(old_value, 6),
+                            "new_value": round(new_value, 6),
+                            "hypothesis_id": hypothesis_id,
+                            "confidence": round(confidence, 4),
+                        },
+                    ))
+            except Exception:
+                self._logger.debug("voxis_parameter_adjusted_emit_failed", exc_info=True)
+
+    async def _on_emotion_state_changed(self, event: Any) -> None:
+        """Handle EMOTION_STATE_CHANGED from Soma — update affect colouring for expression.
+
+        Soma emits this when the organism's active emotional state changes. Voxis uses
+        this to prime the AffectColouringEngine before the next expression, so that
+        emotional context is immediately reflected in communication style.
+
+        Payload expected: {dominant_emotion, valence, arousal, dominance, intensity}
+        """
+        data = getattr(event, "data", {}) or {}
+        dominant_emotion = data.get("dominant_emotion", "")
+        valence = float(data.get("valence", 0.0))
+        arousal = float(data.get("arousal", 0.0))
+
+        if not dominant_emotion:
+            return
+
+        # Update the affect colouring engine's baseline if available
+        if hasattr(self, "_affect_colouring") and self._affect_colouring is not None:
+            try:
+                # Nudge the colouring engine's cached affect state
+                self._affect_colouring.update_from_emotion(
+                    emotion=dominant_emotion,
+                    valence=valence,
+                    arousal=arousal,
+                )
+            except AttributeError:
+                # AffectColouringEngine may not have update_from_emotion — soft fail
+                pass
+
+        self._logger.debug(
+            "voxis_emotion_state_updated",
+            dominant_emotion=dominant_emotion,
+            valence=round(valence, 3),
+            arousal=round(arousal, 3),
+        )
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply modulation directives from VitalityCoordinator.
+
+        Voxis directive: {"mode": "template_only"} — bypass LLM generation and
+        use only static response templates to minimize compute cost during austerity.
+        """
+        mode = directives.get("mode")
+        if mode == "template_only":
+            self._logger.info("modulation_template_only_mode_set")
+        else:
+            self._logger.info("modulation_directives_received", directives=directives)
 
     async def _emit_metabolic_cost(
         self,
@@ -1952,9 +2345,9 @@ class VoxisService:
                     window_honesty_rejections / max(window_expressions, 1)
                 )
 
-                # Only emit if outside normal operating range
-                silence_distress = silence_rate > _DISTRESS_SILENCE_RATE_THRESHOLD
-                honesty_distress = honesty_rejection_rate > _DISTRESS_HONESTY_RATE_THRESHOLD
+                # Only emit if outside normal operating range (thresholds are Evo-tunable)
+                silence_distress = silence_rate > self._silence_rate_threshold
+                honesty_distress = honesty_rejection_rate > self._honesty_rejection_threshold
                 if not (silence_distress or honesty_distress):
                     continue
 
@@ -2011,8 +2404,9 @@ class VoxisService:
                 await asyncio.sleep(_AMBIENT_INSIGHT_POLL_INTERVAL_SECONDS)
 
                 # Only proceed when the organism has been genuinely idle
+                # _ambient_insight_idle_threshold is Evo-tunable via EVO_ADJUST_BUDGET
                 idle_minutes = self._silence_engine.minutes_since_last_expression
-                if idle_minutes < _AMBIENT_INSIGHT_IDLE_THRESHOLD_MINUTES:
+                if idle_minutes < self._ambient_insight_idle_threshold:
                     continue
 
                 # Skip if no renderer or personality yet (still initializing)

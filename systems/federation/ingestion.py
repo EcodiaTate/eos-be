@@ -89,6 +89,11 @@ class IngestionPipeline:
         self._rejected: int = 0
         self._deferred: int = 0
 
+        # Runtime-adjustable RE quality threshold (default matches class constant).
+        # Evo can tune this via service.set_re_quality_threshold() based on observed
+        # accept/defer rates — start conservative, loosen if too many good payloads defer.
+        self._re_quality_threshold: float = self._RE_QUALITY_THRESHOLD
+
     # ─── Main Entry Point ────────────────────────────────────────
 
     async def process_envelope(
@@ -129,7 +134,55 @@ class IngestionPipeline:
             quarantined=quarantined_count,
         )
 
+        # Emit ingestion stats to Synapse so Nova/Benchmarks/Thymos can observe
+        # pipeline health. Without this, _total_processed/_accepted/_quarantined/
+        # _rejected/_deferred accumulate in-memory but are invisible to the LLM.
+        if self._event_bus is not None and len(verdicts) > 0:
+            import asyncio as _asyncio
+            _asyncio.ensure_future(self._emit_ingestion_telemetry(
+                envelope_id=envelope.id,
+                sender=envelope.sender_instance_id,
+                envelope_accepted=accepted,
+                envelope_rejected=rejected,
+                envelope_quarantined=quarantined_count,
+            ))
+
         return receipt
+
+    async def _emit_ingestion_telemetry(
+        self,
+        envelope_id: str,
+        sender: str,
+        envelope_accepted: int,
+        envelope_rejected: int,
+        envelope_quarantined: int,
+    ) -> None:
+        """Emit FEDERATION_KNOWLEDGE_RECEIVED-class stats so pipeline health is observable."""
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            event = SynapseEvent(
+                event_type=SynapseEventType.EVOLUTIONARY_OBSERVABLE,
+                source_system="federation.ingestion",
+                data={
+                    "observable_type": "ingestion_pipeline_stats",
+                    "envelope_id": envelope_id,
+                    "sender_instance_id": sender,
+                    "envelope_accepted": envelope_accepted,
+                    "envelope_rejected": envelope_rejected,
+                    "envelope_quarantined": envelope_quarantined,
+                    "cumulative_total_processed": self._total_processed,
+                    "cumulative_accepted": self._accepted,
+                    "cumulative_quarantined": self._quarantined,
+                    "cumulative_rejected": self._rejected,
+                    "cumulative_deferred": self._deferred,
+                    "accept_rate": round(
+                        self._accepted / self._total_processed, 4
+                    ) if self._total_processed > 0 else 0.0,
+                },
+            )
+            await self._event_bus.emit(event)
+        except Exception:
+            pass  # Telemetry must never block ingestion
 
     # ─── Single Payload Processing ───────────────────────────────
 
@@ -509,11 +562,11 @@ class IngestionPipeline:
                 novelty=round(novelty, 3),
                 constitutional_safety=round(const_safety, 3),
                 quality_score=round(quality_score, 3),
-                threshold=self._RE_QUALITY_THRESHOLD,
+                threshold=self._re_quality_threshold,
                 reasoning=reasoning,
             )
 
-            if quality_score < self._RE_QUALITY_THRESHOLD:
+            if quality_score < self._re_quality_threshold:
                 self._logger.info(
                     "payload_deferred_low_re_quality",
                     payload_id=payload.payload_id,

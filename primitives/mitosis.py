@@ -51,6 +51,7 @@ class ChildPosition(EOSBaseModel):
     total_dividends_paid_usd: Decimal = Decimal("0")
     status: ChildStatus = ChildStatus.SPAWNING
     rescue_count: int = 0                                  # Max 2 rescues allowed
+    max_rescues: int = 2                                   # Configurable cap; populated from OikosConfig.mitosis_max_rescues_per_child
     consecutive_positive_days: int = 0                     # Toward independence (need 90+)
     spawned_at: datetime = Field(default_factory=utc_now)
     last_health_report_at: datetime | None = None
@@ -69,5 +70,5 @@ class ChildPosition(EOSBaseModel):
 
     @property
     def is_rescuable(self) -> bool:
-        """True if the child can still receive rescue funding (max 2)."""
-        return self.rescue_count < 2 and self.status != ChildStatus.DEAD
+        """True if the child can still receive rescue funding (up to max_rescues)."""
+        return self.rescue_count < self.max_rescues and self.status != ChildStatus.DEAD

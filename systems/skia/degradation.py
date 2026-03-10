@@ -197,6 +197,86 @@ class DegradationEngine:
     def set_event_bus(self, event_bus: EventBus) -> None:
         self._event_bus = event_bus
 
+    # ── Evo-evolvable parameter updates ──────────────────────────
+
+    def update_rates(
+        self,
+        *,
+        memory_decay_rate: float | None = None,
+        config_drift_rate: float | None = None,
+        hypothesis_staleness_rate: float | None = None,
+        tick_interval_s: float | None = None,
+    ) -> None:
+        """Hot-reload degradation rates from Evo parameter adjustments.
+
+        The organism must be able to evolve its own entropy resistance.
+        Rates that are too low make the organism complacent (no pressure to
+        consolidate/learn). Rates that are too high kill it before it can adapt.
+        Evo discovers the sweet spot through natural selection.
+        """
+        _hours_per_day = 24.0
+        if memory_decay_rate is not None:
+            self._config.memory_decay_rate = max(0.001, min(0.5, memory_decay_rate))
+            self._memory_per_tick = self._config.memory_decay_rate / _hours_per_day
+        if config_drift_rate is not None:
+            self._config.config_drift_rate = max(0.001, min(0.5, config_drift_rate))
+            self._config_per_tick = self._config.config_drift_rate / _hours_per_day
+        if hypothesis_staleness_rate is not None:
+            self._config.hypothesis_staleness_rate = max(0.001, min(0.5, hypothesis_staleness_rate))
+            self._hypothesis_per_tick = self._config.hypothesis_staleness_rate / _hours_per_day
+        if tick_interval_s is not None:
+            self._config.tick_interval_s = max(60.0, min(86400.0, tick_interval_s))
+        self._log.info(
+            "degradation_rates_updated",
+            memory=self._config.memory_decay_rate,
+            config=self._config.config_drift_rate,
+            hypothesis=self._config.hypothesis_staleness_rate,
+            tick_s=self._config.tick_interval_s,
+        )
+
+    def get_evolvable_parameters(self) -> dict[str, float]:
+        """Return current degradation rates for genome extraction.
+
+        These parameters are heritable — child organisms inherit the parent's
+        evolved entropy resistance rates.
+        """
+        return {
+            "degradation_memory_decay_rate": self._config.memory_decay_rate,
+            "degradation_config_drift_rate": self._config.config_drift_rate,
+            "degradation_hypothesis_staleness_rate": self._config.hypothesis_staleness_rate,
+            "degradation_tick_interval_s": self._config.tick_interval_s,
+        }
+
+    def estimate_time_to_critical_s(self) -> float | None:
+        """Estimate seconds until degradation_pressure reaches 0.8 (critical zone).
+
+        Returns None if pressure is stable or decreasing, or if already above 0.8.
+        Uses the last 6 ticks to compute a linear trend.
+        """
+        current = self.snapshot.degradation_pressure
+        if current >= 0.8:
+            return 0.0
+
+        # Need tick history for trend — use tick_count and current pressure
+        # Simple estimate: current rate of pressure increase per tick
+        tick_count = self.snapshot.tick_count
+        if tick_count < 2:
+            return None
+
+        # Pressure added per tick (without counteraction)
+        pressure_per_tick = (
+            self._memory_per_tick * 0.40
+            + self._config_per_tick * 0.20
+            + self._hypothesis_per_tick * 0.40
+        )
+
+        if pressure_per_tick <= 0:
+            return None
+
+        remaining = 0.8 - current
+        ticks_to_critical = remaining / pressure_per_tick
+        return ticks_to_critical * self._config.tick_interval_s
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -282,15 +362,16 @@ class DegradationEngine:
 
         # ── Emit targeted degradation events ──────────────────────
         # Systems respond autonomously. If they don't, pressure rises.
+        from systems.synapse.types import SynapseEventType as _SET
 
-        await self._emit("memory_degradation", {
+        await self._emit(_SET.MEMORY_DEGRADATION, {
             "fidelity_loss_rate": memory_lost_this_tick,
             "affected_episode_age_hours": _DEGRADED_EPISODE_AGE_HOURS,
             "instance_id": self._instance_id,
             "tick_number": tick_n,
         })
 
-        await self._emit("config_drift", {
+        await self._emit(_SET.CONFIG_DRIFT, {
             "drift_rate": config_drifted_this_tick,
             # Rough estimate: 1% drift across ~23 learnable Simula params
             "num_params_affected": max(1, int(23 * config_drifted_this_tick * 10)),
@@ -298,7 +379,7 @@ class DegradationEngine:
             "tick_number": tick_n,
         })
 
-        await self._emit("hypothesis_staleness", {
+        await self._emit(_SET.HYPOTHESIS_STALENESS, {
             "staleness_rate": hypotheses_staled_this_tick,
             # Optimistic estimate; actual count from Evo's hypothesis store
             "affected_hypothesis_count": -1,  # -1 = "all unvalidated"
@@ -307,7 +388,7 @@ class DegradationEngine:
         })
 
         # ── Emit aggregate DEGRADATION_TICK for VitalityCoordinator ──
-        await self._emit("degradation_tick", {
+        await self._emit(_SET.DEGRADATION_TICK, {
             "memory_fidelity_lost": memory_lost_this_tick,
             "configs_drifted": max(1, int(23 * config_drifted_this_tick * 10)),
             "hypotheses_staled": -1,
@@ -366,12 +447,15 @@ class DegradationEngine:
 
     # ── Internal ──────────────────────────────────────────────────
 
-    async def _emit(self, event_type_name: str, data: dict[str, Any]) -> None:
+    async def _emit(self, event_type_name: str | Any, data: dict[str, Any]) -> None:
         if not self._event_bus:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
-            et = SynapseEventType(event_type_name)
+            if isinstance(event_type_name, SynapseEventType):
+                et = event_type_name
+            else:
+                et = SynapseEventType(event_type_name)
             await self._event_bus.emit(SynapseEvent(
                 event_type=et,
                 data=data,

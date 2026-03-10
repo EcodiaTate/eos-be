@@ -36,8 +36,8 @@ ReasoningEngineService(
 | `evaluate()` | ✅ | Thin wrapper around `generate()` with minimal system prompt |
 | `generate_with_tools()` | ✅ | Satisfies ABC; vLLM tool-call support is model-dependent — Claude handles tool use in practice |
 | `close()` | ✅ | Closes httpx AsyncClient |
-| `load_adapter()` | ✅ | vLLM `/v1/load_lora_adapter` for CLoRA hot-swap |
-| `unload_adapter()` | ✅ | vLLM `/v1/unload_lora_adapter` |
+| `load_adapter()` | ✅ | Tries dynamic `/v1/load_lora_adapter`; graceful 404 fallback for startup-loaded adapters (`--lora-modules`) |
+| `unload_adapter()` | ✅ | Tries dynamic `/v1/unload_lora_adapter`; graceful 404 fallback |
 | `supports_adapters` | ✅ | Returns `True` |
 
 **Timeout:** 30s for generate, 5s for startup probe.
@@ -76,10 +76,10 @@ ReasoningEngineService(
 Benchmarks can subscribe to `RE_ENGINE_STATUS_CHANGED` to track `llm_dependency` KPI transitions.
 
 ### LoRA Adapter Pipeline (future)
-- `load_adapter(adapter_path, adapter_id)` → vLLM `/v1/load_lora_adapter`
+- `load_adapter(adapter_path, adapter_id)` — tries dynamic `/v1/load_lora_adapter` first; falls back to client-side tracking if 404 (adapter loaded at vLLM startup via `--lora-modules`)
 - CLoRA fine-tuning pipeline produces adapter `.safetensors` files
-- Pipeline calls `app.state.reasoning_engine.load_adapter()` after each training run
-- No restart required — vLLM swaps adapters in-place
+- For dynamic loading: pipeline calls `app.state.reasoning_engine.load_adapter()` after each training run (requires `--enable-lora` on vLLM)
+- For static loading: restart vLLM with `--lora-modules adapter_name=path/to/adapter`
 - `active_adapter_id` tracks current loaded adapter (IPFS CID by convention)
 
 ---
@@ -127,6 +127,51 @@ ReasoningEngineService.load_adapter() — hot-swap into vLLM, no restart
 | `RE_TRAINING_FAILED` | Training subprocess failed or timed out; payload: run_id, tier, reason |
 | `RE_KL_GATE_REJECTED` | STABLE KL gate blocked deployment; payload: run_id, kl_divergence, budget, adapter_path |
 | `BENCHMARK_REGRESSION` | Anchor perplexity spiked >20% above baseline; payload: metric, current, baseline, spike_pct |
+| `MODEL_ROLLBACK_TRIGGERED` | Post-deploy quality check failed (post_rate < pre_rate × 0.90); payload: run_id, reason, pre_success_rate, post_success_rate, window_attempts, rollback_adapter, auto_rollback=True |
+| `RE_ADAPTER_QUALITY_CONFIRMED` | Post-deploy quality check passed (post_rate > pre_rate × 1.05); payload: run_id, pre_success_rate, post_success_rate, improvement_pct, window_attempts |
+| `RE_TRAINING_EXAMPLE` | Emitted on adapter rollback as a training signal for future cycles |
+
+### Trigger reasons (added 2026-03-08)
+| Reason | Threshold | Description |
+|--------|-----------|-------------|
+| `tier2_urgent_requested` | ≥50 examples (lowered from 300) | `RE_TRAINING_REQUESTED` event received; `_urgent_training_requested = True` |
+
+### Post-Deployment Quality Monitoring (2026-03-08)
+
+After every successful adapter deploy, the CLO opens a 500-cycle monitoring window.
+`NovaService._on_axon_execution_result()` calls `clo.record_re_outcome(success)` for every
+RE decision.  When the window fills, `_evaluate_post_deploy_quality()` runs:
+
+| Outcome | Condition | Action |
+|---------|-----------|--------|
+| **Rollback** | `post_rate < pre_rate × 0.90` (≥10% degradation) | `_rollback_adapter()` — restore previous adapter, reset Thompson "re" Beta params, emit `MODEL_ROLLBACK_TRIGGERED` + `RE_TRAINING_EXAMPLE` |
+| **Confirm** | `post_rate > pre_rate × 1.05` (≥5% improvement) | `_confirm_adapter()` — emit `RE_ADAPTER_QUALITY_CONFIRMED`; adapter becomes new baseline |
+| **Neutral** | Within ±5–10% of baseline | Log only; keep current adapter |
+
+**State fields added to `ContinualLearningOrchestrator`:**
+| Field | Type | Purpose |
+|-------|------|---------|
+| `_pre_deploy_baseline` | `dict \| None` | Snapshot of success_rate + eval_loss before deploy; persisted to Redis `eos:re:pre_deploy_baseline` |
+| `_pre_deploy_adapter_path` | `str \| None` | Previous adapter path; restored on rollback |
+| `_post_deploy_successes` | `int` | Accumulated successes in monitoring window |
+| `_post_deploy_attempts` | `int` | Total RE decisions in monitoring window |
+| `_monitoring_active` | `bool` | True while window is open |
+
+**Wiring:**
+- `nova.set_clo(clo)` — called in `core/registry.py` after CLO init; injects CLO reference into Nova
+- `clo.record_re_outcome(success)` — called from `NovaService._on_axon_execution_result()` for every RE decision outcome (non-fatal, no-op when monitoring inactive)
+- Thompson arm reset on rollback: approximates pre-deploy Beta as `alpha=rate×20, beta=(1−rate)×20`, patched into Redis hash `nova:thompson_sampler`
+
+**New Redis key:**
+| Key | Value |
+|-----|-------|
+| `eos:re:pre_deploy_baseline` | JSON dict: success_rate, eval_loss, cycle, timestamp, adapter_path |
+
+**New SynapseEventType entries:**
+| Event | Purpose |
+|-------|---------|
+| `RE_ADAPTER_QUALITY_CONFIRMED` | Deployment quality verified (≥5% improvement) |
+| `MODEL_ROLLBACK_TRIGGERED` | Already existed; now also emitted on quality degradation rollback |
 
 ### Redis keys
 | Key | Value |
@@ -134,6 +179,7 @@ ReasoningEngineService.load_adapter() — hot-swap into vLLM, no restart
 | `eos:re:last_train_at` | ISO-8601 datetime of last completed run |
 | `eos:re:training_runs` | JSON list of last 50 `TrainingRun` records |
 | `eos:re:thompson_success_rate` | Float written by Nova; read for degradation trigger |
+| `eos:re:pre_deploy_baseline` | JSON dict of pre-deployment quality snapshot |
 
 ### Failure safety
 - Training failure **never crashes the organism** — always caught, logged, `RE_TRAINING_FAILED` emitted
@@ -641,6 +687,7 @@ Both `_pending_shared_adapter` and `_pending_dpo_adapter` are set to `None` imme
 |-------------|---------|-----------|
 | `ADAPTER_SHARE_REQUEST` | `_on_adapter_share_request` | Reply with current slow adapter path when `target_instance_id` matches `INSTANCE_ID` env var |
 | `ADAPTER_SHARE_OFFER` | `_on_adapter_share_offer` | Store `merged_adapter_path` as `_pending_shared_adapter` |
+| `RE_TRAINING_REQUESTED` | `_on_re_training_requested` | Sets `_urgent_training_requested = True`; next `should_train()` fires Tier 2 with lowered min_examples threshold (50 vs 300). Emitted by Evo (on RE KPI regression) and Nova (5+ consecutive sub-0.50 RE decisions). |
 
 ### New SynapseEventType entries
 
@@ -662,26 +709,123 @@ Both `_pending_shared_adapter` and `_pending_dpo_adapter` are set to `None` imme
 
 - **Tier 3 full retrain**: `full_retrain_interval_days=90` is checked but always falls through to Tier 2. True Tier 3 (full fine-tune, not LoRA delta) is not implemented.
 - **No RE → Benchmarks metrics**: `generate()` latency, token counts, and model_used are not yet emitted as observables. Add `RE_TRAINING_EXAMPLE` emission here once the RE produces reliable outputs worth training on.
-- **No health check polling**: Circuit breaker reacts to failures but doesn't proactively reprobe after opening. Add a background task to probe every N minutes and auto-close the circuit on recovery.
+- ~~**No health check polling**~~: RESOLVED (8 Mar 2026) — `start_reprobe_loop()` reprobes every 120s when circuit is open.
 - **No streaming support**: vLLM supports SSE streaming; current impl buffers full response. Streaming would reduce time-to-first-token for deliberation.
 - **Tool-call quality unknown**: `generate_with_tools()` may produce malformed JSON depending on the base model; Claude handles all tool use in practice.
 
 ---
 
+## S3 Adapter Bridge (8 Mar 2026)
+
+Decouples training (CLO on organism host) from inference (vLLM on GPU pod). S3 is the handoff point.
+
+### Architecture
+
+```
+CLO trains adapter → anti-forgetting stack → KL gate passes
+        ↓
+Step 6d.1: _upload_adapter_to_s3()
+  → Upload adapter files to s3://{bucket}/{prefix}{instance}/{timestamp}/
+  → Write latest_manifest.json at s3://{prefix}{instance}/latest_manifest.json
+        ↓
+Pod-side: scripts/re/adapter_watcher.py
+  → Polls latest_manifest.json every 120s
+  → Downloads new adapter version
+  → Restarts vLLM with --lora-modules pointing to new adapter
+        ↓
+RE Service: _reprobe_loop()
+  → Detects vLLM recovery after restart
+  → Closes circuit breaker
+  → Organism resumes RE routing via Thompson sampling
+```
+
+### S3 upload (`continual_learning.py`)
+
+Added as Step 6d.1, after `load_adapter()` (which gracefully handles 404 for static-loaded adapters). Uploads all adapter files + writes a manifest JSON at a well-known key. Non-fatal — local deployment still works if S3 fails.
+
+**Manifest fields:** `version`, `run_id`, `instance_id`, `adapter_s3_prefix`, `kl_divergence`, `eval_loss`, `files`, `uploaded_at`
+
+### Pod-side watcher (`scripts/re/adapter_watcher.py`)
+
+Standalone script that manages the vLLM process lifecycle on the inference pod.
+
+**Responsibilities:**
+- Start vLLM with existing adapter (or base model) on boot
+- Poll S3 manifest every N seconds (default 120)
+- Download new adapter versions, restart vLLM with updated `--lora-modules`
+- Clean up old adapter versions (keep last 3)
+- Auto-restart vLLM if it crashes unexpectedly
+
+**Usage:**
+```bash
+# Default — manages vLLM + polls S3 every 120s
+python scripts/re/adapter_watcher.py
+
+# Custom poll interval
+python scripts/re/adapter_watcher.py --poll-interval 60
+
+# One-shot check (CI/testing)
+python scripts/re/adapter_watcher.py --once
+
+# Download only (external vLLM management)
+python scripts/re/adapter_watcher.py --no-vllm
+```
+
+### Circuit breaker reprobe (`service.py`)
+
+`start_reprobe_loop()` runs a background task that probes `/v1/models` every 120s when the circuit is open or RE was never available. When vLLM comes back (e.g. after adapter_watcher restarts it), the circuit auto-closes and `RE_ENGINE_STATUS_CHANGED` is emitted — Thompson sampling resumes routing to RE.
+
+### Configuration (env vars)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RE_ADAPTER_S3_BUCKET` | `ecodiaos-re-training` | S3 bucket for adapter uploads |
+| `RE_ADAPTER_S3_PREFIX` | `adapters/production/` | S3 key prefix |
+| `INSTANCE_ID` | `genesis` | Instance identifier in S3 path |
+| `ECODIAOS_RE_REPROBE_INTERVAL_S` | `120` | Seconds between reprobe attempts |
+| `VLLM_PORT` | `8001` | vLLM serve port (pod-side) |
+| `VLLM_BASE_MODEL` | `Qwen/Qwen3-8B` | Base model for vLLM (pod-side) |
+| `VLLM_EXTRA_ARGS` | `""` | Additional vLLM args (pod-side) |
+| `ADAPTER_LOCAL_DIR` | `/workspace/adapters` | Local adapter storage (pod-side) |
+| `ADAPTER_NAME` | `eos_production` | LoRA module name in vLLM (pod-side) |
+
+---
+
+## Genesis Deployment (8 Mar 2026)
+
+**genesis_001** — first LoRA adapter trained and deployed.
+
+| Detail | Value |
+|--------|-------|
+| Base model | Qwen/Qwen3-8B |
+| Training data | `data/re_training_batches/genesis_teaching_001.jsonl` (516 examples) |
+| LoRA config | r=32, α=64, targets: q/k/v/o/gate/up/down, 4-bit NF4 quant |
+| Training | 3 epochs, batch=1, grad_accum=16, max_seq_len=3072, final loss 1.42 |
+| Hardware | RunPod 4090 (24GB VRAM), ~15 minutes |
+| Benchmark | 77/80 substantive responses (96.25%), 3 empty-think on complex multi-system prompts |
+| Serving | RunPod L4 pod, vLLM, port 8002, `--lora-modules genesis_001=/workspace/adapters/genesis_001/adapter` |
+| Model name in vLLM | `genesis_001` (used as the `model` field in API calls) |
+
+**Adapter loading**: vLLM current version does NOT expose `/v1/load_lora_adapter` — adapters must be passed at startup via `--lora-modules`. Code now gracefully handles 404 from dynamic endpoint.
+
+---
+
 ## How to Test
 
-**With vLLM running:**
+**With vLLM running (static adapter):**
 ```bash
-# Start vLLM with any OpenAI-compatible model
-vllm serve Qwen/Qwen3-8B --served-model-name ecodiaos-reasoning --port 8001
+# Start vLLM with LoRA adapter loaded at startup
+vllm serve Qwen/Qwen3-8B --port 8001 \
+  --enable-lora \
+  --lora-modules genesis_001=/path/to/adapter
 
-# Set env vars
+# Set env vars — use adapter name as model
 export ECODIAOS_RE_VLLM_URL=http://localhost:8001/v1
-export ECODIAOS_RE_MODEL=ecodiaos-reasoning
+export ECODIAOS_RE_MODEL=genesis_001
 
 # Start EOS — logs should show:
-#   reasoning_engine_available model=ecodiaos-reasoning
-#   nova_re_wired model=ecodiaos-reasoning url=http://localhost:8001/v1
+#   reasoning_engine_available model=genesis_001
+#   nova_re_wired model=genesis_001 url=http://localhost:8001/v1
 ```
 
 **Without vLLM (default / Claude-only mode):**
@@ -753,13 +897,14 @@ score = 0.30 × reasoning_depth
 
 ### Output Format
 
-JSONL — one record per line, `messages` format for Qwen3 chat template:
+JSONL — one record per line, `messages` format for Qwen3 chat template.
+Reasoning scaffold (Steps 1-4) is wrapped in `<think>` tags to align with Qwen3's native CoT mechanism. Step 5 (Decision) is the visible output:
 
 ```json
 {"messages": [
   {"role": "system",    "content": "You are the reasoning engine of EcodiaOS..."},
   {"role": "user",      "content": "## Current State\n...## Episode Context\n..."},
-  {"role": "assistant", "content": "## Step 1: Situation Assessment\n...## Step 5: Decision\n..."}
+  {"role": "assistant", "content": "<think>\n## Step 1: Situation Assessment\n...## Step 4: Constitutional Check\n...\n</think>\n\n## Step 5: Decision\nAction: ..."}
 ]}
 ```
 

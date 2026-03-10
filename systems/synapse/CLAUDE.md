@@ -64,11 +64,25 @@
 
 ### MetabolicTracker (`metabolism.py`)
 - O(1) hot-path `log_usage()`, no allocations, EMA burn rate (α=0.15)
-- Per-system cost breakdown
-- Rolling deficit = total_cost − total_revenue
+- **Provider-aware pricing**: `_PROVIDER_PRICING` dict maps provider tags to (input, output) price per token. `"re"`, `"vllm"`, `"ollama"`, `"local"` = $0; `"claude-haiku"` = $0.80/$4; `"claude-sonnet"` = $3/$15; `"claude-opus"` = $15/$75 per 1M tokens
+- **Two-dimension cost model**: API costs (per-token, EMA burn rate) + Infrastructure costs (per-hour, polled from provider APIs). `burn_rate_usd_per_hour = API EMA + infra hourly`
+- Per-system + per-provider cost breakdown
+- Rolling deficit = total_cost (API + infra) − total_revenue
+- Infrastructure tracking: `update_infrastructure_cost()`, `remove_infrastructure_resource()`, `accrue_infrastructure_cost()`. Per-resource dict (e.g. `"runpod:pod_abc123" → $0.74/hr`)
 - `inject_revenue()` emits `REVENUE_INJECTED` at salience=1.0
 - Window reset every 50 cycles; `hours_until_depleted = balance / burn_rate_hour`
+- `MetabolicSnapshot` extended: `api_cost_usd_per_hour`, `infra_cost_usd_per_hour`, `total_api_cost_usd`, `total_infra_cost_usd`, `per_provider_cost_usd`, `infra_resources`
 - **M1 (Phase 2 Chat 7)**: SynapseService now subscribes to `REVENUE_INJECTED` and `STARVATION_WARNING` from Oikos. `_on_oikos_revenue_injected` forwards earned revenue to the tracker reactively (deficit was previously unbounded if Oikos never called `inject_revenue()` directly). `_on_oikos_starvation_warning` caches the starvation level for SomaTick relay.
+- **8 Mar 2026**: `METABOLIC_SNAPSHOT` and `METABOLIC_PRESSURE` payloads now include `api_cost_usd_per_hour` and `infra_cost_usd_per_hour` split fields — enables Oikos two-ledger reconciliation. `ORGANISM_TELEMETRY` now includes `api_burn_rate_usd_per_hour` and `dependency_ratio` (infra_burn / total_burn, target → 0).
+
+### InfrastructureCostPoller (`infra_cost_poller.py`)
+- Background asyncio task, polls RunPod GraphQL API every 5 minutes
+- Two modes: specific pod (`RUNPOD_POD_ID`) or auto-discover all pods via `myself { pods { ... } }`
+- Static fallback via `ECODIAOS_INFRA_COST_USD_PER_HOUR` env var
+- Accrues infrastructure cost into MetabolicTracker deficit each poll cycle
+- Auto-removes resources that stop running; gracefully falls to $0/hr if API unavailable
+- Wired in Phase 11 of `registry.py`; stopped on shutdown
+- **2026-03-08**: Accepts optional `event_bus` — emits `INFRASTRUCTURE_COST_CHANGED` whenever total infra cost changes by >5% between polls. Tracks `_prev_infra_cost_usd_per_hour`. Emission is fault-tolerant (`contextlib.suppress`). Nova + Soma + Oikos can subscribe for reactive economic awareness.
 
 ### EventBus (`event_bus.py`)
 - Dual output: in-memory callbacks + Redis pub/sub on `synapse_events` channel
@@ -117,6 +131,7 @@
 | `coherence.py` | CoherenceMonitor — 4 metrics, composite, drag trigger |
 | `degradation.py` | DegradationManager — per-system strategies, cascade, restart |
 | `metabolism.py` | MetabolicTracker — O(1) cost accounting, burn rate, revenue |
+| `infra_cost_poller.py` | InfrastructureCostPoller — RunPod API polling, autonomous cost discovery |
 | `event_bus.py` | EventBus — dual output, timeout, ring buffer |
 | `types.py` | All Synapse types and SynapseEventType enum |
 | `sentinel.py` | Sentinel health/watchdog utilities |
@@ -154,8 +169,14 @@
 | `VITALITY_RESTORED` | Fatal threshold recovered | — |
 | `ORGANISM_DIED` | Death sequence complete | — |
 | `ORGANISM_RESURRECTED` | External resurrection | — |
+| `ORGANISM_TELEMETRY` | Every 50 cycles (50-cycle maintenance block) | Full `OrganismTelemetry` snapshot: burn_rate, runway_hours, api_burn_rate_usd_per_hour, dependency_ratio, coherence_composite, rhythm_state, health summaries, cpu_per_system, emotions, interoception signals, cycle_number |
+| `INFRASTRUCTURE_COST_CHANGED` | Infra cost changes >5% (polled every 5min) | `infra_cost_usd_per_hour`, `prev_infra_cost_usd_per_hour`, `change_pct`, `infra_resources` dict |
+| `METABOLIC_SNAPSHOT` / `METABOLIC_PRESSURE` | Every 50 cycles | Now includes `api_cost_usd_per_hour` + `infra_cost_usd_per_hour` split (8 Mar 2026) enabling Oikos two-ledger reconciliation |
+| `CONTENT_PUBLISHED` | Axon `PublishContentExecutor` on success | `platform`, `post_id`, `url`, `content_summary`, `entity_id` |
+| `CONTENT_ENGAGEMENT_REPORT` | Axon `PublishContentExecutor` engagement poll | `platform`, `post_id`, `likes`, `reposts`, `replies`, `reach`, `measured_at` |
 
 ### Events Consumed
+- `INTEROCEPTIVE_ALERT` → `_on_interoceptive_alert_for_cache` — caches error_rate/cascade/latency signals for inclusion in next `ORGANISM_TELEMETRY` broadcast; resets cascade/latency transient flags after broadcast
 - `REVENUE_INJECTED` → `_on_oikos_revenue_injected` — forwards Oikos revenue to MetabolicTracker deficit (M1)
 - `STARVATION_WARNING` → `_on_oikos_starvation_warning` — caches starvation level for SomaTick relay (M1)
 - `GRID_METABOLISM_CHANGED` → `_on_grid_metabolism_changed` — enters/exits CONSERVATION clock throttle

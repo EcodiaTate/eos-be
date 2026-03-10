@@ -35,40 +35,49 @@ from systems.soma.types import (
 
 logger = structlog.get_logger("systems.soma.metabolic_regulator")
 
-# -- Deficit tier thresholds (USD) -------------------------------------------
+# -- Default deficit tier thresholds (USD) -----------------------------------
+# AUTONOMY: All tiers and shift magnitudes are learnable. The organism
+# discovers its own optimal sensitivity to financial stress through Evo.
 
-_SUBSISTENCE_USD: float = 1.0    # Mild -- curiosity narrows
-_STRAIN_USD: float = 10.0        # Moderate -- arousal rises, valence drops
-_STARVATION_USD: float = 50.0    # Acute -- survival mode
+_DEFAULT_METABOLIC_TIERS: dict[str, float] = {
+    "subsistence_usd": 1.0,     # Mild -- curiosity narrows
+    "strain_usd": 10.0,         # Moderate -- arousal rises, valence drops
+    "starvation_usd": 50.0,     # Acute -- survival mode
+}
 
-# -- Maximum biological shifts at full starvation ----------------------------
+_DEFAULT_METABOLIC_SHIFTS: dict[str, float] = {
+    "max_arousal_lift": 0.35,           # Arousal pushed up (survival activation)
+    "max_valence_suppression": 0.45,    # Valence pulled down (felt negativity)
+    "max_curiosity_suppression": 0.40,  # Epistemic appetite narrows
+    "max_temporal_lift": 0.30,          # Temporal pressure rises (urgency to earn)
+}
 
-_MAX_AROUSAL_LIFT: float = 0.35           # Arousal pushed up (survival activation)
-_MAX_VALENCE_SUPPRESSION: float = 0.45    # Valence pulled down (felt negativity)
-_MAX_CURIOSITY_SUPPRESSION: float = 0.40  # Epistemic appetite narrows
-_MAX_TEMPORAL_LIFT: float = 0.30          # Temporal pressure rises (urgency to earn)
 
-
-def _deficit_severity(deficit_usd: float) -> float:
+def _deficit_severity(
+    deficit_usd: float,
+    subsistence: float = 1.0,
+    strain: float = 10.0,
+    starvation: float = 50.0,
+) -> float:
     """
     Map a rolling deficit in USD to a [0.0, 1.0] severity score.
 
     Piecewise linear through three tiers so each tier contributes a
     distinct gradient the organism can feel progressively.
+
+    Tier thresholds are parameterized — the organism learns its own
+    sensitivity to financial stress.
     """
     if deficit_usd <= 0.0:
         return 0.0
-    if deficit_usd >= _STARVATION_USD:
+    if deficit_usd >= starvation:
         return 1.0
-    if deficit_usd <= _SUBSISTENCE_USD:
-        # 0 -> subsistence: 0.0 -> 0.15
-        return (deficit_usd / _SUBSISTENCE_USD) * 0.15
-    if deficit_usd <= _STRAIN_USD:
-        # subsistence -> strain: 0.15 -> 0.60
-        ratio = (deficit_usd - _SUBSISTENCE_USD) / (_STRAIN_USD - _SUBSISTENCE_USD)
+    if deficit_usd <= subsistence:
+        return (deficit_usd / subsistence) * 0.15
+    if deficit_usd <= strain:
+        ratio = (deficit_usd - subsistence) / (strain - subsistence)
         return 0.15 + ratio * 0.45
-    # strain -> starvation: 0.60 -> 1.0
-    ratio = (deficit_usd - _STRAIN_USD) / (_STARVATION_USD - _STRAIN_USD)
+    ratio = (deficit_usd - strain) / (starvation - strain)
     return 0.60 + ratio * 0.40
 
 
@@ -105,9 +114,50 @@ class MetabolicAllostaticRegulator(AllostaticController):
         self._synapse: Any = None
         self._last_severity: float = 0.0
 
+        # ── LEARNABLE metabolic parameters (Evo/Simula can tune) ──
+        self._tiers: dict[str, float] = dict(_DEFAULT_METABOLIC_TIERS)
+        self._shifts: dict[str, float] = dict(_DEFAULT_METABOLIC_SHIFTS)
+
     def set_synapse(self, synapse: Any) -> None:
         """Wire Synapse reference so the regulator can read MetabolicSnapshot."""
         self._synapse = synapse
+
+    # ── LEARNABLE parameter API (AUTONOMY) ──
+
+    def adjust_tier(self, name: str, value: float) -> bool:
+        """Adjust a metabolic tier threshold. Called by Evo ADJUST_BUDGET."""
+        if name not in self._tiers:
+            return False
+        self._tiers[name] = max(0.01, value)
+        logger.info("metabolic_tier_adjusted", name=name, value=round(value, 4))
+        return True
+
+    def adjust_shift(self, name: str, value: float) -> bool:
+        """Adjust a metabolic stress shift magnitude. Called by Evo ADJUST_BUDGET."""
+        if name not in self._shifts:
+            return False
+        self._shifts[name] = max(0.0, min(1.0, value))
+        logger.info("metabolic_shift_adjusted", name=name, value=round(value, 4))
+        return True
+
+    def get_metabolic_params(self) -> dict[str, Any]:
+        """Return all learnable metabolic parameters for introspection."""
+        return {"tiers": dict(self._tiers), "shifts": dict(self._shifts)}
+
+    def export_learnable_params(self) -> dict[str, Any]:
+        """Export for genome inheritance."""
+        return {"tiers": dict(self._tiers), "shifts": dict(self._shifts)}
+
+    def import_learnable_params(self, params: dict[str, Any]) -> None:
+        """Import from parent genome."""
+        if "tiers" in params:
+            for k, v in params["tiers"].items():
+                if k in self._tiers:
+                    self._tiers[k] = max(0.01, float(v))
+        if "shifts" in params:
+            for k, v in params["shifts"].items():
+                if k in self._shifts:
+                    self._shifts[k] = max(0.0, min(1.0, float(v)))
 
     # -- Setpoint override ---------------------------------------------------
 
@@ -161,7 +211,12 @@ class MetabolicAllostaticRegulator(AllostaticController):
 
         snapshot = self._read_metabolic_snapshot()
         if snapshot is not None:
-            severity = _deficit_severity(float(snapshot.get("rolling_deficit_usd", 0.0)))
+            severity = _deficit_severity(
+                float(snapshot.get("rolling_deficit_usd", 0.0)),
+                self._tiers["subsistence_usd"],
+                self._tiers["strain_usd"],
+                self._tiers["starvation_usd"],
+            )
             if severity > 0.0:
                 tier = _severity_tier(severity)
                 if tier != _severity_tier(self._last_severity):
@@ -192,11 +247,21 @@ class MetabolicAllostaticRegulator(AllostaticController):
         deficit_usd = float(snapshot.get("rolling_deficit_usd", 0.0))
         burn_rate_usd_per_hour = float(snapshot.get("burn_rate_usd_per_hour", 0.0))
 
-        debt_severity = _deficit_severity(deficit_usd)
+        debt_severity = _deficit_severity(
+            deficit_usd,
+            self._tiers["subsistence_usd"],
+            self._tiers["strain_usd"],
+            self._tiers["starvation_usd"],
+        )
 
         # Anticipatory: $5/hr feels like subsistence pressure even at zero debt
         anticipatory_equiv_usd = burn_rate_usd_per_hour * 0.5
-        anticipatory_severity = _deficit_severity(anticipatory_equiv_usd) * 0.4
+        anticipatory_severity = _deficit_severity(
+            anticipatory_equiv_usd,
+            self._tiers["subsistence_usd"],
+            self._tiers["strain_usd"],
+            self._tiers["starvation_usd"],
+        ) * 0.4
 
         return min(1.0, debt_severity + anticipatory_severity)
 
@@ -224,16 +289,16 @@ class MetabolicAllostaticRegulator(AllostaticController):
         )
 
         self._target_setpoints[InteroceptiveDimension.AROUSAL] = _clamp(
-            base_arousal + severity * _MAX_AROUSAL_LIFT, 0.0, 1.0
+            base_arousal + severity * self._shifts["max_arousal_lift"], 0.0, 1.0
         )
         self._target_setpoints[InteroceptiveDimension.VALENCE] = _clamp(
-            base_valence - severity * _MAX_VALENCE_SUPPRESSION, -1.0, 1.0
+            base_valence - severity * self._shifts["max_valence_suppression"], -1.0, 1.0
         )
         self._target_setpoints[InteroceptiveDimension.CURIOSITY_DRIVE] = _clamp(
-            base_curiosity - severity * _MAX_CURIOSITY_SUPPRESSION, 0.0, 1.0
+            base_curiosity - severity * self._shifts["max_curiosity_suppression"], 0.0, 1.0
         )
         self._target_setpoints[InteroceptiveDimension.TEMPORAL_PRESSURE] = _clamp(
-            base_temporal + severity * _MAX_TEMPORAL_LIFT, 0.0, 1.0
+            base_temporal + severity * self._shifts["max_temporal_lift"], 0.0, 1.0
         )
 
     def _clear_starvation_targets(self) -> None:

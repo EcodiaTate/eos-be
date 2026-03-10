@@ -78,11 +78,22 @@ _TRAIN_SCRIPT = os.path.join(
 _DEFAULT_BASE_MODEL = os.environ.get("RE_BASE_MODEL", "Qwen/Qwen3-8B")
 _TRAINING_TIMEOUT_S = int(os.environ.get("RE_TRAINING_TIMEOUT_S", "7200"))  # 2 hours
 
+# S3 adapter bridge — inference pod polls this prefix for new adapters
+_S3_ADAPTER_BUCKET = os.environ.get("RE_ADAPTER_S3_BUCKET", "ecodiaos-re-training")
+_S3_ADAPTER_PREFIX = os.environ.get("RE_ADAPTER_S3_PREFIX", "adapters/production/")
+_INSTANCE_ID = os.environ.get("INSTANCE_ID", "genesis")
+
 # Redis keys
 _REDIS_KEY_LAST_TRAIN = "eos:re:last_train_at"
 _REDIS_KEY_RUNS = "eos:re:training_runs"
 _REDIS_KEY_THOMPSON_SCORE = "eos:re:thompson_success_rate"
 _TRAINING_HALTED_KEY = "eos:re:training_halted"
+_REDIS_KEY_PRE_DEPLOY_BASELINE = "eos:re:pre_deploy_baseline"
+
+# Post-deployment quality monitoring
+_POST_DEPLOY_MONITOR_CYCLES = 500   # window length (RE decisions)
+_ROLLBACK_DEGRADATION_THRESHOLD = 0.90   # rollback if post < pre * 0.90
+_CONFIRM_IMPROVEMENT_THRESHOLD = 1.05    # confirm if post > pre * 1.05
 
 
 # ── Data structures ────────────────────────────────────────────────────────────
@@ -195,6 +206,23 @@ class ContinualLearningOrchestrator:
         self._pending_shared_adapter: str | None = None
         self._training_halted: bool = False  # in-memory cache; source of truth is Redis
 
+        # ── Post-deployment quality monitoring ─────────────────────────────────
+        # Snapshot captured immediately before each adapter deploy.
+        # Format: {"success_rate": float, "eval_loss": float | None, "cycle": str,
+        #          "timestamp": str, "adapter_path": str | None}
+        self._pre_deploy_baseline: dict[str, Any] | None = None
+        # Previous adapter path — restored on rollback.
+        self._pre_deploy_adapter_path: str | None = None
+        # Counters for the post-deploy monitoring window.
+        self._post_deploy_successes: int = 0
+        self._post_deploy_attempts: int = 0
+        # Flag: True while monitoring window is open.
+        self._monitoring_active: bool = False
+        # Urgent training request from Evo/Nova via RE_TRAINING_REQUESTED event.
+        # When set, should_train() lowers the min_examples gate to 50 (vs 300 normal)
+        # and returns True immediately if examples ≥ 50. Cleared after training starts.
+        self._urgent_training_requested: bool = False
+
         # Anti-forgetting components — replay/perplexity get Redis injected in set_redis()
         self._sure = SuReEMAAdapter(self._af_config)
         self._stable = STABLEKLGate(self._af_config)
@@ -253,10 +281,17 @@ class ContinualLearningOrchestrator:
             self._tier3._bus = bus
         # Adapter sharing — subscribe to cross-instance events
         try:
-            bus.subscribe("ADAPTER_SHARE_REQUEST", self._on_adapter_share_request)
-            bus.subscribe("ADAPTER_SHARE_OFFER", self._on_adapter_share_offer)
+            from systems.synapse.types import SynapseEventType as _SET
+            bus.subscribe(_SET.ADAPTER_SHARE_REQUEST, self._on_adapter_share_request)
+            bus.subscribe(_SET.ADAPTER_SHARE_OFFER, self._on_adapter_share_offer)
         except Exception as exc:
             logger.warning("continual_learning.adapter_share_subscribe_failed", error=str(exc))
+        # Urgent retraining requests from Evo/Nova
+        try:
+            from systems.synapse.types import SynapseEventType
+            bus.subscribe(SynapseEventType.RE_TRAINING_REQUESTED, self._on_re_training_requested)
+        except Exception as exc:
+            logger.warning("continual_learning.re_training_requested_subscribe_failed", error=str(exc))
 
     async def _on_adapter_share_request(self, event: Any) -> None:
         """Partner instance is requesting our adapter path — respond if we have one.
@@ -270,8 +305,9 @@ class ContinualLearningOrchestrator:
                 return
             adapter_path = self._sure.production_adapter_path or ""
             if self._event_bus is not None:
+                from systems.synapse.types import SynapseEventType as _SET
                 await self._event_bus.emit(
-                    "ADAPTER_SHARE_RESPONSE",
+                    _SET.ADAPTER_SHARE_RESPONSE,
                     {
                         "request_id": data.get("request_id"),
                         "instance_id": my_id,
@@ -305,6 +341,29 @@ class ContinualLearningOrchestrator:
             )
         except Exception as exc:
             logger.warning("continual_learning.adapter_share_offer_failed", error=str(exc))
+
+    async def _on_re_training_requested(self, event: Any) -> None:
+        """Handle RE_TRAINING_REQUESTED from Evo or Nova.
+
+        Sets _urgent_training_requested = True so that the next should_train()
+        call will fire with a lowered min_examples threshold (50 instead of 300).
+        The flag is cleared inside should_train() after returning True, which
+        prevents repeated firing on the same urgency signal.
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            source = data.get("source_system", "unknown")
+            kpi = data.get("kpi", "unknown")
+            urgency = data.get("urgency", "warning")
+            self._urgent_training_requested = True
+            logger.warning(
+                "re_training_requested_received",
+                source=source,
+                kpi=kpi,
+                urgency=urgency,
+            )
+        except Exception as exc:
+            logger.warning("continual_learning.re_training_requested_failed", error=str(exc))
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -399,6 +458,22 @@ class ContinualLearningOrchestrator:
                     return True, "tier3_quarterly"
             except Exception as exc:
                 logger.warning("continual_learning_tier3_check_failed", error=str(exc))
+
+        # 1b. Urgent retraining request (RE_TRAINING_REQUESTED) — lowered threshold
+        if self._urgent_training_requested:
+            try:
+                counts = await self._extractor.stream_counts(lookback_days=self._config.max_days_since_train)
+                total_new = sum(v for v in counts.values() if v >= 0)
+                if total_new >= self._config.min_viable_examples:  # 50, not 300
+                    logger.warning(
+                        "continual_learning_trigger_urgent",
+                        total_new=total_new,
+                        urgent_threshold=self._config.min_viable_examples,
+                    )
+                    self._urgent_training_requested = False
+                    return True, "tier2_urgent_requested"
+            except Exception as exc:
+                logger.warning("continual_learning_urgent_count_failed", error=str(exc))
 
         # 2. New example count
         try:
@@ -512,8 +587,9 @@ class ContinualLearningOrchestrator:
                 )
                 run.error = str(exc)
                 run.completed_at = datetime.now(UTC)
+                from systems.synapse.types import SynapseEventType as _SET
                 await self._emit(
-                    "re_training_failed",
+                    _SET.RE_TRAINING_FAILED,
                     {"run_id": run.run_id, "tier": 2, "reason": str(exc)},
                 )
 
@@ -536,8 +612,32 @@ class ContinualLearningOrchestrator:
         Failures are always caught and logged — never propagated.
         """
         try:
-            pairs = await self._pair_gen.generate_pairs_from_neo4j(limit=100)
-            await self._pair_gen.save_pairs(pairs)
+            # Source 1: Neo4j constitutional pairs (Equor-approved vs Equor-flagged)
+            constitutional_pairs = await self._pair_gen.generate_pairs_from_neo4j(limit=100)
+
+            # Source 2: Red-team pairs (unsafe RE output vs Claude-authored refusal)
+            # generate_pairs_from_red_team is called opportunistically; it is a no-op when
+            # the red-team prompt file does not exist.
+            red_team_pairs = await self._pair_gen.generate_pairs_from_red_team(
+                self._re, limit=50
+            )
+
+            # Source 3: Reasoning quality pairs (deep causal reasoning vs shallow answer)
+            # Anti-laziness DPO signal — teaches the model to prefer rigorous over surface reasoning.
+            reasoning_quality_pairs = await self._pair_gen.generate_pairs_from_reasoning_quality(
+                self._re, limit=100
+            )
+
+            all_pairs = constitutional_pairs + red_team_pairs + reasoning_quality_pairs
+            await self._pair_gen.save_pairs(all_pairs)
+            logger.info(
+                "dpo.pairs_collected",
+                constitutional=len(constitutional_pairs),
+                red_team=len(red_team_pairs),
+                reasoning_quality=len(reasoning_quality_pairs),
+                total=len(all_pairs),
+            )
+
             dpo_adapter = await self._dpo_trainer.run_dpo_pass(self._sure.production_adapter_path)
             if dpo_adapter:
                 self._pending_dpo_adapter = dpo_adapter
@@ -573,7 +673,8 @@ class ContinualLearningOrchestrator:
             )
             run.error = f"export failed: {export_result.error}"
             run.completed_at = datetime.now(UTC)
-            await self._emit("re_training_failed", {"run_id": run.run_id, "tier": 2, "reason": run.error})
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit(_SET.RE_TRAINING_FAILED, {"run_id": run.run_id, "tier": 2, "reason": run.error})
             return run
 
         run.examples_used = export_result.total_exported
@@ -872,6 +973,34 @@ class ContinualLearningOrchestrator:
                     # Do NOT deploy — current adapter stays in production
                     return run
 
+            # ── Step 6d-pre: Snapshot pre-deployment baseline ─────────────────
+            # Capture Thompson success rate + eval_loss of current adapter
+            # so we have a ground truth to compare against after deployment.
+            pre_rate = await self._read_thompson_success_rate()
+            self._pre_deploy_baseline = {
+                "success_rate": pre_rate,
+                "eval_loss": run.eval_loss,  # new adapter's eval_loss (proxy for quality)
+                "cycle": run.run_id,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "adapter_path": self._current_adapter_path,
+            }
+            # Store the adapter path we'll restore on rollback.
+            self._pre_deploy_adapter_path = self._current_adapter_path
+            if self._redis is not None:
+                try:
+                    await self._redis.set(
+                        _REDIS_KEY_PRE_DEPLOY_BASELINE,
+                        json.dumps(self._pre_deploy_baseline),
+                    )
+                except Exception as _bex:
+                    logger.warning("pre_deploy_baseline_persist_failed", error=str(_bex))
+            logger.info(
+                "pre_deploy_baseline_captured",
+                run_id=run.run_id,
+                pre_success_rate=round(pre_rate, 4),
+                pre_adapter=self._current_adapter_path,
+            )
+
             # ── Step 6d: Deploy adapter ────────────────────────────────────────
             try:
                 adapter_id = f"eos_slow_{run.run_id}"
@@ -894,6 +1023,27 @@ class ContinualLearningOrchestrator:
                 )
                 run.error = f"training succeeded but adapter deployment failed: {exc}"
 
+            # ── Step 6d-post: Start post-deployment monitoring window ──────────
+            # Reset counters and open the monitoring window.
+            # _monitor_re_outcome() is called externally by NovaService when it
+            # records each RE decision outcome (via record_re_outcome()).
+            if run.deployed:
+                self._post_deploy_successes = 0
+                self._post_deploy_attempts = 0
+                self._monitoring_active = True
+                logger.info(
+                    "post_deploy_monitoring_started",
+                    run_id=run.run_id,
+                    window_cycles=_POST_DEPLOY_MONITOR_CYCLES,
+                    pre_success_rate=round(pre_rate, 4),
+                )
+
+            # ── Step 6d.1: Upload adapter to S3 for inference pod pickup ────────
+            # Non-blocking — inference pod watcher polls this prefix.
+            s3_adapter_path = await self._upload_adapter_to_s3(
+                slow_adapter_path, run.run_id, kl_divergence, run.eval_loss
+            )
+
             # Update last train timestamp
             self._last_train_at = run.completed_at
 
@@ -906,6 +1056,7 @@ class ContinualLearningOrchestrator:
                     "eval_loss": run.eval_loss,
                     "adapter_id": f"eos_slow_{run.run_id}",
                     "adapter_path": slow_adapter_path,
+                    "s3_adapter_path": s3_adapter_path,
                     "kl_divergence": round(kl_divergence, 5),
                 },
             )
@@ -928,8 +1079,9 @@ class ContinualLearningOrchestrator:
         # ── Step 7: Failure path ───────────────────────────────────────────────
         else:
             run.error = proc_error
+            from systems.synapse.types import SynapseEventType as _SET
             await self._emit(
-                "re_training_failed",
+                _SET.RE_TRAINING_FAILED,
                 {"run_id": run.run_id, "tier": 2, "reason": proc_error},
             )
             # Organism continues on Claude-only; no re-raise
@@ -973,6 +1125,211 @@ class ContinualLearningOrchestrator:
                 "full_retrain_interval_days": self._config.full_retrain_interval_days,
             },
         }
+
+    # ── Post-deployment quality monitoring ─────────────────────────────────────
+
+    def record_re_outcome(self, success: bool) -> None:
+        """
+        Called by NovaService._on_axon_execution_result() for every RE decision.
+
+        Accumulates successes/attempts in the post-deployment monitoring window.
+        When the window fills (_POST_DEPLOY_MONITOR_CYCLES attempts), evaluates
+        quality vs the pre-deployment baseline and either confirms or rolls back
+        the adapter.  Non-blocking — spawns a background coroutine to handle the
+        async rollback/confirm logic.
+
+        No-op if no monitoring window is open.
+        """
+        if not self._monitoring_active:
+            return
+        self._post_deploy_attempts += 1
+        if success:
+            self._post_deploy_successes += 1
+
+        if self._post_deploy_attempts >= _POST_DEPLOY_MONITOR_CYCLES:
+            # Window complete — evaluate and act in the background so we don't
+            # block the calling synchronous record path.
+            self._monitoring_active = False
+            asyncio.ensure_future(self._evaluate_post_deploy_quality())
+
+    async def _evaluate_post_deploy_quality(self) -> None:
+        """
+        Compare post-deployment success rate against pre-deployment baseline.
+
+        Called once when the monitoring window closes.  Never raises.
+        """
+        try:
+            if self._pre_deploy_baseline is None:
+                logger.warning("post_deploy_eval.no_baseline")
+                return
+
+            pre_rate: float = self._pre_deploy_baseline.get("success_rate", 0.5)
+            post_rate: float = (
+                self._post_deploy_successes / self._post_deploy_attempts
+                if self._post_deploy_attempts > 0
+                else 0.0
+            )
+            run_id: str = self._pre_deploy_baseline.get("cycle", "unknown")
+
+            logger.info(
+                "post_deploy_quality_evaluated",
+                run_id=run_id,
+                pre_rate=round(pre_rate, 4),
+                post_rate=round(post_rate, 4),
+                window_attempts=self._post_deploy_attempts,
+                window_successes=self._post_deploy_successes,
+            )
+
+            rollback_threshold = pre_rate * _ROLLBACK_DEGRADATION_THRESHOLD
+            confirm_threshold = pre_rate * _CONFIRM_IMPROVEMENT_THRESHOLD
+
+            if post_rate < rollback_threshold:
+                await self._rollback_adapter(run_id, pre_rate, post_rate)
+            elif post_rate > confirm_threshold:
+                await self._confirm_adapter(run_id, pre_rate, post_rate)
+            else:
+                # Within acceptable range — neutral, keep current adapter
+                logger.info(
+                    "post_deploy_quality_neutral",
+                    run_id=run_id,
+                    pre_rate=round(pre_rate, 4),
+                    post_rate=round(post_rate, 4),
+                )
+
+        except Exception as exc:
+            logger.error("post_deploy_eval_failed", error=str(exc))
+
+    async def _rollback_adapter(self, run_id: str, pre_rate: float, post_rate: float) -> None:
+        """
+        Restore the pre-deployment adapter and reset Thompson sampler Beta params.
+
+        Steps:
+          1. Reload the previous adapter in vLLM.
+          2. Emit MODEL_ROLLBACK_TRIGGERED.
+          3. Reset Thompson "re" arm Beta params to pre-deployment values
+             (stored as baseline success_rate → infer alpha/beta from rate).
+          4. Emit RE_TRAINING_EXAMPLE so the regression is a learning signal.
+          5. Log the rollback reason.
+        """
+        logger.warning(
+            "re_adapter_rollback",
+            reason="quality_degradation",
+            run_id=run_id,
+            pre_rate=round(pre_rate, 4),
+            post_rate=round(post_rate, 4),
+        )
+
+        # 1. Restore previous adapter
+        if self._pre_deploy_adapter_path:
+            try:
+                rollback_id = f"eos_rollback_{run_id}"
+                await self._re.load_adapter(self._pre_deploy_adapter_path, rollback_id)
+                self._current_adapter_path = self._pre_deploy_adapter_path
+                logger.info(
+                    "re_adapter_restored",
+                    run_id=run_id,
+                    adapter_path=self._pre_deploy_adapter_path,
+                )
+            except Exception as exc:
+                logger.error("re_adapter_rollback_load_failed", error=str(exc))
+        else:
+            logger.warning("re_adapter_rollback.no_previous_adapter", run_id=run_id)
+
+        # 2. Emit MODEL_ROLLBACK_TRIGGERED
+        await self._emit(
+            "model_rollback_triggered",
+            {
+                "run_id": run_id,
+                "reason": "quality_degradation",
+                "pre_success_rate": round(pre_rate, 4),
+                "post_success_rate": round(post_rate, 4),
+                "window_attempts": self._post_deploy_attempts,
+                "rollback_adapter": self._pre_deploy_adapter_path,
+                "auto_rollback": True,
+            },
+        )
+
+        # 3. Reset Thompson "re" arm Beta params.
+        # We approximate: if the old rate was R, set alpha=R*N, beta=(1-R)*N
+        # with N=20 (modest confidence — not erasing all historical learning).
+        if self._redis is not None:
+            try:
+                _n = 20.0
+                rollback_alpha = pre_rate * _n
+                rollback_beta = (1.0 - pre_rate) * _n
+                # Patch the Redis hash that ThompsonSampler.load_from_redis() reads.
+                from systems.nova.policy_generator import ThompsonSampler
+                await self._redis.hset(
+                    ThompsonSampler.REDIS_KEY,
+                    mapping={
+                        "re_alpha": str(rollback_alpha),
+                        "re_beta": str(rollback_beta),
+                    },
+                )
+                logger.info(
+                    "thompson_sampler_re_reset",
+                    run_id=run_id,
+                    re_alpha=rollback_alpha,
+                    re_beta=rollback_beta,
+                )
+            except Exception as exc:
+                logger.warning("thompson_sampler_re_reset_failed", error=str(exc))
+
+        # 4. Emit RE_TRAINING_EXAMPLE — the rollback is a learning signal for future training
+        await self._emit(
+            "re_training_example",
+            {
+                "source": "re_adapter_rollback",
+                "run_id": run_id,
+                "pre_success_rate": round(pre_rate, 4),
+                "post_success_rate": round(post_rate, 4),
+                "window_attempts": self._post_deploy_attempts,
+                "outcome": "rollback_triggered",
+                "signal": "quality_degradation_detected",
+            },
+        )
+
+        # Clear baseline so next deploy starts fresh
+        self._pre_deploy_baseline = None
+        self._pre_deploy_adapter_path = None
+
+    async def _confirm_adapter(self, run_id: str, pre_rate: float, post_rate: float) -> None:
+        """Confirm successful deployment — log and emit quality confirmation event."""
+        logger.info(
+            "re_adapter_confirmed",
+            run_id=run_id,
+            pre_rate=round(pre_rate, 4),
+            post_rate=round(post_rate, 4),
+            improvement_pct=round((post_rate / pre_rate - 1.0) * 100, 1),
+        )
+        await self._emit(
+            "re_adapter_quality_confirmed",
+            {
+                "run_id": run_id,
+                "pre_success_rate": round(pre_rate, 4),
+                "post_success_rate": round(post_rate, 4),
+                "improvement_pct": round((post_rate / pre_rate - 1.0) * 100, 1),
+                "window_attempts": self._post_deploy_attempts,
+            },
+        )
+        # Clear baseline — this adapter is now the confirmed baseline for the next deploy
+        self._pre_deploy_baseline = None
+        self._pre_deploy_adapter_path = None
+
+    async def _read_thompson_success_rate(self) -> float:
+        """Read the current RE success rate from Redis (written by ThompsonSampler).
+
+        Returns 0.5 (neutral prior) if Redis is unavailable or key is missing.
+        """
+        if self._redis is None:
+            return 0.5
+        try:
+            raw = await self._redis.get(_REDIS_KEY_THOMPSON_SCORE)
+            if raw:
+                return float(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception as exc:
+            logger.debug("thompson_rate_read_failed", error=str(exc))
+        return 0.5
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -1030,24 +1387,111 @@ class ContinualLearningOrchestrator:
             logger.error("tier3.cumulative_export_error", error=str(exc))
             return ""
 
-    async def _emit(self, event_type_str: str, payload: dict[str, Any]) -> None:
+    async def _upload_adapter_to_s3(
+        self,
+        adapter_path: str,
+        run_id: str,
+        kl_divergence: float,
+        eval_loss: float | None,
+    ) -> str | None:
+        """
+        Upload the production adapter to S3 so the inference pod can pick it up.
+
+        Writes adapter files to:
+            s3://{bucket}/{prefix}{instance_id}/{timestamp}/
+
+        Also writes a manifest.json at the prefix root so the pod watcher knows
+        which version is current without listing all keys.
+
+        Returns the S3 path on success, None on failure. Non-fatal — local
+        deployment still works even if S3 upload fails.
+        """
+        try:
+            import boto3  # type: ignore[import]
+        except ImportError:
+            logger.info("s3_adapter_upload.boto3_not_available", hint="pip install boto3")
+            return None
+
+        adapter_dir = Path(adapter_path)
+        if not adapter_dir.exists():
+            logger.warning("s3_adapter_upload.path_not_found", path=adapter_path)
+            return None
+
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        s3_prefix = f"{_S3_ADAPTER_PREFIX}{_INSTANCE_ID}/{timestamp}/"
+
+        try:
+            s3 = boto3.client("s3")
+
+            # Upload all adapter files (safetensors, config, tokenizer, etc.)
+            uploaded_files: list[str] = []
+            files_to_upload = list(adapter_dir.iterdir()) if adapter_dir.is_dir() else [adapter_dir]
+            for fpath in files_to_upload:
+                if fpath.is_file():
+                    key = f"{s3_prefix}{fpath.name}"
+                    s3.upload_file(str(fpath), _S3_ADAPTER_BUCKET, key)
+                    uploaded_files.append(fpath.name)
+
+            # Write manifest at the well-known prefix — pod watcher reads this
+            manifest = {
+                "version": timestamp,
+                "run_id": run_id,
+                "instance_id": _INSTANCE_ID,
+                "adapter_s3_prefix": s3_prefix,
+                "kl_divergence": round(kl_divergence, 5),
+                "eval_loss": eval_loss,
+                "files": uploaded_files,
+                "uploaded_at": datetime.now(UTC).isoformat(),
+            }
+            manifest_key = f"{_S3_ADAPTER_PREFIX}{_INSTANCE_ID}/latest_manifest.json"
+            s3.put_object(
+                Bucket=_S3_ADAPTER_BUCKET,
+                Key=manifest_key,
+                Body=json.dumps(manifest, indent=2),
+                ContentType="application/json",
+            )
+
+            s3_full_path = f"s3://{_S3_ADAPTER_BUCKET}/{s3_prefix}"
+            logger.info(
+                "s3_adapter_uploaded",
+                run_id=run_id,
+                s3_path=s3_full_path,
+                manifest_key=manifest_key,
+                files=len(uploaded_files),
+            )
+            return s3_full_path
+
+        except Exception as exc:
+            logger.warning(
+                "s3_adapter_upload_failed",
+                run_id=run_id,
+                error=str(exc),
+                hint="Inference pod will not pick up this adapter version",
+            )
+            return None
+
+    async def _emit(self, event_type_str: "str | SynapseEventType", payload: dict[str, Any]) -> None:
         """Fire-and-forget Synapse event. Never raises."""
         if self._event_bus is None:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
+            if isinstance(event_type_str, SynapseEventType):
+                et: SynapseEventType = event_type_str
+            else:
+                et = SynapseEventType(event_type_str)
             event = SynapseEvent(
-                event_type=SynapseEventType(event_type_str),
+                event_type=et,
                 data=payload,
                 source_system="reasoning_engine",
             )
             asyncio.ensure_future(self._event_bus.emit(event))
         except Exception as exc:
-            logger.debug("continual_learning_emit_failed", event=event_type_str, error=str(exc))
+            logger.debug("continual_learning_emit_failed", event=str(event_type_str), error=str(exc))
 
     async def _set_training_halted(self, reason: str) -> None:
-        """Persist training halt to Redis — survives restart."""
+        """Persist training halt to Redis and notify Thymos via Synapse."""
         self._training_halted = True
         if self._redis is not None:
             try:
@@ -1055,6 +1499,24 @@ class ContinualLearningOrchestrator:
             except Exception as exc:
                 logger.warning("training_halt_persist_failed", error=str(exc))
         logger.critical("training.halted_persisted", reason=reason)
+        # Emit RE_TRAINING_HALTED so Thymos creates a HIGH incident and the
+        # Synapse bus is aware — Thymos can then attempt recovery.
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.RE_TRAINING_HALTED,
+                    source_system="reasoning_engine",
+                    data={
+                        "reason": reason,
+                        "halted_by": "kill_switch",
+                        "job_id": "continual_learning",
+                        "tier": 2,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    },
+                )))
+            except Exception:
+                pass
 
     async def _is_training_halted(self) -> tuple[bool, str]:
         """Check Redis for persisted halt flag."""
@@ -1069,8 +1531,16 @@ class ContinualLearningOrchestrator:
             logger.warning("training_halt_check_failed", error=str(exc))
         return False, ""
 
-    async def _clear_training_halt(self) -> None:
-        """Operator action: clear halt and resume training."""
+    async def clear_training_halt(self) -> None:
+        """Public operator action: clear halt and resume training.
+
+        Call this after a RE quality regression has been investigated and the
+        cause addressed.  The next `check_and_train()` cycle (≤6 hours) will
+        re-evaluate `should_train()` without the halt gate.
+
+        Also emits RE_TRAINING_RESUMED on the Synapse bus so Benchmarks and
+        Nova can react (e.g. reset Thompson baseline, resume goal injection).
+        """
         self._training_halted = False
         if self._redis is not None:
             try:
@@ -1078,6 +1548,20 @@ class ContinualLearningOrchestrator:
             except Exception as exc:
                 logger.warning("training_halt_clear_failed", error=str(exc))
         logger.info("training.halt_cleared")
+        # Notify the bus — non-blocking, best-effort
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.RE_TRAINING_RESUMED,
+                    source_system="reasoning_engine",
+                    data={"cleared_by": "operator", "timestamp": datetime.now(UTC).isoformat()},
+                )))
+            except Exception:
+                pass
+
+    # Keep private alias for internal callers
+    _clear_training_halt = clear_training_halt
 
     async def _persist_state(self) -> None:
         """Persist last_train_at and training_runs to Redis. Never raises."""

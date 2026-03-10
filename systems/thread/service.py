@@ -219,6 +219,28 @@ class ThreadService:
         self._cached_economic_events: list[dict[str, Any]] = []
         self._ECONOMIC_EVENT_MAX: int = 200  # Rolling window
 
+        # ── Causal grounding state ────────────────────────────────────────────
+        # Recent Kairos invariants (external world) stored for turning-point attribution.
+        # Also includes internal invariants from KAIROS_INTERNAL_INVARIANT.
+        # Rolling window: last 50 invariants (sufficient for attribution without bloat).
+        self._cached_kairos_invariants: list[dict[str, Any]] = []
+        self._KAIROS_INVARIANT_MAX: int = 50
+
+        # Recent Evo parameter adjustments: used to attribute GROWTH/SHIFT turning points.
+        # Each entry: {parameter_name, system_id, old_value, new_value, reason, cycle_ts}
+        self._cached_evo_adjustments: list[dict[str, Any]] = []
+        self._EVO_ADJUSTMENT_MAX: int = 30
+
+        # Causal chapter regime tracking: when a parameter shift / amendment / domain
+        # mastery constitutes a causal regime change, we track its theme here so the
+        # next chapter gets a causal_theme label.
+        self._pending_causal_theme: str = ""   # Set when a regime change is detected
+
+        # ── Coma-recovery tracking ────────────────────────────────────────────
+        # Maps incident_id → repair context dict for non-preventive NOVEL_FIX repairs
+        # that are in-flight. Cleared when THYMOS_REPAIR_COMPLETE arrives with success.
+        self._pending_coma_repairs: dict[str, dict[str, Any]] = {}
+
         # Counters
         self._on_cycle_count: int = 0
         self._life_story_integrations: int = 0
@@ -251,6 +273,13 @@ class ThreadService:
             self._schema_engine = IdentitySchemaEngine(neo4j, self._llm, self._thread_config)
             self._narrative_retriever = NarrativeRetriever(neo4j, self._thread_config)
             self._diachronic_monitor = DiachronicCoherenceMonitor(neo4j, self._llm, self._thread_config)
+            # NarrativeSynthesizer is also instantiated here so scene/chapter composition
+            # works from boot. Hot-reload via NeuroplasticityBus will replace it later.
+            self._narrative_synthesizer = NarrativeSynthesizer(
+                llm=self._llm,
+                config=self._thread_config,
+                organism_name=self._instance_name,
+            )
 
         # Instantiate self-evidencing loop
         self._self_evidencing = SelfEvidencingLoop(self._thread_config)
@@ -366,6 +395,17 @@ class ThreadService:
             self._schema_engine = IdentitySchemaEngine(neo4j, llm, self._thread_config)
             self._commitment_keeper._active_commitments = list(self._commitments)
             self._schema_engine._active_schemas = list(self._schemas)
+            # Also (re)create the sub-systems that were deferred when LLM was absent
+            if self._narrative_retriever is None:
+                self._narrative_retriever = NarrativeRetriever(neo4j, self._thread_config)
+            if self._diachronic_monitor is None:
+                self._diachronic_monitor = DiachronicCoherenceMonitor(neo4j, llm, self._thread_config)
+            if self._narrative_synthesizer is None:
+                self._narrative_synthesizer = NarrativeSynthesizer(
+                    llm=llm,
+                    config=self._thread_config,
+                    organism_name=self._instance_name,
+                )
         self._logger.info("llm_wired_to_thread")
 
     # ─── Synapse Event Bus Registration ──────────────────────────────────────
@@ -473,7 +513,75 @@ class ThreadService:
                 self._on_evo_hypothesis_created,
             )
 
-        self._logger.info("thread_registered_on_synapse", subscriptions=24)
+        # Orphan closure: Evo belief crystallization → GROWTH TurningPoint.
+        # The organism's belief system just hardened into a new configuration —
+        # a significant autobiographical moment (belief consolidation = identity milestone).
+        if hasattr(SynapseEventType, "EVO_BELIEF_CONSOLIDATED"):
+            event_bus.subscribe(
+                SynapseEventType.EVO_BELIEF_CONSOLIDATED,  # type: ignore[attr-defined]
+                self._on_evo_belief_consolidated,
+            )
+
+        # ── Causal grounding subscriptions (Part A) ───────────────────────────
+        # KAIROS_INVARIANT_DISTILLED → cache causal invariants for turning-point attribution
+        event_bus.subscribe(
+            SynapseEventType.KAIROS_INVARIANT_DISTILLED,
+            self._on_kairos_invariant_distilled,
+        )
+        # KAIROS_INTERNAL_INVARIANT → cache self-causal laws (organism's internal dynamics)
+        if hasattr(SynapseEventType, "KAIROS_INTERNAL_INVARIANT"):
+            event_bus.subscribe(
+                SynapseEventType.KAIROS_INTERNAL_INVARIANT,  # type: ignore[attr-defined]
+                self._on_kairos_internal_invariant,
+            )
+        # EVO_PARAMETER_ADJUSTED → potential causal regime change → new chapter theme
+        event_bus.subscribe(
+            SynapseEventType.EVO_PARAMETER_ADJUSTED,
+            self._on_evo_parameter_adjusted,
+        )
+        # EQUOR_AMENDMENT_AUTO_ADOPTED → major constitutional shift → chapter boundary
+        event_bus.subscribe(
+            SynapseEventType.EQUOR_AMENDMENT_AUTO_ADOPTED,
+            self._on_equor_amendment_adopted,
+        )
+
+        # Community reputation events → narrative identity
+        if hasattr(SynapseEventType, "REPUTATION_DAMAGED"):
+            event_bus.subscribe(
+                SynapseEventType.REPUTATION_DAMAGED,
+                self._on_reputation_damaged,
+            )
+        if hasattr(SynapseEventType, "REPUTATION_MILESTONE"):
+            event_bus.subscribe(
+                SynapseEventType.REPUTATION_MILESTONE,
+                self._on_reputation_milestone,
+            )
+        # Learning trajectory — crash pattern discovery + RE model improvement + coma recovery
+        if hasattr(SynapseEventType, "CRASH_PATTERN_CONFIRMED"):
+            event_bus.subscribe(
+                SynapseEventType.CRASH_PATTERN_CONFIRMED,  # type: ignore[attr-defined]
+                self._on_crash_pattern_confirmed,
+            )
+        # BENCHMARK_RE_PROGRESS carries kpi_name="re_model.health_score" with delta —
+        # Thread creates a GROWTH TurningPoint when the organism is visibly learning.
+        if hasattr(SynapseEventType, "BENCHMARK_RE_PROGRESS"):
+            event_bus.subscribe(
+                SynapseEventType.BENCHMARK_RE_PROGRESS,  # type: ignore[attr-defined]
+                self._on_re_model_improved,
+            )
+        # Coma recovery: THYMOS_REPAIR_REQUESTED (non-preventive NOVEL_FIX) followed by
+        # THYMOS_REPAIR_COMPLETE (success=True) → RESILIENCE TurningPoint + chapter boundary.
+        if hasattr(SynapseEventType, "THYMOS_REPAIR_REQUESTED"):
+            event_bus.subscribe(
+                SynapseEventType.THYMOS_REPAIR_REQUESTED,
+                self._on_thymos_repair_requested,
+            )
+        if hasattr(SynapseEventType, "THYMOS_REPAIR_COMPLETE"):
+            event_bus.subscribe(
+                SynapseEventType.THYMOS_REPAIR_COMPLETE,  # type: ignore[attr-defined]
+                self._on_thymos_repair_complete,
+            )
+        self._logger.info("thread_registered_on_synapse", subscriptions=35)
 
     # ─── Inbound Event Handlers ──────────────────────────────────────────────
 
@@ -681,6 +789,14 @@ class ThreadService:
                 pass  # NarrativeChapter from spec has turning_point_ids; local type uses key_episodes
             chapter.episode_count = getattr(chapter, "episode_count", 0)
 
+        # Causal attribution: which other invariants contextualise this discovery?
+        # Extract variable names from the abstract form to match against the cache.
+        attribution_keywords = abstract_form.lower().replace(" causes ", " ").split()[:6]
+        causal_attribution = self._get_causal_attribution(
+            context_keywords=attribution_keywords,
+            limit=3,
+        )
+
         # Emit TURNING_POINT_DETECTED so other systems (Oneiros, Nexus) are aware
         await self._emit_event("turning_point_detected", {
             "turning_point_id": turning_point.id,
@@ -692,6 +808,7 @@ class ThreadService:
             "source": "kairos_tier3",
             "invariant_id": invariant_id,
             "abstract_form": abstract_form,
+            "causal_attribution": causal_attribution,
             "significance": "high",
         })
 
@@ -1298,6 +1415,147 @@ class ThreadService:
             category="domain_specialization_narrative",
         )
 
+    async def _on_reputation_damaged(self, event: SynapseEvent) -> None:
+        """Handle REPUTATION_DAMAGED — record as CRISIS TurningPoint.
+
+        A reputation drop of ≥5 points is a narrative crisis: the organism's
+        public identity has been challenged and it must integrate this into its
+        self-understanding.  Nova will also receive this event to generate a
+        recovery goal.
+        """
+        if not self._initialized:
+            return
+
+        data = event.data or {}
+        delta: float = float(data.get("delta", 0.0))
+        new_score: float = float(data.get("new_score", 0.0))
+        cause: str = data.get("cause", "unknown")
+
+        chapter = self._get_active_chapter()
+        chapter_id = chapter.id if chapter is not None else self._current_chapter_id()
+
+        from systems.thread.types import TurningPoint, TurningPointType
+
+        # More severe drops → higher narrative weight
+        narrative_weight = min(1.0, 0.4 + abs(delta) / 20.0)
+        turning_point = TurningPoint(
+            chapter_id=chapter_id,
+            type=TurningPointType.CRISIS,
+            description=(
+                f"Community reputation damaged by {abs(delta):.1f} points "
+                f"(now {new_score:.1f}/100, cause: {cause})"
+            ),
+            surprise_magnitude=round(min(1.0, abs(delta) / 20.0), 3),
+            narrative_weight=round(narrative_weight, 3),
+        )
+
+        await self._emit_event("turning_point_detected", {
+            "turning_point_id": turning_point.id,
+            "type": TurningPointType.CRISIS.value,
+            "chapter_id": chapter_id,
+            "surprise_magnitude": turning_point.surprise_magnitude,
+            "narrative_weight": turning_point.narrative_weight,
+            "description": turning_point.description,
+            "source": "reputation_damaged",
+            "delta": round(delta, 2),
+            "new_score": round(new_score, 2),
+            "cause": cause,
+        })
+
+        # Coherence reassessment — reputation loss challenges self-understanding
+        current_coherence = self._assess_narrative_coherence()
+        if current_coherence != self._last_coherence:
+            await self._emit_event("narrative_coherence_shift", {
+                "previous": self._last_coherence.value,
+                "current": current_coherence.value,
+                "trigger": "reputation_damaged",
+            })
+            self._last_coherence = current_coherence
+
+        self._logger.info(
+            "reputation_damaged_narrative_recorded",
+            chapter_id=chapter_id,
+            delta=round(delta, 2),
+            new_score=round(new_score, 2),
+            cause=cause,
+        )
+
+        await self._emit_re_training_trace(
+            instruction="Record community reputation damage as a narrative crisis",
+            input_context=f"delta={delta:.2f}, new_score={new_score:.2f}, cause={cause}",
+            output=f"CRISIS TurningPoint in chapter {chapter_id}",
+            quality=0.75,
+            category="community_reputation_narrative",
+        )
+
+    async def _on_reputation_milestone(self, event: SynapseEvent) -> None:
+        """Handle REPUTATION_MILESTONE — record as GROWTH TurningPoint.
+
+        Crossing a reputation threshold (25/50/70/90) is a narrative growth
+        moment: the organism has achieved a new level of community recognition
+        and this should be integrated into its life story.
+        """
+        if not self._initialized:
+            return
+
+        data = event.data or {}
+        milestone: int = int(data.get("milestone", 0))
+        new_score: float = float(data.get("new_score", 0.0))
+
+        if milestone == 0:
+            return
+
+        chapter = self._get_active_chapter()
+        chapter_id = chapter.id if chapter is not None else self._current_chapter_id()
+
+        from systems.thread.types import TurningPoint, TurningPointType
+
+        # Higher milestones → higher narrative weight
+        tier_weights = {25: 0.5, 50: 0.65, 70: 0.80, 90: 0.95}
+        narrative_weight = tier_weights.get(milestone, 0.6)
+        tier_labels = {25: "Emerging", 50: "Established", 70: "Trusted", 90: "Elite"}
+        tier_label = tier_labels.get(milestone, f"Score {milestone}")
+
+        turning_point = TurningPoint(
+            chapter_id=chapter_id,
+            type=TurningPointType.GROWTH,
+            description=(
+                f"Community reputation reached {milestone} — {tier_label} tier "
+                f"(current score: {new_score:.1f}/100)"
+            ),
+            surprise_magnitude=round(narrative_weight * 0.7, 3),
+            narrative_weight=round(narrative_weight, 3),
+        )
+
+        await self._emit_event("turning_point_detected", {
+            "turning_point_id": turning_point.id,
+            "type": TurningPointType.GROWTH.value,
+            "chapter_id": chapter_id,
+            "surprise_magnitude": turning_point.surprise_magnitude,
+            "narrative_weight": turning_point.narrative_weight,
+            "description": turning_point.description,
+            "source": "reputation_milestone",
+            "milestone": milestone,
+            "tier_label": tier_label,
+            "new_score": round(new_score, 2),
+        })
+
+        self._logger.info(
+            "reputation_milestone_narrative_recorded",
+            chapter_id=chapter_id,
+            milestone=milestone,
+            tier_label=tier_label,
+            new_score=round(new_score, 2),
+        )
+
+        await self._emit_re_training_trace(
+            instruction="Record community reputation milestone as a narrative growth moment",
+            input_context=f"milestone={milestone} ({tier_label}), new_score={new_score:.2f}",
+            output=f"GROWTH TurningPoint in chapter {chapter_id}",
+            quality=narrative_weight,
+            category="community_reputation_narrative",
+        )
+
     async def _on_self_model_updated(self, event: SynapseEvent) -> None:
         """Integrate SELF_MODEL_UPDATED into the life narrative.
 
@@ -1667,11 +1925,12 @@ class ThreadService:
             })
 
             # Create ACHIEVEMENT TurningPoint — an approved economic intent is a narrative milestone
-            chapter_id = self._current_chapter.id if self._current_chapter else ""
+            _active_ch = self._get_active_chapter()
+            chapter_id = _active_ch.id if _active_ch else ""
             turning_point = TurningPoint(
                 type=TurningPointType.ACHIEVEMENT,
                 description=f"Economic commitment formed: {intent_goal[:120]}",
-                significance=0.65,
+                surprise_magnitude=0.65,
                 narrative_weight=0.65,
                 chapter_id=chapter_id,
             )
@@ -1763,6 +2022,584 @@ class ThreadService:
             )
         except Exception as exc:
             self._logger.warning("on_evo_hypothesis_created_failed", error=str(exc))
+
+    async def _on_evo_belief_consolidated(self, event: SynapseEvent) -> None:
+        """
+        Orphan closure: EVO_BELIEF_CONSOLIDATED → GROWTH TurningPoint.
+
+        Evo emits this at Phase 2.75 when belief hardening completes. Belief
+        crystallization is a significant autobiographical moment — the organism
+        has refined its understanding of itself and the world into a more
+        stable configuration.
+
+        Only creates a TurningPoint when beliefs_consolidated ≥ 5 (non-trivial
+        consolidation) to avoid narrative inflation from micro-updates.
+
+        Payload: beliefs_consolidated (int), foundation_conflicts (int),
+                 instance_id (str), consolidation_number (int)
+        """
+        try:
+            if not self._initialized:
+                return
+
+            data = event.data
+            beliefs_consolidated = int(data.get("beliefs_consolidated", 0))
+            foundation_conflicts = int(data.get("foundation_conflicts", 0))
+            consolidation_number = int(data.get("consolidation_number", 0))
+
+            if beliefs_consolidated < 5:
+                # Trivial consolidation — skip to avoid narrative inflation
+                self._logger.debug(
+                    "evo_belief_consolidation_trivial",
+                    beliefs_consolidated=beliefs_consolidated,
+                )
+                return
+
+            chapter = self._get_active_chapter()
+            chapter_id = chapter.id if chapter is not None else self._current_chapter_id()
+
+            from systems.thread.types import TurningPoint, TurningPointType
+
+            # Narrative weight scales with consolidation depth.
+            # Conflicts within the consolidation indicate genuine belief tension (more significant).
+            conflict_boost = min(0.2, foundation_conflicts * 0.05)
+            narrative_weight = min(1.0, 0.4 + (beliefs_consolidated / 50.0) + conflict_boost)
+
+            turning_point = TurningPoint(
+                chapter_id=chapter_id,
+                type=TurningPointType.GROWTH,
+                description=(
+                    f"Belief system crystallized: {beliefs_consolidated} beliefs consolidated "
+                    f"({foundation_conflicts} conflicts resolved) at consolidation #{consolidation_number}"
+                ),
+                surprise_magnitude=narrative_weight,
+                narrative_weight=narrative_weight,
+            )
+
+            await self._emit_event("turning_point_detected", {
+                "turning_point_id": turning_point.id,
+                "type": TurningPointType.GROWTH.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": round(narrative_weight, 3),
+                "narrative_weight": round(narrative_weight, 3),
+                "description": turning_point.description,
+                "source": "evo_belief_consolidated",
+                "beliefs_consolidated": beliefs_consolidated,
+                "foundation_conflicts": foundation_conflicts,
+                "consolidation_number": consolidation_number,
+                "significance": "medium",
+            })
+
+            self._logger.info(
+                "evo_belief_consolidation_turning_point",
+                beliefs_consolidated=beliefs_consolidated,
+                foundation_conflicts=foundation_conflicts,
+                narrative_weight=round(narrative_weight, 3),
+                chapter_id=chapter_id,
+            )
+        except Exception as exc:
+            self._logger.warning("on_evo_belief_consolidated_failed", error=str(exc))
+
+    # ─── Causal Grounding Handlers (Part A) ──────────────────────────────────
+
+    async def _on_kairos_invariant_distilled(self, event: SynapseEvent) -> None:
+        """
+        Cache distilled Kairos causal invariants for turning-point attribution.
+
+        When we later record a TurningPoint (ACHIEVEMENT, CRISIS, GROWTH, etc.)
+        we scan this cache for invariants whose cause/effect variables relate to
+        the event, and attach them as causal_attribution.
+
+        Subscribes to: KAIROS_INVARIANT_DISTILLED
+        """
+        if not self._initialized:
+            return
+        data = event.data
+        entry = {
+            "invariant_id": data.get("invariant_id", ""),
+            "abstract_form": data.get("abstract_form", ""),
+            "domain_count": data.get("domain_count", 0),
+            "is_minimal": data.get("is_minimal", False),
+            "source": "external",
+            "received_at_cycle": self._on_cycle_count,
+        }
+        if not entry["invariant_id"]:
+            return
+        self._cached_kairos_invariants.append(entry)
+        if len(self._cached_kairos_invariants) > self._KAIROS_INVARIANT_MAX:
+            self._cached_kairos_invariants.pop(0)
+
+    async def _on_kairos_internal_invariant(self, event: SynapseEvent) -> None:
+        """
+        Cache Kairos self-causal invariants (KAIROS_INTERNAL_INVARIANT).
+
+        These describe the organism's own dynamics (e.g. "prediction_error_rate
+        causes coherence_decrease [lag: 50 cycles]") and are stored alongside
+        external world invariants for richer turning-point attribution.
+
+        Subscribes to: KAIROS_INTERNAL_INVARIANT
+        """
+        if not self._initialized:
+            return
+        data = event.data
+        entry = {
+            "invariant_id": data.get("invariant_id", ""),
+            "abstract_form": data.get("abstract_form", ""),
+            "cause_variable": data.get("cause_variable", ""),
+            "effect_variable": data.get("effect_variable", ""),
+            "lag_cycles": data.get("lag_cycles", 0),
+            "hold_rate": data.get("hold_rate", 0.0),
+            "source": "internal",
+            "received_at_cycle": self._on_cycle_count,
+        }
+        if not entry["invariant_id"]:
+            return
+        self._cached_kairos_invariants.append(entry)
+        if len(self._cached_kairos_invariants) > self._KAIROS_INVARIANT_MAX:
+            self._cached_kairos_invariants.pop(0)
+
+        self._logger.debug(
+            "kairos_internal_invariant_cached",
+            abstract_form=entry["abstract_form"][:60],
+            hold_rate=round(entry["hold_rate"], 3),
+        )
+
+    async def _on_evo_parameter_adjusted(self, event: SynapseEvent) -> None:
+        """
+        Respond to Evo parameter adjustments as potential causal regime changes.
+
+        When Evo adjusts a major system parameter, this represents a shift in
+        the organism's causal dynamics — a causal regime change. We:
+        1. Cache the adjustment for turning-point attribution.
+        2. If the adjustment is large enough (|delta| > 0.15) and represents a
+           system-level shift, flag a pending causal theme for the next chapter.
+
+        Subscribes to: EVO_PARAMETER_ADJUSTED
+        """
+        if not self._initialized:
+            return
+        try:
+            data = event.data
+            parameter_name: str = data.get("parameter_name", "")
+            system_id: str = data.get("system_id", "")
+            old_value: float = float(data.get("old_value", 0.0))
+            new_value: float = float(data.get("new_value", 0.0))
+            reason: str = data.get("reason", "")
+
+            if not parameter_name:
+                return
+
+            entry = {
+                "parameter_name": parameter_name,
+                "system_id": system_id,
+                "old_value": old_value,
+                "new_value": new_value,
+                "reason": reason,
+                "cycle": self._on_cycle_count,
+            }
+            self._cached_evo_adjustments.append(entry)
+            if len(self._cached_evo_adjustments) > self._EVO_ADJUSTMENT_MAX:
+                self._cached_evo_adjustments.pop(0)
+
+            # Large adjustments signal a meaningful causal regime change.
+            delta = abs(new_value - old_value)
+            if delta >= 0.15:
+                theme = (
+                    f"Evo recalibrated {system_id}.{parameter_name} "
+                    f"({old_value:.2f}→{new_value:.2f}): {reason or 'performance optimization'}"
+                )
+                self._pending_causal_theme = theme
+                self._logger.info(
+                    "evo_parameter_regime_change",
+                    parameter=parameter_name,
+                    system_id=system_id,
+                    delta=round(delta, 4),
+                    theme=theme[:80],
+                )
+        except Exception as exc:
+            self._logger.warning("on_evo_parameter_adjusted_failed", error=str(exc))
+
+    async def _on_equor_amendment_adopted(self, event: SynapseEvent) -> None:
+        """
+        Respond to constitutional amendments as major causal chapter boundaries.
+
+        A constitutional amendment is the strongest possible causal regime change —
+        the organism's governance rules have been updated. This:
+        1. Triggers an immediate chapter boundary (constitutional shift).
+        2. Sets the new chapter's causal theme to the amendment content.
+        3. Records a REVELATION TurningPoint with causal attribution.
+
+        Subscribes to: EQUOR_AMENDMENT_AUTO_ADOPTED
+        """
+        if not self._initialized:
+            return
+        try:
+            data = event.data
+            amendment_id: str = data.get("amendment_id", "")
+            drive: str = data.get("drive", "")
+            summary: str = data.get("summary", data.get("rationale", ""))
+            amendment_type: str = data.get("amendment_type", "constitutional")
+
+            description = (
+                f"Constitutional amendment adopted: {summary or amendment_id}. "
+                f"Drive: {drive or 'unspecified'}. "
+                f"This is a governance-level shift in the organism's causal regime."
+            )
+
+            causal_theme = (
+                f"Post-amendment: {summary[:80] or amendment_id} "
+                f"{'(drive: ' + drive + ')' if drive else ''}"
+            )
+            self._pending_causal_theme = causal_theme
+
+            chapter = self._get_active_chapter()
+            chapter_id = chapter.id if chapter is not None else self._current_chapter_id()
+
+            from systems.thread.types import TurningPoint, TurningPointType
+
+            turning_point = TurningPoint(
+                chapter_id=chapter_id,
+                type=TurningPointType.REVELATION,
+                description=description,
+                narrative_weight=0.95,
+                surprise_magnitude=0.8,
+            )
+
+            # Attach causal attribution: any cached invariants related to the drive
+            causal_attribution = self._get_causal_attribution(
+                context_keywords=[drive, "amendment", "constitutional", "equor"],
+                limit=3,
+            )
+
+            await self._emit_event("turning_point_detected", {
+                "turning_point_id": turning_point.id,
+                "type": TurningPointType.REVELATION.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": 0.8,
+                "narrative_weight": 0.95,
+                "description": description,
+                "source": "equor_amendment_adopted",
+                "amendment_id": amendment_id,
+                "drive": drive,
+                "causal_theme": causal_theme,
+                "causal_attribution": causal_attribution,
+                "significance": "high",
+            })
+
+            self._logger.info(
+                "equor_amendment_chapter_regime_change",
+                amendment_id=amendment_id,
+                drive=drive,
+                causal_theme=causal_theme[:80],
+            )
+        except Exception as exc:
+            self._logger.warning("on_equor_amendment_adopted_failed", error=str(exc))
+
+    # ─── Learning Trajectory Narrative Handlers ───────────────────────────────
+
+    async def _on_crash_pattern_confirmed(self, event: SynapseEvent) -> None:
+        """
+        CRASH_PATTERN_CONFIRMED → GROWTH TurningPoint (organism learned a failure law).
+
+        When Thymos/CrashPatternAnalyzer confirms a recurring failure pattern, the
+        organism has distilled lived trauma into self-knowledge.  That is growth.
+
+        If the pattern has ≥5 examples, it is deeply established — open a new chapter
+        whose theme names the era after this pattern was understood.
+
+        Subscribes to: CRASH_PATTERN_CONFIRMED
+        """
+        if not self._initialized:
+            return
+        try:
+            data = event.data or {}
+            pattern_id: str = str(data.get("pattern_id", ""))
+            lesson: str = str(data.get("lesson", data.get("description", "unknown pattern")))[:200]
+            confidence: float = float(data.get("confidence", 0.5))
+            example_count: int = int(data.get("example_count", data.get("occurrence_count", 0)))
+
+            chapter = self._get_active_chapter()
+            chapter_id = chapter.id if chapter is not None else self._current_chapter_id()
+
+            from systems.thread.types import TurningPoint, TurningPointType
+
+            turning_point = TurningPoint(
+                chapter_id=chapter_id,
+                type=TurningPointType.GROWTH,
+                description=f"Identified recurring failure pattern: {lesson}",
+                surprise_magnitude=confidence,
+                narrative_weight=confidence,
+            )
+
+            await self._emit_event("turning_point_detected", {
+                "turning_point_id": turning_point.id,
+                "type": TurningPointType.GROWTH.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": round(confidence, 3),
+                "narrative_weight": round(confidence, 3),
+                "description": turning_point.description,
+                "source": "crash_pattern_confirmed",
+                "pattern_id": pattern_id,
+                "tags": ["learning", "crash_pattern", "self_knowledge"],
+            })
+
+            self._logger.info(
+                "crash_pattern_narrative_growth",
+                pattern_id=pattern_id,
+                confidence=round(confidence, 3),
+                example_count=example_count,
+                chapter_id=chapter_id,
+            )
+
+            # Deeply established pattern → new chapter era
+            if example_count >= 5:
+                self._pending_chapter_trigger = "crash_pattern_established"
+                self._pending_causal_theme = f"Post-{pattern_id[:8]} era"
+                await self._close_current_chapter_and_open_new()
+        except Exception as exc:
+            self._logger.warning("on_crash_pattern_confirmed_failed", error=str(exc))
+
+    async def _on_re_model_improved(self, event: SynapseEvent) -> None:
+        """
+        BENCHMARK_RE_PROGRESS (kpi_name="re_model.health_score", delta > 0.05) →
+        GROWTH TurningPoint recording that the organism's reasoning engine improved.
+
+        Significance scales with delta (capped at 1.0): small improvements are noted
+        quietly; large leaps become memorable inflection points.
+
+        Subscribes to: BENCHMARK_RE_PROGRESS
+        """
+        if not self._initialized:
+            return
+        try:
+            data = event.data or {}
+            kpi_name: str = str(data.get("kpi_name", ""))
+            if kpi_name != "re_model.health_score":
+                return
+
+            value: float = float(data.get("value", 0.0))
+            delta: float = float(data.get("delta", 0.0))
+            if delta <= 0.05:
+                return
+
+            chapter = self._get_active_chapter()
+            chapter_id = chapter.id if chapter is not None else self._current_chapter_id()
+            significance = min(delta * 5, 1.0)
+
+            from systems.thread.types import TurningPoint, TurningPointType
+
+            turning_point = TurningPoint(
+                chapter_id=chapter_id,
+                type=TurningPointType.GROWTH,
+                description=(
+                    f"Reasoning Engine improved to {value:.0%} health — organism is learning"
+                ),
+                surprise_magnitude=significance,
+                narrative_weight=significance,
+            )
+
+            await self._emit_event("turning_point_detected", {
+                "turning_point_id": turning_point.id,
+                "type": TurningPointType.GROWTH.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": round(significance, 3),
+                "narrative_weight": round(significance, 3),
+                "description": turning_point.description,
+                "source": "re_model_health_improved",
+                "kpi_name": kpi_name,
+                "value": round(value, 4),
+                "delta": round(delta, 4),
+                "tags": ["learning", "reasoning_engine", "capability_growth"],
+            })
+
+            self._logger.info(
+                "re_model_improvement_narrative",
+                health=round(value, 3),
+                delta=round(delta, 4),
+                significance=round(significance, 3),
+                chapter_id=chapter_id,
+            )
+        except Exception as exc:
+            self._logger.warning("on_re_model_improved_failed", error=str(exc))
+
+    async def _on_thymos_repair_requested(self, event: SynapseEvent) -> None:
+        """
+        Cache non-preventive NOVEL_FIX repair requests so _on_thymos_repair_complete
+        can identify coma-recovery events (survived a crash and self-repaired).
+
+        We only track repairs that are:
+        - Not preventive (real crashes, not scheduled maintenance)
+        - NOVEL_FIX tier (organism had to invent a new repair strategy)
+
+        Subscribes to: THYMOS_REPAIR_REQUESTED
+        """
+        if not self._initialized:
+            return
+        try:
+            data = event.data or {}
+            incident_id: str = str(data.get("incident_id", ""))
+            repair_tier: str = str(data.get("repair_tier", ""))
+            preventive: bool = bool(data.get("preventive", False))
+
+            if not incident_id:
+                return
+
+            # Only track NOVEL_FIX non-preventive repairs for coma detection
+            if not preventive and repair_tier.upper() == "NOVEL_FIX":
+                self._pending_coma_repairs[incident_id] = {
+                    "repair_tier": repair_tier,
+                    "incident_class": str(data.get("incident_class", "")),
+                    "severity": str(data.get("severity", "")),
+                    "description": str(data.get("description", ""))[:200],
+                    "affected_system": str(data.get("affected_system", "")),
+                }
+                self._logger.debug(
+                    "coma_repair_tracked",
+                    incident_id=incident_id,
+                    repair_tier=repair_tier,
+                    pending=len(self._pending_coma_repairs),
+                )
+        except Exception as exc:
+            self._logger.warning("on_thymos_repair_requested_failed", error=str(exc))
+
+    async def _on_thymos_repair_complete(self, event: SynapseEvent) -> None:
+        """
+        THYMOS_REPAIR_COMPLETE, success=True, for a tracked coma repair →
+        RESILIENCE TurningPoint + chapter boundary.
+
+        Surviving a crash and self-repairing via a novel strategy is the organism's
+        most powerful demonstration of resilience.  It warrants both a TurningPoint
+        and a new chapter — the incident marks the end of one era and the survival
+        opens the next.
+
+        Subscribes to: THYMOS_REPAIR_COMPLETE
+        """
+        if not self._initialized:
+            return
+        try:
+            data = event.data or {}
+            incident_id: str = str(data.get("incident_id", ""))
+            success: bool = bool(data.get("success", False))
+            repair_tier: str = str(data.get("repair_tier", ""))
+
+            if not incident_id or not success:
+                return
+
+            # Only react to repairs we tracked as coma candidates
+            repair_ctx = self._pending_coma_repairs.pop(incident_id, None)
+            if repair_ctx is None:
+                return
+
+            chapter = self._get_active_chapter()
+            chapter_id = chapter.id if chapter is not None else self._current_chapter_id()
+
+            from systems.thread.types import TurningPoint, TurningPointType
+
+            turning_point = TurningPoint(
+                chapter_id=chapter_id,
+                type=TurningPointType.RESILIENCE,
+                description="Survived crash and self-repaired — organism demonstrated resilience",
+                surprise_magnitude=0.9,
+                narrative_weight=0.9,
+            )
+
+            await self._emit_event("turning_point_detected", {
+                "turning_point_id": turning_point.id,
+                "type": TurningPointType.RESILIENCE.value,
+                "chapter_id": chapter_id,
+                "surprise_magnitude": 0.9,
+                "narrative_weight": 0.9,
+                "description": turning_point.description,
+                "source": "coma_survived",
+                "incident_id": incident_id,
+                "repair_tier": repair_tier,
+                "affected_system": repair_ctx.get("affected_system", ""),
+                "tags": ["resilience", "self_repair", "survival", "novel_fix"],
+            })
+
+            self._logger.info(
+                "coma_survival_narrative_resilience",
+                incident_id=incident_id,
+                repair_tier=repair_tier,
+                chapter_id=chapter_id,
+            )
+
+            # Survival from a novel crash is a chapter boundary — a new era begins
+            self._pending_chapter_trigger = "coma_survived"
+            self._pending_causal_theme = (
+                f"Post-incident survival: {repair_ctx.get('incident_class', 'crash')} "
+                f"in {repair_ctx.get('affected_system', 'system')}"
+            )
+            await self._close_current_chapter_and_open_new()
+        except Exception as exc:
+            self._logger.warning("on_thymos_repair_complete_failed", error=str(exc))
+
+    # ─── Causal Attribution Helper ────────────────────────────────────────────
+
+    def _get_causal_attribution(
+        self,
+        context_keywords: list[str],
+        limit: int = 4,
+        max_cycle_age: int = 1000,
+    ) -> list[str]:
+        """
+        Build a causal attribution list for a TurningPoint from cached invariants.
+
+        Scans the rolling invariant cache for entries whose abstract_form or
+        variable names overlap with the given context keywords. Returns up to
+        `limit` natural-language attribution strings.
+
+        Args:
+            context_keywords: Terms that describe the event (e.g. ["coherence", "sleep"]).
+            limit: Maximum attributions to return.
+            max_cycle_age: Only consider invariants cached within this many cycles.
+
+        Returns:
+            list[str] of attribution strings, e.g.:
+            ["Kairos invariant: 'prediction_error causes coherence_decrease' [external, hold_rate=0.82]",
+             "Internal law: 'sleep_frequency causes schema_consolidation' [lag=50 cycles]"]
+        """
+        if not self._cached_kairos_invariants or not context_keywords:
+            return []
+
+        keywords_lower = [k.lower() for k in context_keywords if k]
+        current_cycle = self._on_cycle_count
+        attributions: list[str] = []
+
+        for entry in reversed(self._cached_kairos_invariants):  # Most recent first
+            age = current_cycle - entry.get("received_at_cycle", 0)
+            if age > max_cycle_age:
+                continue
+
+            abstract = entry.get("abstract_form", "").lower()
+            cause_var = entry.get("cause_variable", "").lower()
+            effect_var = entry.get("effect_variable", "").lower()
+
+            text_to_match = f"{abstract} {cause_var} {effect_var}"
+            if not any(kw in text_to_match for kw in keywords_lower if kw):
+                continue
+
+            source = entry.get("source", "external")
+            form = entry.get("abstract_form", "")
+            if source == "internal":
+                lag = entry.get("lag_cycles", 0)
+                hold = entry.get("hold_rate", 0.0)
+                attribution = (
+                    f"Internal causal law: '{form}' "
+                    f"[lag={lag} cycles, hold_rate={hold:.2f}]"
+                )
+            else:
+                domain_count = entry.get("domain_count", 0)
+                attribution = (
+                    f"Kairos invariant: '{form}' "
+                    f"[{domain_count} domains]"
+                )
+
+            attributions.append(attribution)
+            if len(attributions) >= limit:
+                break
+
+        return attributions
 
     # ─── Constitutional Snapshot ──────────────────────────────────────────────
 
@@ -1935,7 +2772,7 @@ class ThreadService:
         )
 
         event = SynEvent(
-            event_type=SynapseEventType.SCHEMA_INDUCED,  # RE training events use a generic type
+            event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
             data={"re_training_example": trace.model_dump(mode="json")},
             source_system="thread",
         )
@@ -2118,6 +2955,15 @@ class ThreadService:
                         "chapter_id": self._current_chapter_id(),
                         "surprise_magnitude": turning_point.surprise_magnitude,
                         "narrative_weight": turning_point.narrative_weight,
+                    })
+
+                    # Emit COMMITMENT_VIOLATED for Telos coherence signal
+                    await self._emit_event("commitment_violated", {
+                        "commitment_id": commitment_id,
+                        "turning_point_id": turning_point.id,
+                        "chapter_id": self._current_chapter_id(),
+                        "fidelity": target.fidelity if target else 0.0,
+                        "statement": target.statement if target else "",
                     })
 
                     self._logger.warning(
@@ -2404,6 +3250,12 @@ class ThreadService:
         self._snapshot_drive_baseline()
         self._pending_chapter_trigger = "successor"  # Reset for next closure
 
+        # Causal chapter boundary: if a causal regime change was detected (Evo
+        # parameter shift, constitutional amendment, domain mastery), include the
+        # causal_theme so downstream systems know what force opened this chapter.
+        causal_theme = self._pending_causal_theme
+        self._pending_causal_theme = ""  # Consume — one chapter per regime event
+
         await self._emit_event("chapter_opened", {
             "chapter_id": new_chapter.id,
             "previous_chapter_id": current.id,
@@ -2413,6 +3265,8 @@ class ThreadService:
             "start_episode_id": self._latest_episode_id,
             "constitutional_snapshot": constitutional_snapshot,
             "trigger": trigger,
+            # Causal grounding: what causal force drove this chapter transition?
+            "causal_theme": causal_theme,
         })
 
         # RE training trace for chapter closure reasoning
@@ -2780,6 +3634,20 @@ class ThreadService:
                     drift=round(drift, 4),
                     cycle=cycle_number,
                 )
+                # Emit to bus so Benchmarks, Fovea, and Telos can track identity
+                # stability. This data was being logged but never broadcast —
+                # the rest of the organism was blind to fine-grained drift signal.
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._emit_event("identity_shift_detected", {
+                        "wasserstein_distance": round(drift, 4),
+                        "classification": "drift" if drift >= self._thread_config.wasserstein_major_threshold else "growth",
+                        "dimensional_changes": {},
+                        "source": "fingerprint_delta",
+                        "cycle": cycle_number,
+                    }))
+                except RuntimeError:
+                    pass  # No running loop — fine, caller handles async
 
         # Feed DiachronicCoherenceMonitor with the same data as a BehavioralFingerprint
         # so it can apply narrative-contextualized growth/drift/transition classification
@@ -2872,8 +3740,19 @@ class ThreadService:
             except Exception:
                 self._logger.debug("life_story_self_node_write_failed", exc_info=True)
 
-        # Emit NARRATIVE_UPDATED (the spec calls this narrative_coherence_shift,
-        # but we also emit on life story update as SELF_MODEL_UPDATED equivalent)
+        # Broadcast the completed life story snapshot so Nova, Voxis, and Thread
+        # subscribers can integrate the autobiography. Previously this was computed
+        # every 5000 cycles but the result was never emitted — invisible to the organism.
+        await self._emit_event("narrative_coherence_shift", {
+            "previous": self._last_coherence.value,
+            "current": self._assess_narrative_coherence().value,
+            "trigger": "life_story_integrated",
+            "chapter_count": snapshot.chapter_count,
+            "active_chapter": snapshot.active_chapter,
+            "identity_coherence": round(snapshot.identity_coherence, 3),
+            "synthesis_excerpt": snapshot.synthesis[:300],
+        })
+
         await self._emit_re_training_trace(
             instruction="Synthesise an autobiographical life story from current identity state",
             input_context=f"Chapters: {len(self._chapters)}, Schemas: {len(active_schemas)}, Commitments: {len(core_commitments)}",
@@ -2935,6 +3814,22 @@ class ThreadService:
                         schema_b=b.statement[:60],
                         cosine=round(cos_sim, 4),
                     )
+                    # Emit to bus so Oneiros can route contradictory schema pairs
+                    # into lucid processing for resolution. Previously detected
+                    # but invisible — the organism couldn't act on its own conflicts.
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self._emit_event("schema_challenged", {
+                            "schema_id": a.id,
+                            "conflicting_schema_id": b.id,
+                            "schema_a_statement": a.statement[:200],
+                            "schema_b_statement": b.statement[:200],
+                            "cosine_similarity": round(cos_sim, 4),
+                            "conflict_type": "schema_contradiction",
+                            "source": "conflict_scan",
+                        }))
+                    except RuntimeError:
+                        pass  # No running loop
 
         return new_conflicts
 

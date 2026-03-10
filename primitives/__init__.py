@@ -29,6 +29,8 @@ from primitives.federation import (
     VIOLATION_MULTIPLIER,
     AssistanceRequest,
     AssistanceResponse,
+    CapacityOffer,
+    DelegationResult,
     FederationInteraction,
     FederationLink,
     FederationLinkStatus,
@@ -39,10 +41,21 @@ from primitives.federation import (
     KnowledgeRequest,
     KnowledgeResponse,
     KnowledgeType,
+    MarketplaceBid,
+    MarketplaceListing,
+    MarketplaceListingStatus,
+    MarketplaceRating,
+    OffloadRequest,
+    PoolParticipant,
     PrivacyLevel,
+    TaskDelegation,
+    TaskStatus,
+    TaskType,
     TrustLevel,
     TrustPolicy,
     ViolationType,
+    YieldPoolProposal,
+    YieldPoolStatus,
 )
 from primitives.governance import AmendmentProposal, EquorProvisioningApproval, GovernanceRecord
 from primitives.intent import (
@@ -88,16 +101,20 @@ from primitives.genome import (
 )
 from primitives.genome_inheritance import (
     AmendmentSnapshot,
+    AtuneGenomeFragment,
     AxonGenomeFragment,
     AxonTemplateSnapshot,
     BeliefGenome,
     DriveWeightSnapshot,
     DriftHistoryEntry,
     EquorGenomeFragment,
+    NovaGenomeFragment,
+    PersonaFragment,
     SimulaGenome,
     SimulaMutationEntry,
     TeloDriveCalibration,
     TelosGenomeFragment,
+    VoxisGenomeFragment,
 )
 from primitives.metabolic import (
     MetabolicGate,
@@ -117,7 +134,13 @@ from primitives.evolution import (
     ChangeCategory,
     ProposalStatus,
 )
-from primitives.telemetry import InstanceHealth, MetricPoint, SystemHealth
+from primitives.telemetry import (
+    InstanceHealth,
+    MetricPoint,
+    OrganismTelemetry,
+    SystemHealth,
+    SystemHealthSummary,
+)
 from primitives.causal import (
     ApplicableDomain,
     CausalInvariant,
@@ -162,6 +185,7 @@ __all__ = [
     "AmendmentProposal", "GovernanceRecord",
     # Telemetry
     "MetricPoint", "SystemHealth", "InstanceHealth",
+    "SystemHealthSummary", "OrganismTelemetry",
     # Federation
     "InstanceIdentityCard", "FederationLink", "FederationLinkStatus",
     "TrustLevel", "TrustPolicy", "ViolationType", "InteractionOutcome",
@@ -180,10 +204,13 @@ __all__ = [
     "OrganGenomeSegment", "OrganismGenome", "GenomeExtractionProtocol",
     # Genome Inheritance (spawn-time schemas)
     "AmendmentSnapshot", "EquorGenomeFragment",
+    "AtuneGenomeFragment",
     "BeliefGenome", "DriveWeightSnapshot", "DriftHistoryEntry",
     "SimulaGenome", "SimulaMutationEntry",
     "AxonTemplateSnapshot", "AxonGenomeFragment",
     "TeloDriveCalibration", "TelosGenomeFragment",
+    "NovaGenomeFragment", "VoxisGenomeFragment",
+    "PersonaFragment",
     # Metabolic Gate
     "MetabolicPermission", "MetabolicSubscription", "MetabolicGate",
     # Evolutionary

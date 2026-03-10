@@ -98,6 +98,9 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "coma_drill: full crash recovery loop tests (Skia→Thymos→Simula coma/resurrection cycle)",
+]
 
 [tool.mypy]
 python_version = "3.12"

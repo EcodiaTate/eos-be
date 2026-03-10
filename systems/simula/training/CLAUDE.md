@@ -223,6 +223,26 @@ Set `WANDB_API_KEY` in the environment (or `.env`). All other vars have sensible
 
 ---
 
+## Qwen3 `<think>` Tag Training Format (8 Mar 2026)
+
+The instruction-format branch now wraps `reasoning_trace` in Qwen3-native `<think>` tags:
+
+```
+<think>
+{reasoning_trace content}
+</think>
+
+{output_action content}
+```
+
+This teaches the model to use its native chain-of-thought mechanism instead of outputting reasoning as visible prose. The `messages` format path is unchanged — if your JSONL already uses `{"messages": [...]}` format, the assistant content should include `<think>` tags directly.
+
+**Before (genesis_001):** reasoning was injected into the user prompt as `Reasoning: {trace}`, and the assistant output was just `output_action`. The model learned to output reasoning as visible text, not inside think tags.
+
+**After:** reasoning moves to the assistant side inside `<think>` tags. The model learns to think internally before responding — matching Qwen3's pretrained behaviour.
+
+---
+
 ## Known Issues / Remaining Work
 
 - `signal.pause()` at the end has a Windows fallback (`while True: sleep(3600)`) — this is only needed in Akash mode to keep the status server alive after training.

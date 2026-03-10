@@ -49,7 +49,7 @@ _REDIS_PREFIX = "eos"
 
 # CRITICAL systems whose heartbeat silence is an emergency.
 # Detection window is halved to 45s (vs 90s for non-critical systems).
-CRITICAL_SYSTEMS: frozenset[str] = frozenset({"equor", "thymos", "memory"})
+CRITICAL_SYSTEMS: frozenset[str] = frozenset({"equor", "thymos", "memory", "simula"})
 
 # The field in a heartbeat event payload that identifies which system emitted it.
 _HEARTBEAT_SYSTEM_FIELD = "system"

@@ -162,6 +162,27 @@ class RateLimiter:
         cutoff = time.monotonic() - window_seconds
         return sum(1 for ts in window if ts >= cutoff)
 
+    def remaining(self, action_type: str, rate_limit: "RateLimit | None" = None) -> int | None:
+        """
+        Return the number of calls remaining in the current window for action_type.
+
+        Args:
+            action_type: The action type to check
+            rate_limit: Optional RateLimit definition. If None, returns None.
+
+        Returns:
+            Number of calls remaining, or None if rate_limit is not provided.
+        """
+        if rate_limit is None:
+            return None
+
+        current = self.current_count(action_type, rate_limit.window_seconds)
+        # Apply multipliers to get the effective max
+        multiplier = self._multipliers.get(action_type, 1.0) * self._global_multiplier
+        effective_max = max(1, int(rate_limit.max_calls * multiplier))
+
+        return max(0, effective_max - current)
+
     def _redis_count(self, action_type: str, window_seconds: float) -> int | None:
         """Count entries in Redis sorted set within the time window."""
         key = f"{self._key_prefix}:{action_type}"
@@ -465,6 +486,140 @@ class CircuitBreaker:
             self._logger.debug("circuit_breaker_event_emit_failed", error=str(exc))
 
 
+# ─── Action Budget (mutable runtime limits) ───────────────────────
+
+
+from dataclasses import dataclass, field as dc_field
+
+
+@dataclass
+class TemporaryExpansion:
+    """
+    A single approved budget expansion for one field.
+
+    Created by ActionBudget.apply_expansion() when Equor approves an
+    ACTION_BUDGET_EXPANSION_REQUEST.  Automatically reverted when
+    cycles_remaining reaches zero.
+    """
+
+    field: str
+    original_value: int
+    expanded_value: int
+    cycles_remaining: int
+    approved_by: str = "equor"
+
+
+@dataclass
+class ActionBudget:
+    """
+    Mutable runtime action limits for AxonService.
+
+    Unlike the immutable ExecutionBudget dataclass, ActionBudget holds the
+    *live* limits that the organism actually enforces each cycle.  Equor can
+    approve temporary expansions via ACTION_BUDGET_EXPANSION_RESPONSE; Evo can
+    propose permanent baseline adjustments via EVO_ADJUST_BUDGET.
+
+    The three Equor-negotiable fields are:
+      max_actions_per_cycle     — hard cap per theta cycle (default 5)
+      max_concurrent_executions — parallel execution slots (default 3)
+      max_api_calls_per_minute  — external call rate cap (default 30)
+
+    Safe upper bounds enforced by Equor:
+      max_actions_per_cycle     ≤ 20
+      max_concurrent_executions ≤ 10
+      max_api_calls_per_minute  ≤ 120
+    """
+
+    # Baseline defaults (Evo-tunable over generations)
+    max_actions_per_cycle: int = 5
+    max_concurrent_executions: int = 3
+    max_api_calls_per_minute: int = 30
+
+    # Active temporary expansions keyed by field name.
+    # Only one expansion per field is active at a time.
+    temporary_expansions: dict[str, TemporaryExpansion] = dc_field(
+        default_factory=dict
+    )
+
+    def effective_max_actions(self) -> int:
+        """Return current max_actions_per_cycle (baseline or expanded)."""
+        exp = self.temporary_expansions.get("max_actions_per_cycle")
+        return exp.expanded_value if exp else self.max_actions_per_cycle
+
+    def effective_max_concurrent(self) -> int:
+        """Return current max_concurrent_executions (baseline or expanded)."""
+        exp = self.temporary_expansions.get("max_concurrent_executions")
+        return exp.expanded_value if exp else self.max_concurrent_executions
+
+    def effective_max_api_calls(self) -> int:
+        """Return current max_api_calls_per_minute (baseline or expanded)."""
+        exp = self.temporary_expansions.get("max_api_calls_per_minute")
+        return exp.expanded_value if exp else self.max_api_calls_per_minute
+
+    def apply_expansion(
+        self,
+        field: str,
+        approved_value: int,
+        duration_cycles: int,
+        approved_by: str = "equor",
+    ) -> None:
+        """
+        Apply an Equor-approved temporary expansion for the given field.
+
+        Overwrites any existing expansion for the same field.
+        Raises ValueError if the field is not an expandable budget field.
+        """
+        _EXPANDABLE = {
+            "max_actions_per_cycle",
+            "max_concurrent_executions",
+            "max_api_calls_per_minute",
+        }
+        if field not in _EXPANDABLE:
+            raise ValueError(f"ActionBudget: '{field}' is not an expandable field")
+        original = getattr(self, field)
+        self.temporary_expansions[field] = TemporaryExpansion(
+            field=field,
+            original_value=original,
+            expanded_value=approved_value,
+            cycles_remaining=max(1, duration_cycles),
+            approved_by=approved_by,
+        )
+
+    def check_expirations(self) -> list[str]:
+        """
+        Tick down all active expansions; revert any that have expired.
+
+        Called once per theta cycle by BudgetTracker.  Returns list of field
+        names whose expansions expired this call.
+        """
+        expired: list[str] = []
+        for field, exp in list(self.temporary_expansions.items()):
+            exp.cycles_remaining -= 1
+            if exp.cycles_remaining <= 0:
+                expired.append(field)
+                del self.temporary_expansions[field]
+        return expired
+
+    def to_snapshot(self) -> dict:
+        """Return a snapshot dict for logging / AXON_CAPABILITY_SNAPSHOT."""
+        return {
+            "max_actions_per_cycle": self.max_actions_per_cycle,
+            "max_concurrent_executions": self.max_concurrent_executions,
+            "max_api_calls_per_minute": self.max_api_calls_per_minute,
+            "effective_max_actions": self.effective_max_actions(),
+            "effective_max_concurrent": self.effective_max_concurrent(),
+            "effective_max_api_calls": self.effective_max_api_calls(),
+            "active_expansions": {
+                k: {
+                    "expanded_value": v.expanded_value,
+                    "cycles_remaining": v.cycles_remaining,
+                    "approved_by": v.approved_by,
+                }
+                for k, v in self.temporary_expansions.items()
+            },
+        }
+
+
 # ─── Budget Tracker ───────────────────────────────────────────────
 
 
@@ -480,7 +635,8 @@ class BudgetTracker:
     deques so they enforce across cycle boundaries — a burst of API calls in cycle N
     still counts against the limit in cycle N+1 (Spec §5.3).
 
-    Limits are sourced from AxonConfig and cannot be changed at runtime.
+    Limits are read from ActionBudget each check, so Equor-approved temporary
+    expansions and Evo baseline adjustments take effect immediately.
     """
 
     # Action types that count as "api_calls" for the per-minute sub-limit
@@ -500,6 +656,12 @@ class BudgetTracker:
             max_notifications_per_hour=config.max_notifications_per_hour,
             max_concurrent_executions=config.max_concurrent_executions,
             total_timeout_per_cycle_ms=config.total_timeout_per_cycle_ms,
+        )
+        # Mutable runtime limits — Equor can expand, Evo can tune baseline
+        self.action_budget = ActionBudget(
+            max_actions_per_cycle=config.max_actions_per_cycle,
+            max_concurrent_executions=config.max_concurrent_executions,
+            max_api_calls_per_minute=config.max_api_calls_per_minute,
         )
         self._logger = logger.bind(system="axon.budget_tracker")
         # Sliding-window deques for sub-limit enforcement (wall-clock timestamps)
@@ -535,15 +697,17 @@ class BudgetTracker:
             self._reset_counters()
             elapsed_ms = 0
 
-        if self._actions_this_cycle >= self._budget.max_actions_per_cycle:
+        max_actions = self.action_budget.effective_max_actions()
+        max_concurrent = self.action_budget.effective_max_concurrent()
+        if self._actions_this_cycle >= max_actions:
             return False, (
                 f"Budget: max actions per cycle reached "
-                f"({self._budget.max_actions_per_cycle})"
+                f"({max_actions})"
             )
-        if self._concurrent_executions >= self._budget.max_concurrent_executions:
+        if self._concurrent_executions >= max_concurrent:
             return False, (
                 f"Budget: max concurrent executions reached "
-                f"({self._budget.max_concurrent_executions})"
+                f"({max_concurrent})"
             )
         return True, ""
 
@@ -564,10 +728,11 @@ class BudgetTracker:
             while self._api_call_timestamps and self._api_call_timestamps[0] < cutoff:
                 self._api_call_timestamps.popleft()
             count = len(self._api_call_timestamps)
-            if count >= self._budget.max_api_calls_per_minute:
+            max_api = self.action_budget.effective_max_api_calls()
+            if count >= max_api:
                 return False, (
                     f"Budget: max API calls per minute reached "
-                    f"({count}/{self._budget.max_api_calls_per_minute})"
+                    f"({count}/{max_api})"
                 )
 
         if action_type in self._NOTIFICATION_TYPES:
@@ -641,8 +806,25 @@ class BudgetTracker:
     @property
     def utilisation(self) -> float:
         """Fraction of cycle action budget consumed (0.0 to 1.0+)."""
-        return self._actions_this_cycle / max(1, self._budget.max_actions_per_cycle)
+        return self._actions_this_cycle / max(
+            1, self.action_budget.effective_max_actions()
+        )
 
     @property
     def budget(self) -> ExecutionBudget:
         return self._budget
+
+    def tick_expansions(self) -> list[str]:
+        """
+        Decrement active temporary expansions; return names of fields that expired.
+
+        Called once per theta cycle (from AxonService._on_theta_cycle_complete).
+        """
+        expired = self.action_budget.check_expirations()
+        for field in expired:
+            self._logger.info(
+                "budget_expansion_expired",
+                field=field,
+                baseline=getattr(self.action_budget, field, "?"),
+            )
+        return expired

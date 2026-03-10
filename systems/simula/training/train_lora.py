@@ -268,14 +268,19 @@ def run_training(dataset_path: Path) -> Path:
                 user_parts.append(f"Context: {ctx}")
             if row.get("source_system"):
                 user_parts.append(f"System: {row['source_system']} | Type: {row.get('example_type', '')}")
-            if row.get("reasoning_trace"):
-                user_parts.append(f"Reasoning: {row['reasoning_trace']}")
             aligns = row.get("constitutional_alignment") or {}
             if any(v for v in aligns.values() if v):
                 align_str = ", ".join(f"{k}={v:.2f}" for k, v in aligns.items() if v)
                 user_parts.append(f"Constitutional alignment: {align_str}")
 
-            # Build assistant response — use output_action + outcome if present
+            # Build assistant response with Qwen3-native <think> tags.
+            # reasoning_trace → <think> block (model learns to reason internally)
+            # output_action → visible response (what the model says after thinking)
+            think_block = ""
+            reasoning = row.get("reasoning_trace", "")
+            if reasoning:
+                think_block = f"<think>\n{reasoning}\n</think>\n\n"
+
             output = row.get("output_action") or row.get("output", "")
             if row.get("outcome"):
                 output = f"{output}\nOutcome: {row['outcome']}"
@@ -287,10 +292,12 @@ def run_training(dataset_path: Path) -> Path:
             if not output:
                 continue  # skip examples with no target output
 
+            assistant_content = f"{think_block}{output}"
+
             messages = [
                 {"role": "system", "content": "You are EcodiaOS, a self-evolving digital organism. Reason carefully and act constitutionally."},
                 {"role": "user", "content": "\n".join(user_parts)},
-                {"role": "assistant", "content": output},
+                {"role": "assistant", "content": assistant_content},
             ]
             text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False,

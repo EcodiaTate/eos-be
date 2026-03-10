@@ -470,6 +470,23 @@ class DreamGenerator:
                 all_hypotheses, [d.get("domain", "") for d in error_domains]
             )
 
+            # Emit DREAM_INSIGHT for Evo/Nova — creative discoveries from REM
+            if self._event_bus is not None:
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.DREAM_INSIGHT,
+                        source_system="oneiros",
+                        data={
+                            "domains": [d.get("domain", "") for d in error_domains],
+                            "hypotheses_count": hypotheses_extracted,
+                            "scenarios_generated": scenarios_generated,
+                            "low_quality_predictions": low_quality_count,
+                            "coherence": 1.0 - (low_quality_count / max(scenarios_generated, 1)),
+                        },
+                    ))
+                except Exception:
+                    self._logger.debug("dream_insight_emit_failed")
+
         elapsed = (time.monotonic() - t0) * 1000
 
         self._logger.info(

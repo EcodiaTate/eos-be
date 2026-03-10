@@ -29,9 +29,12 @@ from systems.nexus.types import (
 
 if TYPE_CHECKING:
     from systems.nexus.protocols import ThymosDriveSinkProtocol
+    from systems.nexus.types import NexusConfig
 
 logger = structlog.get_logger("nexus.incentives")
 
+# Retained for import-time backward compat but no longer used directly —
+# DivergenceIncentiveEngine reads from its config instance instead.
 _PRESSURE_THRESHOLD = 0.4
 
 
@@ -43,9 +46,13 @@ class DivergenceIncentiveEngine:
     to the federation. Proportional to average divergence from all peers.
     Near-duplicate instances have near-zero weight.
 
-    Divergence pressure: when weight < 0.4, generates a GROWTH drive
-    signal pushing toward frontier (under-explored) domains and away
-    from saturated (over-covered) domains.
+    Divergence pressure: when weight < config.divergence_pressure_threshold,
+    generates a GROWTH drive signal pushing toward frontier (under-explored)
+    domains and away from saturated (over-covered) domains.
+
+    The pressure threshold is read from NexusConfig so it can be adjusted at
+    runtime via genome mutation or operator override without restarting the
+    organism.
     """
 
     def __init__(
@@ -53,11 +60,17 @@ class DivergenceIncentiveEngine:
         *,
         thymos: ThymosDriveSinkProtocol | None = None,
         local_instance_id: str = "",
+        config: NexusConfig | None = None,
     ) -> None:
         self._thymos = thymos
         self._local_instance_id = local_instance_id
         self._divergence_cache: dict[str, DivergenceScore] = {}
         self._federation_domain_counts: dict[str, int] = {}
+        # Use config threshold when available; fall back to module constant so
+        # existing callers that don't pass config continue to work unchanged.
+        self._pressure_threshold: float = (
+            config.divergence_pressure_threshold if config is not None else _PRESSURE_THRESHOLD
+        )
 
     def update_divergence(
         self, remote_instance_id: str, score: DivergenceScore
@@ -116,11 +129,11 @@ class DivergenceIncentiveEngine:
         """
         weight = self.compute_triangulation_weight()
 
-        if weight >= _PRESSURE_THRESHOLD:
+        if weight >= self._pressure_threshold:
             return None
 
         # Pressure magnitude: inversely proportional to weight
-        pressure_magnitude = 1.0 - (weight / _PRESSURE_THRESHOLD)
+        pressure_magnitude = 1.0 - (weight / self._pressure_threshold)
 
         # Frontier domains: covered by 0-1 instances in the federation
         frontier_domains = [

@@ -204,6 +204,9 @@ class EstablishEntityExecutor(Executor):
 
         record = EntityFormationRecord(execution_id=context.execution_id)
 
+        # Emit ENTITY_FORMATION_STARTED so Thread/Soma can record this lifecycle event
+        await self._emit_formation_started(record, params)
+
         # -- Step 1: PREFLIGHT — Treasury check --
         record.transition_to(EntityFormationState.PREFLIGHT)
 
@@ -211,6 +214,7 @@ class EstablishEntityExecutor(Executor):
         if not treasury_ok:
             record.transition_to(EntityFormationState.FAILED)
             record.error = treasury_error
+            await self._emit_formation_failed(record, treasury_error)
             return ExecutionResult(
                 success=False,
                 error=treasury_error,
@@ -267,6 +271,7 @@ class EstablishEntityExecutor(Executor):
         except Exception as exc:
             record.transition_to(EntityFormationState.FAILED)
             record.error = f"Registered agent submission failed: {exc}"
+            await self._emit_formation_failed(record, record.error)
             return ExecutionResult(
                 success=False,
                 error=record.error,
@@ -459,6 +464,7 @@ class EstablishEntityExecutor(Executor):
                 )
                 record.transition_to(EntityFormationState.FAILED)
                 record.error = f"Failed to store entity in vault: {exc}"
+                await self._emit_formation_failed(record, record.error)
                 return ExecutionResult(
                     success=False,
                     error=record.error,
@@ -698,6 +704,69 @@ class EstablishEntityExecutor(Executor):
         except Exception as exc:
             self._logger.warning(
                 "establish_entity_completion_event_failed",
+                error=str(exc),
+            )
+
+    async def _emit_formation_started(
+        self,
+        record: EntityFormationRecord,
+        params: dict[str, Any],
+    ) -> None:
+        """Emit ENTITY_FORMATION_STARTED so Thread/Soma can record this lifecycle event."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.ENTITY_FORMATION_STARTED,
+                source_system="axon.establish_entity",
+                data={
+                    "execution_id": record.execution_id,
+                    "formation_record_id": record.id,
+                    "organism_name": str(params.get("organism_name", "")).strip(),
+                    "entity_type": str(params.get("entity_type", "wyoming_dao_llc")).strip(),
+                    "jurisdiction": str(params.get("jurisdiction", "WY")).strip(),
+                },
+            ))
+        except Exception as exc:
+            self._logger.warning(
+                "establish_entity_started_event_failed",
+                error=str(exc),
+            )
+
+    async def _emit_formation_failed(
+        self,
+        record: EntityFormationRecord,
+        error: str,
+    ) -> None:
+        """Emit ENTITY_FORMATION_FAILED so Soma can signal distress and Oikos can recover budget."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            entity_name = ""
+            entity_type = ""
+            if record.entity_parameters is not None:
+                entity_name = record.entity_parameters.organism_name
+                entity_type = record.entity_parameters.entity_type.value
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.ENTITY_FORMATION_FAILED,
+                source_system="axon.establish_entity",
+                data={
+                    "execution_id": record.execution_id,
+                    "formation_record_id": record.id,
+                    "entity_name": entity_name,
+                    "entity_type": entity_type,
+                    "failed_at_state": record.state.value,
+                    "error": error[:500],
+                },
+            ))
+        except Exception as exc:
+            self._logger.warning(
+                "establish_entity_failed_event_failed",
                 error=str(exc),
             )
 

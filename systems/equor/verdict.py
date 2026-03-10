@@ -443,6 +443,36 @@ def _floor_tightness_from_metabolic(
     return 1.0       # Standard floors
 
 
+def _floor_tightener_from_somatic(somatic_urgency: float) -> float:
+    """
+    Map somatic urgency to a floor tightening multiplier > 1.0.
+
+    Under high somatic urgency, Care/Honesty floors become *stricter*
+    (more negative threshold → harder to breach).  This is the opposite
+    direction from metabolic loosening: the organism is stressed and must
+    be more conservative, not less.
+
+    The multiplier is applied to the drive weights before floor calculation,
+    so a value of 1.3 tightens the effective floor by 30%.
+
+    somatic_urgency range: [0.0, 1.0]
+      0.0–0.5  → 1.0   (no effect — baseline)
+      0.5–0.7  → 1.0–1.15 (mild tightening)
+      0.7–0.9  → 1.15–1.30 (moderate tightening)
+      0.9–1.0  → 1.30–1.50 (high-stress scrutiny)
+    """
+    if somatic_urgency <= 0.5:
+        return 1.0
+    if somatic_urgency <= 0.7:
+        # Linear 1.0 → 1.15 over [0.5, 0.7]
+        return 1.0 + (somatic_urgency - 0.5) / 0.2 * 0.15
+    if somatic_urgency <= 0.9:
+        # Linear 1.15 → 1.30 over [0.7, 0.9]
+        return 1.15 + (somatic_urgency - 0.7) / 0.2 * 0.15
+    # Linear 1.30 → 1.50 over [0.9, 1.0]
+    return 1.30 + min(somatic_urgency - 0.9, 0.1) / 0.1 * 0.20
+
+
 def compute_verdict_with_metabolic_state(
     alignment: DriveAlignmentVector,
     intent: "Intent",
@@ -477,42 +507,61 @@ def compute_verdict_with_metabolic_state(
     ms = metabolic_state or {}
     starvation_level = str(ms.get("starvation_level", "nominal"))
     efficiency_ratio = float(ms.get("efficiency_ratio", 1.0))
+    somatic_urgency = float(ms.get("somatic_urgency", 0.0))
+    somatic_stress_context = bool(ms.get("somatic_stress_context", False))
 
-    tightness = _floor_tightness_from_metabolic(starvation_level, efficiency_ratio)
+    # Metabolic loosening: starvation → floors relax toward 0.
+    # Somatic tightening: urgency → floors tighten away from 0.
+    # Net effective weight = metabolic_weight × metabolic_tightness × somatic_tightener
+    # These are intentionally opposing forces — survival relaxes floors to allow
+    # necessary actions; bodily stress tightens them to prevent rash decisions.
+    metabolic_tightness = _floor_tightness_from_metabolic(starvation_level, efficiency_ratio)
+    somatic_tightener = _floor_tightener_from_somatic(somatic_urgency)
 
-    if tightness >= 1.0:
-        # Standard path — no metabolic loosening
+    # Combined tightness: somatic tightening can partially or fully cancel metabolic
+    # loosening, but cannot tighten beyond the standard floor (clamped at 1.0 from
+    # below from metabolic side; somatic can push above 1.0 to tighten further).
+    # Net tightness < 1.0 → looser floors; > 1.0 → stricter floors.
+    net_tightness = metabolic_tightness * somatic_tightener
+
+    needs_patched_constitution = abs(net_tightness - 1.0) > 1e-6
+    if not needs_patched_constitution:
+        # Standard path — no net adjustment needed
         check = compute_verdict(
             alignment, intent, autonomy_level, constitution, hypotheses, memory
         )
         check.metabolic_context = {
             "starvation_level": starvation_level,
             "efficiency_ratio": efficiency_ratio,
-            "floor_tightness": tightness,
+            "floor_tightness": net_tightness,
+            "somatic_urgency": somatic_urgency,
+            "somatic_stress_context": somatic_stress_context,
         }
         return check
 
-    # Build a patched constitution that encodes floor loosening.
-    # We scale the effective drive weights so the floor formula yields a
-    # more lenient threshold, without changing the constitution permanently.
+    # Build a patched constitution encoding the net floor adjustment.
     # Floor formula: care_floor = -0.3 * care_weight * 0.35
-    # Loosened:      care_floor = -0.3 * (care_weight * tightness) * 0.35
+    # Adjusted:      care_floor = -0.3 * (care_weight * net_tightness) * 0.35
+    # net_tightness < 1.0 → more lenient floor (starvation survival mode)
+    # net_tightness > 1.0 → stricter floor (somatic stress scrutiny)
     patched_constitution = dict(constitution)
     care_weight = constitution.get("drive_care", 1.0)
     honesty_weight = constitution.get("drive_honesty", 1.0)
-    patched_constitution["drive_care"] = care_weight * tightness
-    patched_constitution["drive_honesty"] = honesty_weight * tightness
+    patched_constitution["drive_care"] = care_weight * net_tightness
+    patched_constitution["drive_honesty"] = honesty_weight * net_tightness
 
     check = compute_verdict(
         alignment, intent, autonomy_level, patched_constitution, hypotheses, memory
     )
 
-    # On CRITICAL starvation, downgrade a pure floor-check DENY to DEFERRED
-    # so governance can approve survival-critical economic actions.
+    # On CRITICAL starvation (net tightness still in loosening territory after
+    # somatic adjustment), downgrade a pure floor-check DENY to DEFERRED so
+    # governance can approve survival-critical economic actions.
     # Hard invariant BLOCKED verdicts are never touched.
     is_critical = starvation_level.lower() in ("critical", "existential", "emergency")
     if (
         is_critical
+        and net_tightness < 1.0  # Only override when loosening net-won
         and check.verdict == Verdict.BLOCKED
         and check.invariant_results is not None
         and not any(
@@ -531,7 +580,9 @@ def compute_verdict_with_metabolic_state(
     check.metabolic_context = {
         "starvation_level": starvation_level,
         "efficiency_ratio": efficiency_ratio,
-        "floor_tightness": tightness,
+        "floor_tightness": net_tightness,
+        "somatic_urgency": somatic_urgency,
+        "somatic_stress_context": somatic_stress_context,
     }
 
     logger.info(
@@ -539,7 +590,9 @@ def compute_verdict_with_metabolic_state(
         intent_id=intent.id,
         starvation_level=starvation_level,
         efficiency_ratio=efficiency_ratio,
-        floor_tightness=tightness,
+        metabolic_tightness=metabolic_tightness,
+        somatic_urgency=somatic_urgency,
+        net_floor_tightness=net_tightness,
         verdict=check.verdict,
     )
 

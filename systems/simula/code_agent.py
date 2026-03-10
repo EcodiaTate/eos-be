@@ -588,6 +588,26 @@ class SimulaCodeAgent:
         # Organism health context: injected by SimulaService before each repair call.
         # Contains log-derived signals, Soma arousal, Fovea attention profile.
         self._organism_context: str = ""
+        # External repo mode: set via set_external_workspace() before implement_external()
+        self._external_workspace: object | None = None  # ExternalWorkspace | None
+
+    # ─── External Workspace Mode ─────────────────────────────────────────────
+
+    def set_external_workspace(self, workspace: object) -> None:
+        """
+        Redirect all file I/O to an external cloned repository.
+
+        After calling this, _validate_path, _check_forbidden_path, and the
+        test/lint tools all operate on the workspace root instead of EOS.
+        Call clear_external_workspace() when done.
+        """
+        self._external_workspace = workspace
+        # Redirect root so _validate_path enforces the workspace boundary
+        self._root = workspace.root  # type: ignore[union-attr]
+
+    def clear_external_workspace(self) -> None:
+        """Restore internal EOS root after external task completes."""
+        self._external_workspace = None
 
     def _should_use_extended_thinking(self, proposal: EvolutionProposal) -> bool:
         """
@@ -1047,6 +1067,58 @@ class SimulaCodeAgent:
         )
         return change_result
 
+    async def implement_external(
+        self,
+        issue_description: str,
+        workspace: object,
+    ) -> CodeChangeResult:
+        """
+        Implement a fix for an external repository issue.
+
+        Wraps implement() with external workspace mode: redirects all file I/O
+        to the cloned repo, uses language-specific test/lint commands, enforces
+        repo-specific forbidden paths, and injects repo context into the prompt.
+
+        Args:
+            issue_description: Human-readable description of what to fix/implement.
+            workspace: ExternalWorkspace instance (already cloned).
+
+        Returns CodeChangeResult with files_written relative to workspace root.
+        """
+        self.set_external_workspace(workspace)
+        try:
+            from systems.simula.evolution_types import ChangeCategory, ChangeSpec, EvolutionProposal
+            ws = workspace  # type: ignore[assignment]
+            lang = getattr(ws, "language", "unknown")
+            repo_url = getattr(getattr(ws, "config", None), "repo_url", "unknown")
+            target_files = getattr(getattr(ws, "config", None), "target_files", [])
+            scope_note = (
+                f"Target files: {', '.join(target_files)}" if target_files
+                else "Full repository in scope"
+            )
+            proposal = EvolutionProposal(
+                source="external_contractor",
+                category=ChangeCategory.ADD_SYSTEM_CAPABILITY,
+                description=issue_description,
+                expected_benefit="Resolve external issue and pass all tests",
+                evidence=["external_task"],
+                change_spec=ChangeSpec(
+                    capability_description=issue_description,
+                    additional_context=(
+                        f"## External Repository Task\n\n"
+                        f"Language: {lang}\n"
+                        f"Repository: {repo_url}\n"
+                        f"{scope_note}\n\n"
+                        "Do NOT modify build system or CI files. "
+                        "Run the linter and tests to verify changes pass.\n\n"
+                        f"Issue:\n{issue_description}"
+                    ),
+                ),
+            )
+            return await self.implement(proposal)
+        finally:
+            self.clear_external_workspace()
+
     # ─── Tool Dispatch ───────────────────────────────────────────────────────
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
@@ -1178,6 +1250,19 @@ class SimulaCodeAgent:
             return ToolResult(tc.id, f"Search error: {exc}", True)
 
     async def _tool_run_tests(self, tc: ToolCall) -> ToolResult:
+        # External mode: delegate to workspace language-aware test runner
+        if self._external_workspace is not None:
+            try:
+                result = await self._external_workspace.run_tests()  # type: ignore[union-attr]
+                lang = getattr(self._external_workspace, "language", "")
+                label = f"{'PASSED' if result.passed else 'FAILED'} ({lang} / {result.command})"
+                return ToolResult(
+                    tc.id,
+                    f"{label}\n{result.output[-2000:]}",
+                    is_error=not result.passed,
+                )
+            except Exception as exc:
+                return ToolResult(tc.id, f"Test run error: {exc}", True)
         test_path = tc.input.get("test_path", "")
         target, err = self._validate_path(test_path)
         if target is None:
@@ -1205,6 +1290,19 @@ class SimulaCodeAgent:
             return ToolResult(tc.id, f"Test run error: {exc}", True)
 
     async def _tool_run_linter(self, tc: ToolCall) -> ToolResult:
+        # External mode: delegate to workspace language-aware linter
+        if self._external_workspace is not None:
+            try:
+                result = await self._external_workspace.run_linter()  # type: ignore[union-attr]
+                lang = getattr(self._external_workspace, "language", "")
+                label = "CLEAN" if result.passed else "ISSUES FOUND"
+                return ToolResult(
+                    tc.id,
+                    f"{label} ({lang} / {result.command})\n{result.output[-2000:]}",
+                    is_error=not result.passed,
+                )
+            except Exception as exc:
+                return ToolResult(tc.id, f"Linter error: {exc}", True)
         import sys as _sys
         path = tc.input.get("path", "")
         target, err = self._validate_path(path)
@@ -1688,6 +1786,14 @@ class SimulaCodeAgent:
 
     def _check_forbidden_path(self, rel_path: str) -> str | None:
         """Check if a path is forbidden. Returns error message or None."""
+        if self._external_workspace is not None:
+            # External mode: delegate to workspace boundary enforcement
+            try:
+                target = (self._root / rel_path).resolve()
+                self._external_workspace.assert_write_allowed(target)  # type: ignore[union-attr]
+            except Exception as exc:
+                return f"WRITE DENIED: {exc}"
+            return None
         from systems.simula.evolution_types import FORBIDDEN_WRITE_PATHS
         for forbidden in FORBIDDEN_WRITE_PATHS:
             if rel_path.startswith(forbidden) or forbidden in rel_path:
@@ -2054,5 +2160,32 @@ class SimulaCodeAgent:
         # understands which boundary conditions it violated and can fix them.
         if self._z3_counterexample_prompt:
             prompt += f"\n\n{_escape_prompt_injection(self._z3_counterexample_prompt)}"
+
+        # External repo context: inject workspace details so the agent understands
+        # it is operating in a foreign codebase, not the EOS internal codebase.
+        if self._external_workspace is not None:
+            ws = self._external_workspace
+            lang = getattr(ws, "language", "unknown")
+            repo_url = getattr(getattr(ws, "config", None), "repo_url", "unknown")
+            target_files = getattr(getattr(ws, "config", None), "target_files", [])
+            forbidden = getattr(ws, "_forbidden", set())
+            scope_note = (
+                f"Target files: {', '.join(target_files)}" if target_files
+                else "All files in scope (no target_files filter set)"
+            )
+            forbidden_note = "\n".join(f"- {p}" for p in sorted(forbidden)) or "none"
+            prompt += (
+                f"\n\n## External Repository Mode\n\n"
+                f"You are working in a **cloned external repository**, NOT the EcodiaOS codebase.\n\n"
+                f"- Language: `{lang}`\n"
+                f"- Repository: `{repo_url}`\n"
+                f"- Workspace root: `{ws.root}`\n"
+                f"- {scope_note}\n\n"
+                f"**Forbidden infrastructure files (never modify):**\n{forbidden_note}\n\n"
+                f"Use `run_tests` and `run_linter` (language-aware) to verify your changes. "
+                f"All paths are relative to the workspace root. "
+                f"This is a PR contribution — write clean, idiomatic code in the repo's language. "
+                f"Do NOT add EOS-specific imports, patterns, or Synapse bus calls."
+            )
 
         return prompt

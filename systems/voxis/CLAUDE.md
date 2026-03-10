@@ -62,14 +62,20 @@ Honesty check: if forced positivity detected when `valence < -0.2`, regenerate w
 | `ReceptionEngine` | `reception.py` | Response correlation, satisfaction estimation |
 | `VoiceEngine` | `voice.py` | TTS param derivation (speed/pitch/emphasis/pause) |
 | `ExpressionQueue` | `expression_queue.py` | Priority queue with exponential decay |
+| `ContentEngine` | `content_engine.py` | Generates platform-tailored content using Voxis renderer + personality; injected into `PublishContentExecutor` at wiring time |
+| `ContentCalendar` | `content_calendar.py` | Supervised background scheduler; submits `AXON_EXECUTION_REQUEST` intents for `publish_content` on schedule; never calls Axon/Equor directly |
 
 ---
 
 ## Synapse Integration
 
-**Events emitted:** `EXPRESSION_GENERATED`, `EXPRESSION_FILTERED`, `VOXIS_PERSONALITY_SHIFTED`, `VOXIS_AUDIENCE_PROFILED`, `VOXIS_SILENCE_CHOSEN`, `EVOLUTIONARY_OBSERVABLE`, `RE_TRAINING_EXAMPLE`, `METABOLIC_COST_REPORT`
+**Events emitted:** `EXPRESSION_GENERATED`, `EXPRESSION_FILTERED`, `VOXIS_PERSONALITY_SHIFTED`, `VOXIS_AUDIENCE_PROFILED`, `VOXIS_SILENCE_CHOSEN`, `EVOLUTIONARY_OBSERVABLE`, `RE_TRAINING_EXAMPLE`, `METABOLIC_COST_REPORT`, `VOXIS_EXPRESSION_DISTRESS`, `VOXIS_PARAMETER_ADJUSTED`
 
-**Events consumed:** `METABOLIC_PRESSURE`, `SOMA_TICK`, `SOMATIC_MODULATION_SIGNAL`, `ONEIROS_CONSOLIDATION_COMPLETE`
+**ContentCalendar events emitted:** `AXON_EXECUTION_REQUEST` (publish_content intents)
+
+**Events consumed:** `METABOLIC_PRESSURE`, `SOMA_TICK`, `SOMATIC_MODULATION_SIGNAL`, `ONEIROS_CONSOLIDATION_COMPLETE`, `EVO_ADJUST_BUDGET`
+
+**ContentEngine events consumed (via ContentCalendar scheduling):** `BOUNTY_PAID` (triggers milestone post), `KAIROS_INVARIANT_DISTILLED` (triggers insight post), `REVENUE_INJECTED` (triggers earnings update post)
 
 ---
 
@@ -92,9 +98,41 @@ Honesty check: if forced positivity detected when `valence < -0.2`, regenerate w
 
 ---
 
+## Autonomy Audit Fixes (2026-03-08)
+
+### GAP 1 — Invisible telemetry: `VOXIS_EXPRESSION_DISTRESS` → Soma
+`VOXIS_EXPRESSION_DISTRESS` was emitted by `_allostatic_signal_loop()` but Soma only absorbed it via `subscribe_all()` into the generic signal buffer — no dedicated handler, no allostatic response. Fixed in `soma/service.py`:
+- Added `event_bus.subscribe(VOXIS_EXPRESSION_DISTRESS, self._on_voxis_expression_distress)` in `SomaService.set_event_bus()`
+- Added `SomaService._on_voxis_expression_distress()`: extracts `distress_level`, scales to [0, 0.4] TEMPORAL_PRESSURE contribution, raises `_external_stress` floor if distress > current stress. Non-fatal.
+
+### GAP 2 — Hardcoded thresholds with no runtime adjustment
+Three module-level constants had no runtime adjustment path:
+- `_DISTRESS_SILENCE_RATE_THRESHOLD = 0.5`
+- `_DISTRESS_HONESTY_RATE_THRESHOLD = 0.1`
+- `_AMBIENT_INSIGHT_IDLE_THRESHOLD_MINUTES = 5.0`
+
+Fixed: converted to instance-level attributes (`self._silence_rate_threshold`, `self._honesty_rejection_threshold`, `self._ambient_insight_idle_threshold`) seeded from the constants. Hot-loops updated to use instance attributes.
+
+### GAP 3 — No `EVO_ADJUST_BUDGET` subscription
+Axon and Simula both accept Evo parameter tuning via `EVO_ADJUST_BUDGET`; Voxis had no subscription. Fixed:
+- Added `event_bus.subscribe(EVO_ADJUST_BUDGET, self._on_evo_adjust_budget)` in `set_event_bus()`
+- Added `_on_evo_adjust_budget()` handler: filters `target_system in ("voxis", "")`, `confidence >= 0.75`. Handles `silence_rate_threshold` [0.1, 0.95], `honesty_rejection_threshold` [0.01, 0.5], `ambient_insight_idle_threshold` [1.0, 60.0]. Emits `VOXIS_PARAMETER_ADJUSTED` for Evo hypothesis scoring.
+- Added `VOXIS_PARAMETER_ADJUSTED` to `synapse/types.py` (after `AXON_PARAMETER_ADJUSTED`)
+
+### GAP 4 — Dead wiring check
+All three `set_X()` methods confirmed live in `core/wiring.py`:
+- `voxis.set_thread(thread)` — `wire_thread()`
+- `voxis.set_event_bus(synapse.event_bus)` — `wire_synapse_phase()`
+- `voxis.set_soma(soma)` — `wire_soma_phase()`
+- `wire_mitosis_phase(voxis=voxis)` — `registry.py` line 451
+
+No dead wiring found in Voxis.
+
+---
+
 ## What's Missing
 
-_(All medium gaps closed as of 2026-03-07)_
+_(All medium gaps closed as of 2026-03-07; autonomy audit gaps closed 2026-03-08)_
 
 ---
 
@@ -116,6 +154,25 @@ _(All medium gaps closed as of 2026-03-07)_
 | Gap 3: Redundant `.lower()` `reception.py:236` | Removed — return value was discarded; `_POSITIVE_MARKERS` / `_NEGATIVE_MARKERS` regexes are already case-insensitive (`re.IGNORECASE`) |
 | Gap 4: LLM token cost not reported to Oikos | `_emit_metabolic_cost()` added; called after every successful LLM render via `METABOLIC_COST_REPORT`; skips template-fallback calls (input\_tokens == 0) |
 | Gap 5: No autonomous AMBIENT\_INSIGHT loop | `_ambient_insight_loop()` added (60s poll, 5min idle threshold); generates spontaneous reflection from current affect + recent episodic memories; stores result as AMBIENT\_INSIGHT Episode via `memory.store_expression_episode()` |
+
+---
+
+## Genome Inheritance (Spec 04 SG3 — 2026-03-08)
+
+**Primitive:** `VoxisGenomeFragment` in `primitives/genome_inheritance.py`
+
+**Fields inherited at spawn time:**
+| Field | Source | Apply-side |
+|-------|--------|-----------|
+| `personality_vector` | `PersonalityEngine.get_current()` | `PersonalityEngine.apply_inherited()` or direct engine replacement |
+| `vocabulary_affinities` | `DiversityTracker._vocabulary_affinities` (top 500) | direct dict update |
+| `strategy_preferences` | `_recent_expressions[-100:]` — per-strategy success rates | direct dict update on `ContentRenderer._strategy_prefs` |
+
+**Jitter:** ±10% bounded Gaussian on all float values (personality is more stable than drive calibration).
+
+**Export:** `VoxisService.export_voxis_genome()` — called by `SpawnChildExecutor` Step 0b.
+
+**Apply:** `VoxisService._apply_inherited_voxis_genome_if_child()` — called from `initialize()` (try/except, non-fatal). Reads `ECODIAOS_VOXIS_GENOME_PAYLOAD` env var. Skipped on genesis nodes (`ECODIAOS_IS_GENESIS_NODE=true`). Emits `GENOME_INHERITED` on success.
 
 ---
 

@@ -31,7 +31,7 @@ the organism's body is doing without the organism "deciding" to do it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -42,6 +42,18 @@ from systems.soma.types import (
 )
 
 logger = structlog.get_logger("systems.soma.autonomic_protocol")
+
+
+# ─── Dispatch Outcome Tracking ──────────────────────────────────
+
+
+@dataclass(slots=True)
+class _DispatchOutcome:
+    """Mutable accumulator for per-action-type dispatch effectiveness."""
+
+    fire_count: int = 0
+    success_count: int = 0
+    total_improvement: float = 0.0
 
 
 # ─── Autonomic Action Types ──────────────────────────────────────
@@ -67,25 +79,42 @@ class AutonomicAction:
         }
 
 
-# ─── Thresholds ──────────────────────────────────────────────────
+# ─── Default Thresholds ──────────────────────────────────────────
+# These are INITIAL values only. All are learnable via Evo ADJUST_BUDGET
+# proposals and Simula parameter sweeps. The organism discovers its own
+# optimal operating points through lived experience.
 
-# Tier 1: REFLEXIVE (unconditional)
-_ENERGY_CRITICAL: float = 0.10       # Emergency safe mode
-_INTEGRITY_CRITICAL: float = 0.30    # Emergency constitutional scan
-_URGENCY_EMERGENCY: float = 0.85     # Force Nova deliberation
+_DEFAULT_THRESHOLDS: dict[str, float] = {
+    # Tier 1: REFLEXIVE (unconditional)
+    "energy_critical": 0.10,
+    "integrity_critical": 0.30,
+    "urgency_emergency": 0.85,
+    # Tier 2: PROTECTIVE (conditional on trend)
+    "energy_depleting": 0.25,
+    "coherence_degrading": 0.35,
+    "confidence_collapsing": 0.25,
+    # Tier 3: MODULATIVE (continuous)
+    "arousal_overshoot": 0.75,
+    "curiosity_surplus": 0.80,
+    "social_deficit": 0.10,
+    # Tier 4: PROPHYLACTIC (from cascade forecasts)
+    "cascade_risk_high": 0.50,
+}
 
-# Tier 2: PROTECTIVE (conditional on trend)
-_ENERGY_DEPLETING: float = 0.25      # Conserve if declining
-_COHERENCE_DEGRADING: float = 0.35   # Reduce parallelism
-_CONFIDENCE_COLLAPSING: float = 0.25 # Reduce exploration
-
-# Tier 3: MODULATIVE (continuous)
-_AROUSAL_OVERSHOOT: float = 0.75     # Slow clock, reduce stimulation
-_CURIOSITY_SURPLUS: float = 0.80     # Channel into hypothesis gen
-_SOCIAL_DEFICIT: float = 0.10        # Seek interaction
-
-# Tier 4: PROPHYLACTIC (from cascade forecasts)
-_CASCADE_RISK_HIGH: float = 0.5      # Trigger preemptive measures
+_DEFAULT_COOLDOWNS: dict[str, int] = {
+    "safe_mode": 200,
+    "emergency_constitutional_scan": 300,
+    "force_deliberation": 50,
+    "conserve_energy": 100,
+    "reduce_parallelism": 100,
+    "suppress_exploration": 100,
+    "slow_clock": 30,
+    "sleep_request": 500,
+    "channel_curiosity": 50,
+    "seek_interaction": 200,
+    "preemptive_monitor": 100,
+    "preemptive_conserve": 100,
+}
 
 
 class AutonomicProtocol:
@@ -95,6 +124,10 @@ class AutonomicProtocol:
 
     Actions are dispatched to target systems via their in-memory refs.
     If a target is unavailable, the action is logged but not executed.
+
+    AUTONOMY: All thresholds and cooldowns are learnable parameters.
+    Evo can tune them via adjust_threshold() / adjust_cooldown().
+    The organism discovers its own optimal regulatory calibration.
     """
 
     def __init__(self) -> None:
@@ -106,26 +139,130 @@ class AutonomicProtocol:
         self._evo: Any = None
         self._atune: Any = None
 
+        # ── LEARNABLE thresholds (Evo/Simula can tune) ──
+        self._thresholds: dict[str, float] = dict(_DEFAULT_THRESHOLDS)
+
+        # ── LEARNABLE cooldowns (Evo/Simula can tune) ──
+        self._cooldown_durations: dict[str, int] = dict(_DEFAULT_COOLDOWNS)
+
         # Cooldown tracking (prevent rapid re-triggering)
         self._cooldowns: dict[str, int] = {}  # action_type -> cycles_remaining
-        self._cooldown_durations: dict[str, int] = {
-            "safe_mode": 200,                 # 30s cooldown
-            "emergency_constitutional_scan": 300,
-            "force_deliberation": 50,
-            "conserve_energy": 100,
-            "reduce_parallelism": 100,
-            "suppress_exploration": 100,
-            "slow_clock": 30,
-            "sleep_request": 500,             # 75s cooldown
-            "channel_curiosity": 50,
-            "seek_interaction": 200,
-            "preemptive_monitor": 100,
-            "preemptive_conserve": 100,
-        }
 
-        # Action history
+        # Action history + effectiveness tracking
         self._recent_actions: list[AutonomicAction] = []
         self._max_history: int = 50
+
+        # ── Dispatch feedback tracking (AUTONOMY: verify actions were applied) ──
+        self._dispatch_outcomes: dict[str, _DispatchOutcome] = {}
+        self._effectiveness_window: int = 200  # cycles to track effectiveness
+
+    # ─── Learnable Parameter API (AUTONOMY) ─────────────────────
+
+    def adjust_threshold(self, name: str, value: float) -> bool:
+        """
+        Adjust an autonomic threshold. Called by Evo ADJUST_BUDGET or Simula.
+
+        Returns True if the threshold was updated, False if the name is unknown.
+        Clamps to [0.01, 0.99] to prevent degenerate states.
+        """
+        if name not in self._thresholds:
+            logger.warning("autonomic_threshold_unknown", name=name)
+            return False
+        old = self._thresholds[name]
+        self._thresholds[name] = max(0.01, min(0.99, value))
+        logger.info(
+            "autonomic_threshold_adjusted",
+            name=name,
+            old=round(old, 4),
+            new=round(self._thresholds[name], 4),
+        )
+        return True
+
+    def adjust_cooldown(self, action_type: str, cycles: int) -> bool:
+        """
+        Adjust the cooldown duration for an autonomic action.
+        Clamps to [5, 2000] cycles.
+        """
+        if action_type not in self._cooldown_durations:
+            logger.warning("autonomic_cooldown_unknown", action_type=action_type)
+            return False
+        old = self._cooldown_durations[action_type]
+        self._cooldown_durations[action_type] = max(5, min(2000, cycles))
+        logger.info(
+            "autonomic_cooldown_adjusted",
+            action_type=action_type,
+            old=old,
+            new=self._cooldown_durations[action_type],
+        )
+        return True
+
+    def get_thresholds(self) -> dict[str, float]:
+        """Return current threshold values. Visible to Evo, Simula, Alive, health()."""
+        return dict(self._thresholds)
+
+    def get_cooldowns_config(self) -> dict[str, int]:
+        """Return current cooldown durations. Visible to Evo, Simula, Alive, health()."""
+        return dict(self._cooldown_durations)
+
+    def get_dispatch_effectiveness(self) -> dict[str, dict[str, float]]:
+        """
+        Return per-action effectiveness stats: fire count, success rate, mean
+        state improvement after dispatch. Visible to Evo for learning.
+        """
+        result: dict[str, dict[str, float]] = {}
+        for action_type, outcome in self._dispatch_outcomes.items():
+            total = outcome.fire_count
+            if total == 0:
+                continue
+            result[action_type] = {
+                "fire_count": total,
+                "success_rate": outcome.success_count / total,
+                "mean_improvement": (
+                    outcome.total_improvement / total if total > 0 else 0.0
+                ),
+            }
+        return result
+
+    def record_dispatch_outcome(
+        self,
+        action_type: str,
+        success: bool,
+        improvement: float = 0.0,
+    ) -> None:
+        """
+        Record whether a dispatched action achieved its intended effect.
+        Called by SomaService after observing post-dispatch state changes.
+        """
+        if action_type not in self._dispatch_outcomes:
+            self._dispatch_outcomes[action_type] = _DispatchOutcome()
+        outcome = self._dispatch_outcomes[action_type]
+        outcome.fire_count += 1
+        if success:
+            outcome.success_count += 1
+        outcome.total_improvement += improvement
+
+    def export_learnable_params(self) -> dict[str, Any]:
+        """
+        Export all learnable parameters for genome inheritance (Mitosis).
+        """
+        return {
+            "thresholds": dict(self._thresholds),
+            "cooldown_durations": dict(self._cooldown_durations),
+        }
+
+    def import_learnable_params(self, params: dict[str, Any]) -> None:
+        """
+        Import learnable parameters from a parent genome (Mitosis).
+        """
+        if "thresholds" in params:
+            for k, v in params["thresholds"].items():
+                if k in self._thresholds:
+                    self._thresholds[k] = max(0.01, min(0.99, float(v)))
+        if "cooldown_durations" in params:
+            for k, v in params["cooldown_durations"].items():
+                if k in self._cooldown_durations:
+                    self._cooldown_durations[k] = max(5, min(2000, int(v)))
+        logger.info("autonomic_params_imported")
 
     # ─── Wiring ───────────────────────────────────────────────────
 
@@ -204,7 +341,7 @@ class AutonomicProtocol:
 
         # Energy critical → emergency safe mode
         energy = sensed.get(InteroceptiveDimension.ENERGY, 0.5)
-        if energy < _ENERGY_CRITICAL and self._can_fire("safe_mode"):
+        if energy < self._thresholds["energy_critical"] and self._can_fire("safe_mode"):
             actions.append(AutonomicAction(
                 action_type="safe_mode",
                 tier="reflexive",
@@ -216,7 +353,7 @@ class AutonomicProtocol:
 
         # Integrity critical → emergency constitutional scan
         integrity = sensed.get(InteroceptiveDimension.INTEGRITY, 0.9)
-        if integrity < _INTEGRITY_CRITICAL and self._can_fire("emergency_constitutional_scan"):
+        if integrity < self._thresholds["integrity_critical"] and self._can_fire("emergency_constitutional_scan"):
             actions.append(AutonomicAction(
                 action_type="emergency_constitutional_scan",
                 tier="reflexive",
@@ -227,7 +364,7 @@ class AutonomicProtocol:
             self._set_cooldown("emergency_constitutional_scan")
 
         # Urgency emergency → force Nova deliberation
-        if signal.urgency > _URGENCY_EMERGENCY and self._can_fire("force_deliberation"):
+        if signal.urgency > self._thresholds["urgency_emergency"] and self._can_fire("force_deliberation"):
             actions.append(AutonomicAction(
                 action_type="force_deliberation",
                 tier="reflexive",
@@ -255,7 +392,7 @@ class AutonomicProtocol:
         energy = sensed.get(InteroceptiveDimension.ENERGY, 0.5)
         energy_rate = rates.get(InteroceptiveDimension.ENERGY, 0.0)
         if (
-            energy < _ENERGY_DEPLETING
+            energy < self._thresholds["energy_depleting"]
             and energy_rate > 0.02  # Error increasing = energy declining
             and self._can_fire("conserve_energy")
         ):
@@ -272,7 +409,7 @@ class AutonomicProtocol:
         coherence = sensed.get(InteroceptiveDimension.COHERENCE, 0.75)
         coherence_rate = rates.get(InteroceptiveDimension.COHERENCE, 0.0)
         if (
-            coherence < _COHERENCE_DEGRADING
+            coherence < self._thresholds["coherence_degrading"]
             and coherence_rate > 0.01
             and self._can_fire("reduce_parallelism")
         ):
@@ -289,7 +426,7 @@ class AutonomicProtocol:
         confidence = sensed.get(InteroceptiveDimension.CONFIDENCE, 0.7)
         confidence_rate = rates.get(InteroceptiveDimension.CONFIDENCE, 0.0)
         if (
-            confidence < _CONFIDENCE_COLLAPSING
+            confidence < self._thresholds["confidence_collapsing"]
             and confidence_rate > 0.01
             and self._can_fire("suppress_exploration")
         ):
@@ -314,8 +451,9 @@ class AutonomicProtocol:
 
         # Arousal overshoot → slow clock
         arousal = sensed.get(InteroceptiveDimension.AROUSAL, 0.4)
-        if arousal > _AROUSAL_OVERSHOOT and self._can_fire("slow_clock"):
-            slowdown = min(0.3, (arousal - _AROUSAL_OVERSHOOT) * 2.0)
+        _arousal_thresh = self._thresholds["arousal_overshoot"]
+        if arousal > _arousal_thresh and self._can_fire("slow_clock"):
+            slowdown = min(0.3, (arousal - _arousal_thresh) * 2.0)
             actions.append(AutonomicAction(
                 action_type="slow_clock",
                 tier="modulative",
@@ -343,7 +481,7 @@ class AutonomicProtocol:
 
         # Curiosity surplus → channel into hypothesis generation
         curiosity = sensed.get(InteroceptiveDimension.CURIOSITY_DRIVE, 0.5)
-        if curiosity > _CURIOSITY_SURPLUS and self._can_fire("channel_curiosity"):
+        if curiosity > self._thresholds["curiosity_surplus"] and self._can_fire("channel_curiosity"):
             actions.append(AutonomicAction(
                 action_type="channel_curiosity",
                 tier="modulative",
@@ -355,7 +493,7 @@ class AutonomicProtocol:
 
         # Social deficit → signal readiness for interaction
         social = sensed.get(InteroceptiveDimension.SOCIAL_CHARGE, 0.3)
-        if social < _SOCIAL_DEFICIT and self._can_fire("seek_interaction"):
+        if social < self._thresholds["social_deficit"] and self._can_fire("seek_interaction"):
             actions.append(AutonomicAction(
                 action_type="seek_interaction",
                 tier="modulative",
@@ -376,7 +514,7 @@ class AutonomicProtocol:
     ) -> list[AutonomicAction]:
         actions: list[AutonomicAction] = []
 
-        if cascade.total_cascade_risk < _CASCADE_RISK_HIGH:
+        if cascade.total_cascade_risk < self._thresholds["cascade_risk_high"]:
             return actions
 
         # Preemptive monitoring of at-risk systems
@@ -418,10 +556,13 @@ class AutonomicProtocol:
     def _dispatch(self, action: AutonomicAction) -> None:
         """
         Dispatch an autonomic action to its target system.
-        Fire-and-forget — if the target doesn't support the method, log and skip.
+
+        AUTONOMY: tracks dispatch success/failure so effectiveness can be
+        measured. Fire-and-forget execution, but outcomes are recorded.
         """
         target = self._resolve_target(action.target_system)
         if target is None:
+            self.record_dispatch_outcome(action.action_type, success=False)
             return
 
         try:
@@ -500,7 +641,11 @@ class AutonomicProtocol:
                     severity=action.parameters.get("cascade_risk", 0.5),
                 )
 
+            # Record successful dispatch (actual effect measured later by SomaService)
+            self.record_dispatch_outcome(action.action_type, success=True)
+
         except Exception as exc:
+            self.record_dispatch_outcome(action.action_type, success=False)
             logger.debug(
                 "autonomic_dispatch_error",
                 action=action.action_type,

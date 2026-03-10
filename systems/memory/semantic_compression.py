@@ -144,9 +144,10 @@ async def compress_community_embeddings(
     start = time.monotonic()
 
     # ── Step 1: Fetch episode embeddings for this community ──────────
+    # Community nodes use `id` as the unique property (set by _materialize_community_nodes).
     rows = await neo4j.execute_read(
         """
-        MATCH (c:Community {community_id: $cid})<-[:BELONGS_TO]-(entity:Entity)
+        MATCH (c:Community {id: $cid})<-[:BELONGS_TO]-(entity:Entity)
         MATCH (entity)<-[:MENTIONS]-(ep:Episode)
         WHERE ep.embedding IS NOT NULL
           AND ep.embedding_compressed IS NULL
@@ -237,7 +238,7 @@ async def compress_community_embeddings(
             pb.created_at = datetime(),
             pb.updated_at = datetime()
         WITH pb
-        MATCH (c:Community {community_id: $cid})
+        MATCH (c:Community {id: $cid})
         MERGE (c)-[:COMPRESSED_VIA]->(pb)
         """,
         {
@@ -327,12 +328,12 @@ async def run_semantic_compression(
     """
     start = time.monotonic()
 
-    # Get all communities
+    # Get all communities — use `id` which is the canonical property on Community nodes.
     communities = await neo4j.execute_read(
         """
         MATCH (c:Community)
-        WHERE c.community_id IS NOT NULL
-        RETURN c.community_id AS cid, c.member_count AS members
+        WHERE c.id IS NOT NULL
+        RETURN c.id AS cid, c.member_count AS members
         ORDER BY c.member_count DESC
         """
     )

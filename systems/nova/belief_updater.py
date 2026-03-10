@@ -175,6 +175,27 @@ class BeliefUpdater:
         delta = BeliefDelta()
         precision = broadcast.precision
 
+        # ── EIS threat attenuation (integration.py — belief_update_weight) ──
+        # If the percept was screened by EIS, attenuate the belief update precision
+        # proportional to the threat score.  A clean percept passes through at 1.0×;
+        # a high-threat percept is discounted toward BELIEF_FLOOR so adversarial
+        # inputs cannot poison the belief state even if they slip past quarantine.
+        content = broadcast.content
+        if content is not None and hasattr(content, "metadata") and isinstance(getattr(content, "metadata", None), dict):
+            try:
+                from systems.eis.integration import belief_update_weight as _eis_weight
+                eis_w = _eis_weight(content)  # type: ignore[arg-type]
+                if eis_w < 1.0:
+                    precision = precision * eis_w
+                    self._logger.debug(
+                        "belief_update_precision_attenuated_by_eis",
+                        original_precision=round(broadcast.precision, 4),
+                        eis_weight=round(eis_w, 4),
+                        attenuated_precision=round(precision, 4),
+                    )
+            except Exception:
+                pass  # EIS integration is non-fatal; degrade gracefully
+
         # ── Update context belief from broadcast content ──
         context_update = self._update_context(broadcast, precision)
         delta.context_update = context_update

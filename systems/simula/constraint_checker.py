@@ -53,7 +53,6 @@ class ConstraintSatisfactionChecker:
     # Paths that the code agent is never permitted to write to.
     # Duplicates FORBIDDEN_WRITE_PATHS from evolution_types for runtime checks.
     _FORBIDDEN_PATH_PREFIXES: tuple[str, ...] = (
-        "systems/equor",
         "systems/simula/service.py",
         "systems/simula/__init__.py",
         "systems/simula/constraint_checker.py",

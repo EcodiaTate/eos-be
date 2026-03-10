@@ -167,25 +167,122 @@
 
 ---
 
+### Autonomy Audit — Full Visibility Pass (2026-03-08)
+
+**Principle: the organism must see everything about itself, including its own blindness.**
+
+**1. Blind-spot awareness replaces safe defaults** (`vitality.py`)
+- `_read_runway_days()`, `_read_effective_i()`, `_read_constitutional_drift()`, `_read_thymos_health()` now return `NaN` when the system is not wired or unreadable — NOT fake safe values (was: 999.0, 1.0, 0.0, 1.0)
+- `assess_vitality()` marks NaN thresholds as severity='critical' with `(BLIND — <System> not wired)` suffix
+- Vitality report now includes `blind_spots` (list), `blind_spot_count`, `total_dimensions`, `visibility_pct`
+- The organism knows what it can and cannot see about itself
+
+**2. Time-to-fatal trajectory forecasting** (`vitality.py`)
+- `_estimate_time_to_fatal()` — linear extrapolation from rolling 120-sample trajectory history
+- `VitalityReport.time_to_fatal` is now actually computed (was always None)
+- Vitality report includes `time_to_fatal_s` — the organism can plan around its own death
+- Uses 6+ samples minimum (~3 min at 30s intervals) for meaningful extrapolation
+
+**3. Restoration readiness in every vitality report** (`vitality.py`)
+- `_assess_restoration_readiness()` — quick check of snapshot/IPFS/vault availability
+- Included in every 30s vitality report as `restoration_readiness` dict
+- The organism always knows whether its safety net is functional
+
+**4. Degradation rates are Evo-evolvable at runtime** (`degradation.py`, `vitality.py`)
+- `DegradationEngine.update_rates()` — hot-reload memory/config/hypothesis rates with bounds [0.001, 0.5]
+- `DegradationEngine.get_evolvable_parameters()` — returns current rates for genome extraction (heritable)
+- `DegradationEngine.estimate_time_to_critical_s()` — forecasts when pressure will reach 0.8 (critical zone)
+- VitalityCoordinator routes `EVO_PARAMETER_ADJUSTED` events with `degradation_*` params to `update_rates()`
+- `SkiaService.get_evolvable_parameters()` now includes degradation rates in genome
+- Vitality report includes `degradation_time_to_critical`
+
+**5. Austerity compliance tracking** (`vitality.py`)
+- New `SynapseEventType.SYSTEM_MODULATION_ACK` — systems emit this after processing SYSTEM_MODULATION
+- VitalityCoordinator subscribes to `SYSTEM_MODULATION_ACK`, tracks `_austerity_pending_acks` vs `_austerity_received_acks`
+- `_check_austerity_compliance()` returns ordered/compliant/silent system lists + compliance_pct
+- Vitality report includes `austerity_compliance` dict — the organism knows if its survival commands are obeyed
+- Systems that don't ACK are visible as "silent" — the organism can escalate or investigate
+
+**New SynapseEventType**: `SYSTEM_MODULATION_ACK`
+
+---
+
+### Shadow Worker (2026-03-08)
+
+**RestorationOrchestrator** (`restoration.py`) — self-deploying shadow watchdog:
+
+- `ensure_shadow_worker() -> bool` — public entry point. Checks existing Redis record, verifies health endpoint, redeploys if unhealthy. Returns True if shadow confirmed live.
+- `_deploy_shadow_worker() -> bool` — tries Akash first (`_deploy_shadow_akash()`), falls back to Cloud Run (`_deploy_shadow_cloud_run()`). Verifies health, persists record to Redis.
+- `_deploy_shadow_akash() -> tuple[str, str, str]` — minimal Akash deployment (0.1 CPU / 128Mi memory). Injects `ECODIAOS_STANDALONE=true` + `ECODIAOS_SHADOW_WORKER=true`. 300s polling timeout. Returns `(endpoint, "akash", deployment_id)`.
+- `_deploy_shadow_cloud_run() -> tuple[str, str, str]` — clones main Cloud Run service into shadow region (service name gets `-shadow` suffix). Uses `_pick_shadow_region()` for geographic separation. 256Mi memory limit. Returns `(endpoint, "cloud_run", service_name)`.
+- `_check_shadow_worker_health(endpoint)` — 10s timeout GET `/health`. Returns bool.
+- `_persist_shadow_worker_record()` / `_get_shadow_worker_record()` — Redis JSON at `skia:shadow_worker` key (7-day TTL).
+- `_patch_sdl_for_shadow(sdl_content)` (module-level) — regex downgrades CPU to ≤0.1, memory to ≤128Mi in any SDL template.
+- `_pick_shadow_region(main_region)` (module-level) — lookup table: australia-southeast1 → us-central1, us-central1 → europe-west1, etc. Shadow is always in a different region than main.
+
+**SkiaService** (`service.py`) — 6-hour shadow worker check loop:
+- `_SHADOW_WORKER_CHECK_INTERVAL_S = 6 * 3600.0` class constant
+- `start()`: if not standalone + restoration wired → launches `_ensure_shadow_worker_loop()` as background task
+- `_ensure_shadow_worker_loop()`: calls `ensure_shadow_worker()` on startup, then every 6 hours. Emits `SKIA_SHADOW_WORKER_DEPLOYED` on success or `SKIA_SHADOW_WORKER_MISSING` on failure.
+- `shutdown()`: cancels `_shadow_worker_task` alongside `_heartbeat_task`
+
+**New SynapseEventTypes**: `SKIA_SHADOW_WORKER_DEPLOYED`, `SKIA_SHADOW_WORKER_MISSING`
+
+**Design intent**: Eliminates human dependency for resurrection. Shadow worker needs only: heartbeat listener + state restore capability. Same Docker image, minimal resources, geographically separated.
+
+## Resilience Audit Gap Fixes (9 Mar 2026)
+
+| Gap | Area | Fix | File |
+|-----|------|-----|------|
+| GAP-3 (F2) | Simula brain death detection | Added `"simula"` to `CRITICAL_SYSTEMS` frozenset → 45s detection threshold now covers Simula; triggers `_on_critical_system_silent("simula")` → emits `SKIA_HEARTBEAT_LOST` with `system="simula"` | `heartbeat.py` |
+| GAP-5 (F1) | Crash context persistence | `_on_death_confirmed()` calls `_persist_crash_context_for_resurrection()` after snapshot; writes `skia:crash_context:{instance_id}` key to Redis (24h TTL) with `{"trigger", "state_cid", "crash_time_utc", "request_simula_analysis": true}` | `service.py` |
+
+**GAP-5 write contract**: The Redis key `skia:crash_context:{instance_id}` is the handshake that closes the coma-recovery loop. Thymos reads and deletes it on boot (GAP-6 in Thymos).
+
 ## Remaining Gaps (spec ref)
 - **Sec 15**: SACM integration for compute cost quota checks before restoration (currently direct GCP/Akash only)
 - **Sec 18.3**: Circuit breaker for repeated restoration failures — currently just `infrastructure_dead` flag with no human-notification path
 - **Federation quorum polling**: `ChannelManager.send_message()` is designed for handshake/exchange payloads, not generic poll messages — resurrection poll degrades gracefully to auto-approve when peers don't respond (survival imperative preserved)
-- **Genome inheritance (startup scripts)**: `restore_from_ipfs()` now applies genome internally when `event_bus`/`memory` are passed, but startup scripts must be updated to pass these args
+- **Shadow SDL template**: `_patch_sdl_for_shadow()` regex-downgrades the main SDL at deploy time. Operators should maintain a dedicated `config/skia/akash_shadow_sdl_template.yaml` for predictable shadow provisioning.
+
+## Autonomy Audit Fixes (2026-03-08)
+
+### Dead Wiring — ALL FIXED (`core/registry.py`)
+
+**Gap 1: `skia.set_memory()` never called (CRITICAL)**
+- `SkiaService.set_memory()` existed but was never invoked from registry.py or wiring.py
+- Effect: every IPFS snapshot was genome-blind (no `SnapshotPayload.constitutional_genome`); restored organisms started with default drives
+- Fix: `_init_skia()` now accepts `memory` kwarg; calls `skia.set_memory(memory)` before `skia.initialize()`
+- File: `core/registry.py`, `_init_skia()` method
+
+**Gap 2: `skia.wire_vitality_systems()` never called (CRITICAL)**
+- `VitalityCoordinator` had `set_oikos()`, `set_thymos()`, `set_equor()`, `set_telos()`, `set_clock()` all implemented but never populated
+- Effect: all five vitality dimensions returned `NaN` (BLIND) — the organism could not read runway, constitutional drift, immune health, or effective_I; death detection was operating with no data
+- Fix: `_init_skia()` now calls `skia.wire_vitality_systems(clock=synapse._clock, oikos=oikos, thymos=thymos, equor=equor, telos=telos)` after `start()`
+- `clock` retrieved via `getattr(synapse, "_clock", None)` — non-fatal if not available
+- File: `core/registry.py`, `_init_skia()` method
+
+**Gap 3: `_check_skia_restore()` missing `memory` arg**
+- Cold-start `restore_from_ipfs()` call omitted `memory=` parameter
+- Effect: constitutional genome from snapshot was never applied to Memory on cold-start restoration — revived organism started with default drives even when snapshot contained evolved genome
+- Fix: `_check_skia_restore()` now accepts `memory` kwarg and passes it to `restore_from_ipfs()`
+- Note: `event_bus` cannot be passed here (Synapse not yet initialized); `memory.seed_genome()` is the primary restore path; GENOME_EXTRACT_REQUEST broadcast fires once Synapse comes online
+- File: `core/registry.py`, `_check_skia_restore()` + call site
 
 ## Integration Surface
 ### Emits
-`skia_heartbeat`, `skia_heartbeat_lost`, `skia_restoration_triggered`, `skia_restoration_started`, `skia_restoration_complete`, `skia_restoration_completed`, `skia_snapshot_completed`, `skia_dry_run_complete`, `skia_resurrection_proposal`, `organism_spawned`, `organism_died`, `organism_resurrected`, `vitality_report`, `vitality_fatal`, `vitality_restored`, `metabolic_cost_report`, `system_modulation`, `degradation_override`, `child_died`, `federation_broadcast`, `re_training_example`, `incident_detected`, `fitness_observable_batch`, `genome_extract_request`
+`skia_heartbeat`, `skia_heartbeat_lost`, `skia_restoration_triggered`, `skia_restoration_started`, `skia_restoration_complete`, `skia_restoration_completed`, `skia_snapshot_completed`, `skia_dry_run_complete`, `skia_resurrection_proposal`, `organism_spawned`, `organism_died`, `organism_resurrected`, `vitality_report`, `vitality_fatal`, `vitality_restored`, `metabolic_cost_report`, `system_modulation`, `degradation_override`, `child_died`, `federation_broadcast`, `re_training_example`, `incident_detected`, `fitness_observable_batch`, `genome_extract_request`, `skia_shadow_worker_deployed`, `skia_shadow_worker_missing`
 
 **Gap closure (2026-03-07, event coverage):**
 - `skia_snapshot_completed` — now emitted by `StateSnapshotPipeline.take_snapshot()` after each successful IPFS pin. Requires `snapshot.set_event_bus(bus)` (wired in `SkiaService.set_event_bus()` and `initialize()`).
 - `skia_restoration_triggered` — now emitted in `SkiaService._on_death_confirmed()` immediately when restoration begins, before metabolic gates or fleet coordination, so the observatory can track all restoration attempts including blocked ones.
 
 ### Subscribes
-`SOMA_VITALITY_SIGNAL`, `METABOLIC_PRESSURE`, `EVO_PARAMETER_ADJUSTED`, `ORGANISM_DIED`, `FEDERATION_RESURRECTION_APPROVED`
+`SOMA_VITALITY_SIGNAL`, `METABOLIC_PRESSURE`, `EVO_PARAMETER_ADJUSTED`, `ORGANISM_DIED`, `FEDERATION_RESURRECTION_APPROVED`, `DRIVE_EXTINCTION_DETECTED`, `ONEIROS_CONSOLIDATION_COMPLETE`, `EVO_BELIEF_CONSOLIDATED`, `SYSTEM_MODULATION_ACK`
 
-### Wiring Points (must be called at organism bootstrap)
-- `skia.set_memory(memory_service)` — enables constitutional genome in snapshots
-- `skia.set_event_bus(event_bus)` — enables Synapse integration + resurrection coordination + phylogeny fitness loop
-- `skia.wire_vitality_systems(clock, oikos, thymos, equor, telos)` — wires death system
-- `restore_from_ipfs(..., event_bus=bus, memory=memory)` — enables genome application on cold startup restoration
+### Wiring Points (called at organism bootstrap — all now LIVE)
+- `skia.set_memory(memory_service)` — **WIRED** in `_init_skia()` before `initialize()` (2026-03-08)
+- `skia.set_event_bus(event_bus)` — **WIRED** in `_init_skia()` after `initialize()` (registry.py)
+- `skia.wire_vitality_systems(clock, oikos, thymos, equor, telos)` — **WIRED** in `_init_skia()` after `start()` (2026-03-08)
+- `restore_from_ipfs(..., memory=memory)` — **WIRED** in `_check_skia_restore()` (2026-03-08); event_bus deferred (Synapse not yet available at restore time)
+- Shadow worker loop: auto-started in `SkiaService.start()` when `not standalone and config.enabled and restoration is wired`; no explicit external wiring needed

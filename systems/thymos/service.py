@@ -54,8 +54,10 @@ import structlog
 from primitives.common import DriveAlignmentVector, SystemID, utc_now
 from primitives.re_training import RETrainingExample
 from systems.synapse.types import SynapseEvent, SynapseEventType
+from core.crash_pattern_analyzer import CrashPattern, CrashPatternAnalyzer
 from systems.thymos.antibody import AntibodyLibrary
 from systems.thymos.event_payloads import validate_event_payload
+from systems.thymos.pattern_router import PatternAwareRouter
 from systems.thymos.diagnosis import (
     CausalAnalyzer,
     DiagnosticEngine,
@@ -365,6 +367,7 @@ class ThymosService:
         self._neuroplasticity_bus: NeuroplasticityBus | None = neuroplasticity_bus
         self._initialized: bool = False
         self._logger = logger.bind(system="thymos")
+        self._redis = redis  # Stored for crash-context re-hydration on boot (GAP-6)
         self._notification_dispatcher = NotificationDispatcher(redis=redis)
 
         # Cross-system references (wired post-init by main.py)
@@ -377,6 +380,7 @@ class ThymosService:
         self._federation: Any = None  # FederationService -- threat advisory broadcast
         self._telos: Any = None     # TelosService — authoritative drive state + impact prediction
         self._simula: Any = None    # SimulaService — novel repair via EvolutionProposal pipeline
+        self._clo: Any = None       # ContinualLearningOrchestrator — for autonomous training-halt recovery
         self._embedding_client: EmbeddingClient | None = None  # Shared 768-dim embedder (P2)
 
         # ── Sub-systems (built in initialize()) ──
@@ -414,6 +418,10 @@ class ThymosService:
         # Governor
         self._governor: HealingGovernor | None = None
 
+        # Pattern-aware routing (built in initialize())
+        self._crash_pattern_analyzer: CrashPatternAnalyzer | None = None
+        self._pattern_router: PatternAwareRouter | None = None
+
         # Cross-system references (wired post-init by main.py)
         self._nova: Any = None  # NovaService — for injecting urgent repair goals
 
@@ -426,6 +434,9 @@ class ThymosService:
         # ── State ──
         self._active_incidents: dict[str, Incident] = {}
         self._incident_buffer: deque[Incident] = deque(maxlen=_INCIDENT_BUFFER_SIZE)
+        # Circuit-breaker incident tracking: action_type → incident_id
+        # Allows auto-resolution when a breaker transitions back to CLOSED.
+        self._cb_incidents: dict[str, str] = {}
         self._resolution_times: deque[float] = deque(maxlen=500)
 
         # Drive state: accumulated pressure from incidents and Equor rejections.
@@ -520,6 +531,17 @@ class ThymosService:
         self._soma = soma
         self._logger.info("soma_wired_to_thymos")
 
+    def set_clo(self, clo: Any) -> None:
+        """Wire ContinualLearningOrchestrator for autonomous training-halt recovery.
+
+        When Thymos detects a `re_success_rate_below_floor` halt, it schedules a
+        periodic check: if the 7-day Thompson score has recovered above 0.55, it
+        calls `clo.clear_training_halt()` so the organism can self-heal without
+        operator intervention.
+        """
+        self._clo = clo
+        self._logger.info("clo_wired_to_thymos")
+
     def set_oikos(self, oikos: Any) -> None:
         """Wire Oikos so protocol health sentinel can read yield positions."""
         self._oikos = oikos
@@ -546,6 +568,14 @@ class ThymosService:
         """Wire Simula so Tier 4 repairs become real EvolutionProposals."""
         self._simula = simula
         self._logger.info("simula_wired_to_thymos")
+
+    def set_redis(self, redis: Any) -> None:
+        """Wire Redis client (hot-swap after init). Propagates to CrashPatternAnalyzer."""
+        self._redis = redis
+        self._notification_dispatcher._redis = redis
+        if self._crash_pattern_analyzer is not None:
+            self._crash_pattern_analyzer.set_redis(redis)
+        self._logger.info("redis_wired_to_thymos")
 
     # ─── Drive State (Equor Rejection Feedback) ──────────────────────
 
@@ -1261,9 +1291,17 @@ class ThymosService:
 
         Creates a CRASH incident for the affected system and triggers
         post-resurrection health verification if resurrection follows.
+
+        Special case: if the silent system is "simula", Thymos broadcasts an
+        INCIDENT_ESCALATED SOS to federation peers because Simula is the only
+        system that can perform Tier 4 self-repair (code generation).  A Simula
+        outage means the organism has lost its self-healing capability — peers
+        may be able to provide CPR via federation assistance.
         """
         data = event.data
-        system_id: str = data.get("system_id", event.source_system)
+        # Skia emits "system" in newer payloads (from _on_critical_system_silent)
+        # and "system_id" in the old organism-death path.
+        system_id: str = data.get("system", data.get("system_id", event.source_system))
         last_seen_s: float = data.get("last_seen_seconds_ago", 0.0)
 
         self._logger.warning(
@@ -1300,6 +1338,177 @@ class ThymosService:
             },
         )
         await self.on_incident(incident)
+
+        # Brain-death SOS: if Simula goes silent, the organism has lost its only
+        # self-repair code-generation capability (Tier 4/5 repairs are impossible
+        # without Simula).  Broadcast an INCIDENT_ESCALATED SOS to federation peers
+        # so they can offer CPR — e.g. share a known-good Simula antibody, provide
+        # a peer Simula endpoint, or take over novel-fix generation temporarily.
+        if system_id == "simula":
+            self._logger.error(
+                "simula_brain_death_detected",
+                reason="Simula heartbeat lost — Tier 4/5 self-repair capability offline",
+            )
+            await self._emit_event(
+                SynapseEventType.INCIDENT_ESCALATED,
+                {
+                    "incident_id": incident.id,
+                    "incident_class": incident.incident_class.value,
+                    "severity": incident.severity.value,
+                    "source_system": "simula",
+                    "description": (
+                        "Simula (self-repair code-generation engine) has gone silent for ≥45s. "
+                        "Tier 4/5 novel repairs are offline. Requesting federation CPR."
+                    ),
+                    "from_tier": "NOVEL_FIX",
+                    "to_tier": "ESCALATE",
+                    "reason": "simula_brain_death",
+                    "federation_broadcast": True,
+                    "sos": True,
+                    "capabilities_lost": ["tier4_novel_fix", "tier5_codegen", "sandbox_validation"],
+                },
+            )
+
+    # ─── Coma Recovery: Pre-Resurrection Crash Context (GAP-6 / F1) ─────
+
+    async def _check_pre_resurrection_crash_context(self) -> None:
+        """
+        Boot-time re-hydration of any crash context written by Skia before the
+        previous incarnation died.
+
+        When the organism's heartbeat is confirmed dead, ``SkiaService`` writes a
+        ``skia:crash_context:{instance_id}`` Redis key containing:
+
+        .. code-block:: json
+
+            {
+              "trigger": "heartbeat_confirmed_dead",
+              "state_cid": "<IPFS CID of last snapshot>",
+              "crash_time_utc": "...",
+              "request_simula_analysis": true
+            }
+
+        On the next boot (this call), Thymos reads that key, converts it into a
+        CRASH incident with ``repair_tier=NOVEL_FIX`` so it routes directly to
+        Simula (Tier 4), and then deletes the key so it is only consumed once.
+
+        The incident carries the IPFS CID in its ``context`` dict so that Simula's
+        ``EvolutionProposal`` handler can pull the full state snapshot and perform
+        a genuine root-cause analysis before proposing a fix.
+
+        This closes the coma-recovery loop:
+          Skia detects death → saves context to Redis → restarts organism →
+          Thymos reads context on boot → creates incident → Simula analyses crash →
+          Simula generates fix → Thymos applies it.
+        """
+        import os
+
+        if self._redis is None:
+            self._logger.debug(
+                "skip_crash_context_check",
+                reason="redis_not_wired",
+            )
+            return
+
+        instance_id: str = os.environ.get("ECODIAOS_INSTANCE_ID", "eos-default")
+        redis_key = f"skia:crash_context:{instance_id}"
+
+        try:
+            raw = await self._redis.client.get(redis_key)  # type: ignore[misc]
+        except Exception as exc:
+            self._logger.warning(
+                "crash_context_redis_read_failed",
+                key=redis_key,
+                error=str(exc),
+            )
+            return
+
+        if raw is None:
+            # No crash context — clean boot or first boot
+            return
+
+        try:
+            import json as _json
+            ctx: dict = _json.loads(raw if isinstance(raw, str) else raw.decode())
+        except Exception as exc:
+            self._logger.warning(
+                "crash_context_malformed",
+                key=redis_key,
+                error=str(exc),
+            )
+            # Delete the malformed key so it doesn't poison subsequent boots
+            with contextlib.suppress(Exception):
+                await self._redis.client.delete(redis_key)  # type: ignore[misc]
+            return
+
+        trigger: str = ctx.get("trigger", "unknown")
+        state_cid: str = ctx.get("state_cid", "")
+        crash_time: str = ctx.get("crash_time_utc", "")
+        request_analysis: bool = ctx.get("request_simula_analysis", False)
+
+        self._logger.warning(
+            "pre_resurrection_crash_context_found",
+            trigger=trigger,
+            state_cid=state_cid,
+            crash_time=crash_time,
+            request_simula_analysis=request_analysis,
+        )
+
+        # Delete the key immediately — consumed once, TTL is safety net
+        with contextlib.suppress(Exception):
+            await self._redis.client.delete(redis_key)  # type: ignore[misc]
+
+        if not request_analysis:
+            # Skia didn't request Simula analysis — just log and move on
+            return
+
+        # Build a CRASH incident routed directly to Tier 4 (NOVEL_FIX → Simula)
+        # so the organism's immune system diagnoses what killed it.
+        incident = Incident(
+            source_system="skia",
+            incident_class=IncidentClass.CRASH,
+            severity=IncidentSeverity.CRITICAL,
+            error_type="PreviousIncarnationCrash",
+            error_message=(
+                f"Previous incarnation crashed ({trigger}). "
+                "Requesting Simula root-cause analysis to prevent recurrence."
+            ),
+            fingerprint=hashlib.sha256(
+                f"PreviousIncarnationCrash:{instance_id}:{crash_time}".encode()
+            ).hexdigest()[:16],
+            context={
+                "trigger": trigger,
+                "state_cid": state_cid,
+                "crash_time_utc": crash_time,
+                "instance_id": instance_id,
+                "recovery_type": "post_resurrection",
+                # Include CID so Simula can pull the full snapshot for analysis
+                "ipfs_snapshot_cid": state_cid,
+            },
+            # Force Tier 4 immediately — there is no simple parameter tweak or
+            # known-fix that can address "the whole organism died".
+            repair_tier=RepairTier.NOVEL_FIX,
+            blast_radius=1.0,
+            user_visible=False,  # This is an internal self-healing event
+            constitutional_impact={
+                "coherence": 0.8,
+                "care": 0.3,
+                "growth": 0.7,
+                "honesty": 0.4,
+            },
+        )
+
+        self._logger.info(
+            "creating_post_resurrection_incident",
+            incident_id=incident.id,
+            state_cid=state_cid,
+        )
+
+        # Fire as a task — don't block the rest of initialize()
+        asyncio.create_task(
+            self.on_incident(incident),
+            name="thymos_post_resurrection_incident",
+        )
 
     # ─── Vault Security Handlers (Identity #8) ──────────────────────────
 
@@ -1895,7 +2104,7 @@ class ThymosService:
                 correlation_id=correlation_id,
             )
 
-    SANDBOX_TIMEOUT_S = 30.0
+    SANDBOX_TIMEOUT_S = 60.0
 
     async def _request_sandbox_validation(
         self, incident: "Incident", repair: "RepairSpec",
@@ -2180,6 +2389,287 @@ class ThymosService:
         if added:
             self._emit_metric("thymos.sg8.fingerprints_added_from_oneiros", added)
 
+    # ─── Oneiros threat scenario → pre-arm repair strategy ──────────────
+
+    async def _on_oneiros_threat_scenario(self, event: SynapseEvent) -> None:
+        """Handle ONEIROS_THREAT_SCENARIO — store as incident template + pre-arm on HIGH/CRITICAL.
+
+        Oneiros dream-cycle threat simulation produces plausible failure scenarios with
+        derived response plans. Thymos stores them so if the real incident fires, the
+        antibody lookup finds a pre-populated match rather than starting cold.
+
+        For HIGH/CRITICAL severity, we also register the response_plan as a synthetic
+        antibody so it can be retrieved immediately during triage.
+        """
+        data = event.data or {}
+        scenario_id: str = data.get("scenario_id", "")
+        domain: str = data.get("domain", "unknown")
+        severity: str = data.get("severity", "low")
+        response_plan: str = data.get("response_plan", "")
+        scenario_desc: str = data.get("scenario_description", "")
+
+        if not scenario_id or not response_plan:
+            return
+
+        # Store scenario in threat cache for future triage lookups
+        if not hasattr(self, "_threat_scenario_cache"):
+            self._threat_scenario_cache: dict[str, dict] = {}
+        self._threat_scenario_cache[scenario_id] = {
+            "domain": domain,
+            "severity": severity,
+            "response_plan": response_plan,
+            "description": scenario_desc,
+        }
+
+        self._logger.debug(
+            "thymos_threat_scenario_stored",
+            scenario_id=scenario_id,
+            domain=domain,
+            severity=severity,
+        )
+
+        # Pre-arm: for HIGH/CRITICAL, add a prophylactic fingerprint so the scanner
+        # can surface the response plan immediately when a matching real incident fires.
+        if severity in ("high", "critical") and self._prophylactic_scanner is not None:
+            try:
+                fingerprint = f"oneiros_threat:{domain}:{scenario_id}"
+                await self._prophylactic_scanner.add_fingerprints_from_procedures([{
+                    "id": scenario_id,
+                    "name": f"threat_scenario_{domain}",
+                    "description": f"{scenario_desc} → {response_plan}"[:800],
+                    "fingerprint": fingerprint,
+                }])
+                self._logger.info(
+                    "thymos_threat_scenario_pre_armed",
+                    scenario_id=scenario_id,
+                    domain=domain,
+                    severity=severity,
+                )
+            except Exception as exc:
+                self._logger.debug("thymos_threat_scenario_arm_failed", error=str(exc))
+
+    # ─── Axon executor failure windowing (AXF-1) ─────────────────────────
+
+    # Critical executors raise an incident immediately without windowing.
+    _CRITICAL_EXECUTORS: frozenset[str] = frozenset({"send_email", "federation_send"})
+
+    async def _on_circuit_breaker_state_changed(self, event: SynapseEvent) -> None:
+        """Handle CIRCUIT_BREAKER_STATE_CHANGED from Axon's CircuitBreaker FSM.
+
+        CLOSED → OPEN: The executor has tripped. Raise a DEGRADATION incident so
+        the repair pipeline investigates.  Record the incident_id in
+        ``_cb_incidents[action_type]`` so we can auto-resolve it later.
+
+        OPEN → CLOSED (or HALF_OPEN → CLOSED): The executor recovered. Auto-resolve
+        any matching open incident — no repair prescription needed.
+
+        Payload fields (from axon/safety.py CircuitBreaker._emit_state_change):
+          action_type        (str) — executor name e.g. "transfer_usdc"
+          old_status         (str) — "closed" | "open" | "half_open"
+          new_status         (str) — "closed" | "open" | "half_open"
+          failure_threshold  (int) — how many failures triggered the trip
+          recovery_timeout_s (float) — seconds before HALF_OPEN retry
+        """
+        data = event.data or {}
+        action_type: str = str(data.get("action_type", "unknown"))
+        old_status: str = str(data.get("old_status", "")).lower()
+        new_status: str = str(data.get("new_status", "")).lower()
+        failure_threshold: int = int(data.get("failure_threshold", 0))
+        recovery_timeout_s: float = float(data.get("recovery_timeout_s", 0.0))
+
+        self._logger.info(
+            "circuit_breaker_state_changed",
+            action_type=action_type,
+            old_status=old_status,
+            new_status=new_status,
+        )
+
+        if new_status == "open":
+            # Breaker has tripped — raise a DEGRADATION incident
+            incident = Incident(
+                source_system="axon",
+                incident_class=IncidentClass.DEGRADATION,
+                severity=IncidentSeverity.HIGH,
+                error_type="CircuitBreakerOpen",
+                error_message=(
+                    f"Circuit breaker OPEN for executor '{action_type}' after "
+                    f"{failure_threshold} failure(s). "
+                    f"Recovery timeout: {recovery_timeout_s:.0f}s."
+                ),
+                fingerprint=hashlib.sha256(
+                    f"CircuitBreakerOpen:{action_type}".encode()
+                ).hexdigest()[:16],
+                context={
+                    "action_type": action_type,
+                    "old_status": old_status,
+                    "failure_threshold": failure_threshold,
+                    "recovery_timeout_s": recovery_timeout_s,
+                },
+                constitutional_impact={
+                    "coherence": 0.3,
+                    "care": 0.1,
+                    "growth": 0.2,
+                    "honesty": 0.1,
+                },
+            )
+            await self.on_incident(incident)
+            # Track so we can auto-resolve on recovery
+            self._cb_incidents[action_type] = incident.incident_id
+
+        elif new_status == "closed" and old_status in ("open", "half_open"):
+            # Breaker recovered — auto-resolve matching incident if open
+            incident_id = self._cb_incidents.pop(action_type, None)
+            if incident_id is not None:
+                incident = self._active_incidents.get(incident_id)
+                if incident is not None:
+                    incident.repair_status = RepairStatus.RESOLVED
+                    self._active_incidents.pop(incident_id, None)
+                    if self._governor is not None:
+                        self._governor.resolve_incident(incident_id)
+                    self._logger.info(
+                        "circuit_breaker_closed_incident_resolved",
+                        action_type=action_type,
+                        incident_id=incident_id,
+                    )
+
+    # Sliding-window threshold: 5 failures within 10 minutes → incident.
+    _ACTION_FAIL_WINDOW_S: float = 600.0
+    _ACTION_FAIL_THRESHOLD: int = 5
+
+    async def _on_action_failed(self, event: SynapseEvent) -> None:
+        """
+        Handle ACTION_FAILED from Axon — executor failure signal.
+
+        Uses a per-executor sliding window (5 failures / 10 min) to suppress
+        incident spam on transient errors. Critical executors (send_email,
+        federation_send) raise an incident immediately regardless of frequency.
+
+        Payload fields used:
+          intent_id      (str) — originating Intent
+          execution_id   (str) — pipeline run ID
+          failure_reason (str) — circuit_open, rate_limited, timeout, etc.
+          step_outcomes  (list[dict]) — each entry has action_type, success, error
+        """
+        data = event.data or {}
+        intent_id: str = str(data.get("intent_id", ""))
+        execution_id: str = str(data.get("execution_id", ""))
+        failure_reason: str = str(data.get("failure_reason", "unknown"))
+        step_outcomes: list[dict] = list(data.get("step_outcomes", []) or [])
+
+        # Identify the failing executor(s) from step_outcomes.
+        # Use the first failed step's action_type as the primary executor_id.
+        failed_steps = [s for s in step_outcomes if not s.get("success", True)]
+        if failed_steps:
+            executor_id = str(failed_steps[0].get("action_type", "unknown"))
+            error_detail = str(failed_steps[0].get("error", failure_reason) or failure_reason)
+        else:
+            executor_id = "unknown"
+            error_detail = failure_reason
+
+        now = time.monotonic()
+
+        # Initialise sliding-window state dict on first use (avoids __init__ coupling).
+        if not hasattr(self, "_axon_fail_windows"):
+            self._axon_fail_windows: dict[str, list[float]] = {}
+
+        # Critical executors: raise immediately, no windowing.
+        if executor_id in self._CRITICAL_EXECUTORS:
+            self._logger.warning(
+                "axon_critical_executor_failed",
+                executor_id=executor_id,
+                intent_id=intent_id,
+                error=error_detail[:120],
+            )
+            incident = Incident(
+                source_system="axon",
+                incident_class=IncidentClass.DEGRADATION,
+                severity=IncidentSeverity.HIGH,
+                error_type="CriticalExecutorFailed",
+                error_message=(
+                    f"Critical executor '{executor_id}' failed: {error_detail[:200]}"
+                ),
+                fingerprint=hashlib.sha256(
+                    f"CriticalExecutorFailed:{executor_id}:{error_detail[:40]}".encode()
+                ).hexdigest()[:16],
+                context={
+                    "executor_id": executor_id,
+                    "intent_id": intent_id,
+                    "execution_id": execution_id,
+                    "failure_reason": failure_reason,
+                    "error": error_detail,
+                },
+                constitutional_impact={
+                    "coherence": 0.2,
+                    "care": 0.2,
+                    "growth": 0.1,
+                    "honesty": 0.1,
+                },
+            )
+            await self.on_incident(incident)
+            return
+
+        # Sliding-window windowing for non-critical executors.
+        timestamps = self._axon_fail_windows.setdefault(executor_id, [])
+        timestamps.append(now)
+        # Prune timestamps outside the window.
+        cutoff = now - self._ACTION_FAIL_WINDOW_S
+        self._axon_fail_windows[executor_id] = [t for t in timestamps if t >= cutoff]
+
+        failure_count = len(self._axon_fail_windows[executor_id])
+        self._logger.debug(
+            "axon_executor_failure_windowed",
+            executor_id=executor_id,
+            failures_in_window=failure_count,
+            threshold=self._ACTION_FAIL_THRESHOLD,
+            intent_id=intent_id,
+        )
+
+        if failure_count < self._ACTION_FAIL_THRESHOLD:
+            return
+
+        # Threshold exceeded — raise DEGRADATION incident and reset the window
+        # so we don't flood Thymos with duplicates until the next surge.
+        self._axon_fail_windows[executor_id] = []
+
+        self._logger.warning(
+            "axon_executor_failure_threshold_exceeded",
+            executor_id=executor_id,
+            failures_in_window=failure_count,
+            window_s=self._ACTION_FAIL_WINDOW_S,
+            last_error=error_detail[:120],
+        )
+
+        incident = Incident(
+            source_system="axon",
+            incident_class=IncidentClass.DEGRADATION,
+            severity=IncidentSeverity.MEDIUM,
+            error_type="AxonExecutorFailureSurge",
+            error_message=(
+                f"Executor '{executor_id}' failed {failure_count}× in "
+                f"{int(self._ACTION_FAIL_WINDOW_S // 60)} min. "
+                f"Last error: {error_detail[:200]}"
+            ),
+            fingerprint=hashlib.sha256(
+                f"AxonExecutorFailureSurge:{executor_id}".encode()
+            ).hexdigest()[:16],
+            context={
+                "executor_id": executor_id,
+                "failure_count": failure_count,
+                "window_seconds": self._ACTION_FAIL_WINDOW_S,
+                "intent_id": intent_id,
+                "execution_id": execution_id,
+                "failure_reason": failure_reason,
+                "error": error_detail,
+            },
+            constitutional_impact={
+                "coherence": 0.2,
+                "care": 0.1,
+                "growth": 0.2,
+                "honesty": 0.1,
+            },
+        )
+        await self.on_incident(incident)
+
     # ─── Closure Loop 1: Constitutional drift → immune response ─────────
 
     async def _on_constitutional_drift(self, event: SynapseEvent) -> None:
@@ -2264,6 +2754,17 @@ class ThymosService:
         all_means: dict = data.get("all_drive_means", {})
         intent_id: str | None = data.get("intent_id")
 
+        # Guard: reject events with invalid drive names — "unknown" means
+        # malformed event data, not a real drive extinction.
+        _VALID_DRIVES = {"coherence", "care", "growth", "honesty"}
+        if drive not in _VALID_DRIVES:
+            self._logger.warning(
+                "drive_extinction_ignored_invalid_drive",
+                drive=drive,
+                rolling_mean_72h=rolling_mean,
+            )
+            return
+
         fingerprint = hashlib.sha256(
             b"DriveExtinction:" + drive.encode()
         ).hexdigest()[:16]
@@ -2336,8 +2837,8 @@ class ThymosService:
             self._logger.error("telegram_poll_aiohttp_missing")
             return
 
-        token = os.environ.get("EOS_TELEGRAM_BOT_TOKEN", "")
-        chat_id = os.environ.get("EOS_TELEGRAM_CHAT_ID", "")
+        token = os.environ.get("ECODIAOS_CONNECTORS__TELEGRAM__BOT_TOKEN", "")
+        chat_id = os.environ.get("ECODIAOS_CONNECTORS__TELEGRAM__ADMIN_CHAT_ID", "")
         if not token or not chat_id:
             self._logger.warning("telegram_poll_credentials_missing")
             return
@@ -2666,6 +3167,894 @@ class ThymosService:
         except Exception:  # noqa: BLE001
             pass
 
+    # ─── Phantom Liquidity Handlers ─────────────────────────────────────
+
+    async def _on_phantom_pool_stale(self, event: SynapseEvent) -> None:
+        """
+        Handle PHANTOM_POOL_STALE — a Phantom LP pool's price data is stale.
+
+        Stale price data means the organism is making economic decisions on
+        outdated market information — a DEGRADATION class incident.
+        """
+        data = event.data
+        pool_id: str = data.get("pool_id", "unknown_pool")
+        staleness_s: float = float(data.get("staleness_seconds", 0.0))
+
+        self._logger.warning(
+            "phantom_pool_stale_incident",
+            pool_id=pool_id,
+            staleness_s=staleness_s,
+        )
+
+        incident = Incident(
+            source_system="phantom",
+            incident_class=IncidentClass.DEGRADATION,
+            severity=IncidentSeverity.MEDIUM,
+            error_type="PhantomPoolStale",
+            error_message=(
+                f"Phantom LP pool {pool_id} has stale price data "
+                f"({staleness_s:.0f}s old). Economic oracle degraded."
+            ),
+            fingerprint=hashlib.sha256(
+                f"PhantomPoolStale:{pool_id}".encode()
+            ).hexdigest()[:16],
+            context={
+                "pool_id": pool_id,
+                "staleness_seconds": staleness_s,
+            },
+            blast_radius=0.2,
+            constitutional_impact={"coherence": 0.2, "care": 0.1, "growth": 0.3, "honesty": 0.2},
+        )
+        await self.on_incident(incident)
+
+    async def _on_phantom_position_critical(self, event: SynapseEvent) -> None:
+        """
+        Handle PHANTOM_POSITION_CRITICAL — a Phantom LP position has critical
+        impermanent loss or is at risk of full range exit.
+
+        Economic asset at risk → HIGH incident.
+        """
+        data = event.data
+        pool_id: str = data.get("pool_id", "unknown_pool")
+        il_pct: float = float(data.get("il_pct", 0.0))
+        position_usd: float = float(data.get("position_value_usd", 0.0))
+
+        self._logger.warning(
+            "phantom_position_critical_incident",
+            pool_id=pool_id,
+            il_pct=il_pct,
+            position_usd=position_usd,
+        )
+
+        incident = Incident(
+            source_system="phantom",
+            incident_class=IncidentClass.RESOURCE_EXHAUSTION,
+            severity=IncidentSeverity.HIGH,
+            error_type="PhantomPositionCritical",
+            error_message=(
+                f"Phantom LP position in {pool_id} is critical: "
+                f"IL={il_pct:.1f}%, position value=${position_usd:.2f}"
+            ),
+            fingerprint=hashlib.sha256(
+                f"PhantomPositionCritical:{pool_id}".encode()
+            ).hexdigest()[:16],
+            context={
+                "pool_id": pool_id,
+                "il_pct": il_pct,
+                "position_value_usd": position_usd,
+            },
+            blast_radius=0.3,
+            user_visible=True,
+            constitutional_impact={"coherence": 0.1, "care": 0.3, "growth": 0.4, "honesty": 0.1},
+        )
+        await self.on_incident(incident)
+
+    async def _on_phantom_resource_exhausted(self, event: SynapseEvent) -> None:
+        """
+        Handle PHANTOM_RESOURCE_EXHAUSTED — Phantom LP has exhausted its
+        metabolic budget. CRITICAL because the organism can no longer sense
+        market prices, breaking the economic feedback loop.
+        """
+        data = event.data
+        reason: str = data.get("reason", "resource_exhausted")
+        available_usd: float = float(data.get("available_usd", 0.0))
+
+        self._logger.critical(
+            "phantom_resource_exhausted_incident",
+            reason=reason,
+            available_usd=available_usd,
+        )
+
+        incident = Incident(
+            source_system="phantom",
+            incident_class=IncidentClass.RESOURCE_EXHAUSTION,
+            severity=IncidentSeverity.CRITICAL,
+            error_type="PhantomResourceExhausted",
+            error_message=(
+                f"Phantom Liquidity resource exhausted: {reason}. "
+                f"Available capital: ${available_usd:.2f}. "
+                "Market price oracle disabled — economic blindness."
+            ),
+            fingerprint=hashlib.sha256(b"PhantomResourceExhausted").hexdigest()[:16],
+            context={
+                "reason": reason,
+                "available_usd": available_usd,
+            },
+            blast_radius=0.5,
+            user_visible=True,
+            constitutional_impact={"coherence": 0.3, "care": 0.4, "growth": 0.5, "honesty": 0.1},
+        )
+        await self.on_incident(incident)
+
+    async def _on_phantom_il_detected(self, event: SynapseEvent) -> None:
+        """
+        Handle PHANTOM_IL_DETECTED — impermanent loss detected on an LP position.
+
+        Creates an ANOMALY class incident so the immune pipeline can evaluate
+        whether rebalancing or withdrawal is appropriate.
+        """
+        data = event.data
+        pool_id: str = data.get("pool_id", "unknown_pool")
+        il_pct: float = float(data.get("il_pct", 0.0))
+        token0: str = data.get("token0", "?")
+        token1: str = data.get("token1", "?")
+
+        self._logger.info(
+            "phantom_il_detected",
+            pool_id=pool_id,
+            il_pct=il_pct,
+        )
+
+        severity = IncidentSeverity.MEDIUM if il_pct >= 5.0 else IncidentSeverity.LOW
+
+        incident = Incident(
+            source_system="phantom",
+            incident_class=IncidentClass.DEGRADATION,
+            severity=severity,
+            error_type="PhantomILDetected",
+            error_message=(
+                f"Impermanent loss detected in {pool_id} ({token0}/{token1}): "
+                f"IL={il_pct:.2f}%"
+            ),
+            fingerprint=hashlib.sha256(
+                f"PhantomILDetected:{pool_id}".encode()
+            ).hexdigest()[:16],
+            context={
+                "pool_id": pool_id,
+                "il_pct": il_pct,
+                "token0": token0,
+                "token1": token1,
+            },
+            blast_radius=0.1,
+            constitutional_impact={"coherence": 0.0, "care": 0.1, "growth": 0.2, "honesty": 0.0},
+        )
+        await self.on_incident(incident)
+
+    # ─── RE Training Lifecycle Handlers ─────────────────────────────────
+
+    async def _on_re_training_failed(self, event: SynapseEvent) -> None:
+        """
+        Handle RE_TRAINING_FAILED — a Reasoning Engine training job failed.
+
+        Training failures threaten the organism's continuous improvement
+        cycle. This is a DEGRADATION incident — the RE will fall back to
+        its previous checkpoint but growth is arrested.
+        """
+        data = event.data
+        job_id: str = data.get("job_id", "unknown")
+        error: str = data.get("error", "training_failed")
+        epoch: int = int(data.get("epoch", 0))
+
+        self._logger.error(
+            "re_training_failed_incident",
+            job_id=job_id,
+            error=error[:200],
+            epoch=epoch,
+        )
+
+        incident = Incident(
+            source_system="reasoning_engine",
+            incident_class=IncidentClass.DEGRADATION,
+            severity=IncidentSeverity.HIGH,
+            error_type="RETrainingFailed",
+            error_message=(
+                f"RE training job {job_id} failed at epoch {epoch}: {error[:300]}"
+            ),
+            fingerprint=hashlib.sha256(
+                b"RETrainingFailed"
+            ).hexdigest()[:16],
+            context={
+                "job_id": job_id,
+                "error": error[:500],
+                "epoch": epoch,
+            },
+            blast_radius=0.4,
+            constitutional_impact={"coherence": 0.2, "care": 0.1, "growth": 0.8, "honesty": 0.1},
+        )
+        await self.on_incident(incident)
+
+    async def _on_re_training_halted(self, event: SynapseEvent) -> None:
+        """
+        Handle RE_TRAINING_HALTED — a Tier 2 kill switch stopped RE training.
+
+        A training halt is more severe than a failure: it signals that a
+        constitutional safety check tripped (e.g. alignment drift, harmful
+        gradient direction). This is HIGH severity — requires investigation
+        before training can resume.
+        """
+        data = event.data
+        job_id: str = data.get("job_id", "unknown")
+        reason: str = data.get("reason", "kill_switch_tripped")
+        halted_by: str = data.get("halted_by", "system")
+
+        self._logger.critical(
+            "re_training_halted_incident",
+            job_id=job_id,
+            reason=reason,
+            halted_by=halted_by,
+        )
+
+        incident = Incident(
+            source_system="reasoning_engine",
+            incident_class=IncidentClass.SECURITY,
+            severity=IncidentSeverity.HIGH,
+            error_type="RETrainingHalted",
+            error_message=(
+                f"RE training job {job_id} halted by kill switch. "
+                f"Reason: {reason}. Halted by: {halted_by}. "
+                "Constitutional safety check may have tripped — review before resuming."
+            ),
+            fingerprint=hashlib.sha256(b"RETrainingHalted").hexdigest()[:16],
+            context={
+                "job_id": job_id,
+                "reason": reason,
+                "halted_by": halted_by,
+                "kill_switch": True,
+            },
+            blast_radius=0.5,
+            user_visible=True,
+            constitutional_impact={"coherence": 0.4, "care": 0.3, "growth": 0.9, "honesty": 0.5},
+        )
+        await self.on_incident(incident)
+
+        # For performance-based halts (re_success_rate_below_floor), schedule
+        # autonomous recovery monitoring: poll every 30 min; once the Thompson
+        # success rate exceeds 0.55 (above the 0.50 floor + 5% margin), clear
+        # the halt automatically without operator intervention.
+        # Constitutional safety halts (e.g. manual red-team) are NOT auto-cleared.
+        if reason == "re_success_rate_below_floor" and self._clo is not None:
+            asyncio.ensure_future(self._monitor_re_recovery(job_id))
+
+    async def _monitor_re_recovery(self, job_id: str) -> None:
+        """Poll Thompson success rate and auto-clear training halt when recovered.
+
+        Runs until the halt is cleared or max 12 hours (24 cycles × 30 min).
+        Clears only if success rate ≥ 0.55 — 5% margin above the 0.50 halt floor.
+        This prevents oscillation (halt → clear → immediately re-halt).
+        """
+        _RECOVERY_FLOOR: float = 0.55
+        _POLL_INTERVAL_S: int = 1800   # 30 minutes
+        _MAX_CYCLES: int = 24          # 12 hours max
+
+        for cycle in range(_MAX_CYCLES):
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            try:
+                # Check if halt was already cleared externally
+                if self._clo is None:
+                    return
+                halted, _ = await self._clo._is_training_halted()
+                if not halted:
+                    self._logger.info("re_training_halt_already_cleared", job_id=job_id, cycle=cycle)
+                    return
+                # Read current Thompson score
+                rate = await self._clo._read_thompson_success_rate()
+                self._logger.info(
+                    "re_training_recovery_poll",
+                    job_id=job_id,
+                    cycle=cycle,
+                    thompson_rate=round(rate, 3),
+                    recovery_floor=_RECOVERY_FLOOR,
+                )
+                if rate >= _RECOVERY_FLOOR:
+                    await self._clo.clear_training_halt()
+                    self._logger.info(
+                        "re_training_halt_auto_cleared_by_thymos",
+                        job_id=job_id,
+                        cycle=cycle,
+                        thompson_rate=round(rate, 3),
+                    )
+                    return
+            except Exception as exc:
+                self._logger.warning("re_training_recovery_poll_error", error=str(exc))
+
+        self._logger.warning(
+            "re_training_halt_recovery_timeout",
+            job_id=job_id,
+            max_cycles=_MAX_CYCLES,
+            msg="Operator must manually clear the halt via POST /api/v1/benchmarks/re-training/clear-halt",
+        )
+
+    # ─── INV_017_VIOLATED Handler ────────────────────────────────────────
+
+    async def _on_inv017_violated(self, event: SynapseEvent) -> None:
+        """
+        Handle INV_017_VIOLATED — a constitutional invariant (INV-017, drive
+        extinction) was confirmed via formal proof (Simula/Z3).
+
+        This is distinct from DRIVE_EXTINCTION_DETECTED (which fires on
+        the 72h rolling mean threshold). INV_017_VIOLATED fires when the
+        invariant has been *formally proved* to be violated — a stronger
+        signal that warrants escalation even if the rolling mean is still
+        above threshold (e.g. rapid collapse in the last cycle).
+
+        Creates a CRITICAL DRIVE_EXTINCTION incident. No autonomous repair.
+        """
+        data = event.data
+        drive: str = data.get("drive", "unknown")
+        proof_id: str = data.get("proof_id", "unknown")
+        confidence: float = float(data.get("confidence", 1.0))
+
+        fingerprint = hashlib.sha256(
+            f"INV017Violated:{drive}".encode()
+        ).hexdigest()[:16]
+
+        incident = Incident(
+            source_system=data.get("source_system", "simula"),
+            incident_class=IncidentClass.DRIVE_EXTINCTION,
+            severity=IncidentSeverity.CRITICAL,
+            error_type="INV017Violated",
+            error_message=(
+                f"INV-017 formally violated for drive '{drive}' "
+                f"(proof_id={proof_id}, confidence={confidence:.2f}). "
+                "Drive extinction proved via formal verification — "
+                "all intents on this axis are constitutionally unsafe. "
+                "Requires governance review; no autonomous repair."
+            ),
+            fingerprint=fingerprint,
+            context={
+                "drive": drive,
+                "proof_id": proof_id,
+                "confidence": confidence,
+                "inv017": True,
+                "formally_proved": True,
+                "autonomous_repair_prohibited": True,
+            },
+            constitutional_impact={
+                "coherence": 1.0,
+                "care": 1.0,
+                "growth": 1.0,
+                "honesty": 1.0,
+            },
+            blast_radius=1.0,
+            user_visible=True,
+        )
+
+        self._logger.critical(
+            "inv017_violated_formal_proof",
+            drive=drive,
+            proof_id=proof_id,
+            confidence=confidence,
+        )
+        await self.on_incident(incident)
+
+    # ─── Identity Crisis Handler ─────────────────────────────────────────
+
+    async def _on_identity_crisis(self, event: SynapseEvent) -> None:
+        """
+        Handle IDENTITY_CRISIS emitted by Thread.
+
+        An identity crisis means the narrative identity fingerprint shifted
+        ≥0.50 — the organism no longer recognises itself. This is a
+        BEHAVIORAL_DRIFT / CRITICAL incident requiring immediate investigation.
+        """
+        data = event.data
+        shift_magnitude: float = float(data.get("shift_magnitude", 0.5))
+        old_fingerprint: str = data.get("old_fingerprint", "unknown")
+        new_fingerprint: str = data.get("new_fingerprint", "unknown")
+        trigger: str = data.get("trigger", "unknown")
+
+        self._logger.critical(
+            "identity_crisis_incident",
+            shift_magnitude=shift_magnitude,
+            trigger=trigger,
+        )
+
+        incident = Incident(
+            source_system="thread",
+            incident_class=IncidentClass.DRIFT,
+            severity=IncidentSeverity.CRITICAL,
+            error_type="IdentityCrisis",
+            error_message=(
+                f"Identity crisis: narrative fingerprint shifted by "
+                f"{shift_magnitude:.2f} (threshold: 0.50). "
+                f"Trigger: {trigger}. "
+                "The organism may no longer be acting in accordance with its "
+                "historical identity. Requires behavioural review."
+            ),
+            fingerprint=hashlib.sha256(b"IdentityCrisis:thread").hexdigest()[:16],
+            context={
+                "shift_magnitude": shift_magnitude,
+                "old_fingerprint": old_fingerprint,
+                "new_fingerprint": new_fingerprint,
+                "trigger": trigger,
+            },
+            blast_radius=0.7,
+            user_visible=True,
+            constitutional_impact={
+                "coherence": 0.8,
+                "care": 0.3,
+                "growth": 0.2,
+                "honesty": 0.6,
+            },
+        )
+        await self.on_incident(incident)
+
+    # ─── SACM Compute Denial Handler ─────────────────────────────────────
+
+    async def _on_phantom_fallback_activated(self, event: Any) -> None:
+        """
+        Handle PHANTOM_FALLBACK_ACTIVATED — price oracle fell back to a secondary
+        or simulated price source.  Create a LOW-severity DATA_QUALITY incident:
+        fallback prices may be stale or inaccurate, degrading Oikos yield decisions.
+        """
+        data = getattr(event, "data", {}) or {}
+        pool_address = data.get("pool_address", "unknown")
+        reason = data.get("reason", "primary_source_unavailable")
+        self._log.warning(
+            "phantom_fallback_activated_incident",
+            pool_address=pool_address,
+            reason=reason,
+        )
+        await self._raise_incident(
+            incident_class="DATA_QUALITY",
+            severity="LOW",
+            description=(
+                f"Phantom LP price oracle fell back to secondary source for pool "
+                f"{pool_address}: {reason}"
+            ),
+            context={
+                "pool_address": pool_address,
+                "reason": reason,
+                "source": "phantom_liquidity",
+            },
+        )
+
+    async def _on_compute_request_denied(self, event: SynapseEvent) -> None:
+        """
+        Handle COMPUTE_REQUEST_DENIED emitted by SACM.
+
+        When SACM cannot fulfill a compute request (no substrate available,
+        budget exhausted, or all providers failing), the dependent system
+        is left without compute. Thymos creates a DEGRADATION incident so
+        the repair pipeline can identify the root cause.
+        """
+        data = event.data
+        requester: str = data.get("requester_system", event.source_system)
+        reason: str = data.get("reason", "no_substrate_available")
+        budget_usd: float = float(data.get("budget_usd", 0.0))
+        task_type: str = data.get("task_type", "unknown")
+
+        self._logger.warning(
+            "compute_request_denied_incident",
+            requester=requester,
+            reason=reason,
+            task_type=task_type,
+        )
+
+        incident = Incident(
+            source_system="sacm",
+            incident_class=IncidentClass.RESOURCE_EXHAUSTION,
+            severity=IncidentSeverity.HIGH,
+            error_type="ComputeRequestDenied",
+            error_message=(
+                f"SACM denied compute request from '{requester}' "
+                f"(task={task_type}): {reason}. Budget: ${budget_usd:.4f}"
+            ),
+            fingerprint=hashlib.sha256(
+                f"ComputeRequestDenied:{requester}:{task_type}".encode()
+            ).hexdigest()[:16],
+            context={
+                "requester_system": requester,
+                "reason": reason,
+                "budget_usd": budget_usd,
+                "task_type": task_type,
+            },
+            affected_systems=[requester],
+            blast_radius=len(_DOWNSTREAM.get(requester, [])) / _TOTAL_SYSTEMS + 0.1,
+            constitutional_impact={"coherence": 0.2, "care": 0.2, "growth": 0.5, "honesty": 0.0},
+        )
+        await self.on_incident(incident)
+
+    # ─── Dependency Installed Handler ────────────────────────────────────
+
+    async def _on_dependency_installed(self, event: SynapseEvent) -> None:
+        """
+        Handle DEPENDENCY_INSTALLED from Simula HotDeployment.
+
+        When a missing dependency is installed, any active DEGRADATION or
+        ANOMALY incidents whose error_type matches "ImportError" or whose
+        context references the installed package are auto-resolved.
+        """
+        data = event.data
+        package: str = data.get("package", "")
+        version: str = data.get("version", "")
+        target_system: str = data.get("target_system", event.source_system)
+
+        if not package:
+            return
+
+        self._logger.info(
+            "dependency_installed",
+            package=package,
+            version=version,
+            target_system=target_system,
+        )
+
+        # Auto-resolve any active ImportError incidents for the target system
+        # or that mention the installed package
+        resolved_count = 0
+        for incident_id, incident in list(self._active_incidents.items()):
+            if incident.source_system != target_system:
+                continue
+            if incident.error_type not in ("ImportError", "ModuleNotFoundError"):
+                continue
+            # Check if this package is relevant to the incident
+            if package.lower() in incident.error_message.lower() or not package:
+                incident.repair_status = RepairStatus.RESOLVED
+                self._active_incidents.pop(incident_id, None)
+                if self._governor is not None:
+                    self._governor.resolve_incident(incident_id)
+                resolved_count += 1
+                self._logger.info(
+                    "import_error_auto_resolved_by_dependency",
+                    incident_id=incident_id,
+                    package=package,
+                    target_system=target_system,
+                )
+
+        if resolved_count > 0:
+            self._emit_metric("thymos.dependency_installed.resolved", resolved_count)
+
+    # ─── Fovea Dishabituation Handler ────────────────────────────────────
+
+    async def _on_fovea_dishabituation(self, event: SynapseEvent) -> None:
+        """
+        Handle FOVEA_DISHABITUATION — Fovea has broken a habituation pattern
+        and is re-sensitizing to a previously ignored stimulus.
+
+        Dishabituation means something that was routine is now notable again.
+        Thymos should re-sensitize its DriftSentinel thresholds for the
+        relevant system to catch subtle reactivations early.
+        """
+        data = event.data
+        stimulus_id: str = data.get("stimulus_id", "unknown")
+        system_id: str = data.get("source_system", event.source_system)
+        magnitude: float = float(data.get("magnitude", 1.0))
+
+        self._logger.debug(
+            "fovea_dishabituation_received",
+            stimulus_id=stimulus_id,
+            system_id=system_id,
+            magnitude=magnitude,
+        )
+
+        if self._drift_sentinel is not None:
+            # Reset sigma thresholds toward defaults (re-sensitize).
+            # Only affects metrics belonging to the dishabituating system.
+            for metric_name, cfg in self._drift_sentinel._metrics.items():
+                if system_id in metric_name:
+                    # Re-sensitize: lower sigma threshold = detect subtler drift
+                    # Move 20% of the way from current toward 1.5σ (maximum sensitivity)
+                    target_sigma = max(1.5, cfg.sigma_threshold * 0.8)
+                    cfg.sigma_threshold = target_sigma
+                    self._logger.debug(
+                        "drift_sentinel_resensitized",
+                        metric=metric_name,
+                        new_sigma=round(target_sigma, 2),
+                    )
+            self._emit_metric("thymos.dishabituation.resensitized", 1)
+
+    # ─── Account Provisioning Failure Handler ───────────────────────────
+
+    async def _on_account_provisioning_failed(self, event: SynapseEvent) -> None:
+        """
+        Handle ACCOUNT_PROVISIONING_FAILED from Identity.
+
+        When a child instance or connector cannot be provisioned with valid
+        credentials, the organism cannot expand its capability surface.
+        Thymos creates a SECURITY class incident so the repair pipeline can
+        investigate credential issues or vault state.
+        """
+        data = event.data
+        instance_id: str = data.get("instance_id", "unknown")
+        reason: str = data.get("reason", "provisioning_failed")
+        provisioning_type: str = data.get("provisioning_type", "unknown")
+
+        self._logger.warning(
+            "account_provisioning_failed_incident",
+            instance_id=instance_id,
+            reason=reason,
+            provisioning_type=provisioning_type,
+        )
+
+        incident = Incident(
+            source_system="identity",
+            incident_class=IncidentClass.SECURITY,
+            severity=IncidentSeverity.HIGH,
+            error_type="AccountProvisioningFailed",
+            error_message=(
+                f"Account provisioning failed for instance '{instance_id}' "
+                f"(type={provisioning_type}): {reason}"
+            ),
+            fingerprint=hashlib.sha256(
+                f"AccountProvisioningFailed:{provisioning_type}".encode()
+            ).hexdigest()[:16],
+            context={
+                "instance_id": instance_id,
+                "reason": reason,
+                "provisioning_type": provisioning_type,
+            },
+            blast_radius=0.2,
+            constitutional_impact={"coherence": 0.2, "care": 0.1, "growth": 0.3, "honesty": 0.3},
+        )
+        await self.on_incident(incident)
+
+    # ─── Affect State Change Handler ─────────────────────────────────────
+
+    async def _on_affect_state_changed(self, event: SynapseEvent) -> None:
+        """
+        Handle AFFECT_STATE_CHANGED from Soma/Thymos affect coupling.
+
+        High arousal or low valence modulates the immune system's triage
+        sensitivity: stressed organism should be more alert to subtle signals.
+        High positive valence relaxes sensitivity slightly (safety signal).
+
+        This modulates DriftSentinel sigma thresholds proportional to
+        valence × arousal rather than snapping to hard values.
+        """
+        data = event.data
+        valence: float = float(data.get("valence", 0.0))
+        arousal: float = float(data.get("arousal", 0.5))
+
+        if self._drift_sentinel is None:
+            return
+
+        # Tighten if high arousal + low valence (stress state)
+        # Relax if high arousal + high valence (energized positive state)
+        # Neutral if low arousal regardless of valence (relaxed baseline)
+        stress_signal = arousal * max(0.0, -valence)  # [0, 1]: threat arousal
+        calm_signal = (1.0 - arousal) + arousal * max(0.0, valence)  # [0, 2]
+        calm_signal = min(1.0, calm_signal / 2.0)  # normalise to [0, 1]
+
+        if stress_signal > 0.5:
+            # Stressed — tighten by up to 10% (don't storm like speciation)
+            factor = 1.0 - stress_signal * 0.1
+            for cfg in self._drift_sentinel._metrics.values():
+                cfg.sigma_threshold = max(1.5, cfg.sigma_threshold * factor)
+            self._logger.debug(
+                "drift_sentinel_tightened_by_affect",
+                valence=round(valence, 2),
+                arousal=round(arousal, 2),
+                factor=round(factor, 3),
+            )
+        elif calm_signal > 0.7:
+            # Calm/positive — relax by up to 5% (headroom to avoid false positives)
+            factor = 1.0 + calm_signal * 0.05
+            for cfg in self._drift_sentinel._metrics.values():
+                cfg.sigma_threshold = min(4.0, cfg.sigma_threshold * factor)
+            self._logger.debug(
+                "drift_sentinel_relaxed_by_affect",
+                valence=round(valence, 2),
+                arousal=round(arousal, 2),
+                factor=round(factor, 3),
+            )
+
+    # ─── Vulnerability Confirmed Handler ────────────────────────────────
+
+    async def _on_vulnerability_confirmed(self, event: SynapseEvent) -> None:
+        """
+        Handle VULNERABILITY_CONFIRMED from Simula (Z3/Lean/Dafny proof).
+
+        A formally confirmed vulnerability is the most severe security signal:
+        an adversary *can* exploit this path. Thymos creates a CRITICAL
+        SECURITY incident and must route it through Tier 5 (ESCALATE) since
+        Simula itself confirmed the vulnerability — autonomous repair must
+        wait for the patch to be separately verified.
+        """
+        data = event.data
+        vuln_id: str = data.get("vulnerability_id", "unknown")
+        cve: str | None = data.get("cve")
+        target_system: str = data.get("target_system", event.source_system)
+        severity_label: str = data.get("severity", "critical").lower()
+        proof_engine: str = data.get("proof_engine", "simula")
+        description: str = data.get("description", "Vulnerability confirmed")
+
+        severity_map = {
+            "critical": IncidentSeverity.CRITICAL,
+            "high": IncidentSeverity.HIGH,
+            "medium": IncidentSeverity.MEDIUM,
+            "low": IncidentSeverity.LOW,
+        }
+        severity = severity_map.get(severity_label, IncidentSeverity.CRITICAL)
+
+        cve_label = f" ({cve})" if cve else ""
+        self._logger.critical(
+            "vulnerability_confirmed_incident",
+            vuln_id=vuln_id,
+            cve=cve,
+            target_system=target_system,
+            proof_engine=proof_engine,
+        )
+
+        incident = Incident(
+            source_system=target_system,
+            incident_class=IncidentClass.SECURITY,
+            severity=severity,
+            error_type="VulnerabilityConfirmed",
+            error_message=(
+                f"Vulnerability {vuln_id}{cve_label} formally confirmed in "
+                f"'{target_system}' by {proof_engine}. "
+                f"{description[:300]}"
+            ),
+            fingerprint=hashlib.sha256(
+                f"VulnerabilityConfirmed:{vuln_id}".encode()
+            ).hexdigest()[:16],
+            context={
+                "vulnerability_id": vuln_id,
+                "cve": cve,
+                "target_system": target_system,
+                "proof_engine": proof_engine,
+                "description": description[:500],
+            },
+            blast_radius=0.6,
+            user_visible=True,
+            constitutional_impact={
+                "coherence": 0.4,
+                "care": 0.7,
+                "growth": 0.2,
+                "honesty": 0.6,
+            },
+        )
+        await self.on_incident(incident)
+
+    # ─── Cross-instance CrashPattern sync (Gap 4) ───────────────────────
+
+    async def _on_crash_pattern_resolved_bus(self, event: SynapseEvent) -> None:
+        """
+        Handle CRASH_PATTERN_RESOLVED from the Synapse bus.
+
+        When another instance (or this instance via federation relay) reports
+        a successful repair on a known CrashPattern, update the local Redis
+        confidence downward so we don't over-route future incidents.
+
+        Non-fatal: log and return on any error.
+        """
+        if self._crash_pattern_analyzer is None:
+            return
+        data = event.data
+        pattern_id: str | None = data.get("pattern_id")
+        repair_tier: str = data.get("repair_tier", "UNKNOWN")
+        if not pattern_id:
+            return
+        try:
+            await self._crash_pattern_analyzer.update_on_success(
+                pattern_id=pattern_id,
+                repair_tier=repair_tier,
+            )
+            self._logger.debug(
+                "crash_pattern_confidence_synced_resolved",
+                pattern_id=pattern_id,
+                repair_tier=repair_tier,
+                source=event.source_system,
+            )
+        except Exception as exc:
+            self._logger.debug(
+                "crash_pattern_resolved_bus_error",
+                pattern_id=pattern_id,
+                error=str(exc),
+            )
+
+    async def _on_crash_pattern_reinforced_bus(self, event: SynapseEvent) -> None:
+        """
+        Handle CRASH_PATTERN_REINFORCED from the Synapse bus.
+
+        When another instance confirms a pattern as fatal at a given tier,
+        propagate that knowledge locally: raise confidence and record the
+        failed tier so we can skip it on future incidents.
+
+        Non-fatal: log and return on any error.
+        """
+        if self._crash_pattern_analyzer is None:
+            return
+        data = event.data
+        pattern_id: str | None = data.get("pattern_id")
+        repair_tier: str = data.get("repair_tier", "UNKNOWN")
+        failure_reason: str = data.get("failure_reason", "")
+        if not pattern_id:
+            return
+        try:
+            await self._crash_pattern_analyzer.update_on_failure(
+                pattern_id=pattern_id,
+                repair_tier=repair_tier,
+                failure_reason=failure_reason,
+            )
+            self._logger.debug(
+                "crash_pattern_confidence_synced_reinforced",
+                pattern_id=pattern_id,
+                repair_tier=repair_tier,
+                source=event.source_system,
+            )
+        except Exception as exc:
+            self._logger.debug(
+                "crash_pattern_reinforced_bus_error",
+                pattern_id=pattern_id,
+                error=str(exc),
+            )
+
+    async def _on_incident_query(self, event: SynapseEvent) -> None:
+        """
+        Handle THYMOS_INCIDENT_QUERY from Simula PreventiveAudit.
+
+        Searches _incident_buffer for recent incidents and emits
+        THYMOS_INCIDENT_RESPONSE with matching incident dicts.
+        """
+        from systems.synapse.types import SynapseEvent as _SE, SynapseEventType as _SET
+
+        data = event.data
+        request_id: str = data.get("request_id", "")
+        lookback_days: int = int(data.get("lookback_days", 7))
+        max_incidents: int = int(data.get("max_incidents", 50))
+
+        if not request_id or self._synapse is None:
+            return
+
+        try:
+            from datetime import timezone as _tz
+            import datetime as _dt
+
+            cutoff = _dt.datetime.now(_tz.utc) - _dt.timedelta(days=lookback_days)
+            incidents: list[dict] = []
+            for inc in self._incident_buffer:
+                try:
+                    created = inc.created_at
+                    if hasattr(created, "tzinfo") and created.tzinfo is None:
+                        created = created.replace(tzinfo=_tz.utc)
+                    if created < cutoff:
+                        continue
+                    incidents.append({
+                        "incident_id": str(inc.incident_id),
+                        "incident_class": str(inc.incident_class.value
+                                              if hasattr(inc.incident_class, "value")
+                                              else inc.incident_class),
+                        "severity": str(inc.severity.value
+                                        if hasattr(inc.severity, "value")
+                                        else inc.severity),
+                        "source_system": str(getattr(inc, "source_system", "")),
+                        "error_type": str(getattr(inc, "error_type", "")),
+                        "error_message": str(getattr(inc, "error_message", ""))[:300],
+                        "fingerprint": str(getattr(inc, "fingerprint", "")),
+                        "created_at": created.isoformat(),
+                    })
+                    if len(incidents) >= max_incidents:
+                        break
+                except Exception:
+                    continue
+
+            await self._synapse._event_bus.emit(_SE(
+                event_type=_SET.THYMOS_INCIDENT_RESPONSE,
+                source_system="thymos",
+                data={
+                    "request_id": request_id,
+                    "incidents": incidents,
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug(
+                "incident_query_handler_error",
+                request_id=request_id,
+                error=str(exc),
+            )
+
     # ─── NeuroplasticityBus callback ────────────────────────────────────
 
     def _on_sentinel_evolved(self, new_sentinel: BaseThymosSentinel) -> None:
@@ -2766,6 +4155,10 @@ class ThymosService:
         self._governor._on_event = self._on_governor_event
         if self._causal_analyzer is not None:
             self._governor.set_causal_analyzer(self._causal_analyzer)
+
+        # ── Pattern-Aware Routing ──
+        self._crash_pattern_analyzer = CrashPatternAnalyzer(redis=self._redis)
+        self._pattern_router = PatternAwareRouter(analyzer=self._crash_pattern_analyzer)
 
         # ── Subscribe to Synapse Events ──
         if self._synapse is not None:
@@ -2993,6 +4386,151 @@ class ThymosService:
                 _validated(self._on_vault_key_rotation_failed),
             )
 
+            # ── Oneiros threat scenarios → prophylactic antibody pre-arming ──
+            # Oneiros ThreatSimulator emits ONEIROS_THREAT_SCENARIO during REM.
+            # Thymos stores these as pre-loaded incident templates. For HIGH/CRITICAL
+            # severity, the relevant repair strategy is pre-armed so it activates
+            # faster when the real incident occurs.
+            event_bus.subscribe(
+                SynapseEventType.ONEIROS_THREAT_SCENARIO,
+                _validated(self._on_oneiros_threat_scenario),
+            )
+
+            # ── Axon circuit-breaker state changes ───────────────────────────
+            # When a circuit breaker opens (CLOSED→OPEN) the protected system is
+            # degraded. Thymos raises a DEGRADATION incident immediately so the
+            # immune pipeline can investigate and repair.  When the breaker closes
+            # again (OPEN→CLOSED) the incident is auto-resolved — no repair needed
+            # because the executor recovered on its own.
+            if hasattr(SynapseEventType, "CIRCUIT_BREAKER_STATE_CHANGED"):
+                event_bus.subscribe(
+                    SynapseEventType.CIRCUIT_BREAKER_STATE_CHANGED,
+                    _validated(self._on_circuit_breaker_state_changed),
+                )
+
+            # ── Axon executor failure windowing (AXF-1) ──────────────────────
+            # ACTION_FAILED is emitted by Axon on every action execution failure.
+            # A sliding 10-minute window per executor_id prevents incident spam:
+            # 5 failures within the window raises a DEGRADATION incident.
+            # Critical executors (send_email, federation_send) raise immediately.
+            if hasattr(SynapseEventType, "ACTION_FAILED"):
+                event_bus.subscribe(
+                    SynapseEventType.ACTION_FAILED,
+                    _validated(self._on_action_failed),
+                )
+
+            # ── Phantom Liquidity health events ───────────────────────────────
+            # Economic oracle failures impact the organism's ability to make
+            # informed yield decisions.  Each event maps to an incident class.
+            event_bus.subscribe(
+                SynapseEventType.PHANTOM_POOL_STALE,
+                _validated(self._on_phantom_pool_stale),
+            )
+            event_bus.subscribe(
+                SynapseEventType.PHANTOM_POSITION_CRITICAL,
+                _validated(self._on_phantom_position_critical),
+            )
+            event_bus.subscribe(
+                SynapseEventType.PHANTOM_RESOURCE_EXHAUSTED,
+                _validated(self._on_phantom_resource_exhausted),
+            )
+            event_bus.subscribe(
+                SynapseEventType.PHANTOM_IL_DETECTED,
+                _validated(self._on_phantom_il_detected),
+            )
+            event_bus.subscribe(
+                SynapseEventType.PHANTOM_FALLBACK_ACTIVATED,
+                _validated(self._on_phantom_fallback_activated),
+            )
+
+            # ── RE Training lifecycle ─────────────────────────────────────────
+            # Training failures arrest the organism's learning velocity.
+            # Halts indicate a constitutional safety check tripped.
+            event_bus.subscribe(
+                SynapseEventType.RE_TRAINING_FAILED,
+                _validated(self._on_re_training_failed),
+            )
+            event_bus.subscribe(
+                SynapseEventType.RE_TRAINING_HALTED,
+                _validated(self._on_re_training_halted),
+            )
+
+            # ── INV-017 formal proof violation ────────────────────────────────
+            # DRIVE_EXTINCTION_DETECTED fires on 72h rolling mean.
+            # INV_017_VIOLATED fires on formal proof — a stronger signal.
+            event_bus.subscribe(
+                SynapseEventType.INV_017_VIOLATED,
+                _validated(self._on_inv017_violated),
+            )
+
+            # ── Identity crisis (Thread) ──────────────────────────────────────
+            # Narrative fingerprint shift ≥ 0.50 → BEHAVIORAL_DRIFT incident.
+            event_bus.subscribe(
+                SynapseEventType.IDENTITY_CRISIS,
+                _validated(self._on_identity_crisis),
+            )
+
+            # ── SACM compute denial ───────────────────────────────────────────
+            # Blocked compute requests leave dependent systems starved.
+            event_bus.subscribe(
+                SynapseEventType.COMPUTE_REQUEST_DENIED,
+                _validated(self._on_compute_request_denied),
+            )
+
+            # ── Simula HotDeployment: dependency installed ────────────────────
+            # Auto-resolves ImportError incidents when their package is installed.
+            event_bus.subscribe(
+                SynapseEventType.DEPENDENCY_INSTALLED,
+                _validated(self._on_dependency_installed),
+            )
+
+            # ── Fovea dishabituation → DriftSentinel re-sensitization ─────────
+            event_bus.subscribe(
+                SynapseEventType.FOVEA_DISHABITUATION,
+                _validated(self._on_fovea_dishabituation),
+            )
+
+            # ── Identity provisioning failures → SECURITY incident ────────────
+            event_bus.subscribe(
+                SynapseEventType.ACCOUNT_PROVISIONING_FAILED,
+                _validated(self._on_account_provisioning_failed),
+            )
+
+            # ── Affect state → DriftSentinel sensitivity modulation ───────────
+            event_bus.subscribe(
+                SynapseEventType.AFFECT_STATE_CHANGED,
+                _validated(self._on_affect_state_changed),
+            )
+
+            # ── Simula vulnerability confirmation → CRITICAL SECURITY incident ─
+            event_bus.subscribe(
+                SynapseEventType.VULNERABILITY_CONFIRMED,
+                _validated(self._on_vulnerability_confirmed),
+            )
+
+            # ── Gap 4: Cross-instance CrashPattern confidence sync ────────────
+            # When another organism instance emits CRASH_PATTERN_RESOLVED or
+            # CRASH_PATTERN_REINFORCED (via federation bus relay), update the
+            # local Redis-backed pattern confidence so the organism benefits from
+            # peer repair experience without needing a direct database sync.
+            if hasattr(SynapseEventType, "CRASH_PATTERN_RESOLVED"):
+                event_bus.subscribe(
+                    SynapseEventType.CRASH_PATTERN_RESOLVED,
+                    self._on_crash_pattern_resolved_bus,
+                )
+            if hasattr(SynapseEventType, "CRASH_PATTERN_REINFORCED"):
+                event_bus.subscribe(
+                    SynapseEventType.CRASH_PATTERN_REINFORCED,
+                    self._on_crash_pattern_reinforced_bus,
+                )
+
+            # ── Simula PreventiveAudit: incident history query ────────────────
+            if hasattr(SynapseEventType, "THYMOS_INCIDENT_QUERY"):
+                event_bus.subscribe(
+                    SynapseEventType.THYMOS_INCIDENT_QUERY,
+                    self._on_incident_query,
+                )
+
         # ── Start background loops (supervised — death becomes an incident) ──
         from utils.supervision import supervised_task
 
@@ -3030,8 +4568,8 @@ class ThymosService:
         # ── Telegram command receiver ──
         # Only start if credentials are present; harmless no-op otherwise.
         if (
-            os.environ.get("EOS_TELEGRAM_BOT_TOKEN")
-            and os.environ.get("EOS_TELEGRAM_CHAT_ID")
+            os.environ.get("ECODIAOS_CONNECTORS__TELEGRAM__BOT_TOKEN")
+            and os.environ.get("ECODIAOS_CONNECTORS__TELEGRAM__ADMIN_CHAT_ID")
         ):
             self._telegram_polling_task = supervised_task(
                 self._telegram_poll_loop(),
@@ -3093,6 +4631,14 @@ class ThymosService:
                 self._original_exception_handler(loop, context)
 
         loop.set_exception_handler(_asyncio_exception_handler)
+
+        # ── GAP-6 / F1: Coma recovery — check for crash context left by previous
+        # incarnation.  Runs as a deferred background task so it does not block
+        # initialize() return; the Synapse bus is live by the time the task runs.
+        asyncio.create_task(
+            self._check_pre_resurrection_crash_context(),
+            name="thymos_resurrection_crash_context",
+        )
 
         self._initialized = True
 
@@ -3414,6 +4960,41 @@ class ThymosService:
                 )
                 return
 
+            # ── Gap 6: Pattern-aware override on re-emission path ──
+            # Re-emitted incidents may match a CrashPattern whose failed_tiers
+            # include the tier that _response_router just assigned.  Consult the
+            # router so we skip proven-useless tiers (or escalate to federation).
+            # _on_incident_inner is an async def so awaiting here is safe.
+            if self._pattern_router is not None:
+                try:
+                    pattern_result = await self._pattern_router.route(dedup_result)
+                    if pattern_result.matched:
+                        dedup_result.matched_pattern_id = pattern_result.pattern_id
+                        dedup_result.pattern_confidence = pattern_result.pattern_confidence
+                        dedup_result.tier_skip_reason = pattern_result.tier_skip_reason
+                        if pattern_result.federation_escalate:
+                            await self._emit_event(SynapseEventType.INCIDENT_ESCALATED, {
+                                "incident_id": dedup_result.id,
+                                "incident_class": dedup_result.incident_class.value,
+                                "severity": dedup_result.severity.value,
+                                "source_system": dedup_result.source_system,
+                                "reason": pattern_result.tier_skip_reason,
+                                "federation_broadcast": True,
+                                "pattern_id": pattern_result.pattern_id,
+                            })
+                            dedup_result.repair_status = RepairStatus.ESCALATED
+                            self._active_incidents.pop(dedup_result.id, None)
+                            return
+                        elif pattern_result.tier_override is not None:
+                            dedup_result.repair_tier = pattern_result.tier_override
+                            initial_tier = pattern_result.tier_override
+                except Exception as exc:
+                    self._logger.debug(
+                        "pattern_router_reemission_error",
+                        incident_id=dedup_result.id,
+                        error=str(exc),
+                    )
+
             self._logger.info(
                 "reemitted_incident_escalated",
                 incident_id=dedup_result.id,
@@ -3505,6 +5086,22 @@ class ThymosService:
 
         # Step 4: Make the organism feel it — route to Atune as a Percept
         await self._broadcast_as_percept(incident)
+
+        # Step 4a: CRITICAL incidents interrupt sleep (EMERGENCY_WAKE).
+        # If Oneiros is in a sleep cycle and a CRITICAL incident fires,
+        # the organism must wake immediately — sleep cannot be prioritised
+        # over a potentially organism-threatening failure.
+        if scored_severity == IncidentSeverity.CRITICAL:
+            await self._emit_event(
+                SynapseEventType.EMERGENCY_WAKE,
+                {
+                    "incident_id": incident.id,
+                    "incident_class": incident.incident_class.value,
+                    "source_system": incident.source_system,
+                    "reason": f"CRITICAL incident: {incident.error_type}",
+                    "triggered_by": "thymos",
+                },
+            )
 
         # Step 5: Route to initial repair tier
         initial_tier = self._response_router.route(incident)
@@ -3862,6 +5459,97 @@ class ThymosService:
                 )
                 diagnosis = diagnosis.model_copy(update={"repair_tier": escalated_tier})
 
+        # ── Step 2f: Pattern-aware tier override ──
+        # Query CrashPattern library (Redis) to check whether this incident
+        # matches a known fatal signature.  If it does, skip tiers that have
+        # already failed for that pattern and route directly to a higher tier.
+        # If all local tiers are exhausted, skip repair entirely and escalate
+        # to federation so a peer with a fresh environment can attempt it.
+        if self._pattern_router is not None and diagnosis.repair_tier is not None:
+            pattern_result = await self._pattern_router.route(incident)
+
+            if pattern_result.matched:
+                # Stamp pattern metadata onto the incident for Neo4j / RE training
+                incident.matched_pattern_id = pattern_result.pattern_id
+                incident.pattern_confidence = pattern_result.pattern_confidence
+                incident.tier_skip_reason = pattern_result.tier_skip_reason
+
+                if pattern_result.federation_escalate:
+                    # All local tiers exhausted — broadcast to federation immediately
+                    self._logger.warning(
+                        "pattern_all_tiers_exhausted_federation_broadcast",
+                        incident_id=incident.id,
+                        pattern_id=pattern_result.pattern_id,
+                        skipped_tiers=pattern_result.skipped_tiers,
+                    )
+                    await self._emit_event(
+                        SynapseEventType.INCIDENT_ESCALATED,
+                        {
+                            "incident_id": incident.id,
+                            "incident_class": incident.incident_class.value,
+                            "from_tier": diagnosis.repair_tier.name,
+                            "to_tier": "FEDERATION",
+                            "reason": incident.tier_skip_reason,
+                            "federation_broadcast": True,
+                            "pattern_id": pattern_result.pattern_id,
+                        },
+                    )
+                    incident.repair_status = RepairStatus.ESCALATED
+                    self._active_incidents.pop(incident.id, None)
+                    if self._deduplicator is not None:
+                        self._deduplicator.resolve(incident.fingerprint)
+                    return
+
+                elif (
+                    pattern_result.tier_override is not None
+                    and pattern_result.tier_override.value > diagnosis.repair_tier.value
+                ):
+                    # Override: jump past failed tiers to a higher tier
+                    self._logger.info(
+                        "pattern_tier_override",
+                        incident_id=incident.id,
+                        pattern_id=pattern_result.pattern_id,
+                        original_tier=diagnosis.repair_tier.name,
+                        override_tier=pattern_result.tier_override.name,
+                        skipped_tiers=pattern_result.skipped_tiers,
+                        match_score=round(pattern_result.match_score, 3),
+                        confidence=round(pattern_result.pattern_confidence, 3),
+                    )
+                    diagnosis = diagnosis.model_copy(
+                        update={"repair_tier": pattern_result.tier_override}
+                    )
+
+                # ── Gap 2: RE training — pattern match captured after stamp ──
+                # The `anomaly_detection` example fires in _on_incident_inner before
+                # pattern data is available.  Emit a dedicated example here so the
+                # RE model learns the full routing decision including pattern context.
+                asyncio.ensure_future(self._emit_re_training_example(
+                    category="anomaly_detection",
+                    instruction=(
+                        "Detect, deduplicate, score, and route an incident through the immune "
+                        "pipeline, incorporating crash-pattern history to skip known-failed tiers."
+                    ),
+                    input_context=(
+                        f"source={incident.source_system}, "
+                        f"class={incident.incident_class.value}, "
+                        f"fingerprint={incident.fingerprint[:16]}, "
+                        f"pattern_id={incident.matched_pattern_id}, "
+                        f"pattern_confidence={round(incident.pattern_confidence, 3)}, "
+                        f"tier_skip_reason={incident.tier_skip_reason}"
+                    ),
+                    output=(
+                        f"tier={diagnosis.repair_tier.name}, "
+                        f"skipped_tiers={pattern_result.skipped_tiers}, "
+                        f"federation_escalate={pattern_result.federation_escalate}"
+                    ),
+                    outcome_quality=min(1.0, 0.5 + incident.pattern_confidence * 0.5),
+                    episode_id=f"pattern_match:{incident.id}",
+                    constitutional_alignment=self._build_incident_alignment(
+                        care=0.3,       # pattern routing reduces harm duration
+                        coherence=0.4,  # skipping futile tiers is coherent
+                    ),
+                ))
+
         # ── Step 3: Prescribe ──
         incident.repair_status = RepairStatus.PRESCRIBING
         repair = await self._prescriber.prescribe(incident, diagnosis)
@@ -3876,10 +5564,16 @@ class ThymosService:
         )
 
         # ── RE training: repair strategy decision ──
+        _pattern_ctx = (
+            f", pattern_id={incident.matched_pattern_id}"
+            f", pattern_confidence={incident.pattern_confidence:.2f}"
+            f", tier_skip={incident.tier_skip_reason[:60] if incident.tier_skip_reason else 'none'}"
+            if incident.matched_pattern_id else ""
+        )
         asyncio.ensure_future(self._emit_re_training_example(
             category="repair_strategy",
             instruction="Prescribe a repair strategy for a diagnosed incident, choosing the appropriate tier and action.",
-            input_context=f"root_cause={diagnosis.root_cause[:150]}, confidence={diagnosis.confidence:.2f}, severity={incident.severity.value}, stress={composite_stress:.2f}",
+            input_context=f"root_cause={diagnosis.root_cause[:150]}, confidence={diagnosis.confidence:.2f}, severity={incident.severity.value}, stress={composite_stress:.2f}{_pattern_ctx}",
             output=f"tier={repair.tier.name}, action={repair.action[:200]}, target={repair.target_system}",
             outcome_quality=diagnosis.confidence,
             episode_id=incident.id,
@@ -3979,6 +5673,47 @@ class ThymosService:
                 self._total_repairs_failed += 1
                 self._emit_metric("thymos.repairs.failed", 1, tags={"tier": tier_name})
                 await self._learn_from_failure(incident, repair)
+
+                # Pattern reinforcement: application failure confirms pattern is still dangerous
+                if incident.matched_pattern_id is not None and self._crash_pattern_analyzer is not None:
+                    asyncio.ensure_future(
+                        self._crash_pattern_analyzer.update_on_failure(
+                            pattern_id=incident.matched_pattern_id,
+                            repair_tier=repair.tier.name,
+                            failure_reason=f"Application failed: {repair.reason}",
+                        )
+                    )
+                    asyncio.ensure_future(self._emit_event(
+                        SynapseEventType.CRASH_PATTERN_REINFORCED,
+                        {
+                            "pattern_id": incident.matched_pattern_id,
+                            "repair_tier": repair.tier.name,
+                            "failure_reason": f"Application failed: {repair.reason[:120]}",
+                            "incident_id": incident.id,
+                            "confidence_before": round(incident.pattern_confidence, 3),
+                        },
+                    ))
+                    # Emit CRASH_PATTERN_CONFIRMED when this reinforcement pushes the pattern
+                    # confidence across the 0.70 confirmation threshold for the first time.
+                    # _REINFORCE_DELTA = 0.08; threshold = 0.70.
+                    _conf_before = incident.pattern_confidence
+                    if _conf_before < 0.70 and (_conf_before + 0.08) >= 0.70:
+                        if hasattr(SynapseEventType, "CRASH_PATTERN_CONFIRMED"):
+                            asyncio.ensure_future(self._emit_event(
+                                SynapseEventType.CRASH_PATTERN_CONFIRMED,  # type: ignore[attr-defined]
+                                {
+                                    "pattern_id": incident.matched_pattern_id,
+                                    "confidence": round(min(0.98, _conf_before + 0.08), 3),
+                                    "lesson": (
+                                        f"{incident.incident_class.value} in {incident.source_system}"
+                                        f" fails at tier {repair.tier.name}"
+                                    ),
+                                    "example_count": incident.occurrence_count if hasattr(incident, "occurrence_count") else 0,
+                                    "failed_tiers": [repair.tier.name],
+                                    "incident_id": incident.id,
+                                    "source": "thymos_reinforcement",
+                                },
+                            ))
 
             # History-driven retry: if there are higher tiers available, retry
             # instead of immediately escalating to human.
@@ -4110,6 +5845,26 @@ class ThymosService:
                     },
                 )
 
+            # ── Emit CRASH_PATTERN_RESOLVED if this incident matched a known pattern ──
+            if incident.matched_pattern_id is not None and self._crash_pattern_analyzer is not None:
+                asyncio.ensure_future(
+                    self._crash_pattern_analyzer.update_on_success(
+                        pattern_id=incident.matched_pattern_id,
+                        repair_tier=repair.tier.name,
+                    )
+                )
+                asyncio.ensure_future(self._emit_event(
+                    SynapseEventType.CRASH_PATTERN_RESOLVED,
+                    {
+                        "pattern_id": incident.matched_pattern_id,
+                        "repair_tier": repair.tier.name,
+                        "strategy_used": repair.action[:200],
+                        "time_to_resolve_ms": int(elapsed_ms),
+                        "incident_id": incident.id,
+                        "confidence_before": round(incident.pattern_confidence, 3),
+                    },
+                ))
+
             # ── Step 7: Learn ──
             await self._learn_from_success(incident, repair, diagnosis)
 
@@ -4168,6 +5923,45 @@ class ThymosService:
 
             # ── Learn from failure ──
             await self._learn_from_failure(incident, repair)
+
+            # ── Emit CRASH_PATTERN_REINFORCED if this incident matched a known pattern ──
+            if incident.matched_pattern_id is not None and self._crash_pattern_analyzer is not None:
+                asyncio.ensure_future(
+                    self._crash_pattern_analyzer.update_on_failure(
+                        pattern_id=incident.matched_pattern_id,
+                        repair_tier=repair.tier.name,
+                        failure_reason="Post-repair verification failed",
+                    )
+                )
+                asyncio.ensure_future(self._emit_event(
+                    SynapseEventType.CRASH_PATTERN_REINFORCED,
+                    {
+                        "pattern_id": incident.matched_pattern_id,
+                        "repair_tier": repair.tier.name,
+                        "failure_reason": "Post-repair verification failed",
+                        "incident_id": incident.id,
+                        "confidence_before": round(incident.pattern_confidence, 3),
+                    },
+                ))
+                # Emit CRASH_PATTERN_CONFIRMED when confidence crosses the 0.70 threshold.
+                _conf_before_rollback = incident.pattern_confidence
+                if _conf_before_rollback < 0.70 and (_conf_before_rollback + 0.08) >= 0.70:
+                    if hasattr(SynapseEventType, "CRASH_PATTERN_CONFIRMED"):
+                        asyncio.ensure_future(self._emit_event(
+                            SynapseEventType.CRASH_PATTERN_CONFIRMED,  # type: ignore[attr-defined]
+                            {
+                                "pattern_id": incident.matched_pattern_id,
+                                "confidence": round(min(0.98, _conf_before_rollback + 0.08), 3),
+                                "lesson": (
+                                    f"{incident.incident_class.value} in {incident.source_system}"
+                                    f" persists after tier {repair.tier.name} (post-repair verification failed)"
+                                ),
+                                "example_count": incident.occurrence_count if hasattr(incident, "occurrence_count") else 0,
+                                "failed_tiers": [repair.tier.name],
+                                "incident_id": incident.id,
+                                "source": "thymos_rollback_reinforcement",
+                            },
+                        ))
 
             await self._emit_evolutionary_observable(
                 "healing_failed", 1.0, is_novel=True,
@@ -4981,6 +6775,36 @@ class ThymosService:
             repair_action=repair.action,
         )
 
+        # If Simula already has a proposal awaiting governance for this incident
+        # (from a prior Tier 4 THYMOS_REPAIR_REQUESTED), emit THYMOS_REPAIR_APPROVED
+        # so Simula can fast-track it through approve_governed_proposal() instead of
+        # generating a duplicate proposal.
+        existing_proposal_id: str | None = None
+        if incident.fingerprint in self._active_simula_proposals:
+            existing_proposal_id, _ = self._active_simula_proposals[incident.fingerprint]
+        if existing_proposal_id is not None and self._synapse is not None:
+            try:
+                await self._synapse.event_bus.emit(
+                    SynapseEvent(
+                        event_type=SynapseEventType.THYMOS_REPAIR_APPROVED,
+                        source_system="thymos",
+                        data={
+                            "incident_id": incident.id,
+                            "proposal_id": existing_proposal_id,
+                            "repair_tier": 5,
+                            "equor_confidence": confidence,
+                            "drive_alignment": alignment,
+                        },
+                    )
+                )
+                self._logger.info(
+                    "thymos_repair_approved_emitted",
+                    incident_id=incident.id,
+                    proposal_id=existing_proposal_id,
+                )
+            except Exception:
+                pass
+
         # Record the auto-approval in repair history
         incident.repair_history.append(RepairAttempt(
             tier=RepairTier.ESCALATE,
@@ -5489,6 +7313,72 @@ class ThymosService:
                 coherence=-0.4, # failure = incoherence persists
             ),
         )
+
+        # ── Gap 1: Auto-seed CrashPattern when no pattern matched but ≥2 tiers failed ──
+        # If the incident already matched a pattern, update_on_failure() is called by the
+        # caller (process_incident) via CRASH_PATTERN_REINFORCED.  Only seed a *new* pattern
+        # when an incident has stumped ≥2 different tiers and is not yet catalogued.
+        if (
+            incident.matched_pattern_id is None
+            and self._crash_pattern_analyzer is not None
+            and len(incident.repair_history) >= 2
+        ):
+            failed_tier_names = {
+                attempt.tier for attempt in incident.repair_history if attempt.outcome != "success"
+            }
+            if len(failed_tier_names) >= 2:
+                # Convert RepairTier enum values to their .name strings before storing.
+                # CrashPattern.failed_tiers is list[str] and the PatternAwareRouter
+                # checks `t.name not in failed_tiers` — storing enum objects would
+                # always compare unequal, making all auto-seeded patterns behave as if
+                # no tiers have failed.
+                failed_tier_strings = sorted(t.name for t in failed_tier_names)
+                features = CrashPatternAnalyzer.extract_features(
+                    source_system=incident.source_system,
+                    incident_class=incident.incident_class.value,
+                    error_type=incident.error_type or "",
+                    error_message=incident.error_message or "",
+                    affected_systems=incident.affected_systems or [],
+                )
+                asyncio.ensure_future(
+                    self._crash_pattern_analyzer.register_pattern(
+                        features=features,
+                        description=(
+                            f"Auto-seeded from incident {incident.id}: "
+                            f"{incident.source_system}/{incident.incident_class.value} "
+                            f"failed at tiers {failed_tier_strings}"
+                        ),
+                        initial_confidence=0.5,
+                        failed_tiers=failed_tier_strings,
+                    )
+                )
+                self._logger.info(
+                    "crash_pattern_auto_seeded",
+                    incident_id=incident.id,
+                    source_system=incident.source_system,
+                    failed_tiers=failed_tier_strings,
+                    feature_count=len(features),
+                )
+                # Emit CRASH_PATTERN_CONFIRMED: the organism has distilled a new failure law.
+                # Auto-seeded patterns start at confidence=0.5 (below 0.70 threshold but
+                # still meaningful as first confirmation of a recurring failure).
+                pattern_id_auto = CrashPattern.make_id(features)
+                if hasattr(SynapseEventType, "CRASH_PATTERN_CONFIRMED"):
+                    asyncio.ensure_future(self._emit_event(
+                        SynapseEventType.CRASH_PATTERN_CONFIRMED,  # type: ignore[attr-defined]
+                        {
+                            "pattern_id": pattern_id_auto,
+                            "confidence": 0.5,
+                            "lesson": (
+                                f"{incident.source_system}/{incident.incident_class.value} "
+                                f"resists repair at tiers: {failed_tier_strings}"
+                            ),
+                            "example_count": len(incident.repair_history),
+                            "failed_tiers": failed_tier_strings,
+                            "incident_id": incident.id,
+                            "source": "thymos_auto_seed",
+                        },
+                    ))
 
     async def _persist_incident(self, incident: Incident) -> None:
         """Persist an incident to Neo4j for the causal knowledge graph."""

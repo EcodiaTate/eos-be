@@ -60,6 +60,16 @@ class Interoceptor:
         # Telos reference for Loop 6: confidence + coherence augmentation
         self._telos: Any = None
 
+        # ── AUTONOMY: Cross-system telemetry refs ──
+        # These give the organism visibility into systems that were previously
+        # invisible to somatic sensing, closing critical blind spots.
+        self._fovea: Any = None     # Prediction error by domain
+        self._simula: Any = None    # Self-modification repair latency
+        self._axon: Any = None      # Compute cost / execution stats (SACM)
+        self._logos: Any = None     # Compression quality / cognitive pressure
+        self._evo: Any = None       # Learning velocity / hypothesis success
+        self._benchmarks: Any = None  # Performance regression detection
+
     def set_atune(self, atune: Any) -> None:
         self._atune = atune
 
@@ -85,6 +95,32 @@ class Interoceptor:
     def set_telos(self, telos: Any) -> None:
         """Wire Telos for confidence + coherence augmentation (Loop 6)."""
         self._telos = telos
+
+    # ── AUTONOMY: Cross-system telemetry wiring ──
+
+    def set_fovea(self, fovea: Any) -> None:
+        """Wire Fovea for prediction error domain visibility."""
+        self._fovea = fovea
+
+    def set_simula(self, simula: Any) -> None:
+        """Wire Simula for self-modification repair latency visibility."""
+        self._simula = simula
+
+    def set_axon(self, axon: Any) -> None:
+        """Wire Axon for compute cost / execution stats (SACM proxy)."""
+        self._axon = axon
+
+    def set_logos(self, logos: Any) -> None:
+        """Wire Logos for compression quality / cognitive pressure."""
+        self._logos = logos
+
+    def set_evo(self, evo: Any) -> None:
+        """Wire Evo for learning velocity / hypothesis success rate."""
+        self._evo = evo
+
+    def set_benchmarks(self, benchmarks: Any) -> None:
+        """Wire Benchmarks for performance regression detection."""
+        self._benchmarks = benchmarks
 
     def sense(self) -> dict[InteroceptiveDimension, float]:
         """
@@ -114,37 +150,53 @@ class Interoceptor:
     # ─── Per-Dimension Readers ────────────────────────────────────
 
     def _sense_energy(self) -> float:
-        """ENERGY: 1.0 - token_budget.utilization. Metabolic availability."""
+        """
+        ENERGY: 1.0 - token_budget.utilization, enriched with compute cost awareness.
+
+        AUTONOMY: Now also reads Axon execution stats (mean_cost_usd) so the
+        organism feels compute expense as energy drain, not just token usage.
+        """
+        base: float | None = None
         try:
             if self._token_budget is not None:
-                # Use the lock-free cached snapshot — get_status() is async and
-                # cannot be awaited inside this synchronous 2ms theta-cycle reader.
                 status = (
                     self._token_budget.cached_status
                     if hasattr(self._token_budget, "cached_status")
                     else None
                 )
                 if status is None and hasattr(self._token_budget, "get_status"):
-                    # Fallback: try legacy synchronous get_status (non-budget objects)
                     status = self._token_budget.get_status()
                 if status is not None:
                     if hasattr(status, "utilization"):
-                        return 1.0 - float(status.utilization)
-                    if isinstance(status, dict):
-                        return 1.0 - float(status.get("utilization", 0.5))
-                    # BudgetStatus: derive utilization from tokens_used/tokens_remaining
-                    if hasattr(status, "tokens_used") and hasattr(status, "tokens_remaining"):
+                        base = 1.0 - float(status.utilization)
+                    elif isinstance(status, dict):
+                        base = 1.0 - float(status.get("utilization", 0.5))
+                    elif hasattr(status, "tokens_used") and hasattr(status, "tokens_remaining"):
                         total = status.tokens_used + status.tokens_remaining
-                        return 1.0 - (status.tokens_used / total) if total > 0 else 0.5
-            # Fallback: try synapse resource manager
-            if self._synapse is not None and hasattr(self._synapse, "_resources"):
+                        base = 1.0 - (status.tokens_used / total) if total > 0 else 0.5
+            if base is None and self._synapse is not None and hasattr(self._synapse, "_resources"):
                 resources = self._synapse._resources
                 if hasattr(resources, "get_status"):
                     status = resources.get_status()
                     if hasattr(status, "utilization"):
-                        return 1.0 - float(status.utilization)
+                        base = 1.0 - float(status.utilization)
         except Exception:
             pass
+
+        # AUTONOMY: Axon compute cost enrichment — high cost per action drains energy
+        compute_drain: float = 0.0
+        try:
+            if self._axon is not None and hasattr(self._axon, "executor_stats"):
+                stats = self._axon.executor_stats
+                if stats is not None:
+                    mean_cost = float(stats.get("mean_cost_usd", 0.0) if isinstance(stats, dict) else getattr(stats, "mean_cost_usd", 0.0))
+                    # $0.01/action = 0.0 drain; $0.10/action = 0.15 drain (significant)
+                    compute_drain = min(0.2, mean_cost * 1.5)
+        except Exception:
+            pass
+
+        if base is not None:
+            return max(0.0, base - compute_drain)
         return FALLBACK_VALUES[InteroceptiveDimension.ENERGY]
 
     def _sense_arousal(self) -> float:
@@ -172,9 +224,13 @@ class Interoceptor:
     def _sense_confidence(self) -> float:
         """CONFIDENCE: 1.0 - clamp(mean_prediction_error, 0, 1).
 
-        Augmented with Telos effective_I (Loop 6): a high effective intelligence
-        ratio indicates the generative model is tracking reality well → higher
-        somatic confidence.  Blended at 30% weight to avoid over-dominance.
+        Augmented with:
+        - Telos effective_I (Loop 6, 20% weight)
+        - Fovea per-domain error distribution (AUTONOMY, 10% weight)
+        - Evo learning velocity (AUTONOMY, blended into base)
+
+        The organism feels confident when: prediction errors are low, drives
+        are aligned, error distribution is narrow, and learning is progressing.
         """
         base: float | None = None
         try:
@@ -195,27 +251,62 @@ class Interoceptor:
             if self._telos is not None:
                 report = self._telos.last_report
                 if report is not None:
-                    # effective_I / nominal_I gives a ratio in (0,1] expressing
-                    # how well drives are aligned — a proxy for confidence
                     nominal = max(report.nominal_I, 0.001)
                     telos_confidence = max(0.0, min(1.0, report.effective_I / nominal))
         except Exception:
             pass
 
-        if base is not None and telos_confidence is not None:
-            return base * 0.7 + telos_confidence * 0.3
-        if telos_confidence is not None:
-            return telos_confidence
+        # AUTONOMY: Fovea prediction error spread — narrow spread = confident
+        fovea_confidence: float | None = None
+        try:
+            if self._fovea is not None:
+                # Read cached error count — sync-safe, no async
+                if hasattr(self._fovea, "cached_error_stats"):
+                    stats = self._fovea.cached_error_stats
+                    if stats is not None and isinstance(stats, dict):
+                        # High unprocessed error count = low confidence
+                        count = float(stats.get("unprocessed_count", 0))
+                        fovea_confidence = max(0.0, 1.0 - min(1.0, count / 50.0))
+                elif hasattr(self._fovea, "error_count"):
+                    count = float(self._fovea.error_count)
+                    fovea_confidence = max(0.0, 1.0 - min(1.0, count / 50.0))
+        except Exception:
+            pass
+
+        # AUTONOMY: Evo learning velocity — fast learning = confident
+        evo_boost: float = 0.0
+        try:
+            if self._evo is not None and hasattr(self._evo, "hypothesis_success_rate"):
+                rate = float(self._evo.hypothesis_success_rate)
+                # Success rate > 0.5 → slight confidence boost
+                evo_boost = max(0.0, (rate - 0.5) * 0.1)
+        except Exception:
+            pass
+
+        # Weighted blend: base 55%, telos 20%, fovea 10%, evo 5% (rest = fallback)
+        components: list[tuple[float, float]] = []  # (value, weight)
         if base is not None:
-            return base
+            components.append((base + evo_boost, 0.60))
+        if telos_confidence is not None:
+            components.append((telos_confidence, 0.25))
+        if fovea_confidence is not None:
+            components.append((fovea_confidence, 0.15))
+
+        if components:
+            total_weight = sum(w for _, w in components)
+            return sum(v * w for v, w in components) / total_weight
         return FALLBACK_VALUES[InteroceptiveDimension.CONFIDENCE]
 
     def _sense_coherence(self) -> float:
         """COHERENCE: synapse.coherence_monitor.current_phi (already 0-1).
 
-        Augmented with Telos alignment_gap (Loop 6): a narrowing alignment gap
-        means drives are coherent with effective intelligence → higher somatic
-        coherence.  Blended at 25% weight.
+        Augmented with:
+        - Telos alignment_gap (Loop 6, 20% weight)
+        - Logos compression quality (AUTONOMY, 10% weight) — high compression
+          fidelity = internal consistency
+
+        The organism feels coherent when: systems are integrated (phi), drives
+        are aligned (telos), and knowledge compresses cleanly (logos).
         """
         base: float | None = None
         try:
@@ -241,20 +332,38 @@ class Interoceptor:
             if self._telos is not None:
                 report = self._telos.last_report
                 if report is not None:
-                    # alignment_gap is (nominal_I - effective_I); larger gap = less coherence.
-                    # Normalise to [0,1] using nominal_I as reference.
                     nominal = max(report.nominal_I, 0.001)
                     gap_fraction = max(0.0, min(1.0, report.alignment_gap / nominal))
                     telos_coherence = 1.0 - gap_fraction
         except Exception:
             pass
 
-        if base is not None and telos_coherence is not None:
-            return base * 0.75 + telos_coherence * 0.25
-        if telos_coherence is not None:
-            return telos_coherence
+        # AUTONOMY: Logos compression quality — clean compression = coherent knowledge
+        logos_coherence: float | None = None
+        try:
+            if self._logos is not None:
+                if hasattr(self._logos, "compression_fidelity"):
+                    fidelity = float(self._logos.compression_fidelity)
+                    logos_coherence = max(0.0, min(1.0, fidelity))
+                elif hasattr(self._logos, "cognitive_pressure"):
+                    # High cognitive pressure = low coherence (approaching Schwarzschild)
+                    pressure = float(self._logos.cognitive_pressure)
+                    logos_coherence = max(0.0, 1.0 - min(1.0, pressure))
+        except Exception:
+            pass
+
+        # Weighted blend
+        components: list[tuple[float, float]] = []
         if base is not None:
-            return base
+            components.append((base, 0.60))
+        if telos_coherence is not None:
+            components.append((telos_coherence, 0.25))
+        if logos_coherence is not None:
+            components.append((logos_coherence, 0.15))
+
+        if components:
+            total_weight = sum(w for _, w in components)
+            return sum(v * w for v, w in components) / total_weight
         return FALLBACK_VALUES[InteroceptiveDimension.COHERENCE]
 
     def _sense_social_charge(self) -> float:
@@ -269,14 +378,38 @@ class Interoceptor:
         return FALLBACK_VALUES[InteroceptiveDimension.SOCIAL_CHARGE]
 
     def _sense_curiosity_drive(self) -> float:
-        """CURIOSITY_DRIVE: atune.affect_manager.current_affect.curiosity."""
+        """CURIOSITY_DRIVE: atune.affect_manager.current_affect.curiosity.
+
+        AUTONOMY: Enriched with Evo hypothesis success rate. When hypotheses
+        are succeeding at high rates, curiosity is well-channeled → slight
+        boost. When success rate is very low, curiosity may be misdirected
+        → slight damping to signal "explore differently, not more".
+        """
+        base: float | None = None
         try:
             if self._atune is not None:
                 affect = self._get_current_affect()
                 if affect is not None:
-                    return float(affect.curiosity)
+                    base = float(affect.curiosity)
         except Exception:
             pass
+
+        # AUTONOMY: Evo learning progress modulates curiosity signal
+        evo_modulation: float = 0.0
+        try:
+            if self._evo is not None:
+                if hasattr(self._evo, "hypothesis_success_rate"):
+                    rate = float(self._evo.hypothesis_success_rate)
+                    # Success rate 0.3-0.7 is ideal; outside that range, modulate
+                    if rate > 0.6:
+                        evo_modulation = 0.05  # Learning well → slight curiosity boost
+                    elif rate < 0.15:
+                        evo_modulation = -0.05  # Misdirected → slight damping
+        except Exception:
+            pass
+
+        if base is not None:
+            return max(0.0, min(1.0, base + evo_modulation))
         return FALLBACK_VALUES[InteroceptiveDimension.CURIOSITY_DRIVE]
 
     def _sense_integrity(self) -> float:
@@ -285,13 +418,16 @@ class Interoceptor:
         Thymos is the single source for immune health (ThymosService.current_health_score).
         Equor is the single source for constitutional drift (EquorService.constitutional_drift).
         Soma combines both into one unified integrity signal that the rest of the organism reads.
+
+        AUTONOMY: Enriched with Simula self-repair effectiveness. When Simula
+        repairs are failing or latency is high, the organism feels structurally
+        compromised even if Thymos health looks nominal.
         """
         thymos_health = 1.0
         equor_component = 1.0
 
         try:
             if self._thymos is not None:
-                # ThymosService.current_health_score — synchronous scalar, see thymos/service.py
                 score = self._thymos.current_health_score
                 if score is not None:
                     thymos_health = float(score)
@@ -300,14 +436,29 @@ class Interoceptor:
 
         try:
             if self._equor is not None:
-                # EquorService.constitutional_drift — synchronous scalar from DriftTracker, see equor/service.py
                 drift = self._equor.constitutional_drift
                 if drift is not None:
                     equor_component = 1.0 - max(0.0, min(1.0, float(drift)))
         except Exception:
             pass
 
-        return min(thymos_health, equor_component)
+        # AUTONOMY: Simula repair effectiveness — failed repairs = structural concern
+        simula_integrity: float = 1.0
+        try:
+            if self._simula is not None:
+                if hasattr(self._simula, "repair_success_rate"):
+                    rate = float(self._simula.repair_success_rate)
+                    # Low repair success = integrity concern (max 0.15 reduction)
+                    simula_integrity = 1.0 - max(0.0, min(0.15, (1.0 - rate) * 0.2))
+                elif hasattr(self._simula, "overall_performance_delta"):
+                    delta = float(self._simula.overall_performance_delta)
+                    # Negative delta = performance declining = integrity concern
+                    if delta < 0:
+                        simula_integrity = max(0.85, 1.0 + delta * 0.15)
+        except Exception:
+            pass
+
+        return min(thymos_health, equor_component, simula_integrity)
 
     def _sense_temporal_pressure(self) -> float:
         """

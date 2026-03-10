@@ -91,6 +91,11 @@ _PLATFORM_X = "x"
 _PLATFORM_GITHUB = "github"
 _SUPPORTED_PLATFORMS = frozenset({_PLATFORM_X, _PLATFORM_GITHUB})
 
+# Note: LinkedIn, Telegram channel, Dev.to, Hashnode are supported via
+# PublishContentExecutor (publish_content.py) which uses ContentEngine for
+# per-platform formatting. ExecuteSocialPostExecutor handles X and GitHub only.
+# Use action_type="publish_content" for multi-platform publishing.
+
 _GITHUB_ACTION_GIST = "gist"
 _GITHUB_ACTION_DISCUSSION = "discussion_comment"
 _SUPPORTED_GITHUB_ACTIONS = frozenset({_GITHUB_ACTION_GIST, _GITHUB_ACTION_DISCUSSION})

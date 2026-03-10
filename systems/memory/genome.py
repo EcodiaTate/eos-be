@@ -240,14 +240,14 @@ class MemoryGenomeExtractor:
         try:
             rows = await self._neo4j.execute_read(
                 """
-                MATCH (a:Entity)-[r:SEMANTIC_RELATION]->(b:Entity)
+                MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
                 WHERE a.id IN $entity_ids AND b.id IN $entity_ids
                 RETURN a.id AS source_id,
                        b.id AS target_id,
-                       r.relation_type AS relation_type,
-                       r.weight AS weight,
-                       r.description AS description
-                ORDER BY r.weight DESC
+                       r.type AS relation_type,
+                       coalesce(r.strength, 1.0) AS weight,
+                       coalesce(r.description, '') AS description
+                ORDER BY r.strength DESC
                 LIMIT $limit
                 """,
                 {"entity_ids": entity_ids, "limit": _MAX_RELATIONS},
@@ -543,13 +543,11 @@ class MemoryGenomeExtractor:
                     """
                     MATCH (a:Entity {id: $source_id})
                     MATCH (b:Entity {id: $target_id})
-                    CREATE (a)-[:SEMANTIC_RELATION {
-                        relation_type: $relation_type,
-                        weight: $weight,
-                        description: $description,
-                        source: "parent_genome",
-                        created_at: datetime()
-                    }]->(b)
+                    MERGE (a)-[r:RELATES_TO {type: $relation_type}]->(b)
+                    SET r.strength = $weight,
+                        r.description = $description,
+                        r.source = "parent_genome",
+                        r.created_at = datetime()
                     """,
                     {
                         "source_id": rel["source_id"],

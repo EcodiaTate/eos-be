@@ -73,18 +73,8 @@ class AllocateResourceExecutor(Executor):
                 )
                 # Proceed as a no-op allocation (informational)
 
-            await self._emit_event(
-                SynapseEventType.ACTION_EXECUTED,
-                {
-                    "action_type": self.action_type,
-                    "resource_type": resource_type,
-                    "amount": amount,
-                    "target_system": target_system,
-                    "allocation_id": allocation_id,
-                    "execution_id": context.execution_id,
-                },
-            )
-
+            # RE trace only — AXON_EXECUTION_RESULT is the canonical aggregate;
+            # per-executor ACTION_EXECUTED creates duplicate signals.
             await self._emit_re_trace(context, params, success=True, allocation_id=allocation_id)
 
             return ExecutionResult(
@@ -101,14 +91,6 @@ class AllocateResourceExecutor(Executor):
                 ],
             )
         except Exception as exc:
-            await self._emit_event(
-                SynapseEventType.ACTION_FAILED,
-                {
-                    "action_type": self.action_type,
-                    "error": str(exc),
-                    "execution_id": context.execution_id,
-                },
-            )
             await self._emit_re_trace(context, params, success=False, error=str(exc))
             return ExecutionResult(success=False, error=str(exc))
 

@@ -901,6 +901,227 @@ async def adopt_amendment(
     }
 
 
+async def auto_adopt_single_instance_amendment(
+    neo4j: Neo4jClient,
+    proposal_id: str,
+    drift_score: float,
+    consecutive_cycles: int,
+    *,
+    min_consecutive_cycles: int = 7,
+    min_combined_confidence: float = 4.0,
+    min_supporting_hypotheses: int = 3,
+) -> dict[str, Any]:
+    """
+    Single-instance emergency auto-adoption path.
+
+    When a federation-scale quorum is structurally impossible (total_eligible_voters == 1),
+    an amendment that has already passed its shadow period with zero invariant violations
+    may be adopted autonomously provided the organism meets all three conditions:
+
+    1. Constitutional drift ≥ 0.95 for ≥ 7 consecutive probe cycles (sustained crisis)
+    2. The proposal is in SHADOW_PASSED state (shadow passed, 0 invariant violations)
+    3. The proposal has ≥ 3 supporting hypotheses with combined confidence ≥ 4.0
+
+    Safety: a final constitutional validation runs before the amendment is applied.
+    It refuses to lower any drive below its current value or eliminate a drive.
+
+    Returns:
+        {adopted: True, ...}  on success
+        {adopted: False, reason: ...}  on any gate failure
+    """
+    if drift_score < 0.95:
+        return {
+            "adopted": False,
+            "reason": f"Drift score {drift_score:.3f} below 0.95 threshold for single-instance auto-adoption.",
+        }
+
+    if consecutive_cycles < min_consecutive_cycles:
+        return {
+            "adopted": False,
+            "reason": (
+                f"Only {consecutive_cycles} consecutive high-drift cycles; "
+                f"need {min_consecutive_cycles}."
+            ),
+        }
+
+    proposal = await _get_proposal(neo4j, proposal_id)
+    if proposal is None:
+        return {"adopted": False, "reason": "Proposal not found."}
+
+    details = json.loads(proposal.get("details_json", "{}"))
+    status = details.get("status")
+
+    if status != AmendmentStatus.SHADOW_PASSED.value:
+        return {
+            "adopted": False,
+            "reason": (
+                f"Proposal is in '{status}' status; must be 'shadow_passed' "
+                f"with zero invariant violations for single-instance auto-adoption."
+            ),
+        }
+
+    shadow_report = details.get("shadow_report", {})
+    if shadow_report.get("invariant_violations", 0) > 0:
+        return {
+            "adopted": False,
+            "reason": (
+                f"Shadow period recorded {shadow_report['invariant_violations']} "
+                f"invariant violation(s). Auto-adoption requires exactly 0."
+            ),
+        }
+
+    # Validate evidence quality
+    hypothesis_ids: list[str] = details.get("evidence_hypothesis_ids", [])
+    if len(hypothesis_ids) < min_supporting_hypotheses:
+        return {
+            "adopted": False,
+            "reason": (
+                f"Only {len(hypothesis_ids)} supporting hypothesis IDs; "
+                f"need ≥ {min_supporting_hypotheses}."
+            ),
+        }
+
+    validated = await _validate_evidence(neo4j, hypothesis_ids, min_confidence=0.0)
+    summaries: list[dict[str, Any]] = validated.get("summaries", [])
+    combined_confidence: float = sum(s.get("evidence_score", 0.0) for s in summaries)
+    if combined_confidence < min_combined_confidence:
+        return {
+            "adopted": False,
+            "reason": (
+                f"Combined hypothesis confidence {combined_confidence:.2f} < "
+                f"{min_combined_confidence} required."
+            ),
+        }
+
+    proposed_drives: dict[str, float] = details.get("proposed_drives", {})
+    current_drives: dict[str, float] = details.get("current_drives", {})
+
+    # Safety gate: structural validity
+    valid, reason = validate_amendment_proposal(proposed_drives)
+    if not valid:
+        return {"adopted": False, "reason": f"Safety gate (structural): {reason}"}
+
+    # Safety gate: must NOT lower any drive floor or remove a drive
+    _IMMUTABLE_DRIVES = {"coherence", "care", "growth", "honesty"}
+    for drive in _IMMUTABLE_DRIVES:
+        proposed_val = proposed_drives.get(drive)
+        current_val = current_drives.get(drive)
+        if proposed_val is None:
+            return {
+                "adopted": False,
+                "reason": f"Safety gate: drive '{drive}' missing from proposal.",
+            }
+        if current_val is not None and proposed_val < current_val:
+            return {
+                "adopted": False,
+                "reason": (
+                    f"Safety gate: proposed {drive}={proposed_val} < current {current_val}. "
+                    f"Single-instance auto-adoption cannot lower drive values."
+                ),
+            }
+
+    now = utc_now()
+    amendment_record = json.dumps({
+        "date": now.isoformat(),
+        "proposal_id": proposal_id,
+        "new_values": proposed_drives,
+        "shadow_report": shadow_report,
+        "adoption_method": "single_instance_auto_adoption",
+        "drift_score": drift_score,
+        "consecutive_cycles": consecutive_cycles,
+    })
+
+    # Apply to Constitution node
+    await neo4j.execute_write(
+        """
+        MATCH (s:Self)-[:GOVERNED_BY]->(c:Constitution)
+        SET c.drive_coherence = $coherence,
+            c.drive_care = $care,
+            c.drive_growth = $growth,
+            c.drive_honesty = $honesty,
+            c.version = c.version + 1,
+            c.last_amended = datetime($now),
+            c.amendments = c.amendments + [$amendment_json]
+        """,
+        {
+            "coherence": proposed_drives["coherence"],
+            "care": proposed_drives["care"],
+            "growth": proposed_drives["growth"],
+            "honesty": proposed_drives["honesty"],
+            "now": now.isoformat(),
+            "amendment_json": amendment_record,
+        },
+    )
+
+    # Update proposal status
+    details["status"] = AmendmentStatus.ADOPTED.value
+    details["adopted_at"] = now.isoformat()
+    details["adoption_method"] = "single_instance_auto_adoption"
+
+    await neo4j.execute_write(
+        """
+        MATCH (g:GovernanceRecord {id: $id})
+        SET g.details_json = $details_json,
+            g.amendment_status = $status,
+            g.outcome = 'auto_adopted_single_instance'
+        """,
+        {
+            "id": proposal_id,
+            "details_json": json.dumps(details),
+            "status": AmendmentStatus.ADOPTED.value,
+        },
+    )
+
+    # Neo4j audit trail: AmendmentAutoAdoption node
+    await neo4j.execute_write(
+        """
+        MATCH (g:GovernanceRecord {id: $proposal_id})
+        CREATE (a:AmendmentAutoAdoption {
+            id: $id,
+            proposal_id: $proposal_id,
+            drift_score: $drift_score,
+            consecutive_cycles: $consecutive_cycles,
+            supporting_hypotheses: $supporting_hypotheses,
+            combined_confidence: $combined_confidence,
+            timestamp: datetime($now),
+            adoption_method: 'single_instance_auto_adoption'
+        })
+        CREATE (a)-[:AUTO_ADOPTED]->(g)
+        """,
+        {
+            "id": new_id(),
+            "proposal_id": proposal_id,
+            "drift_score": drift_score,
+            "consecutive_cycles": consecutive_cycles,
+            "supporting_hypotheses": len(summaries),
+            "combined_confidence": round(combined_confidence, 4),
+            "now": now.isoformat(),
+        },
+    )
+
+    logger.warning(
+        "single_instance_auto_adoption",
+        amendment=proposal_id,
+        reason="sustained_drift",
+        drift_score=drift_score,
+        consecutive_cycles=consecutive_cycles,
+        supporting_hypotheses=len(summaries),
+        combined_confidence=round(combined_confidence, 4),
+        new_drives=proposed_drives,
+    )
+
+    return {
+        "adopted": True,
+        "proposal_id": proposal_id,
+        "new_drives": proposed_drives,
+        "adoption_method": "single_instance_auto_adoption",
+        "drift_score": drift_score,
+        "consecutive_cycles": consecutive_cycles,
+        "supporting_hypotheses": len(summaries),
+        "combined_confidence": round(combined_confidence, 4),
+    }
+
+
 async def get_amendment_status(
     neo4j: Neo4jClient,
     proposal_id: str,

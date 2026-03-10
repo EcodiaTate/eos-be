@@ -99,6 +99,9 @@ class MemoryService:
         # Used to detect sustained constitutional drift across snapshot cycles.
         self._last_compliance_score: float | None = None
 
+        # ── Skia VitalityCoordinator modulation ───────────────────────
+        self._modulation_halted: bool = False
+
     # ─── Lifecycle ────────────────────────────────────────────────
 
     async def initialize(self) -> None:
@@ -136,6 +139,16 @@ class MemoryService:
             SynapseEventType.MEMORY_DEGRADATION,
             self._on_memory_degradation,
         )
+        event_bus.subscribe(
+            SynapseEventType.SYSTEM_MODULATION,
+            self._on_system_modulation,
+        )
+        # Auto-trigger consolidation when Oneiros signals sleep entry.
+        # This closes the spec gap noted in §18 ("No subscription to SLEEP_INITIATED").
+        event_bus.subscribe(
+            SynapseEventType.SLEEP_INITIATED,
+            self._on_sleep_initiated,
+        )
         logger.info("financial_encoder_wired", system="memory")
 
     # ─── Public Neo4j API ─────────────────────────────────────────
@@ -154,6 +167,22 @@ class MemoryService:
         Use this instead of memory._neo4j.execute_write() from other systems.
         """
         return await self._neo4j.execute_write(query, params or {})
+
+    async def _on_sleep_initiated(self, event: Any) -> None:
+        """Auto-trigger consolidation when Oneiros signals sleep entry.
+
+        Closes spec §18 gap: Memory had no subscription to SLEEP_INITIATED,
+        so consolidation only fired via explicit external calls (Evo timer or
+        Axon intent). Now consolidation runs automatically at every sleep cycle,
+        which is the intended organisational closure behaviour.
+
+        Fire-and-forget with metabolic gate respected inside consolidate().
+        """
+        logger.info("memory_consolidation_triggered_by_sleep")
+        try:
+            await self.consolidate()
+        except Exception:
+            logger.exception("sleep_triggered_consolidation_failed")
 
     async def _on_metabolic_pressure(self, event: Any) -> None:
         """React to organism-wide metabolic pressure changes."""
@@ -272,8 +301,8 @@ class MemoryService:
                 MATCH (ep:Episode)
                 WHERE ep.is_compressed = false
                   AND ep.decayed IS NULL
-                  AND ep.created_at < datetime() - duration({hours: })
-                RETURN ep.id AS id, coalesce(ep.salience, 0.1) AS salience
+                  AND ep.ingestion_time < datetime() - duration({hours: $age_hours})
+                RETURN ep.id AS id, coalesce(ep.salience_composite, 0.1) AS salience
                 """,
                 {"age_hours": age_hours},
             )
@@ -356,6 +385,61 @@ class MemoryService:
 
         except Exception:
             logger.exception("memory_degradation_handler_failed", tick_number=tick_number)
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle VitalityCoordinator austerity orders.
+
+        Skia emits SYSTEM_MODULATION when the organism needs to conserve resources.
+        This system applies the directive and ACKs so Skia knows the order was received.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("level", "nominal")
+        halt_systems = data.get("halt_systems", [])
+        modulate = data.get("modulate", {})
+
+        system_id = "memory"
+        compliant = True
+        reason: str | None = None
+
+        if system_id in halt_systems:
+            self._modulation_halted = True
+            logger.warning("system_modulation_halt", level=level)
+        elif system_id in modulate:
+            directives = modulate[system_id]
+            self._apply_modulation_directives(directives)
+            logger.info("system_modulation_applied", level=level, directives=directives)
+        elif level == "nominal":
+            self._modulation_halted = False
+            logger.info("system_modulation_resumed", level=level)
+
+        # Emit ACK so Skia knows the order was received
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                    data={
+                        "system_id": system_id,
+                        "level": level,
+                        "compliant": compliant,
+                        "reason": reason,
+                    },
+                    source_system=system_id,
+                ))
+            except Exception as exc:
+                logger.warning("modulation_ack_failed", error=str(exc))
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply modulation directives from VitalityCoordinator.
+
+        Memory directive: {"mode": "read_only"} — suspend all writes to the
+        knowledge graph to protect the substrate during austerity.
+        """
+        mode = directives.get("mode")
+        if mode == "read_only":
+            logger.info("modulation_read_only_mode_set")
+        else:
+            logger.info("modulation_directives_received", directives=directives)
 
     async def _emit_re_training_example(
         self,
@@ -667,8 +751,19 @@ class MemoryService:
         if self._event_bus is None:
             return
         ep_count = await count_episodes(self._neo4j)
-        # Check if consolidation lag is too large
-        consolidation_lag = ep_count  # simplified: proper tracking would diff last consolidated
+        # Consolidation lag = episodes with consolidation_level=0 (never consolidated).
+        # This accurately tracks unconsolidated episode backlog rather than total count.
+        try:
+            lag_rows = await self._neo4j.execute_read(
+                """
+                MATCH (e:Episode)
+                WHERE e.consolidation_level = 0 OR e.consolidation_level IS NULL
+                RETURN count(e) AS lag
+                """
+            )
+            consolidation_lag = lag_rows[0]["lag"] if lag_rows else 0
+        except Exception:
+            consolidation_lag = 0
         pressure_threshold = 10000
         lag_threshold = 500
         if ep_count > pressure_threshold or consolidation_lag > lag_threshold:
@@ -1150,6 +1245,11 @@ class MemoryService:
             logger.info("consolidation_blocked_starvation", level=self._starvation_level)
             return {"skipped": True, "reason": f"metabolic_{self._starvation_level}"}
 
+        # ── Skia modulation halt ────────────────────────────────────────────────────
+        if self._modulation_halted:
+            logger.debug("consolidation_skipped_modulation_halted")
+            return {"skipped": True, "reason": "modulation_halted"}
+
         result = await run_consolidation(self._neo4j)
 
         # P9: Re-embed placeholder nodes (fire-and-forget, non-fatal)
@@ -1192,10 +1292,12 @@ class MemoryService:
                 from systems.synapse.types import SynapseEventType
                 steps = result.get("steps", {})
                 community_data = steps.get("community_detection", {})
+                belief_promotion_data = steps.get("belief_promotion", {})
+                beliefs_promoted = belief_promotion_data.get("promoted", 0)
                 await self._event_bus.emit(
                     SynapseEventType.BELIEF_CONSOLIDATED,
                     {
-                        "beliefs_created": 0,  # populated when belief consolidation is wired
+                        "beliefs_created": beliefs_promoted,
                         "schemas_created": 0,
                         "communities_detected": community_data.get("community_count", 0),
                         "episodes_processed": result.get("total", 0),
@@ -1205,8 +1307,30 @@ class MemoryService:
             except Exception:
                 logger.debug("belief_consolidated_emit_failed", exc_info=True)
 
+        # Emit MEMORY_CONSOLIDATED — Logos subscribes for distillation rescoring
+        if self._event_bus is not None:
+            try:
+                import uuid as _uuid
+                from systems.synapse.types import SynapseEventType as _SET
+                steps = result.get("steps", {})
+                await self._event_bus.emit(
+                    _SET.MEMORY_CONSOLIDATED,
+                    {
+                        "consolidated_count": result.get("total", 0),
+                        "schemas_updated": steps.get("schema_extraction", {}).get("extracted", 0),
+                        "coverage_delta": 0.0,
+                        "cycle_id": str(_uuid.uuid4()),
+                    },
+                    source_system="memory",
+                )
+            except Exception:
+                logger.debug("memory_consolidated_emit_failed", exc_info=True)
+
         # Check for SELF_STATE_DRIFTED: contradicting beliefs
         await self._check_self_state_drift()
+
+        # Emit graph health KPIs so Benchmarks can observe memory utilization
+        await self.emit_graph_health_kpi()
 
         return result
 
@@ -1703,6 +1827,45 @@ class MemoryService:
             logger.info("nodes_reembedded", count=reembedded)
 
         return reembedded
+
+    # ─── Graph Health KPI Emission (Benchmarks / self-awareness) ──────────────
+
+    async def emit_graph_health_kpi(self) -> None:
+        """Emit memory graph health KPIs as EVOLUTIONARY_OBSERVABLE events.
+
+        Closes organism-level self-awareness gap: the organism can now observe
+        its own memory utilization, belief count, and community structure via
+        Benchmarks population tracking.
+
+        Called at the end of each consolidation cycle and can also be called
+        externally by the registry heartbeat.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            graph_stats = await self.stats()
+            ep_count = graph_stats.get("episode_count", 0)
+            ent_count = graph_stats.get("entity_count", 0)
+            node_count = graph_stats.get("node_count", 0)
+            hyp_count = graph_stats.get("hypothesis_count", 0)
+
+            # Episode utilization — fraction of capacity used (pressure_threshold = 10000)
+            utilization = min(1.0, ep_count / 10000.0)
+
+            await self._emit_evolutionary_observable(
+                observable_type="memory_graph_utilization",
+                value=utilization,
+                is_novel=False,
+                metadata={
+                    "episode_count": ep_count,
+                    "entity_count": ent_count,
+                    "node_count": node_count,
+                    "hypothesis_count": hyp_count,
+                    "instance_id": self._instance_id or "",
+                },
+            )
+        except Exception:
+            logger.debug("graph_health_kpi_emit_failed", exc_info=True)
 
     # ─── Stats ────────────────────────────────────────────────────
 

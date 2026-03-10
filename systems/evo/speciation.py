@@ -128,6 +128,10 @@ class SpeciationResult(EOSBaseModel):
     events: list[SpeciationEvent] = Field(default_factory=list)
     niches_created: int = 0
     niches_extinct: int = 0
+    # IDs of niches that went extinct this cycle — needed for EVO_NICHE_EXTINCT
+    # Synapse event so consumers (Telos, Benchmarks, Thread, Alive) can react to
+    # specific niche deaths rather than just a count.
+    extinct_niche_ids: list[str] = Field(default_factory=list)
     ring_species_detected: int = 0
     barriers_evolved: int = 0
     duration_ms: int = 0
@@ -238,6 +242,7 @@ class SpeciationEngine:
             events=events,
             niches_created=sum(len(e.new_niche_ids) for e in events),
             niches_extinct=len(extinct_ids),
+            extinct_niche_ids=list(extinct_ids),
             ring_species_detected=len(rings),
             barriers_evolved=len(self._registry._barriers),
             duration_ms=elapsed_ms,

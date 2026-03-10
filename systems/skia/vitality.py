@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import math
 import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -117,8 +118,25 @@ class VitalityCoordinator:
         self._soma_allostatic_error: float = 0.0
         self._soma_coherence_stress: float = 0.0
 
+        # Latest Telos vitality signal (updated via TELOS_VITALITY_SIGNAL event)
+        # Supplements direct telos.latest_report reads with event-driven cache
+        self._telos_effective_I: float | None = None
+        self._telos_alignment_gap: float = 0.0
+        self._telos_growth_stagnating: bool = False
+
+        # Trajectory history for time-to-fatal estimation (rolling window of readings)
+        # Each entry: (timestamp, {dimension_name: current_value})
+        self._trajectory_history: list[tuple[float, dict[str, float]]] = []
+        _TRAJECTORY_MAX_SAMPLES = 120  # ~1 hour at 30s intervals
+        self._trajectory_max_samples = _TRAJECTORY_MAX_SAMPLES
+
         # Austerity state
         self._current_austerity_level: str = "nominal"
+
+        # Austerity compliance tracking — which systems acknowledged the last modulation?
+        self._austerity_pending_acks: set[str] = set()
+        self._austerity_received_acks: set[str] = set()
+        self._last_austerity_emitted_at: float = 0.0
 
         # ── Degradation Engine (Speciation Bible §8.2) ──────────────
         # Runs its own hourly tick independently of the 30s check loop.
@@ -165,6 +183,17 @@ class VitalityCoordinator:
                 SynapseEventType.EVO_BELIEF_CONSOLIDATED,
                 self._on_evo_belief_consolidated,
             )
+            # Austerity compliance: track which systems actually obey SYSTEM_MODULATION
+            event_bus.subscribe(
+                SynapseEventType.SYSTEM_MODULATION_ACK,
+                self._on_system_modulation_ack,
+            )
+            # Telos intelligence-axis vitality — cache effective_I via event
+            # (supplements direct telos.latest_report reads; reduces coupling)
+            event_bus.subscribe(
+                SynapseEventType.TELOS_VITALITY_SIGNAL,
+                self._on_telos_vitality_signal,
+            )
         except Exception as exc:
             self._log.debug("vitality_event_subscription_failed", error=str(exc))
 
@@ -202,6 +231,18 @@ class VitalityCoordinator:
         self._soma_allostatic_error = float(data.get("allostatic_error", 0.0))
         self._soma_coherence_stress = float(data.get("coherence_stress", 0.0))
 
+    async def _on_telos_vitality_signal(self, event: Any) -> None:
+        """Handle TELOS_VITALITY_SIGNAL — cache Telos intelligence-axis readings.
+
+        Supplements the direct telos.latest_report read path: if Telos
+        is not directly wired but is running on the same bus, this cache
+        keeps effective_I visible to the death-detection logic.
+        """
+        data = getattr(event, "data", {}) or {}
+        self._telos_effective_I = float(data.get("effective_I", 0.0))
+        self._telos_alignment_gap = float(data.get("alignment_gap_severity", 0.0))
+        self._telos_growth_stagnating = bool(data.get("growth_stagnation_flag", False))
+
     async def _on_consolidation_complete(self, event: Any) -> None:
         """
         Oneiros completed a sleep consolidation cycle.
@@ -222,8 +263,86 @@ class VitalityCoordinator:
         Evo applied a parameter adjustment.
         Each adjustment counteracts a small slice of config drift pressure.
         Organisms that don't learn drift further from optimal configuration.
+
+        Also routes degradation rate changes if Evo targets them — the organism
+        can evolve its own entropy resistance.
         """
         self._degradation.on_config_optimised(fraction=0.1)
+
+        # Check if Evo is targeting degradation parameters specifically
+        data = getattr(event, "data", {}) or {}
+        target = data.get("target_system", "")
+        param = data.get("parameter", "")
+        new_value = data.get("new_value")
+        if target == "skia" and new_value is not None and param.startswith("degradation_"):
+            kwargs: dict[str, float] = {}
+            if param == "degradation_memory_decay_rate":
+                kwargs["memory_decay_rate"] = float(new_value)
+            elif param == "degradation_config_drift_rate":
+                kwargs["config_drift_rate"] = float(new_value)
+            elif param == "degradation_hypothesis_staleness_rate":
+                kwargs["hypothesis_staleness_rate"] = float(new_value)
+            elif param == "degradation_tick_interval_s":
+                kwargs["tick_interval_s"] = float(new_value)
+            if kwargs:
+                self._degradation.update_rates(**kwargs)
+
+    async def _on_system_modulation_ack(self, event: Any) -> None:
+        """Track which systems acknowledged the last SYSTEM_MODULATION order.
+
+        The organism must know if its survival commands are being obeyed.
+        Systems that don't ACK within a reasonable window are either dead,
+        crashed, or ignoring orders — all of which the organism needs to know.
+        """
+        data = getattr(event, "data", {}) or {}
+        system_id = data.get("system_id", "")
+        compliant = data.get("compliant", False)
+        level = data.get("level", "")
+
+        if system_id:
+            self._austerity_received_acks.add(system_id)
+            if not compliant:
+                self._log.warning(
+                    "austerity_non_compliant",
+                    system=system_id,
+                    level=level,
+                    reason=data.get("reason", "unknown"),
+                )
+            else:
+                self._log.debug("austerity_ack_received", system=system_id, level=level)
+
+        # Check compliance rate
+        if self._austerity_pending_acks:
+            missing = self._austerity_pending_acks - self._austerity_received_acks
+            if not missing:
+                self._log.info(
+                    "austerity_fully_compliant",
+                    level=self._current_austerity_level,
+                    ack_count=len(self._austerity_received_acks),
+                )
+
+    async def _check_austerity_compliance(self) -> dict[str, Any]:
+        """Return current austerity compliance status for the vitality report.
+
+        The organism sees: which systems were ordered, which obeyed, which are silent.
+        """
+        if not self._austerity_pending_acks:
+            return {"level": "nominal", "ordered": [], "compliant": [], "silent": []}
+
+        missing = self._austerity_pending_acks - self._austerity_received_acks
+        elapsed = time.monotonic() - self._last_austerity_emitted_at
+
+        return {
+            "level": self._current_austerity_level,
+            "ordered": sorted(self._austerity_pending_acks),
+            "compliant": sorted(self._austerity_received_acks & self._austerity_pending_acks),
+            "silent": sorted(missing),
+            "elapsed_since_order_s": round(elapsed, 1),
+            "compliance_pct": round(
+                len(self._austerity_received_acks & self._austerity_pending_acks)
+                / max(1, len(self._austerity_pending_acks)) * 100, 1
+            ),
+        }
 
     async def _on_evo_belief_consolidated(self, event: Any) -> None:
         """
@@ -286,8 +405,21 @@ class VitalityCoordinator:
 
                 report = await self.assess_vitality()
 
+                # Build blind spot list for the report
+                blind_spots = [
+                    t.name for t in report.thresholds
+                    if "(BLIND" in (t.description or "")
+                ]
+
+                # Restoration readiness — can the organism save itself right now?
+                restoration_ready = await self._assess_restoration_readiness()
+
+                # Austerity compliance — are systems obeying survival commands?
+                austerity_compliance = await self._check_austerity_compliance()
+
                 # Emit periodic report (includes degradation_pressure from engine)
-                await self._emit_event("vitality_report", {
+                from systems.synapse.types import SynapseEventType as _SET
+                await self._emit_event(_SET.VITALITY_REPORT, {
                     "instance_id": report.instance_id,
                     "overall_viable": report.overall_viable,
                     "thresholds": [t.model_dump() for t in report.thresholds],
@@ -296,6 +428,14 @@ class VitalityCoordinator:
                         self._degradation.snapshot.degradation_pressure, 4
                     ),
                     "degradation_tick_count": self._degradation.snapshot.tick_count,
+                    "degradation_time_to_critical": self._degradation.estimate_time_to_critical_s(),
+                    "time_to_fatal_s": report.time_to_fatal.total_seconds() if report.time_to_fatal else None,
+                    "blind_spots": blind_spots,
+                    "blind_spot_count": len(blind_spots),
+                    "total_dimensions": 5,
+                    "visibility_pct": round((5 - len(blind_spots)) / 5 * 100, 1),
+                    "restoration_readiness": restoration_ready,
+                    "austerity_compliance": austerity_compliance,
                 })
 
                 # Trigger functional self-model update (rate-limited to 6h inside SelfModelService).
@@ -333,58 +473,90 @@ class VitalityCoordinator:
     # ── VitalitySystemProtocol ────────────────────────────────────
 
     async def assess_vitality(self) -> VitalityReport:
-        """Read all system signals and compose a VitalityReport."""
+        """Read all system signals and compose a VitalityReport.
+
+        NaN values from signal readers indicate the organism is BLIND to that
+        dimension.  Blind thresholds are marked severity='critical' with a
+        '(BLIND)' suffix so the organism knows it cannot assess its own state.
+        A blind threshold is never 'fatal' (you can't die from something you
+        can't measure) but it IS an emergency — blindness must be resolved.
+        """
         now = utc_now()
         thresholds: list[VitalityThreshold] = []
+        blind_dimensions: list[str] = []
 
         # 1. Runway (instantaneous)
+        runway_val = await self._read_runway_days()
         runway_t = RUNWAY_FATAL.model_copy()
-        runway_t.current_value = await self._read_runway_days()
+        if math.isnan(runway_val):
+            blind_dimensions.append("runway_days")
+            runway_t.current_value = -1.0
+            runway_t = runway_t.model_copy(update={
+                "severity": "critical",
+                "description": f"{runway_t.description} (BLIND — Oikos not wired)",
+            })
+        else:
+            runway_t.current_value = runway_val
         thresholds.append(runway_t)
 
         # 2. Brain death (sustained 7 days)
         effective_i = await self._read_effective_i()
         brain_t = BRAIN_DEATH.model_copy()
-        brain_t.current_value = effective_i
-
-        # Track sustained breach duration
-        if effective_i < BRAIN_DEATH.threshold_value:
-            if self._brain_death_breach_since is None:
-                self._brain_death_breach_since = now
-            elapsed = (now - self._brain_death_breach_since).total_seconds()
-            if elapsed < _BRAIN_DEATH_SUSTAINED_S:
-                # Not yet sustained — override to non-fatal for report
-                brain_t = brain_t.model_copy(update={"severity": "critical"})
+        if math.isnan(effective_i):
+            blind_dimensions.append("effective_I")
+            brain_t.current_value = -1.0
+            brain_t = brain_t.model_copy(update={
+                "severity": "critical",
+                "description": f"{brain_t.description} (BLIND — Telos not wired)",
+            })
         else:
-            self._brain_death_breach_since = None
+            brain_t.current_value = effective_i
+            # Track sustained breach duration
+            if effective_i < BRAIN_DEATH.threshold_value:
+                if self._brain_death_breach_since is None:
+                    self._brain_death_breach_since = now
+                elapsed = (now - self._brain_death_breach_since).total_seconds()
+                if elapsed < _BRAIN_DEATH_SUSTAINED_S:
+                    brain_t = brain_t.model_copy(update={"severity": "critical"})
+            else:
+                self._brain_death_breach_since = None
         thresholds.append(brain_t)
 
         # 3. Normative collapse (instantaneous — based on constitutional violations)
         drift = await self._read_constitutional_drift()
-        # NORMATIVE_COLLAPSE threshold is 10 violations/24h (direction=above)
-        # We map drift severity (0-1) to a violation count proxy.
-        # drift > 0.95 means catastrophic normative failure.
-        # Scale: drift * 12 maps 0.95 → 11.4 which breaches threshold_value=10.
         normative_t = NORMATIVE_COLLAPSE.model_copy()
-        normative_t.current_value = drift * 12.0
+        if math.isnan(drift):
+            blind_dimensions.append("constitutional_drift")
+            normative_t.current_value = -1.0
+            normative_t = normative_t.model_copy(update={
+                "severity": "critical",
+                "description": f"{normative_t.description} (BLIND — Equor not wired)",
+            })
+        else:
+            normative_t.current_value = drift * 12.0
         thresholds.append(normative_t)
 
         # 4. Immune failure (sustained 48 hours)
         health_score = await self._read_thymos_health()
-        # health_score is 0-1 where 0 = total failure.
-        # healing_failure_rate = 1.0 - health_score
-        healing_failure_rate = 1.0 - health_score
         immune_t = IMMUNE_FAILURE.model_copy()
-        immune_t.current_value = healing_failure_rate
-
-        if healing_failure_rate > IMMUNE_FAILURE.threshold_value:
-            if self._immune_failure_breach_since is None:
-                self._immune_failure_breach_since = now
-            elapsed = (now - self._immune_failure_breach_since).total_seconds()
-            if elapsed < _IMMUNE_FAILURE_SUSTAINED_S:
-                immune_t = immune_t.model_copy(update={"severity": "critical"})
+        if math.isnan(health_score):
+            blind_dimensions.append("thymos_health")
+            immune_t.current_value = -1.0
+            immune_t = immune_t.model_copy(update={
+                "severity": "critical",
+                "description": f"{immune_t.description} (BLIND — Thymos not wired)",
+            })
         else:
-            self._immune_failure_breach_since = None
+            healing_failure_rate = 1.0 - health_score
+            immune_t.current_value = healing_failure_rate
+            if healing_failure_rate > IMMUNE_FAILURE.threshold_value:
+                if self._immune_failure_breach_since is None:
+                    self._immune_failure_breach_since = now
+                elapsed = (now - self._immune_failure_breach_since).total_seconds()
+                if elapsed < _IMMUNE_FAILURE_SUSTAINED_S:
+                    immune_t = immune_t.model_copy(update={"severity": "critical"})
+            else:
+                self._immune_failure_breach_since = None
         thresholds.append(immune_t)
 
         # 5. Somatic collapse (sustained 48 hours — allostatic error > 0.8)
@@ -405,58 +577,232 @@ class VitalityCoordinator:
             t.severity == "fatal" and t.is_breached for t in thresholds
         )
 
+        # Compute time_to_fatal from trajectory history
+        time_to_fatal = self._estimate_time_to_fatal(thresholds)
+
+        # Log blind spots — the organism MUST be aware of what it cannot see
+        if blind_dimensions:
+            self._log.warning(
+                "vitality_blind_spots",
+                blind_dimensions=blind_dimensions,
+                count=len(blind_dimensions),
+                total_dimensions=5,
+            )
+
         return VitalityReport(
             instance_id=self._instance_id,
             thresholds=thresholds,
             overall_viable=overall_viable,
+            time_to_fatal=time_to_fatal,
             timestamp=now,
         )
 
     # ── Signal Readers ────────────────────────────────────────────
 
     async def _read_runway_days(self) -> float:
-        """Read Oikos EconomicState.runway_days."""
+        """Read Oikos EconomicState.runway_days.
+
+        Returns actual value when Oikos is wired and readable.
+        Returns NaN when the organism is BLIND to its own runway —
+        callers must treat NaN as 'unknown', never as 'safe'.
+        """
         if self._oikos is None:
-            return 999.0  # Safe default when not wired
+            self._log.warning("runway_read_blind", reason="oikos_not_wired")
+            return float("nan")
         try:
-            state = self._oikos.current_economic_state
+            state = self._oikos.snapshot()
             if state is not None:
                 return float(state.runway_days)
         except Exception as exc:
             self._log.warning("oikos_read_failed", error=str(exc))
-        return 999.0
+        self._log.warning("runway_read_blind", reason="oikos_state_unavailable")
+        return float("nan")
 
     async def _read_effective_i(self) -> float:
-        """Read Telos EffectiveIntelligenceReport.effective_I."""
-        if self._telos is None:
-            return 1.0
-        try:
-            report = self._telos.latest_report
-            if report is not None:
-                return float(report.effective_I)
-        except Exception as exc:
-            self._log.warning("telos_read_failed", error=str(exc))
-        return 1.0
+        """Read Telos EffectiveIntelligenceReport.effective_I.
+
+        Returns NaN when blind — the organism must know it cannot see its own intelligence.
+
+        Priority:
+        1. Direct read from telos.last_report (most up-to-date)
+        2. Event-cached value from TELOS_VITALITY_SIGNAL (fallback when not wired)
+        3. NaN (organism knows it's blind)
+        """
+        if self._telos is not None:
+            try:
+                report = self._telos.last_report
+                if report is not None:
+                    return float(report.effective_I)
+            except Exception as exc:
+                self._log.warning("telos_read_failed", error=str(exc))
+
+        # Fall back to event-cached value from TELOS_VITALITY_SIGNAL
+        if self._telos_effective_I is not None:
+            self._log.debug(
+                "effective_i_read_from_event_cache",
+                telos_wired=(self._telos is not None),
+            )
+            return self._telos_effective_I
+
+        self._log.warning(
+            "effective_i_read_blind",
+            reason="telos_not_wired" if self._telos is None else "telos_report_unavailable",
+        )
+        return float("nan")
 
     async def _read_constitutional_drift(self) -> float:
-        """Read Equor constitutional_drift (0.0–1.0)."""
+        """Read Equor constitutional_drift (0.0–1.0).
+
+        Returns NaN when blind — the organism must know it cannot see its own ethics.
+        """
         if self._equor is None:
-            return 0.0
+            self._log.warning("drift_read_blind", reason="equor_not_wired")
+            return float("nan")
         try:
             return float(self._equor.constitutional_drift)
         except Exception as exc:
             self._log.warning("equor_read_failed", error=str(exc))
-        return 0.0
+        self._log.warning("drift_read_blind", reason="equor_drift_unavailable")
+        return float("nan")
 
     async def _read_thymos_health(self) -> float:
-        """Read Thymos current_health_score (0.0–1.0)."""
+        """Read Thymos current_health_score (0.0–1.0).
+
+        Returns NaN when blind — the organism must know it cannot see its own immune health.
+        """
         if self._thymos is None:
-            return 1.0
+            self._log.warning("thymos_read_blind", reason="thymos_not_wired")
+            return float("nan")
         try:
             return float(self._thymos.current_health_score)
         except Exception as exc:
             self._log.warning("thymos_read_failed", error=str(exc))
-        return 1.0
+        self._log.warning("thymos_read_blind", reason="thymos_health_unavailable")
+        return float("nan")
+
+    # ── Trajectory Analysis & Forecasting ────────────────────────
+
+    def _estimate_time_to_fatal(
+        self, thresholds: list[VitalityThreshold]
+    ) -> timedelta | None:
+        """Estimate time until the nearest fatal threshold is breached.
+
+        Uses linear extrapolation from the trajectory history.  Returns None
+        if all dimensions are stable or improving, or if insufficient data.
+
+        The organism needs this to plan — knowing you will die in 3 days
+        is qualitatively different from knowing you are currently alive.
+        """
+        now = time.monotonic()
+
+        # Record current readings into trajectory history
+        readings: dict[str, float] = {}
+        for t in thresholds:
+            if "(BLIND" not in (t.description or "") and t.current_value >= 0:
+                readings[t.name] = t.current_value
+        self._trajectory_history.append((now, readings))
+
+        # Trim to max window
+        if len(self._trajectory_history) > self._trajectory_max_samples:
+            self._trajectory_history = self._trajectory_history[-self._trajectory_max_samples:]
+
+        # Need at least 6 samples (~3 min) for meaningful extrapolation
+        if len(self._trajectory_history) < 6:
+            return None
+
+        min_time_to_fatal_s: float | None = None
+
+        for t in thresholds:
+            if "(BLIND" in (t.description or ""):
+                continue
+            if t.severity == "fatal" and t.is_breached:
+                # Already breached — time_to_fatal is 0
+                return timedelta(seconds=0)
+
+            # Extract this dimension's history
+            dim_history: list[tuple[float, float]] = []
+            for ts, vals in self._trajectory_history:
+                if t.name in vals:
+                    dim_history.append((ts, vals[t.name]))
+
+            if len(dim_history) < 4:
+                continue
+
+            # Linear regression: slope of current_value over time
+            n = len(dim_history)
+            sum_t = sum(ts for ts, _ in dim_history)
+            sum_v = sum(v for _, v in dim_history)
+            sum_tv = sum(ts * v for ts, v in dim_history)
+            sum_tt = sum(ts * ts for ts, _ in dim_history)
+
+            denom = n * sum_tt - sum_t * sum_t
+            if abs(denom) < 1e-12:
+                continue
+
+            slope = (n * sum_tv - sum_t * sum_v) / denom
+
+            # Check if the slope is heading toward the fatal threshold
+            current = t.current_value
+            threshold = t.threshold_value
+
+            if t.direction == "below":
+                # Fatal when value drops below threshold — slope must be negative
+                if slope >= 0:
+                    continue
+                # time = (threshold - current) / slope  [slope is negative, threshold < current]
+                if current <= threshold:
+                    continue  # already breached
+                time_to_cross = (threshold - current) / slope
+            else:
+                # Fatal when value rises above threshold — slope must be positive
+                if slope <= 0:
+                    continue
+                if current >= threshold:
+                    continue  # already breached
+                time_to_cross = (threshold - current) / slope
+
+            if time_to_cross > 0:
+                if min_time_to_fatal_s is None or time_to_cross < min_time_to_fatal_s:
+                    min_time_to_fatal_s = time_to_cross
+
+        if min_time_to_fatal_s is not None:
+            return timedelta(seconds=min_time_to_fatal_s)
+        return None
+
+    async def _assess_restoration_readiness(self) -> dict[str, Any]:
+        """Quick assessment of whether the organism can currently be restored.
+
+        Included in every vitality report so the organism always knows
+        whether its safety net is functional. No point knowing you're dying
+        if you can't also know whether you can be saved.
+        """
+        result: dict[str, Any] = {
+            "snapshot_available": False,
+            "ipfs_connected": False,
+            "vault_available": False,
+            "strategies_available": [],
+            "overall_ready": False,
+        }
+
+        # Check via SkiaService's snapshot pipeline
+        if self._snapshot is not None:
+            result["snapshot_available"] = bool(self._snapshot.last_cid)
+            result["ipfs_connected"] = True  # snapshot pipeline exists → Pinata is wired
+
+        # Vault check is implicit — if snapshot exists, vault was available at init
+        result["vault_available"] = self._snapshot is not None
+
+        # We can infer strategy readiness from whether snapshot pipeline exists
+        # (detailed strategy check is in SkiaService.dry_run_restoration)
+        if self._snapshot is not None:
+            result["strategies_available"].append("ipfs_snapshot_exists")
+
+        result["overall_ready"] = (
+            result["snapshot_available"]
+            and result["vault_available"]
+        )
+
+        return result
 
     # ── Death Sequence ────────────────────────────────────────────
 
@@ -476,13 +822,14 @@ class VitalityCoordinator:
 
         # ── Phase 1: Warning ──────────────────────────────────────
         self._phase = DeathPhase.WARNING
-        await self._emit_event("vitality_fatal", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.VITALITY_FATAL, {
             "instance_id": self._instance_id,
             "reason": reason,
         })
 
         # Set organism-wide degradation to EMERGENCY
-        await self._emit_event("degradation_override", {
+        await self._emit_event(_SET.DEGRADATION_OVERRIDE, {
             "level": "emergency",
             "source": "vitality_coordinator",
         })
@@ -503,7 +850,8 @@ class VitalityCoordinator:
                 self._log.info("death_sequence_cancelled", reason="threshold_recovered")
                 self._phase = DeathPhase.NONE
                 self._death_cause = ""
-                await self._emit_event("vitality_restored", {
+                from systems.synapse.types import SynapseEventType as _SET
+                await self._emit_event(_SET.VITALITY_RESTORED, {
                     "instance_id": self._instance_id,
                     "reason": "threshold_recovered_during_warning",
                 })
@@ -546,7 +894,8 @@ class VitalityCoordinator:
                 self._log.error("clock_stop_failed", error=str(exc))
 
         # Emit ORGANISM_DIED
-        await self._emit_event("organism_died", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.ORGANISM_DIED, {
             "instance_id": self._instance_id,
             "cause": reason,
             "final_report": final_report.model_dump(mode="json") if final_report else {},
@@ -575,6 +924,7 @@ class VitalityCoordinator:
         """Enforce actual behavioral changes based on starvation level.
 
         Called when METABOLIC_PRESSURE events arrive, BEFORE death threshold.
+        Now tracks which systems are expected to ACK compliance.
 
         Levels and actions:
           CAUTIOUS  — log warning, reduce Oneiros dream frequency by 50%
@@ -588,10 +938,14 @@ class VitalityCoordinator:
             return
 
         self._current_austerity_level = level
+        self._austerity_received_acks.clear()
+        self._last_austerity_emitted_at = time.monotonic()
         self._log.warning("austerity_enforced", level=level)
 
+        from systems.synapse.types import SynapseEventType as _SET
         if level == "cautious":
-            await self._emit_event("system_modulation", {
+            self._austerity_pending_acks = {"oneiros"}
+            await self._emit_event(_SET.SYSTEM_MODULATION, {
                 "source": "vitality_coordinator",
                 "level": "cautious",
                 "halt_systems": [],
@@ -599,7 +953,8 @@ class VitalityCoordinator:
             })
 
         elif level == "austerity":
-            await self._emit_event("system_modulation", {
+            self._austerity_pending_acks = {"oneiros", "evo", "simula", "nexus"}
+            await self._emit_event(_SET.SYSTEM_MODULATION, {
                 "source": "vitality_coordinator",
                 "level": "austerity",
                 "halt_systems": ["oneiros"],
@@ -611,7 +966,8 @@ class VitalityCoordinator:
             })
 
         elif level == "emergency":
-            await self._emit_event("system_modulation", {
+            self._austerity_pending_acks = {"oneiros", "evo", "simula", "nexus", "nova", "memory", "voxis"}
+            await self._emit_event(_SET.SYSTEM_MODULATION, {
                 "source": "vitality_coordinator",
                 "level": "emergency",
                 "halt_systems": ["oneiros"],
@@ -627,7 +983,12 @@ class VitalityCoordinator:
 
         elif level == "critical":
             # Halt everything except life-support systems
-            await self._emit_event("system_modulation", {
+            self._austerity_pending_acks = {
+                "oneiros", "nova", "evo", "simula", "nexus",
+                "voxis", "axon", "memory", "equor", "telos",
+                "fovea", "atune",
+            }
+            await self._emit_event(_SET.SYSTEM_MODULATION, {
                 "source": "vitality_coordinator",
                 "level": "critical",
                 "halt_systems": [
@@ -676,8 +1037,9 @@ class VitalityCoordinator:
         self._current_austerity_level = "nominal"
 
         # Emit resurrection event
+        from systems.synapse.types import SynapseEventType as _SET
         runway_days = await self._read_runway_days()
-        await self._emit_event("organism_resurrected", {
+        await self._emit_event(_SET.ORGANISM_RESURRECTED, {
             "instance_id": self._instance_id,
             "trigger": trigger,
             "runway_days": runway_days,
@@ -697,7 +1059,8 @@ class VitalityCoordinator:
     ) -> None:
         """Notify parent and children of this organism's death."""
         # Emit CHILD_DIED for parent's FleetManager
-        await self._emit_event("child_died", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.CHILD_DIED, {
             "instance_id": self._instance_id,
             "cause": self._death_cause,
             "snapshot_cid": snapshot_cid,
@@ -705,7 +1068,7 @@ class VitalityCoordinator:
         })
 
         # Emit PARENT_DIED via Federation for children
-        await self._emit_event("federation_broadcast", {
+        await self._emit_event(_SET.FEDERATION_BROADCAST, {
             "event": "parent_died",
             "instance_id": self._instance_id,
             "cause": self._death_cause,
@@ -748,7 +1111,8 @@ class VitalityCoordinator:
 
     async def _halt_non_essential_systems(self) -> None:
         """During warning phase, halt Nova, Evo, Simula, Oneiros, Federation."""
-        await self._emit_event("system_modulation", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.SYSTEM_MODULATION, {
             "source": "vitality_coordinator",
             "level": "death_warning",
             "halt_systems": ["nova", "evo", "simula", "oneiros", "nexus"],
@@ -761,13 +1125,16 @@ class VitalityCoordinator:
 
     async def _resume_systems(self) -> None:
         """Resume all systems after death sequence cancellation."""
-        await self._emit_event("system_modulation", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.SYSTEM_MODULATION, {
             "source": "vitality_coordinator",
             "level": "nominal",
             "halt_systems": [],
             "modulate": {},
         })
         self._current_austerity_level = "nominal"
+        self._austerity_pending_acks.clear()
+        self._austerity_received_acks.clear()
 
     async def _extract_final_genome(self) -> str:
         """Extract the final OrganismGenome and persist to Neo4j with is_final=True."""
@@ -891,7 +1258,8 @@ class VitalityCoordinator:
 
         # Post-mortem RE training example — teaches the Reasoning Engine what kills organisms.
         # Each death is a labeled training example: input = conditions, output = "organism_died".
-        await self._emit_event("re_training_example", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.RE_TRAINING_EXAMPLE, {
             "source_system": "skia",
             "task_type": "organism_death_analysis",
             "input": {
@@ -914,7 +1282,7 @@ class VitalityCoordinator:
         })
 
         # Incident signal to Thymos — next incarnation boots with awareness of the cause.
-        await self._emit_event("incident_detected", {
+        await self._emit_event(_SET.INCIDENT_DETECTED, {
             "source": "skia_vitality",
             "severity": "HIGH",
             "category": "organism_death",
@@ -926,18 +1294,21 @@ class VitalityCoordinator:
             "final_allostatic_state": final_allostatic_state,
         })
 
-    async def _emit_event(self, event_type_name: str, data: dict[str, Any]) -> None:
+    async def _emit_event(self, event_type_name: "str | SynapseEventType", data: dict[str, Any]) -> None:
         """Emit a Synapse event if the bus is available."""
         if not self._event_bus:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
-            et = SynapseEventType(event_type_name)
+            if isinstance(event_type_name, SynapseEventType):
+                et: SynapseEventType = event_type_name
+            else:
+                et = SynapseEventType(event_type_name)
             await self._event_bus.emit(SynapseEvent(
                 event_type=et,
                 data=data,
                 source_system="skia",
             ))
         except Exception as exc:
-            self._log.warning("event_emit_failed", event=event_type_name, error=str(exc))
+            self._log.warning("event_emit_failed", event=str(event_type_name), error=str(exc))

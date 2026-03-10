@@ -5,10 +5,11 @@ Observation executors are Level 1 (ADVISOR autonomy) — they read and analyse
 without modifying world state. They are the lowest-risk executors in the system:
 reversible in the sense that they have no side effects to reverse.
 
-ObserveExecutor  — records an observation to Memory (episodic store)
+ObserveExecutor    — records an observation to Memory (episodic store)
 QueryMemoryExecutor — retrieves information from the Memory system
-AnalyseExecutor  — runs LLM-based analysis on a topic or dataset
-SearchExecutor   — searches external sources (placeholder for future integrations)
+AnalyseExecutor    — runs LLM-based analysis on a topic or dataset
+SearchExecutor     — searches web via WebIntelligenceClient (Brave/SerpAPI/DDG)
+ScrapePageExecutor — fetches a URL, extracts content, stores in Memory
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from systems.axon.types import (
 )
 
 if TYPE_CHECKING:
+    from clients.web_client import WebIntelligenceClient
     from systems.memory.service import MemoryService
 
 logger = structlog.get_logger()
@@ -404,13 +406,15 @@ def _build_analysis_prompt(
 
 class SearchExecutor(Executor):
     """
-    Search internal and external sources for information.
+    Search the web and internal knowledge base for information.
 
     Supports three search modes:
       - "knowledge_base": Hybrid Memory retrieval (semantic + graph)
       - "community_docs": Memory retrieval filtered to community-tagged episodes
-      - "web": LLM-synthesised answer when no Memory results found,
-               or Memory results supplemented with LLM reasoning
+      - "web": Real web search via WebIntelligenceClient (Brave/SerpAPI/DDG),
+               with LLM summarisation of top results.  Memory fallback included.
+
+    Web search stores findings as Memory episodes with source URL attribution.
 
     Required params:
       query (str): The search query.
@@ -418,23 +422,29 @@ class SearchExecutor(Executor):
     Optional params:
       source (str): "web" | "knowledge_base" | "community_docs". Default "knowledge_base".
       max_results (int): Maximum results. Default 5.
+      store_in_memory (bool): Persist web results to Memory. Default True.
     """
 
     action_type = "search"
-    description = "Search internal knowledge and external sources for information"
+    description = "Search the web and internal knowledge base for information"
     required_autonomy = 1
     reversible = False
-    max_duration_ms = 10_000
+    max_duration_ms = 15_000
     rate_limit = RateLimit.per_minute(20)
 
     def __init__(
         self,
-        memory: MemoryService | None = None,
+        memory: "MemoryService | None" = None,
         llm: Any = None,
+        web_client: "WebIntelligenceClient | None" = None,
     ) -> None:
         self._memory = memory
         self._llm = llm
+        self._web: WebIntelligenceClient | None = web_client
         self._logger = logger.bind(system="axon.executor.search")
+
+    def set_web_client(self, web_client: "WebIntelligenceClient") -> None:
+        self._web = web_client
 
     async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         if not params.get("query"):
@@ -456,6 +466,7 @@ class SearchExecutor(Executor):
         query = params["query"]
         source = params.get("source", "knowledge_base")
         max_results = int(params.get("max_results", 5))
+        store_in_memory = bool(params.get("store_in_memory", True))
 
         self._logger.info(
             "search_execute",
@@ -468,7 +479,7 @@ class SearchExecutor(Executor):
         results: list[dict[str, Any]] = []
         observations: list[str] = []
 
-        # --- Phase 1: Memory retrieval (knowledge_base + community_docs) ---
+        # ── Phase 1: Memory retrieval (knowledge_base + community_docs) ───────
         if self._memory is not None and source in ("knowledge_base", "community_docs"):
             try:
                 response = await self._memory.retrieve(
@@ -490,13 +501,43 @@ class SearchExecutor(Executor):
             except Exception as exc:
                 self._logger.warning("search_memory_error", error=str(exc))
 
-        # --- Phase 2: LLM-synthesised search for "web" or empty results ---
-        if source == "web" or (not results and self._llm is not None):
+        # ── Phase 2: Real web search ──────────────────────────────────────────
+        if source == "web" and self._web is not None:
             try:
-                llm_results = await self._llm_search(query, max_results)
+                web_results = await self._web.search_web(query, num_results=max_results)
+                for sr in web_results:
+                    results.append({
+                        "title": sr.title,
+                        "url": sr.url,
+                        "content": sr.snippet[:500],
+                        "source": sr.source,
+                        "salience": 0.6,
+                    })
+                    observations.append(f"[{sr.source}] {sr.title}: {sr.snippet[:150]}")
+
+                # Summarise results with LLM and store in Memory with attribution
+                if web_results and self._llm is not None:
+                    summary = await self._summarise_web_results(query, web_results)
+                    if summary and store_in_memory and self._memory is not None:
+                        source_urls = [r.url for r in web_results[:3]]
+                        await self._store_web_findings(query, summary, source_urls, context)
+                    if summary:
+                        results.insert(0, {
+                            "content": summary[:500],
+                            "source": "llm_summary",
+                            "salience": 0.7,
+                        })
+                        observations.insert(0, f"Summary: {summary[:200]}")
+            except Exception as exc:
+                self._logger.warning("search_web_error", error=str(exc))
+
+        # ── Phase 3: LLM synthesis fallback (web mode, no web client or results) ─
+        if source == "web" and self._web is None and self._llm is not None:
+            try:
+                llm_results = await self._llm_synthesis_search(query, max_results)
                 results.extend(llm_results)
                 for lr in llm_results:
-                    observations.append(f"LLM: {lr['content'][:200]}")
+                    observations.append(f"[llm] {lr['content'][:200]}")
             except Exception as exc:
                 self._logger.warning("search_llm_error", error=str(exc))
 
@@ -512,21 +553,92 @@ class SearchExecutor(Executor):
             new_observations=observations[:max_results],
         )
 
-    async def _llm_search(
+    async def _summarise_web_results(
+        self, query: str, web_results: list[Any]
+    ) -> str:
+        """LLM-summarise top web results relevant to the query (≤300 chars)."""
+        snippets = "\n".join(
+            f"- [{r.title}] ({r.url}): {r.snippet[:200]}"
+            for r in web_results[:5]
+        )
+        prompt = (
+            f"Query: {query}\n\n"
+            f"Search results:\n{snippets}\n\n"
+            f"Write a concise 2-3 sentence summary of the most relevant findings. "
+            f"Be factual. Mention specific names, numbers, or protocols where present."
+        )
+        try:
+            from clients.llm import Message
+
+            resp = await self._llm.generate(
+                system_prompt="You are EOS synthesising web search results. Be concise and factual.",
+                messages=[Message("user", prompt)],
+                max_tokens=300,
+                temperature=0.2,
+                cache_system="axon.search",
+                cache_method="summarise_web",
+            )
+            return resp.text.strip() if hasattr(resp, "text") else str(resp).strip()
+        except Exception as exc:
+            self._logger.debug("search_summarise_error", error=str(exc))
+            return ""
+
+    async def _store_web_findings(
+        self,
+        query: str,
+        summary: str,
+        source_urls: list[str],
+        context: ExecutionContext,
+    ) -> None:
+        """Store web search findings as a Memory episode with source attribution."""
+        try:
+            from datetime import UTC, datetime
+
+            from primitives.common import Modality, SystemID
+            from primitives.percept import Content, Percept, Provenance, SourceDescriptor
+
+            source_desc = SourceDescriptor(
+                system=SystemID.AXON,
+                channel="web_search",
+                modality=Modality.TEXT,
+            )
+            urls_str = ", ".join(source_urls[:3])
+            full_content = (
+                f"Web search for '{query}':\n{summary}\n"
+                f"Sources: {urls_str}"
+            )
+            percept = Percept(
+                source=source_desc,
+                content=Content(raw=full_content),
+                provenance=Provenance(transforms=[]),
+                salience_hint=0.6,
+                metadata={
+                    "web_query": query,
+                    "source_urls": source_urls,
+                    "scraped_at": datetime.now(UTC).isoformat(),
+                    "execution_id": context.execution_id,
+                },
+            )
+            await self._memory.store_percept(
+                percept=percept,
+                salience_composite=0.6,
+                context_summary=f"Web search: {query}",
+            )
+        except Exception as exc:
+            self._logger.debug("search_store_error", error=str(exc))
+
+    async def _llm_synthesis_search(
         self, query: str, max_results: int
     ) -> list[dict[str, Any]]:
-        """Use LLM to synthesise search results from its knowledge."""
-        if self._llm is None:
-            return []
-
+        """LLM synthesis fallback when no web client is available."""
         prompt = (
-            f"You are EOS searching for information. Answer the following query "
-            f"concisely with up to {max_results} distinct facts or findings.\n\n"
+            f"You are EOS searching for information (no live web access available). "
+            f"Answer the following query concisely with up to {max_results} distinct "
+            f"facts or findings from your training knowledge.\n\n"
             f"Query: {query}\n\n"
             f"Respond with numbered points. Be specific and factual. "
-            f"If uncertain, say so."
+            f"Flag any uncertainty."
         )
-
         try:
             from clients.llm import Message
 
@@ -539,29 +651,247 @@ class SearchExecutor(Executor):
                 cache_method="llm_search",
             )
             text = response.text if hasattr(response, "text") else str(response)
-        except (ImportError, AttributeError):
-            # Fallback to evaluate() if generate() unavailable
+        except Exception:
             try:
                 response = await self._llm.evaluate(prompt=prompt, max_tokens=800)
                 text = response.text if hasattr(response, "text") else str(response)
             except Exception:
                 return []
 
-        # Parse numbered results from LLM response
         results: list[dict[str, Any]] = []
         for line in text.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            # Strip leading number/bullet
-            clean = line.lstrip("0123456789.-) ").strip()
+            clean = line.strip().lstrip("0123456789.-) ").strip()
             if clean:
-                results.append({
-                    "content": clean[:500],
-                    "source": "llm",
-                    "salience": 0.3,
-                })
+                results.append({"content": clean[:500], "source": "llm", "salience": 0.3})
                 if len(results) >= max_results:
                     break
-
         return results
+
+
+# ─── ScrapePageExecutor ───────────────────────────────────────────
+
+
+class ScrapePageExecutor(Executor):
+    """
+    Fetch a URL, extract readable content, and optionally store in Memory.
+
+    Respects robots.txt and per-domain rate limits (enforced by WebIntelligenceClient).
+    Will not scrape paywall content or disallowed domains.
+
+    Required params:
+      url (str): The URL to fetch.
+
+    Optional params:
+      extraction_schema (dict): LLM-guided structured extraction schema.
+          Example: {"protocol": "str", "tvl_usd": "float", "apy": "float"}
+      store_in_memory (bool): Persist extracted content to Memory. Default True.
+      render_js (bool): Use Playwright for JS-heavy pages. Default False.
+    """
+
+    action_type = "scrape_page"
+    description = "Fetch a URL and extract content, respecting robots.txt and rate limits"
+    required_autonomy = 1
+    reversible = False
+    max_duration_ms = 20_000
+    rate_limit = RateLimit.per_minute(10)
+
+    def __init__(
+        self,
+        memory: "MemoryService | None" = None,
+        llm: Any = None,
+        web_client: "WebIntelligenceClient | None" = None,
+        event_bus: Any = None,
+    ) -> None:
+        self._memory = memory
+        self._llm = llm
+        self._web: WebIntelligenceClient | None = web_client
+        self._event_bus = event_bus
+        self._logger = logger.bind(system="axon.executor.scrape_page")
+
+    def set_web_client(self, web_client: "WebIntelligenceClient") -> None:
+        self._web = web_client
+
+    def set_event_bus(self, bus: Any) -> None:
+        self._event_bus = bus
+
+    async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
+        url = params.get("url", "").strip()
+        if not url:
+            return ValidationResult.fail("url is required")
+        if not url.startswith(("http://", "https://")):
+            return ValidationResult.fail("url must start with http:// or https://")
+        schema = params.get("extraction_schema")
+        if schema is not None and not isinstance(schema, dict):
+            return ValidationResult.fail("extraction_schema must be a dict")
+        return ValidationResult.ok()
+
+    async def execute(
+        self,
+        params: dict[str, Any],
+        context: ExecutionContext,
+    ) -> ExecutionResult:
+        url = params["url"].strip()
+        extraction_schema: dict[str, Any] | None = params.get("extraction_schema")
+        store_in_memory = bool(params.get("store_in_memory", True))
+        render_js = bool(params.get("render_js", False))
+
+        self._logger.info(
+            "scrape_page_execute",
+            url=url[:100],
+            has_schema=extraction_schema is not None,
+            store=store_in_memory,
+            execution_id=context.execution_id,
+        )
+
+        if self._web is None:
+            return ExecutionResult(
+                success=False,
+                error="WebIntelligenceClient not configured — set ECODIAOS_SEARCH__PROVIDER",
+            )
+
+        # ── robots.txt check ──────────────────────────────────────────────────
+        if not await self._web.check_robots(url):
+            await self._emit_scrape_blocked(url, "robots_txt", 403)
+            return ExecutionResult(
+                success=False,
+                error=f"Blocked by robots.txt: {url}",
+                data={"url": url, "blocked_by": "robots_txt"},
+            )
+
+        # ── Fetch page ────────────────────────────────────────────────────────
+        page = await self._web.fetch_page(url, render_js=render_js)
+
+        if page.status_code == 429:
+            await self._emit_scrape_blocked(url, "rate_limit", 429)
+            return ExecutionResult(
+                success=False,
+                error=f"Rate limit exceeded for domain: {url}",
+                data={"url": url, "blocked_by": "rate_limit"},
+            )
+
+        if page.status_code not in range(200, 300):
+            await self._emit_scrape_blocked(url, "http_error", page.status_code)
+            return ExecutionResult(
+                success=False,
+                error=f"HTTP {page.status_code} fetching {url}",
+                data={"url": url, "status_code": page.status_code},
+            )
+
+        result_data: dict[str, Any] = {
+            "url": url,
+            "title": page.title,
+            "text_length": len(page.text),
+            "content_hash": page.content_hash,
+            "status_code": page.status_code,
+            "fetched_at": page.fetched_at.isoformat(),
+            "text_preview": page.text[:500],
+        }
+
+        # ── Structured extraction ─────────────────────────────────────────────
+        structured: dict[str, Any] = {}
+        if extraction_schema and self._llm is not None:
+            structured = await self._web.extract_structured(url, extraction_schema, self._llm)
+            result_data["structured"] = structured
+
+        # ── Store in Memory ───────────────────────────────────────────────────
+        episode_id: str | None = None
+        if store_in_memory and self._memory is not None and page.text:
+            episode_id = await self._store_page_content(url, page, structured, context)
+            result_data["episode_id"] = episode_id
+
+        observations = [
+            f"Scraped {url}: {page.title or '(no title)'} ({len(page.text)} chars)"
+        ]
+        if structured:
+            observations.append(f"Extracted: {structured}")
+
+        self._logger.info(
+            "scrape_page_ok",
+            url=url[:80],
+            text_len=len(page.text),
+            has_structured=bool(structured),
+            episode_id=episode_id,
+        )
+
+        return ExecutionResult(
+            success=True,
+            data=result_data,
+            new_observations=observations,
+        )
+
+    async def _store_page_content(
+        self,
+        url: str,
+        page: Any,
+        structured: dict[str, Any],
+        context: ExecutionContext,
+    ) -> str | None:
+        """Store page content as a Memory episode with full source attribution."""
+        try:
+            from datetime import UTC, datetime
+
+            from primitives.common import Modality, SystemID
+            from primitives.percept import Content, Percept, Provenance, SourceDescriptor
+
+            source_desc = SourceDescriptor(
+                system=SystemID.AXON,
+                channel="web_scrape",
+                modality=Modality.TEXT,
+            )
+            # Lead with title and URL for retrieval context, then body text
+            content_str = f"[{page.title}] {url}\n\n{page.text[:8_000]}"
+            if structured:
+                import json
+                content_str += f"\n\nExtracted data:\n{json.dumps(structured, indent=2)}"
+
+            percept = Percept(
+                source=source_desc,
+                content=Content(raw=content_str),
+                provenance=Provenance(transforms=[]),
+                salience_hint=0.55,
+                metadata={
+                    "source_url": url,
+                    "page_title": page.title,
+                    "scraped_at": page.fetched_at.isoformat(),
+                    "content_hash": page.content_hash,
+                    "structured_fields": list(structured.keys()) if structured else [],
+                    "execution_id": context.execution_id,
+                },
+            )
+            episode_id = await self._memory.store_percept(
+                percept=percept,
+                salience_composite=0.55,
+                context_summary=f"Web scrape: {page.title or url}",
+            )
+            return episode_id
+        except Exception as exc:
+            self._logger.debug("scrape_store_error", error=str(exc))
+            return None
+
+    async def _emit_scrape_blocked(
+        self, url: str, reason: str, status_code: int
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            import urllib.parse
+            from datetime import UTC, datetime
+
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            domain = urllib.parse.urlparse(url).netloc.lower()
+            await self._event_bus.emit(
+                SynapseEvent(
+                    event_type=SynapseEventType.WEB_SCRAPE_BLOCKED,
+                    source_system="axon",
+                    data={
+                        "url": url,
+                        "domain": domain,
+                        "reason": reason,
+                        "status_code": status_code,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    },
+                )
+            )
+        except Exception as exc:
+            self._logger.debug("scrape_blocked_emit_error", error=str(exc))

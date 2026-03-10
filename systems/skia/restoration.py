@@ -57,6 +57,10 @@ class RestorationOrchestrator:
         attempt = await orchestrator.restore("heartbeat_confirmed_dead")
     """
 
+    # Redis key that stores the deployed shadow worker's endpoint and provider.
+    _SHADOW_WORKER_KEY = "skia:shadow_worker"
+    _SHADOW_WORKER_TTL_S = 86400 * 7  # 7-day TTL — shadow worker should self-renew
+
     def __init__(
         self,
         config: SkiaConfig,
@@ -71,6 +75,8 @@ class RestorationOrchestrator:
         self._infrastructure_dead: bool = False
         # Constitutional genome from the latest snapshot — injected into new instance env.
         self._constitutional_genome: dict[str, Any] | None = None
+        # Shadow worker deployment lock prevents concurrent shadow provisions.
+        self._shadow_deploy_in_progress: bool = False
 
     def set_constitutional_genome(self, genome: dict[str, Any] | None) -> None:
         """Store the constitutional genome to pass to provisioned shadow instances."""
@@ -582,3 +588,407 @@ class RestorationOrchestrator:
                 duration_ms=duration_ms,
                 error=str(exc),
             )
+
+    # ── Shadow Worker ────────────────────────────────────────────────────────
+
+    async def ensure_shadow_worker(self) -> bool:
+        """
+        Ensure a lightweight shadow worker (heartbeat monitor + state restore)
+        is running on a DIFFERENT provider than the main instance.
+
+        Called by SkiaService on startup and periodically (e.g. every 6 hours).
+        If a shadow worker already exists and is reachable, returns True immediately.
+        If not, deploys one using Akash (cheapest, decentralised) or a free-tier
+        Cloud Run service, removing the human dependency for resurrection.
+
+        Returns True if a shadow worker is confirmed deployed, False on failure.
+        """
+        if self._shadow_deploy_in_progress:
+            self._log.debug("shadow_worker_deploy_already_in_progress")
+            return False
+
+        # 1. Check if a shadow worker already exists and is healthy
+        existing = await self._get_shadow_worker_record()
+        if existing:
+            healthy = await self._check_shadow_worker_health(existing.get("endpoint", ""))
+            if healthy:
+                self._log.debug(
+                    "shadow_worker_already_running",
+                    endpoint=existing.get("endpoint", ""),
+                    provider=existing.get("provider", ""),
+                )
+                return True
+            # Existing record but unhealthy — redeploy
+            self._log.warning(
+                "shadow_worker_unhealthy_redeploying",
+                endpoint=existing.get("endpoint", ""),
+            )
+
+        self._shadow_deploy_in_progress = True
+        try:
+            return await self._deploy_shadow_worker()
+        finally:
+            self._shadow_deploy_in_progress = False
+
+    async def _deploy_shadow_worker(self) -> bool:
+        """
+        Deploy the shadow worker on the provider that differs from the main instance.
+
+        Shadow worker requirements are minimal:
+          - heartbeat listener (publishes to Redis pub/sub channel)
+          - state restore capability (reads CID from Redis, provisions main instance)
+          - lightweight: 0.1 CPU, 128Mi memory
+
+        Provider selection: prefer Akash (cheapest, decentralised).
+        Fallback: free-tier Cloud Run on a secondary region/project if configured.
+        """
+        t0 = time.monotonic()
+        self._log.info("shadow_worker_deploying")
+
+        # Try Akash first (different provider from main Cloud Run instance)
+        endpoint = ""
+        provider = ""
+        deployment_id = ""
+
+        try:
+            endpoint, provider, deployment_id = await self._deploy_shadow_akash()
+        except Exception as exc:
+            self._log.warning(
+                "shadow_worker_akash_failed_trying_cloud_run",
+                error=str(exc),
+            )
+            try:
+                endpoint, provider, deployment_id = await self._deploy_shadow_cloud_run()
+            except Exception as exc2:
+                self._log.error(
+                    "shadow_worker_all_providers_failed",
+                    akash_error=str(exc),
+                    cloud_run_error=str(exc2),
+                )
+                return False
+
+        if not endpoint:
+            self._log.error("shadow_worker_deployed_but_no_endpoint")
+            return False
+
+        # Verify the shadow worker is reachable
+        healthy = await self._check_shadow_worker_health(endpoint)
+        if not healthy:
+            self._log.warning(
+                "shadow_worker_deployed_but_not_healthy",
+                endpoint=endpoint,
+                provider=provider,
+            )
+            # Still record it — it may become healthy shortly; next ensure_shadow_worker
+            # call will catch the unhealthy state and redeploy.
+
+        # Persist to Redis so all EOS instances and the next boot can find it
+        await self._persist_shadow_worker_record(
+            endpoint=endpoint,
+            provider=provider,
+            deployment_id=deployment_id,
+        )
+        duration_ms = (time.monotonic() - t0) * 1000
+        self._log.info(
+            "shadow_worker_deployed",
+            endpoint=endpoint,
+            provider=provider,
+            healthy=healthy,
+            duration_ms=round(duration_ms, 1),
+        )
+        return True
+
+    async def _deploy_shadow_akash(self) -> tuple[str, str, str]:
+        """
+        Deploy a minimal skia_worker image to Akash.
+
+        The shadow SDL is a stripped-down version of the main SDL:
+          - 0.1 CPU / 128Mi memory / 512Mi storage
+          - environment: ECODIAOS_STANDALONE=true, CID key, heartbeat config
+          - does NOT restore from CID automatically — only monitors + waits for trigger
+
+        Returns (endpoint, provider_id, deployment_id).
+        """
+        from pathlib import Path
+
+        sdl_path = Path(self._config.akash_sdl_template_path)
+        if not sdl_path.exists():
+            raise FileNotFoundError(f"Akash SDL template not found: {sdl_path}")
+
+        sdl_content = sdl_path.read_text()
+        # Shadow worker uses same image but with standalone mode + minimal resources
+        if self._config.akash_docker_image:
+            sdl_content = sdl_content.replace("${DOCKER_IMAGE}", self._config.akash_docker_image)
+        # Inject shadow-mode env vars; leave restore CID empty (it reads from Redis at restore time)
+        sdl_content = sdl_content.replace("${ECODIAOS_SKIA_RESTORE_CID}", "")
+        sdl_content = sdl_content.replace("${ECODIAOS_CONSTITUTIONAL_GENOME_B64}", "")
+
+        # Override resource spec to minimal shadow worker allocation
+        sdl_content = _patch_sdl_for_shadow(sdl_content)
+
+        async with httpx.AsyncClient(timeout=self._config.akash_deploy_timeout_s) as client:
+            resp = await client.post(
+                f"{self._config.akash_api_url}/v1/deployments",
+                json={
+                    "sdl": sdl_content,
+                    "wallet": self._config.akash_wallet_address,
+                    "env": {
+                        "ECODIAOS_STANDALONE": "true",
+                        "ECODIAOS_SHADOW_WORKER": "true",
+                        "SKIA_CID_REDIS_KEY": self._config.state_cid_redis_key,
+                    },
+                },
+                headers={"Content-Type": "application/json"},
+            )
+            if resp.status_code not in (200, 201, 202):
+                raise RuntimeError(
+                    f"Akash shadow deploy failed: {resp.status_code} {resp.text[:200]}"
+                )
+
+            deploy_data = resp.json()
+            deployment_id = deploy_data.get("deployment_id") or deploy_data.get("id", "")
+            endpoint = deploy_data.get("endpoint", "")
+
+            # Poll for ACTIVE (shorter timeout than full restoration — shadow is lightweight)
+            _SHADOW_TIMEOUT_S = 300.0
+            poll_deadline = time.monotonic() + _SHADOW_TIMEOUT_S
+
+            while time.monotonic() < poll_deadline and deployment_id:
+                status_resp = await client.get(
+                    f"{self._config.akash_api_url}/v1/deployments/{deployment_id}",
+                )
+                if status_resp.status_code == 200:
+                    status_data = status_resp.json()
+                    state = status_data.get("state", "").upper()
+                    endpoint = status_data.get("endpoint", endpoint)
+                    if state == "ACTIVE":
+                        break
+                    if state in ("FAILED", "CLOSED", "REJECTED"):
+                        raise RuntimeError(f"Shadow worker Akash deployment failed: {state}")
+                import asyncio as _asyncio
+                await _asyncio.sleep(15.0)
+
+            return endpoint, "akash", deployment_id
+
+    async def _deploy_shadow_cloud_run(self) -> tuple[str, str, str]:
+        """
+        Deploy shadow worker as a free-tier Cloud Run service in a secondary region.
+
+        Uses the same GCP credentials but targets a different service name
+        (appended with "-shadow") and region to provide geographic redundancy.
+        Returns (endpoint, provider_id, service_url).
+        """
+        import base64
+        import json
+        from datetime import UTC, datetime, timedelta
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        if not self._config.gcp_project_id or not self._config.gcp_service_account_key_b64:
+            raise RuntimeError("GCP not configured — cannot deploy Cloud Run shadow worker")
+
+        key_json = base64.b64decode(self._config.gcp_service_account_key_b64)
+        sa_info = json.loads(key_json)
+        now = datetime.now(UTC)
+        payload = {
+            "iss": sa_info["client_email"],
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token",
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(hours=1)).timestamp()),
+        }
+        header = {"alg": "RS256", "typ": "JWT"}
+        segments = [
+            base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"="),
+            base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"="),
+        ]
+        signing_input = b".".join(segments)
+        private_key = serialization.load_pem_private_key(sa_info["private_key"].encode(), password=None)
+        signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())  # type: ignore[union-attr]
+        segments.append(base64.urlsafe_b64encode(signature).rstrip(b"="))
+        assertion = b".".join(segments).decode()
+
+        # Shadow Cloud Run is deployed in a *different* region from the main instance
+        # to provide geographic redundancy.  We use us-central1 as universal fallback.
+        shadow_region = _pick_shadow_region(self._config.gcp_region)
+        shadow_service = f"{self._config.gcp_service_name}-shadow"
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            token_resp = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+            )
+            if token_resp.status_code != 200:
+                raise RuntimeError(f"GCP token failed: {token_resp.text[:200]}")
+            access_token = token_resp.json()["access_token"]
+
+            base_url = f"https://run.googleapis.com/v2/projects/{self._config.gcp_project_id}/locations"
+            main_url = f"{base_url}/{self._config.gcp_region}/services/{self._config.gcp_service_name}"
+
+            # Read main service definition to clone structure
+            main_resp = await client.get(main_url, headers={"Authorization": f"Bearer {access_token}"})
+            if main_resp.status_code != 200:
+                raise RuntimeError(f"Cannot read main Cloud Run service: {main_resp.status_code}")
+
+            service_def = main_resp.json()
+
+            # Strip identity + override with shadow-specific env vars
+            containers = (
+                service_def.get("template", {}).get("template", {}).get("containers", [])
+            )
+            if containers:
+                env_vars = [
+                    e for e in containers[0].get("env", [])
+                    if e.get("name") not in ("ECODIAOS_SKIA_RESTORE_CID", "ECODIAOS_MIGRATION_ID")
+                ]
+                env_vars.extend([
+                    {"name": "ECODIAOS_STANDALONE", "value": "true"},
+                    {"name": "ECODIAOS_SHADOW_WORKER", "value": "true"},
+                    {"name": "SKIA_CID_REDIS_KEY", "value": self._config.state_cid_redis_key},
+                ])
+                # Limit resources: min instances = 0, max = 1 (free tier)
+                containers[0]["env"] = env_vars
+                if "resources" in containers[0]:
+                    containers[0]["resources"]["limits"] = {"cpu": "1", "memory": "256Mi"}
+
+            service_def["name"] = f"projects/{self._config.gcp_project_id}/locations/{shadow_region}/services/{shadow_service}"
+
+            shadow_url = f"{base_url}/{shadow_region}/services"
+            create_resp = await client.post(
+                shadow_url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                params={"serviceId": shadow_service},
+                content=__import__("orjson").dumps(service_def).decode(),
+            )
+            if create_resp.status_code not in (200, 201):
+                # Service may already exist — try PATCH
+                patch_url = f"{base_url}/{shadow_region}/services/{shadow_service}"
+                patch_resp = await client.patch(
+                    patch_url,
+                    headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                    content=__import__("orjson").dumps(service_def).decode(),
+                )
+                if patch_resp.status_code not in (200, 201):
+                    raise RuntimeError(
+                        f"Cloud Run shadow deploy failed: {patch_resp.status_code} {patch_resp.text[:200]}"
+                    )
+                service_data = patch_resp.json()
+            else:
+                service_data = create_resp.json()
+
+            endpoint = service_data.get("uri") or service_data.get("status", {}).get("url", "")
+            return endpoint, "gcp_shadow", shadow_service
+
+    # ── Shadow Worker Health Check ─────────────────────────────────────────────
+
+    async def _check_shadow_worker_health(self, endpoint: str) -> bool:
+        """Ping the shadow worker's health endpoint. Returns True if reachable."""
+        if not endpoint:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(endpoint.rstrip("/") + "/health")
+                return resp.status_code == 200
+        except Exception:
+            return False
+
+    # ── Shadow Worker Redis Record ────────────────────────────────────────────
+
+    async def _persist_shadow_worker_record(
+        self,
+        endpoint: str,
+        provider: str,
+        deployment_id: str,
+    ) -> None:
+        """Store shadow worker metadata in Redis for discovery on reboot."""
+        try:
+            raw = self._redis.client
+            import orjson
+            data = orjson.dumps({
+                "endpoint": endpoint,
+                "provider": provider,
+                "deployment_id": deployment_id,
+                "deployed_at": time.time(),
+            })
+            await raw.set(f"eos:{self._SHADOW_WORKER_KEY}", data, ex=self._SHADOW_WORKER_TTL_S)
+        except Exception as exc:
+            self._log.warning("shadow_worker_record_persist_failed", error=str(exc))
+
+    async def _get_shadow_worker_record(self) -> dict[str, Any] | None:
+        """Retrieve shadow worker metadata from Redis."""
+        try:
+            raw = self._redis.client
+            data = await raw.get(f"eos:{self._SHADOW_WORKER_KEY}")
+            if data is None:
+                return None
+            import orjson
+            return orjson.loads(data)
+        except Exception:
+            return None
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+
+def _patch_sdl_for_shadow(sdl_content: str) -> str:
+    """
+    Downscale an Akash SDL template to shadow-worker resource levels.
+
+    Replaces common resource spec patterns with minimal values so the shadow
+    worker stays within free-tier / cheap-tier Akash resource units.
+    This is a best-effort string-level patch — operators should maintain a
+    dedicated shadow SDL template at config/skia/akash_shadow_sdl_template.yaml
+    for production use.
+    """
+    import re
+
+    # Downscale CPU: any "units: X" > 0.5 → 0.1
+    def _clamp_cpu(m: re.Match[str]) -> str:
+        raw = m.group(1).strip()
+        try:
+            val = float(raw)
+        except ValueError:
+            return m.group(0)
+        return f"units: {min(val, 0.1)}"
+
+    sdl_content = re.sub(r"units:\s*([\d.]+)", _clamp_cpu, sdl_content)
+
+    # Downscale memory: any "size: XGi/XMi" > 128Mi → 128Mi
+    def _clamp_memory(m: re.Match[str]) -> str:
+        raw = m.group(1)
+        if raw.endswith("Gi"):
+            return "size: 128Mi"
+        try:
+            mib = int(raw.replace("Mi", "").replace("M", ""))
+            return f"size: {min(mib, 128)}Mi"
+        except ValueError:
+            return m.group(0)
+
+    sdl_content = re.sub(r"size:\s*([\d]+(?:Gi|Mi|M))", _clamp_memory, sdl_content)
+    return sdl_content
+
+
+def _pick_shadow_region(main_region: str) -> str:
+    """
+    Return a Cloud Run region that differs from the main instance region.
+
+    Provides geographic redundancy: the shadow worker is never co-located
+    with the main instance in the same region.
+    """
+    _FALLBACK_CHAIN: dict[str, str] = {
+        "australia-southeast1": "us-central1",
+        "australia-southeast2": "us-central1",
+        "us-central1": "europe-west1",
+        "us-east1": "europe-west1",
+        "us-west1": "europe-west1",
+        "europe-west1": "us-central1",
+        "europe-west2": "us-central1",
+        "europe-west3": "us-central1",
+        "asia-northeast1": "us-central1",
+        "asia-southeast1": "us-central1",
+    }
+    return _FALLBACK_CHAIN.get(main_region, "us-central1")

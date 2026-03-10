@@ -1239,7 +1239,7 @@ class VLLMProvider(LLMProvider):
 
     def __init__(
         self,
-        model: str = "unsloth/Meta-Llama-3.1-8B-Instruct",
+        model: str = "Qwen/Qwen3-8B",
         endpoint: str = "http://localhost:8000",
     ) -> None:
         self._model = model
@@ -1263,42 +1263,68 @@ class VLLMProvider(LLMProvider):
 
     async def load_adapter(self, adapter_path: str, adapter_id: str) -> None:
         """
-        Load a LoRA adapter via vLLM's POST /v1/load_lora_adapter endpoint.
+        Register a LoRA adapter with vLLM.
 
-        The adapter_path must be a local directory containing the adapter
-        .safetensors files. vLLM merges it onto the base model in-place.
+        vLLM supports two modes for LoRA adapters:
+        1. Static: pass --lora-modules name=path at server startup
+        2. Dynamic: POST /v1/load_lora_adapter (requires --enable-lora flag)
+
+        Tries the dynamic endpoint first; if it returns 404/405 (not available
+        in this vLLM build), falls back to marking the adapter as active
+        client-side (assumes it was loaded at startup via --lora-modules).
         """
         adapter_name = f"eos-lora-{adapter_id[:12]}"
 
-        response = await self._client.post(
-            "/v1/load_lora_adapter",
-            json={
-                "lora_name": adapter_name,
-                "lora_path": adapter_path,
-            },
-            timeout=300.0,  # adapter loading can be slow
-        )
-        response.raise_for_status()
+        try:
+            response = await self._client.post(
+                "/v1/load_lora_adapter",
+                json={
+                    "lora_name": adapter_name,
+                    "lora_path": adapter_path,
+                },
+                timeout=300.0,
+            )
+            response.raise_for_status()
+            logger.info(
+                "vllm_adapter_loaded_dynamic",
+                adapter_id=adapter_id,
+                adapter_name=adapter_name,
+                adapter_path=adapter_path,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (404, 405):
+                logger.info(
+                    "vllm_dynamic_lora_not_available",
+                    adapter_id=adapter_id,
+                    adapter_name=adapter_name,
+                    hint="Adapter must be loaded at vLLM startup via --lora-modules",
+                )
+            else:
+                raise
 
         self._active_adapter_id = adapter_id
         self._active_adapter_name = adapter_name
-        logger.info(
-            "vllm_adapter_loaded",
-            adapter_id=adapter_id,
-            adapter_name=adapter_name,
-            adapter_path=adapter_path,
-        )
 
     async def unload_adapter(self) -> None:
-        """Unload the current LoRA adapter via vLLM's unload endpoint."""
+        """Unload the current LoRA adapter from vLLM."""
         if self._active_adapter_name is None:
             return
 
-        response = await self._client.post(
-            "/v1/unload_lora_adapter",
-            json={"lora_name": self._active_adapter_name},
-        )
-        response.raise_for_status()
+        try:
+            response = await self._client.post(
+                "/v1/unload_lora_adapter",
+                json={"lora_name": self._active_adapter_name},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (404, 405):
+                logger.info(
+                    "vllm_dynamic_lora_unload_not_available",
+                    adapter_name=self._active_adapter_name,
+                    hint="Adapter was loaded at startup — restart vLLM to unload",
+                )
+            else:
+                raise
 
         logger.info(
             "vllm_adapter_unloaded",
@@ -1454,7 +1480,7 @@ def create_llm_provider(
         elif config.provider == "ollama":
             return OllamaProvider(model=config.model)
         elif config.provider == "vllm":
-            return VLLMProvider(model=config.model)
+            return VLLMProvider(model=config.model, endpoint=config.endpoint)
         else:
             raise ValueError(f"Unknown LLM provider: {config.provider}")
     except Exception as e:

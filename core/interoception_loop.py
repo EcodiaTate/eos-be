@@ -18,6 +18,7 @@ import structlog
 
 if TYPE_CHECKING:
     from systems.soma.service import SomaService
+    from systems.synapse.bus import EventBus
     from telemetry.log_analyzer import LogAnalyzer
 
 logger = structlog.get_logger()
@@ -27,6 +28,7 @@ async def interoception_loop(
     soma: SomaService,
     analyzer: LogAnalyzer,
     poll_interval_s: float = 10.0,
+    event_bus: EventBus | None = None,
 ) -> None:
     """
     Periodically query log analyzer and inject signals into Soma.
@@ -59,7 +61,7 @@ async def interoception_loop(
                         value=signal.get("value"),
                     )
 
-                # Log if organism is under high pressure
+                # Log if organism is under high pressure; emit bus alerts
                 high_severity = [
                     s for s in signals
                     if s.get("severity") in ("critical", "high")
@@ -70,6 +72,8 @@ async def interoception_loop(
                         signal_count=len(high_severity),
                         signals=[s.get("signal_type") for s in high_severity],
                     )
+                    if event_bus is not None:
+                        await _emit_interoceptive_alerts(event_bus, high_severity)
 
             except Exception as exc:
                 bound_logger.warning(
@@ -134,3 +138,38 @@ def _inject_signal(soma: SomaService, signal: dict[str, Any]) -> None:
         latency_ms=None,
         payload=payload,
     )
+
+
+async def _emit_interoceptive_alerts(
+    event_bus: EventBus,
+    high_severity_signals: list[dict[str, Any]],
+) -> None:
+    """Emit INTEROCEPTIVE_ALERT on the Synapse bus for each high-severity signal."""
+    try:
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        # Map signal_type to alert_type keys that Synapse's interoception cache understands
+        _alert_type_map = {
+            "error_rate": "error_rate",
+            "cascade_pressure": "cascade",
+            "latency_pressure": "latency",
+        }
+
+        for sig in high_severity_signals:
+            signal_type = sig.get("signal_type", "unknown")
+            alert_type = _alert_type_map.get(signal_type, signal_type)
+            await event_bus.emit(
+                SynapseEvent(
+                    event_type=SynapseEventType.INTEROCEPTIVE_ALERT,
+                    source_system="interoception",
+                    data={
+                        "alert_type": alert_type,
+                        "severity": sig.get("severity", "high"),
+                        "value": sig.get("value", 0),
+                        "signal_type": signal_type,
+                        "interpretation": sig.get("interpretation", ""),
+                    },
+                )
+            )
+    except Exception as exc:
+        logger.debug("interoceptive_alert_emit_failed", error=str(exc))

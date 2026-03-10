@@ -89,6 +89,9 @@ class IncrementalVerificationEngine:
         self._reverse_deps: dict[str, set[str]] | None = None
         # MVCC version counter
         self._mvcc_version: int = 0
+        # Inherited Dafny spec hashes from parent genome (one-time boot optimization).
+        # Maps spec path → content hash.  Cleared after first full verification cycle.
+        self._inherited_spec_hashes: dict[str, str] | None = None
 
     # ─── Public API ──────────────────────────────────────────────────────────
 
@@ -175,6 +178,33 @@ class IncrementalVerificationEngine:
             # Cache miss or stale — need re-verification
             invalidated_names.append(func_key)
 
+            # Check if this spec was already verified by the parent organism.
+            # If the content hash matches an inherited hash, skip verification
+            # and treat as pre-verified (one-time boot optimization).
+            if (
+                self._inherited_spec_hashes is not None
+                and sig.content_hash
+                and self._inherited_spec_hashes.get(sig.file_path) == sig.content_hash
+            ):
+                self._log.debug(
+                    "verification_skipped_inherited_from_parent",
+                    function=func_key,
+                    file_path=sig.file_path,
+                    content_hash=sig.content_hash,
+                )
+                pre_verified = CachedVerificationResult(
+                    signature=sig,
+                    formal_verification=None,
+                    test_passed=True,
+                    static_analysis_clean=True,
+                    ttl_seconds=self._hot_ttl,
+                    version_id=version,
+                )
+                results.append(pre_verified)
+                early_cutoffs += 1
+                await self._store_cached(func_key, pre_verified)
+                continue
+
             if formal_verifier is not None:
                 try:
                     fv_result = await formal_verifier(
@@ -235,6 +265,15 @@ class IncrementalVerificationEngine:
             time_ms=total_time_ms,
         )
 
+        # Clear inherited spec hashes after first full verification cycle
+        # (one-time boot optimization — no longer needed after initial run).
+        if self._inherited_spec_hashes is not None:
+            self._log.info(
+                "inherited_spec_hashes_cleared",
+                count=len(self._inherited_spec_hashes),
+            )
+            self._inherited_spec_hashes = None
+
         return result
 
     async def invalidate_for_files(self, files: list[str]) -> int:
@@ -263,6 +302,21 @@ class IncrementalVerificationEngine:
         assert self._dep_graph is not None
         return len(self._dep_graph)
 
+    def seed_inherited_hashes(self, hashes: dict[str, str]) -> None:
+        """
+        Accept Dafny spec content hashes inherited from parent genome.
+
+        During the first verification cycle, specs whose content hash matches
+        an inherited hash are skipped (pre-verified).  The inherited hashes are
+        cleared after the first ``verify_incremental`` call completes.
+        """
+        if hashes:
+            self._inherited_spec_hashes = dict(hashes)
+            self._log.info(
+                "inherited_spec_hashes_loaded",
+                count=len(hashes),
+            )
+
     def get_stats(self) -> dict[str, Any]:
         """Return current incremental engine statistics."""
         return {
@@ -271,6 +325,7 @@ class IncrementalVerificationEngine:
             "hot_ttl_seconds": self._hot_ttl,
             "has_redis": self._redis is not None,
             "has_neo4j": self._neo4j is not None,
+            "inherited_spec_hashes": len(self._inherited_spec_hashes) if self._inherited_spec_hashes else 0,
         }
 
     # ─── Dependency Graph ────────────────────────────────────────────────────

@@ -16,6 +16,7 @@ is used instead, which must complete in ≤100ms.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import random
 import time
@@ -68,6 +69,7 @@ class BasePolicyGenerator(ABC):
         beliefs: BeliefState,
         affect: AffectState,
         memory_traces: list[dict[str, Any]] | None = None,
+        causal_laws_summary: str = "",
     ) -> list[Policy]:
         """
         Generate 2-5 candidate policies for achieving *goal*.
@@ -620,108 +622,193 @@ def procedure_to_policy(procedure: dict[str, Any]) -> Policy:
 
 # ─── Thompson Sampler ─────────────────────────────────────────────
 #
-# Beta-Bernoulli conjugate model for routing slow-path deliberation between
-# the Claude API (incumbent) and the local RE (Reasoning Engine).
+# N-armed Beta-Bernoulli bandit for routing slow-path deliberation across
+# an arbitrary set of LLM providers (Claude, RE/vLLM, Ollama, Bedrock, …).
 #
-# Each model is represented by a Beta distribution: B(alpha, beta).
-# A sample is drawn per decision; the model with the higher sample wins.
-# Successes increment alpha; failures increment beta.
+# Each provider is an "arm" represented by Beta(alpha, beta). A sample is
+# drawn per decision; the arm with the highest sample wins. Arms can be
+# added at runtime (register_arm), enabled/disabled (set_arm_ready), and
+# their outcomes recorded (record_outcome).
+#
+# Backward-compat: "claude" and "re" are the two default arms.
+# set_re_ready(ready) is preserved as a convenience alias for
+# set_arm_ready("re", ready).
+#
 # State is persisted to Redis key nova:thompson_sampler so the organism
 # remembers routing history across restarts.
-#
-# RE routing is gated behind _re_ready: the sampler only considers the RE
-# once the RE signals readiness (set_re_ready(True)). Until then, Claude
-# always wins regardless of the sample.
+
+
+@dataclasses.dataclass
+class ProviderMeta:
+    """Metadata and Beta-distribution params for a single provider arm."""
+
+    alpha: float = 1.0
+    beta: float = 1.0
+    ready: bool = False
+    cost_per_token: float = 0.0       # USD per output token (0 = local/free)
+    latency_estimate_ms: float = 2000.0
+    capability_tags: list[str] = dataclasses.field(default_factory=list)
 
 
 class ThompsonSampler:
     """
-    Beta-Bernoulli Thompson sampler for Claude ↔ RE routing.
+    N-armed Beta-Bernoulli Thompson sampler for LLM provider routing.
 
-    Gap 3 — replaces unconditional Claude API calls in PolicyGenerator
-    with a data-driven multi-armed bandit.  The organism's planning quality
-    improves over time as the RE earns trust through demonstrated outcomes.
+    Generalises the original Claude ↔ RE binary sampler to support any
+    number of provider arms with dynamic registration, readiness gating,
+    and runtime discovery.  Backward-compatible with all existing callers.
     """
 
     REDIS_KEY = "nova:thompson_sampler"
 
     def __init__(self) -> None:
-        # Beta distribution params for each model: {alpha, beta}
-        # Prior: Beta(1, 1) = uniform (no preference)
-        self._alpha: dict[str, float] = {"claude": 1.0, "re": 1.0}
-        self._beta: dict[str, float] = {"claude": 1.0, "re": 1.0}
-        self._re_ready: bool = False
+        self._arms: dict[str, ProviderMeta] = {}
         self._logger = logger.bind(system="nova.thompson_sampler")
+        # Register the two canonical arms (claude always ready, re starts not-ready)
+        self.register_arm("claude", prior_alpha=1.0, prior_beta=1.0, ready=True)
+        self.register_arm("re", prior_alpha=1.0, prior_beta=1.0, ready=False)
+
+    # ── Arm management ────────────────────────────────────────────────
+
+    def register_arm(
+        self,
+        name: str,
+        prior_alpha: float = 1.0,
+        prior_beta: float = 1.0,
+        ready: bool = False,
+        cost_per_token: float = 0.0,
+        latency_estimate_ms: float = 2000.0,
+        capability_tags: list[str] | None = None,
+    ) -> None:
+        """Register a new provider arm (idempotent — existing arms are preserved)."""
+        if name in self._arms:
+            # Only update readiness; preserve accumulated Beta params.
+            self._arms[name].ready = ready
+            return
+        self._arms[name] = ProviderMeta(
+            alpha=prior_alpha,
+            beta=prior_beta,
+            ready=ready,
+            cost_per_token=cost_per_token,
+            latency_estimate_ms=latency_estimate_ms,
+            capability_tags=capability_tags or [],
+        )
+        self._logger.info("thompson_arm_registered", name=name, ready=ready)
+
+    def set_arm_ready(self, name: str, ready: bool) -> None:
+        """Mark a provider arm as available (True) or unavailable (False)."""
+        if name in self._arms:
+            self._arms[name].ready = ready
+            self._logger.info("thompson_arm_readiness", name=name, ready=ready)
 
     def set_re_ready(self, ready: bool) -> None:
-        """Signal that the RE is available for routing."""
-        self._re_ready = ready
+        """Backward-compat alias for set_arm_ready('re', ready)."""
+        self.set_arm_ready("re", ready)
+
+    # ── Sampling ──────────────────────────────────────────────────────
 
     def sample(self) -> str:
         """
-        Draw a sample from each model's Beta distribution.
-        Returns 're' or 'claude' — the winner routes the next slow-path call.
+        Draw a Beta sample for every ready arm and return the winner.
+
+        Falls back to 'claude' when no other arm is ready (claude is always
+        registered and ready by default).
         """
-        if not self._re_ready:
+        ready_arms = {n: m for n, m in self._arms.items() if m.ready}
+        if not ready_arms:
             return "claude"
-        claude_sample = random.betavariate(self._alpha["claude"], self._beta["claude"])
-        re_sample = random.betavariate(self._alpha["re"], self._beta["re"])
-        winner = "re" if re_sample > claude_sample else "claude"
+        if len(ready_arms) == 1:
+            return next(iter(ready_arms))
+
+        samples = {
+            name: random.betavariate(meta.alpha, meta.beta)
+            for name, meta in ready_arms.items()
+        }
+        winner = max(samples, key=lambda k: samples[k])
         self._logger.debug(
             "thompson_sample",
-            claude=round(claude_sample, 4),
-            re=round(re_sample, 4),
+            samples={k: round(v, 4) for k, v in samples.items()},
             winner=winner,
         )
         return winner
 
+    def sample_ranked(self) -> list[str]:
+        """
+        Return all ready arms ranked by their Beta draw (best first).
+
+        Used by the fallback chain: try the winner; on failure, try next, etc.
+        """
+        ready_arms = {n: m for n, m in self._arms.items() if m.ready}
+        if not ready_arms:
+            return ["claude"]
+        samples = {
+            name: random.betavariate(meta.alpha, meta.beta)
+            for name, meta in ready_arms.items()
+        }
+        return sorted(samples, key=lambda k: samples[k], reverse=True)
+
+    # ── Outcome recording ─────────────────────────────────────────────
+
     def record_outcome(self, model: str, success: bool) -> None:
         """Update Beta params based on observed outcome."""
-        if model not in self._alpha:
+        if model not in self._arms:
             return
         if success:
-            self._alpha[model] += 1.0
+            self._arms[model].alpha += 1.0
         else:
-            self._beta[model] += 1.0
+            self._arms[model].beta += 1.0
+
+    # ── Introspection ─────────────────────────────────────────────────
 
     def get_success_rate(self, model: str = "re") -> float:
         """Return current expected success rate (Beta mean) for a model.
 
         Defaults to "re" — used by the safety layer to write eos:re:success_rate_7d.
-        Called by Nova service after each RE-routed outcome to update Redis.
         """
-        alpha = self._alpha.get(model, 1.0)
-        beta = self._beta.get(model, 1.0)
-        return alpha / (alpha + beta)
+        meta = self._arms.get(model)
+        if meta is None:
+            return 0.5
+        return meta.alpha / (meta.alpha + meta.beta)
+
+    @property
+    def means(self) -> dict[str, float]:
+        """Current mean of each arm's Beta distribution (expected success rate)."""
+        return {
+            name: meta.alpha / (meta.alpha + meta.beta)
+            for name, meta in self._arms.items()
+        }
+
+    # ── Redis persistence ─────────────────────────────────────────────
 
     async def load_from_redis(self, redis: Any) -> None:
         """Restore sampler state from Redis (call on startup)."""
         try:
             raw = await redis.hgetall(self.REDIS_KEY)
-            if raw:
-                self._alpha["claude"] = float(raw.get("claude_alpha", 1.0))
-                self._beta["claude"] = float(raw.get("claude_beta", 1.0))
-                self._alpha["re"] = float(raw.get("re_alpha", 1.0))
-                self._beta["re"] = float(raw.get("re_beta", 1.0))
-                self._logger.info(
-                    "thompson_sampler_restored",
-                    claude_alpha=self._alpha["claude"],
-                    claude_beta=self._beta["claude"],
-                    re_alpha=self._alpha["re"],
-                    re_beta=self._beta["re"],
-                )
+            if not raw:
+                return
+            # Generic N-arm keys: "{name}_alpha" / "{name}_beta"
+            for name, meta in self._arms.items():
+                alpha_key = f"{name}_alpha"
+                beta_key = f"{name}_beta"
+                if alpha_key in raw:
+                    meta.alpha = float(raw[alpha_key])
+                if beta_key in raw:
+                    meta.beta = float(raw[beta_key])
+            self._logger.info(
+                "thompson_sampler_restored",
+                arms={n: round(m.alpha / (m.alpha + m.beta), 4) for n, m in self._arms.items()},
+            )
         except Exception as exc:
             self._logger.debug("thompson_sampler_load_failed", error=str(exc))
 
     async def persist_to_redis(self, redis: Any) -> None:
-        """Persist sampler state and RE success rate to Redis (fire-and-forget)."""
+        """Persist all arm states and RE success rate to Redis (fire-and-forget)."""
         try:
-            await redis.hset(self.REDIS_KEY, mapping={
-                "claude_alpha": str(self._alpha["claude"]),
-                "claude_beta": str(self._beta["claude"]),
-                "re_alpha": str(self._alpha["re"]),
-                "re_beta": str(self._beta["re"]),
-            })
+            mapping: dict[str, str] = {}
+            for name, meta in self._arms.items():
+                mapping[f"{name}_alpha"] = str(meta.alpha)
+                mapping[f"{name}_beta"] = str(meta.beta)
+            await redis.hset(self.REDIS_KEY, mapping=mapping)
             # Write RE success rate to canonical keys consumed by:
             #   - ContinualLearningOrchestrator (degradation trigger + kill switch)
             #   - RESuccessRateMonitor (Tier 2 safety kill switch)
@@ -732,13 +819,85 @@ class ThompsonSampler:
         except Exception as exc:
             self._logger.debug("thompson_sampler_persist_failed", error=str(exc))
 
-    @property
-    def means(self) -> dict[str, float]:
-        """Current mean of each model's Beta distribution (expected success rate)."""
-        return {
-            model: self._alpha[model] / (self._alpha[model] + self._beta[model])
-            for model in self._alpha
-        }
+
+# ─── Provider Health Monitor ───────────────────────────────────────
+#
+# Tracks per-provider health signals (consecutive failures, latency EMA).
+# Removes arms from rotation on 3 consecutive failures and re-enables them
+# after a lightweight periodic probe succeeds.  This means if vLLM dies
+# the organism automatically routes to Claude; when vLLM recovers it
+# automatically returns — no operator intervention required.
+
+
+class ProviderHealthMonitor:
+    """
+    Autonomous health tracking for registered LLM provider arms.
+
+    Wired into PolicyGenerator.generate_candidates() — every call outcome
+    is reported here.  The monitor gates arms in/out of the Thompson
+    sampler based on observed reliability.
+    """
+
+    FAILURE_THRESHOLD = 3           # consecutive failures before arm disabled
+    PROBE_INTERVAL_CYCLES = 100     # cycles between re-enabling probes for downed arms
+
+    def __init__(self, sampler: ThompsonSampler) -> None:
+        self._sampler = sampler
+        self._consecutive_failures: dict[str, int] = {}
+        self._latency_ema: dict[str, float] = {}   # ms
+        self._cycle_counter: int = 0
+        self._logger = logger.bind(system="nova.provider_health")
+
+    def record_call(self, provider: str, success: bool, latency_ms: float) -> None:
+        """
+        Record an actual provider call outcome.
+
+        On FAILURE_THRESHOLD consecutive failures the arm is disabled.
+        On any success the consecutive failure counter resets.
+        """
+        if success:
+            self._consecutive_failures[provider] = 0
+            # EMA latency (α=0.2)
+            prev = self._latency_ema.get(provider, latency_ms)
+            self._latency_ema[provider] = 0.8 * prev + 0.2 * latency_ms
+        else:
+            count = self._consecutive_failures.get(provider, 0) + 1
+            self._consecutive_failures[provider] = count
+            if count >= self.FAILURE_THRESHOLD:
+                self._sampler.set_arm_ready(provider, False)
+                self._logger.warning(
+                    "provider_arm_disabled",
+                    provider=provider,
+                    consecutive_failures=count,
+                )
+
+    def on_cycle(self) -> list[str]:
+        """
+        Called once per policy-generation cycle.
+
+        Every PROBE_INTERVAL_CYCLES, returns a list of downed arm names
+        that callers should probe.  On probe success, callers should call
+        re_enable(provider).
+        """
+        self._cycle_counter += 1
+        if self._cycle_counter % self.PROBE_INTERVAL_CYCLES != 0:
+            return []
+        downed = [
+            name
+            for name, meta in self._sampler._arms.items()
+            if not meta.ready and name != "claude"   # claude is never downed
+        ]
+        return downed
+
+    def re_enable(self, provider: str) -> None:
+        """Re-enable a downed arm after a successful health probe."""
+        self._consecutive_failures[provider] = 0
+        self._sampler.set_arm_ready(provider, True)
+        self._logger.info("provider_arm_re_enabled", provider=provider)
+
+    def get_latency_ema(self, provider: str) -> float | None:
+        """Return latency EMA in ms for a provider, or None if unknown."""
+        return self._latency_ema.get(provider)
 
 
 # ─── Policy Generator ─────────────────────────────────────────────
@@ -771,15 +930,78 @@ class PolicyGenerator(BasePolicyGenerator):
         self._max_policies = max_policies
         self._timeout_ms = timeout_ms
         self._logger = logger.bind(system="nova.policy_generator")
-        # Thompson sampler for Claude ↔ RE routing (Gap 3)
+        # N-armed Thompson sampler for provider routing
         self._sampler: ThompsonSampler = thompson_sampler or ThompsonSampler()
-        # RE client — when set and re_ready, the sampler may route here
+        # Health monitor — tracks consecutive failures and latency EMA per arm
+        self._health_monitor: ProviderHealthMonitor = ProviderHealthMonitor(self._sampler)
+        # RE client — the local vLLM reasoning engine (arm="re")
         self._re_client: Any = re_client
+        # Dynamic clients for arms beyond "claude" and "re"
+        # key: arm_name, value: object with .generate() matching LLMProvider interface
+        self._extra_clients: dict[str, Any] = {}
+        # Synapse reference — needed to emit REASONING_CAPABILITY_DEGRADED
+        self._synapse: Any = None
+        # ActionTypeRegistry — runtime list of action types for LLM prompts.
+        # None until NovaService wires it via set_action_type_registry().
+        # When None, falls back to the static AVAILABLE_ACTION_TYPES list.
+        self._action_type_registry: Any = None
         # Configurable bounty template params (learned by Simula via ADJUST_BUDGET)
         self._bounty_min_reward_usd: float = bounty_min_reward_usd
         self._bounty_max_candidates: int = bounty_max_candidates
         # Patch the module-level bounty template so fast-path also uses configured values
         self._patch_bounty_template(bounty_min_reward_usd, bounty_max_candidates)
+
+    def set_synapse(self, synapse: Any) -> None:
+        """Wire Synapse so REASONING_CAPABILITY_DEGRADED can be emitted."""
+        self._synapse = synapse
+
+    def set_action_type_registry(self, registry: Any) -> None:
+        """
+        Wire the ActionTypeRegistry so generate_candidates() reads from the
+        live registry instead of the static AVAILABLE_ACTION_TYPES list.
+
+        Called by NovaService after creating both objects during initialize().
+        """
+        self._action_type_registry = registry
+
+    def register_provider(
+        self,
+        name: str,
+        client: Any,
+        ready: bool = True,
+        cost_per_token: float = 0.0,
+        latency_estimate_ms: float = 2000.0,
+        capability_tags: list[str] | None = None,
+    ) -> None:
+        """
+        Register a dynamic provider arm at runtime.
+
+        Call this when a new vLLM endpoint comes online, Ollama is available
+        locally, or Evo proposes a new substrate.  The arm is immediately
+        eligible for Thompson sampling.
+
+        Args:
+            name: Unique arm identifier (e.g. "re_v2", "ollama_local").
+            client: Object with .generate() matching LLMProvider interface.
+            ready: Whether the arm is immediately available for routing.
+            cost_per_token: USD per output token (0 for local/free providers).
+            latency_estimate_ms: Expected latency hint for observability.
+            capability_tags: Metadata tags (e.g. ["code", "math"]).
+        """
+        self._extra_clients[name] = client
+        self._sampler.register_arm(
+            name,
+            ready=ready,
+            cost_per_token=cost_per_token,
+            latency_estimate_ms=latency_estimate_ms,
+            capability_tags=capability_tags or [],
+        )
+        self._logger.info(
+            "dynamic_provider_registered",
+            name=name,
+            ready=ready,
+            cost_per_token=cost_per_token,
+        )
 
     @staticmethod
     def _patch_bounty_template(min_reward_usd: float, max_candidates: int) -> None:
@@ -806,6 +1028,7 @@ class PolicyGenerator(BasePolicyGenerator):
         beliefs: BeliefState,
         affect: AffectState,
         memory_traces: list[dict[str, Any]] | None = None,
+        causal_laws_summary: str = "",
     ) -> list[Policy]:
         """
         Generate 2-5 candidate policies for achieving a goal.
@@ -822,6 +1045,12 @@ class PolicyGenerator(BasePolicyGenerator):
         start = time.monotonic()
         traces = memory_traces or []
 
+        # Use the live registry if wired; fall back to the static list.
+        if self._action_type_registry is not None:
+            available_types = self._action_type_registry.get_available()
+        else:
+            available_types = AVAILABLE_ACTION_TYPES
+
         prompt = build_policy_generation_prompt(
             instance_name=self._instance_name,
             goal=goal,
@@ -829,65 +1058,117 @@ class PolicyGenerator(BasePolicyGenerator):
             beliefs_summary=summarise_beliefs(beliefs),
             memory_summary=summarise_memories(traces),
             affect=affect,
-            available_action_types=AVAILABLE_ACTION_TYPES,
+            available_action_types=available_types,
             max_policies=min(self._max_policies, 5),
+            causal_laws_summary=causal_laws_summary,
         )
 
-        # ── Thompson sampling: route to Claude or RE ──────────────────────
-        chosen_model = self._sampler.sample()
-        self._last_model_used: str = chosen_model
+        # ── Thompson sampling: ranked fallback chain ──────────────────────
+        # sample_ranked() draws Beta samples for all ready arms and returns
+        # them best-first. We try each in order; on failure we record the
+        # failure and move to the next arm. If ALL arms fail we emit
+        # REASONING_CAPABILITY_DEGRADED and fall back to do-nothing.
+        ranked_arms = self._sampler.sample_ranked()
+        self._last_model_used: str = ranked_arms[0] if ranked_arms else "claude"
 
-        try:
-            if chosen_model == "re" and self._re_client is not None:
-                # RE client must expose the same .generate() interface as LLMProvider
-                response = await self._re_client.generate(
-                    system_prompt=(
-                        f"You are {self._instance_name}'s deliberative reasoning system. "
-                        "Generate structured JSON policy candidates. "
-                        "Be precise and creative. Output only valid JSON."
-                    ),
-                    messages=[Message(role="user", content=prompt)],
-                    max_tokens=2000,
-                    temperature=0.85,
-                    output_format="json",
+        # Notify the health monitor so it can probe downed arms periodically.
+        arms_to_probe = self._health_monitor.on_cycle()
+        if arms_to_probe:
+            self._logger.debug("provider_probe_due", arms=arms_to_probe)
+
+        system_prompt = (
+            f"You are {self._instance_name}'s deliberative reasoning system. "
+            "Generate structured JSON policy candidates. "
+            "Be precise and creative. Output only valid JSON."
+        )
+        messages = [Message(role="user", content=prompt)]
+
+        last_exc: Exception | None = None
+        for arm_name in ranked_arms:
+            arm_start = time.monotonic()
+            try:
+                if arm_name == "re" and self._re_client is not None:
+                    response = await self._re_client.generate(
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        max_tokens=2000,
+                        temperature=0.85,
+                        output_format="json",
+                    )
+                elif arm_name == "claude":
+                    response = await self._llm.generate(
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        max_tokens=2000,
+                        temperature=0.85,
+                        output_format="json",
+                    )
+                else:
+                    # Dynamic arm (Ollama, Bedrock, re_v2, …): must be in _extra_clients
+                    client = self._extra_clients.get(arm_name)
+                    if client is None:
+                        raise RuntimeError(f"No client registered for arm '{arm_name}'")
+                    response = await client.generate(
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        max_tokens=2000,
+                        temperature=0.85,
+                        output_format="json",
+                    )
+
+                latency_ms = int((time.monotonic() - arm_start) * 1000)
+                self._health_monitor.record_call(arm_name, success=True, latency_ms=latency_ms)
+                self._last_model_used = arm_name
+
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                self._logger.debug(
+                    "policy_generation_complete",
+                    elapsed_ms=elapsed_ms,
+                    model=arm_name,
+                    tried_arms=ranked_arms[: ranked_arms.index(arm_name) + 1],
                 )
-            else:
-                # Claude API (default / Thompson sampler chose Claude)
-                self._last_model_used = "claude"
-                response = await self._llm.generate(
-                    system_prompt=(
-                        f"You are {self._instance_name}'s deliberative reasoning system. "
-                        "Generate structured JSON policy candidates. "
-                        "Be precise and creative. Output only valid JSON."
-                    ),
-                    messages=[Message(role="user", content=prompt)],
-                    max_tokens=2000,
-                    temperature=0.85,  # Creative — we want diverse candidates
-                    output_format="json",
+                parsed = _parse_policy_response(response.text)
+                parsed.append(make_do_nothing_policy())
+                return parsed
+
+            except Exception as exc:
+                latency_ms = int((time.monotonic() - arm_start) * 1000)
+                self._health_monitor.record_call(arm_name, success=False, latency_ms=latency_ms)
+                self._sampler.record_outcome(arm_name, success=False)
+                last_exc = exc
+                self._logger.warning(
+                    "provider_arm_failed",
+                    arm=arm_name,
+                    error=str(exc),
+                    remaining=ranked_arms[ranked_arms.index(arm_name) + 1 :],
                 )
+                # Continue to next arm in the fallback chain
 
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            self._logger.debug(
-                "policy_generation_complete",
-                elapsed_ms=elapsed_ms,
-                model=self._last_model_used,
-            )
-
-            parsed = _parse_policy_response(response.text)
-            # Always append do-nothing as the null baseline
-            parsed.append(make_do_nothing_policy())
-            return parsed
-
-        except Exception as exc:
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            self._logger.warning(
-                "policy_generation_failed",
-                error=str(exc),
-                elapsed_ms=elapsed_ms,
-                model=self._last_model_used,
-            )
-            # Fallback: just the do-nothing policy
-            return [make_do_nothing_policy()]
+        # All arms failed — emit REASONING_CAPABILITY_DEGRADED if synapse is wired.
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        self._logger.error(
+            "all_provider_arms_failed",
+            elapsed_ms=elapsed_ms,
+            tried_arms=ranked_arms,
+            error=str(last_exc),
+        )
+        if self._synapse is not None:
+            import asyncio
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                event = SynapseEvent(
+                    event_type=SynapseEventType.REASONING_CAPABILITY_DEGRADED,
+                    source_system="nova",
+                    data={
+                        "tried_arms": ranked_arms,
+                        "error": str(last_exc),
+                        "elapsed_ms": elapsed_ms,
+                    },
+                )
+                asyncio.ensure_future(self._synapse.broadcast(event))
+            except Exception:
+                pass  # Never block the fallback path
+        return [make_do_nothing_policy()]
 
     def generate_economic_intent(
         self,
@@ -966,7 +1247,7 @@ class PolicyGenerator(BasePolicyGenerator):
         success: bool,
         redis: Any = None,
     ) -> None:
-        """Record an intent outcome into the Thompson sampler.
+        """Record an intent outcome into the Thompson sampler and health monitor.
 
         Called by NovaService._on_axon_execution_result() with the model that
         handled the most recent slow-path call.  Routes to the sampler using
@@ -977,6 +1258,9 @@ class PolicyGenerator(BasePolicyGenerator):
         """
         model = getattr(self, "_last_model_used", "claude")
         self._sampler.record_outcome(model, success)
+        # Update health monitor so post-call outcome (e.g. Equor/Axon) feeds into
+        # consecutive-failure tracking (latency unknown here → use 0).
+        self._health_monitor.record_call(model, success=success, latency_ms=0.0)
         if redis is not None:
             import asyncio
             try:

@@ -34,6 +34,11 @@ TemporalDetector = _mod.TemporalDetector
 AffectPatternDetector = _mod.AffectPatternDetector
 build_default_detectors = _mod.build_default_detectors
 
+# Re-export PatternCandidate / PatternType so that lazy imports in service.py
+# (`from systems.evo.detectors import PatternCandidate, PatternType`) resolve
+# correctly even though these are defined in systems.evo.types.
+from systems.evo.types import PatternCandidate, PatternType  # noqa: E402
+
 __all__ = [
     "PatternDetector",
     "CooccurrenceDetector",
@@ -41,4 +46,6 @@ __all__ = [
     "TemporalDetector",
     "AffectPatternDetector",
     "build_default_detectors",
+    "PatternCandidate",
+    "PatternType",
 ]

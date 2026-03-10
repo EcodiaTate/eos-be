@@ -50,11 +50,14 @@
 **Emitted:**
 - `COGNITIVE_PRESSURE` — every 30s, includes `tier_utilization`
 - `BUDGET_EMERGENCY` — when utilization >= 0.90 (debounced 30s)
-- `WORLD_MODEL_UPDATED` — on structural integration, includes `coverage_delta`, `complexity_delta`
+- `WORLD_MODEL_UPDATED` — on structural integration, includes `coverage_delta`, `complexity_delta`, `invariants_tested`, `invariants_violated`
+- `LOGOS_INVARIANT_VIOLATED` — dedicated event when world model invariants are contradicted (Fix 1)
 - `ANCHOR_MEMORY_CREATED` — includes `reason` field
 - `INTELLIGENCE_METRICS` — every 60s
-- `COMPRESSION_CYCLE_COMPLETE` — after decay cycles
+- `COMPRESSION_CYCLE_COMPLETE` — after decay cycles; includes `evicted_item_ids` + `evicted_items` (Fix 2)
 - `SCHWARZSCHILD_THRESHOLD_MET` — once, ever
+- `LOGOS_SCHWARZSCHILD_APPROACHING` — at 80% of any threshold indicator, once per lifetime (Fix 3)
+- `LOGOS_BUDGET_ADMISSION_DENIED` — when `try_admit()` rejects a KU; includes tier, KU amounts, pressure (Fix 4)
 - `RE_TRAINING_EXAMPLE` — on anchor creation and high-MDL compressions
 
 **Subscribed:**
@@ -67,6 +70,8 @@
 - `SLEEP_INITIATED` → pause real-time compression
 - `WAKE_ONSET` → resume compression
 - `INSTANCE_SPAWNED` → snapshot world model for child
+- `INSTANCE_RETIRED` → prune `WorldModel.generative_schemas` where `source_system == retired_instance_id` (2026-03-09)
+- `SYSTEM_MODULATION` → pause compression via `_sleep_active` gate; emit `SYSTEM_MODULATION_ACK` (2026-03-09)
 
 ---
 
@@ -110,6 +115,13 @@
 - **D1/A4 RESOLVED** — `set_memory(Any)` and `self._memory: Any` removed entirely. Dead weight gone.
 - **Sleep gate RESOLVED** — `_sleep_active` now gates `process_experience()`: experiences during Oneiros sleep return immediately with a `HOLOGRAPHIC_ENCODING`-stage result.
 - **SG3/SG4 RESOLVED** — `LogosFitnessRecord` type added; `LogosPersistence.persist_fitness_record()` appends immutable `(:LogosFitnessTimeSeries)` nodes every 60s alongside `INTELLIGENCE_METRICS` broadcast. `set_instance_id()` DI method added.
+
+## Autonomy Gap Closure — 08 March 2026 (v1.3)
+
+- **Fix 1: LOGOS_INVARIANT_VIOLATED** — `integrate_delta()` + `process_experience()` now emit a dedicated `LOGOS_INVARIANT_VIOLATED` event (not just a WARNING log) when `wm.invariants_violated > 0`. `WORLD_MODEL_UPDATED` payload enriched with `invariants_tested` + `invariants_violated`. Kairos/Equor/Thymos can now react.
+- **Fix 2: Eviction visibility** — `COMPRESSION_CYCLE_COMPLETE` payload now includes `evicted_item_ids` (up to 20), `evicted_items` (id+type pairs), `total_evicted_this_cycle`, `eviction_truncated` flag. Organism knows exactly what was discarded and why.
+- **Fix 3: LOGOS_SCHWARZSCHILD_APPROACHING** — Added `_schwarzschild_approaching_emitted` guard + progressive warning in `_schwarzschild_loop()` at 80% of any threshold indicator. Organism gets foresight before cognitive reorganization, not binary surprise.
+- **Fix 4: LOGOS_BUDGET_ADMISSION_DENIED** — `try_admit()` now fire-and-forget emits `LOGOS_BUDGET_ADMISSION_DENIED` via `asyncio.create_task()` when `CognitiveBudgetManager.increment()` returns False. Payload: tier, requested KU, tier used/limit, utilization%, total pressure, urgency, recommendation. No event bus injection needed in `budget.py`.
 
 ## Gap Closure — 07 March 2026 (v1.2)
 

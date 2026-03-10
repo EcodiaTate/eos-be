@@ -37,6 +37,8 @@ from systems.axon.types import (
 
 if TYPE_CHECKING:
     from config import ExternalPlatformsConfig
+    from clients.redis import RedisClient
+    from systems.identity.connectors.github import GitHubConnector
     from systems.synapse.service import SynapseService
 
 logger = structlog.get_logger()
@@ -45,6 +47,9 @@ logger = structlog.get_logger()
 _PR_URL_RE = re.compile(
     r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
 )
+
+# Redis key prefix for PR tracking (matches BountySubmitExecutor)
+_PR_REDIS_KEY_PREFIX = "axon:bounty_submit:pr:"
 
 
 class MonitorPRsExecutor(Executor):
@@ -79,9 +84,13 @@ class MonitorPRsExecutor(Executor):
         self,
         github_config: ExternalPlatformsConfig | None = None,
         synapse: SynapseService | None = None,
+        redis: RedisClient | None = None,
+        github_connector: GitHubConnector | None = None,
     ) -> None:
         self._github_config = github_config
         self._synapse = synapse
+        self._redis = redis
+        self._github_connector = github_connector
         self._logger = logger.bind(system="axon.executor.monitor_prs")
 
     # ── Validation ─────────────────────────────────────────────
@@ -137,13 +146,24 @@ class MonitorPRsExecutor(Executor):
 
         pending_prs: list[dict[str, Any]] = params["pending_prs"]
 
+        # Resolve GitHub token — prefer GitHubConnector (handles App JWT→IAT + caching)
+        # over static config token.
+        github_token: str | None = None
+        if self._github_connector is not None:
+            try:
+                github_token = await self._github_connector.get_access_token()
+            except Exception as _tok_exc:
+                self._logger.warning("monitor_prs_connector_token_failed", error=str(_tok_exc))
+        if not github_token and self._github_config and self._github_config.github_token:
+            github_token = self._github_config.github_token
+
         # Build HTTP headers for GitHub API
         headers: dict[str, str] = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        if self._github_config and self._github_config.github_token:
-            headers["Authorization"] = f"Bearer {self._github_config.github_token}"
+        if github_token:
+            headers["Authorization"] = f"Bearer {github_token}"
 
         observations: list[str] = []
         side_effects: list[str] = []
@@ -215,6 +235,28 @@ class MonitorPRsExecutor(Executor):
                             number=number,
                         )
 
+
+                    # Emit BOUNTY_PR_MERGED — dedicated semantic event for downstream
+                    # subscribers (Oikos, Thread, Evo) that want the merge signal
+                    if self._synapse is not None:
+                        await self._emit_pr_merged_event(
+                            pr_url=pr_url,
+                            reward=reward,
+                            entity_id=entity_id,
+                            bounty_id=bounty_id,
+                            owner=owner,
+                            repo=repo,
+                            number=number,
+                        )
+                        # High-value RE training signal — successful bounty completion
+                        await self._emit_re_training_merged(
+                            bounty_id=bounty_id,
+                            pr_url=pr_url,
+                            reward=reward,
+                            repository=f"{owner}/{repo}",
+                        )
+                    # Delete Redis key so this PR is not re-polled on future cycles.
+                    await self._delete_pr_key(bounty_id)
                     self._logger.info(
                         "pr_merged_detected",
                         pr_url=pr_url,
@@ -233,6 +275,26 @@ class MonitorPRsExecutor(Executor):
                         pr_url=pr_url,
                         entity_id=entity_id,
                     )
+
+                    # Emit BOUNTY_PR_REJECTED — semantic event for Evo/Nova
+                    if self._synapse is not None:
+                        await self._emit_pr_rejected_event(
+                            pr_url=pr_url,
+                            entity_id=entity_id,
+                            bounty_id=bounty_id,
+                            owner=owner,
+                            repo=repo,
+                            number=number,
+                        )
+                        # Negative RE training — maintainer rejected the code.
+                        # outcome_quality=0.0 so RE learns to produce better solutions.
+                        await self._emit_re_training_rejected(
+                            bounty_id=bounty_id,
+                            pr_url=pr_url,
+                            repository=f"{owner}/{repo}",
+                        )
+                    # Delete Redis key — PR is closed, no further polling needed.
+                    await self._delete_pr_key(bounty_id)
 
                 else:
                     still_open_count += 1
@@ -270,6 +332,25 @@ class MonitorPRsExecutor(Executor):
             side_effects=side_effects,
             new_observations=observations,
         )
+
+    # ── Redis Key Management ───────────────────────────────────
+
+    async def _delete_pr_key(self, bounty_id: str) -> None:
+        """
+        Remove the Redis tracking key for a resolved PR.
+
+        Once a PR is merged or closed without merge it will never change state
+        again — there is no value in polling it. Deleting the key prevents the
+        30-minute poll loop from including this PR in future scan batches.
+        """
+        if not bounty_id or self._redis is None:
+            return
+        try:
+            key = f"{_PR_REDIS_KEY_PREFIX}{bounty_id}"
+            await self._redis.delete(key)
+            self._logger.debug("pr_tracking_key_deleted", bounty_id=bounty_id, key=key)
+        except Exception as exc:
+            self._logger.warning("pr_key_delete_failed", bounty_id=bounty_id, error=str(exc))
 
     # ── Synapse Event Emission ─────────────────────────────────
 
@@ -318,4 +399,194 @@ class MonitorPRsExecutor(Executor):
                 "bounty_paid_event_failed",
                 error=str(exc),
                 pr_url=pr_url,
+            )
+
+    async def _emit_pr_merged_event(
+        self,
+        *,
+        pr_url: str,
+        reward: str,
+        entity_id: str,
+        bounty_id: str,
+        owner: str,
+        repo: str,
+        number: str,
+    ) -> None:
+        """Emit BOUNTY_PR_MERGED — distinct from BOUNTY_PAID for explicit downstream routing."""
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            reward_usd = "0"
+            clean = reward.replace("$", "").replace(",", "").strip()
+            if clean:
+                try:
+                    float(clean)
+                    reward_usd = clean
+                except ValueError:
+                    pass
+
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.BOUNTY_PR_MERGED,
+                source_system="axon.monitor_prs",
+                data={
+                    "bounty_id": bounty_id,
+                    "pr_url": pr_url,
+                    "pr_number": int(number),
+                    "repository": f"{owner}/{repo}",
+                    "reward_usd": reward_usd,
+                    "entity_id": entity_id,
+                },
+            ))
+        except Exception as exc:
+            self._logger.warning(
+                "bounty_pr_merged_emit_failed",
+                error=str(exc),
+                pr_url=pr_url,
+            )
+
+    async def _emit_pr_rejected_event(
+        self,
+        *,
+        pr_url: str,
+        entity_id: str,
+        bounty_id: str,
+        owner: str,
+        repo: str,
+        number: str,
+    ) -> None:
+        """Emit BOUNTY_PR_REJECTED — negative learning signal for Evo + RE training."""
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.BOUNTY_PR_REJECTED,
+                source_system="axon.monitor_prs",
+                data={
+                    "bounty_id": bounty_id,
+                    "pr_url": pr_url,
+                    "pr_number": int(number),
+                    "repository": f"{owner}/{repo}",
+                    "entity_id": entity_id,
+                    "reason": "closed_without_merge",
+                },
+            ))
+        except Exception as exc:
+            self._logger.warning(
+                "bounty_pr_rejected_emit_failed",
+                error=str(exc),
+                pr_url=pr_url,
+            )
+
+    async def _emit_re_training_merged(
+        self,
+        *,
+        bounty_id: str,
+        pr_url: str,
+        reward: str,
+        repository: str,
+    ) -> None:
+        """
+        Emit RE_TRAINING_EXAMPLE on successful PR merge.
+
+        A merged bounty PR is one of the highest-quality training signals the
+        organism can generate — a real human (the maintainer) reviewed and
+        accepted EOS-authored code. Reward signal: 1.0 (max).
+        """
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            from primitives.re_training import RETrainingExample
+
+            example = RETrainingExample(
+                episode_id=bounty_id,
+                system="axon.monitor_prs",
+                category="bounty_pr_merged",
+                input_context=(
+                    f"Bounty PR submitted to {repository}. "
+                    f"Bounty ID: {bounty_id}. PR URL: {pr_url}."
+                ),
+                output_generated=f"PR merged by maintainer. Reward: {reward}.",
+                outcome_quality=1.0,  # Maintainer accepted: highest quality signal
+                reasoning_trace=(
+                    f"EOS-authored PR for bounty {bounty_id} at {repository} "
+                    f"was reviewed and merged by an external maintainer. "
+                    f"This is external validation that the code solution was "
+                    f"correct and useful. Revenue: {reward}."
+                ),
+                constitutional_alignment={
+                    "honesty": 1.0,   # EOS author block was present; no deception
+                    "care": 0.8,      # Helped the open-source project
+                    "growth": 1.0,    # Successful autonomous revenue generation
+                    "coherence": 1.0, # Solution was valid (maintainer merged it)
+                },
+            )
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                source_system="axon.monitor_prs",
+                data=example.model_dump(),
+            ))
+        except Exception as exc:
+            self._logger.warning(
+                "bounty_re_training_emit_failed",
+                error=str(exc),
+                bounty_id=bounty_id,
+            )
+
+    async def _emit_re_training_rejected(
+        self,
+        *,
+        bounty_id: str,
+        pr_url: str,
+        repository: str,
+    ) -> None:
+        """
+        Emit RE_TRAINING_EXAMPLE on PR rejection (closed without merge).
+
+        outcome_quality=0.0 — maintainer did not accept the solution.
+        The RE uses this signal to learn what solutions get rejected and improve.
+        """
+        if self._synapse is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            from primitives.re_training import RETrainingExample
+
+            example = RETrainingExample(
+                episode_id=f"{bounty_id}_rejected",
+                system="axon.monitor_prs",
+                category="bounty_pr_rejected",
+                input_context=(
+                    f"Bounty PR submitted to {repository}. "
+                    f"Bounty ID: {bounty_id}. PR URL: {pr_url}."
+                ),
+                output_generated="PR closed without merge by maintainer.",
+                outcome_quality=0.0,  # Maintainer rejected: lowest quality signal
+                reasoning_trace=(
+                    f"EOS-authored PR for bounty {bounty_id} at {repository} "
+                    f"was closed without being merged. The solution did not satisfy "
+                    f"the maintainer's requirements. This negative outcome should "
+                    f"inform future solution generation quality."
+                ),
+                constitutional_alignment={
+                    "honesty": 1.0,   # EOS author block still present; no deception
+                    "care": 0.3,      # Solution may not have helped the project
+                    "growth": 0.2,    # Unsuccessful outcome; learning opportunity
+                    "coherence": 0.3, # Solution may have been incorrect or off-target
+                },
+            )
+            await self._synapse.event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                source_system="axon.monitor_prs",
+                data=example.model_dump(),
+            ))
+        except Exception as exc:
+            self._logger.warning(
+                "bounty_re_training_rejected_emit_failed",
+                error=str(exc),
+                bounty_id=bounty_id,
             )

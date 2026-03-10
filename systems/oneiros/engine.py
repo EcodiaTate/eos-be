@@ -13,8 +13,11 @@ If sleep is interrupted, the system can restore from the Descent checkpoint.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import time
+from collections import deque
+from datetime import datetime  # noqa: TC003
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
@@ -38,6 +41,7 @@ from systems.oneiros.types import (
     STAGE_DURATION_FRACTION,
     SleepCheckpoint,
     SleepCycleV2Report,
+    SleepOutcome,
     SleepSchedulerConfig,
     SleepStageV2,
     SleepTrigger,
@@ -53,6 +57,21 @@ if TYPE_CHECKING:
         SlowWaveReport,
     )
     from systems.synapse.event_bus import EventBus
+
+# KPIs queried from Benchmarks before and after sleep
+_TRACKED_KPIS = (
+    "coherence_composite",
+    "hypothesis_avg_confidence",
+    "schema_count",
+    "re_success_rate",
+    "memory_fragmentation",
+)
+
+# Adaptive threshold bounds
+_THRESHOLD_MIN = 0.75
+_THRESHOLD_MAX = 0.95
+# Consecutive outcome history window
+_OUTCOME_HISTORY_LEN = 5
 
 
 # ─── Stage Protocols ─────────────────────────────────────────────
@@ -190,6 +209,8 @@ class SleepCycleEngine:
         self._evo: EvoHypothesisProtocol | None = None
         self._simula: SimulaProtocol | None = None
         self._equor: ConstitutionalCheckProtocol | None = None
+        self._neo4j: Any = None
+        self._benchmarks: Any = None  # optional BenchmarkService for KPI queries
 
         # State
         self._is_sleeping = False
@@ -200,6 +221,16 @@ class SleepCycleEngine:
 
         # Interrupted checkpoint pending restoration on next sleep cycle
         self._pending_restore_checkpoint: SleepCheckpoint | None = None
+
+        # ── Performance measurement state ──────────────────────────
+        # Captured just before DESCENT
+        self._pre_sleep_baseline: dict[str, float] = {}
+        self._pre_sleep_cycle_id: str = ""
+        self._pre_sleep_timestamp: datetime | None = None
+        # Per-sleep stage completion tracking
+        self._stages_completed: list[str] = []
+        # Ring buffer of recent SleepOutcome verdicts for adaptive threshold
+        self._outcome_history: deque[str] = deque(maxlen=_OUTCOME_HISTORY_LEN)
 
         self._logger = logger.bind(component="engine")
 
@@ -230,6 +261,15 @@ class SleepCycleEngine:
         self._equor = equor
         self._rebuild_stages()
 
+    def set_neo4j(self, neo4j: Any) -> None:
+        """Wire Neo4j for LucidDreamingStage MetaCognition and DirectedExploration."""
+        self._neo4j = neo4j
+        self._rebuild_stages()
+
+    def set_benchmarks(self, benchmarks: Any) -> None:
+        """Wire BenchmarkService for pre/post-sleep KPI queries."""
+        self._benchmarks = benchmarks
+
     def set_creative_goal(self, goal: str | None) -> None:
         """Pass the current creative goal into LucidDreamingStage."""
         self._creative_goal = goal
@@ -253,6 +293,7 @@ class SleepCycleEngine:
             simula=self._simula,
             equor=self._equor,
             event_bus=self._event_bus,
+            neo4j=self._neo4j,
             creative_goal=self._creative_goal,
         )
 
@@ -318,6 +359,9 @@ class SleepCycleEngine:
         self._pending_restore_checkpoint = None
 
         report = SleepCycleV2Report(trigger=trigger)
+
+        # Capture pre-sleep KPI baseline before any stage runs
+        await self._capture_pre_sleep_baseline(report.id)
 
         if restore_checkpoint is not None:
             self._logger.info(
@@ -425,6 +469,9 @@ class SleepCycleEngine:
             # Record sleep completion on scheduler
             self._scheduler.record_sleep_completed()
 
+            # Fire-and-forget: wait 100 cycles then compare KPIs to baseline
+            asyncio.ensure_future(self._compute_and_emit_sleep_outcome(report))
+
             self._logger.info(
                 "sleep_cycle_complete",
                 cycle_id=report.id,
@@ -462,6 +509,7 @@ class SleepCycleEngine:
         """Transition to a new sleep stage, broadcasting SLEEP_STAGE_TRANSITION."""
         previous = self._current_stage
         self._current_stage = stage
+        self._stages_completed.append(stage.value)
 
         self._logger.info(
             "stage_transition",
@@ -496,6 +544,181 @@ class SleepCycleEngine:
             },
         )
         await self._event_bus.emit(event)
+
+        # Co-emit SLEEP_STAGE_CHANGED — semantic alias consumed by Thread, Benchmarks, etc.
+        with contextlib.suppress(Exception):
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.SLEEP_STAGE_CHANGED,
+                source_system=_SOURCE,
+                data={
+                    "from_stage": from_stage.value if from_stage else None,
+                    "to_stage": to_stage.value,
+                },
+            ))
+
+    # -- Performance Measurement ------------------------------------
+
+    async def _query_kpis(self) -> dict[str, float]:
+        """
+        Query current KPIs from BenchmarkService (best-effort, non-fatal).
+
+        Returns a dict of kpi_name → float for each tracked KPI.
+        Missing KPIs are omitted silently.
+        """
+        kpis: dict[str, float] = {}
+        if self._benchmarks is None:
+            return kpis
+        with contextlib.suppress(Exception):
+            if hasattr(self._benchmarks, "get_current_kpis"):
+                raw: dict[str, Any] = await self._benchmarks.get_current_kpis(
+                    list(_TRACKED_KPIS)
+                )
+                for key in _TRACKED_KPIS:
+                    val = raw.get(key)
+                    if isinstance(val, (int, float)):
+                        kpis[key] = float(val)
+        return kpis
+
+    async def _capture_pre_sleep_baseline(self, cycle_id: str) -> None:
+        """Snapshot KPIs just before sleep begins."""
+        self._pre_sleep_baseline = await self._query_kpis()
+        self._pre_sleep_cycle_id = cycle_id
+        self._pre_sleep_timestamp = utc_now()
+        self._stages_completed = []
+        self._logger.debug(
+            "pre_sleep_baseline_captured",
+            cycle_id=cycle_id,
+            kpis=self._pre_sleep_baseline,
+        )
+
+    async def _compute_and_emit_sleep_outcome(
+        self,
+        report: SleepCycleV2Report,
+    ) -> None:
+        """
+        Wait 100 cycles for metrics to stabilise, then compare KPIs to baseline
+        and emit ONEIROS_SLEEP_OUTCOME.  Adapts pressure threshold accordingly.
+
+        This is fire-and-forget — called via asyncio.ensure_future after Emergence.
+        """
+        # 100-cycle stabilisation: each theta cycle ≈ 150ms → ~15s
+        await asyncio.sleep(15.0)
+
+        post_kpis = await self._query_kpis()
+        baseline = self._pre_sleep_baseline
+
+        # Compute per-KPI deltas (skip KPIs missing in either snapshot)
+        deltas: dict[str, float] = {}
+        for key in _TRACKED_KPIS:
+            pre = baseline.get(key)
+            post = post_kpis.get(key)
+            if pre is None or post is None or pre == 0.0:
+                continue
+            # For memory_fragmentation lower is better — invert the sign
+            raw_delta = (post - pre) / abs(pre)
+            deltas[key] = -raw_delta if key == "memory_fragmentation" else raw_delta
+
+        positive = [v for v in deltas.values() if v > 0.0]
+        negative = [v for v in deltas.values() if v < 0.0]
+        net_improvement = sum(positive) / len(positive) if positive else 0.0
+        net_degradation = abs(sum(negative) / len(negative)) if negative else 0.0
+
+        if net_improvement > 0.02 and net_improvement >= net_degradation:
+            verdict = "beneficial"
+        elif net_degradation > 0.02 and net_degradation > net_improvement:
+            verdict = "harmful"
+        else:
+            verdict = "neutral"
+
+        self._outcome_history.append(verdict)
+
+        # Adapt pressure threshold
+        old_threshold = self._config.cognitive_pressure_threshold
+        new_threshold = self._adapt_threshold(verdict, net_improvement)
+        adjusted = new_threshold != old_threshold
+        if adjusted:
+            self._config.cognitive_pressure_threshold = new_threshold
+            self._scheduler._config.cognitive_pressure_threshold = new_threshold
+            self._logger.info(
+                "sleep_threshold_adapted",
+                old=round(old_threshold, 3),
+                new=round(new_threshold, 3),
+                verdict=verdict,
+            )
+
+        outcome = SleepOutcome(
+            sleep_cycle_id=report.id,
+            sleep_duration_ms=int(report.total_duration_ms),
+            stages_completed=self._stages_completed[:],
+            kpi_deltas=deltas,
+            net_improvement=round(net_improvement, 4),
+            net_degradation=round(net_degradation, 4),
+            verdict=verdict,
+            pressure_threshold_adjusted=adjusted,
+            new_pressure_threshold=new_threshold,
+        )
+
+        self._logger.info(
+            "sleep_outcome_evaluated",
+            cycle_id=report.id,
+            verdict=verdict,
+            net_improvement=outcome.net_improvement,
+            net_degradation=outcome.net_degradation,
+            kpi_deltas=deltas,
+        )
+
+        if self._event_bus is not None:
+            with contextlib.suppress(Exception):
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.ONEIROS_SLEEP_OUTCOME,
+                    source_system=_SOURCE,
+                    data=outcome.model_dump(),
+                ))
+
+            # "harmful" → signal Evo to reconsider sleep parameters
+            if verdict == "harmful" and self._event_bus is not None:
+                with contextlib.suppress(Exception):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.LEARNING_PRESSURE,
+                        source_system=_SOURCE,
+                        data={
+                            "source_system": _SOURCE,
+                            "reason": "harmful_sleep_outcome",
+                            "kpi_deltas": deltas,
+                            "net_degradation": outcome.net_degradation,
+                            "sleep_cycle_id": report.id,
+                        },
+                    ))
+
+    def _adapt_threshold(self, verdict: str, net_improvement: float) -> float:
+        """
+        Return the new cognitive_pressure_threshold based on recent outcome history.
+
+        Rules:
+        - 3+ consecutive "beneficial" with net_improvement > 10%: decrease to 0.80 (sleep more)
+        - 3+ consecutive "beneficial" (any improvement): maintain
+        - 2+ consecutive "harmful": increase to 0.90 (sleep less)
+        Bounds: [0.75, 0.95]
+        """
+        current = self._config.cognitive_pressure_threshold
+        history = list(self._outcome_history)  # oldest → newest
+
+        if len(history) < 2:
+            return current
+
+        last_2 = history[-2:]
+        last_3 = history[-3:] if len(history) >= 3 else []
+
+        if all(v == "harmful" for v in last_2):
+            return min(_THRESHOLD_MAX, current + 0.05)
+
+        if last_3 and all(v == "beneficial" for v in last_3):
+            if net_improvement > 0.10:
+                return max(_THRESHOLD_MIN, current - 0.05)
+            # 3+ beneficial but modest improvement: maintain
+            return current
+
+        return current
 
     # -- Interruption -----------------------------------------------
 

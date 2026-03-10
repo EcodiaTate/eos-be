@@ -125,6 +125,10 @@ class DevelopmentalManager:
         self._stage = initial_stage
         self._trigger = StageTransitionTrigger()
         self._novel_attractor_count = 0  # Tracks autonomously discovered attractors
+        self._event_bus: Any = None  # injected by SomaService.set_event_bus()
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        self._event_bus = event_bus
 
     @property
     def stage(self) -> DevelopmentalStage:
@@ -210,3 +214,21 @@ class DevelopmentalManager:
             from_stage=old.value,
             to_stage=new_stage.value,
         )
+        if self._event_bus is not None:
+            import asyncio
+            import contextlib
+            async def _emit() -> None:
+                from systems.synapse.types import SynapseEventType
+                with contextlib.suppress(Exception):
+                    await self._event_bus.emit(
+                        SynapseEventType.DEVELOPMENTAL_MILESTONE,
+                        {
+                            "from_stage": old.value,
+                            "to_stage": new_stage.value,
+                            "capabilities_unlocked": list(
+                                STAGE_CAPABILITIES.get(new_stage, {}).keys()
+                            ),
+                        },
+                        source_system="soma",
+                    )
+            asyncio.ensure_future(_emit())

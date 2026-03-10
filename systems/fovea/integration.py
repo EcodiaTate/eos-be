@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -100,6 +100,10 @@ class DynamicIgnitionThreshold:
         self._ceiling = ceiling
         self._current: float = 0.3  # Bootstrap value
 
+        # Part B: Threshold persistence (Neo4j)
+        self._neo4j_driver: Any = None
+        self._instance_id: str = ""
+
     def record(self, salience: float) -> None:
         """Record an error's habituated salience for threshold computation."""
         self._window.append(salience)
@@ -124,7 +128,90 @@ class DynamicIgnitionThreshold:
     def adjust(self, delta: float) -> float:
         """Shift the threshold by delta, clamped to [floor, ceiling]. Returns new value."""
         self._current = max(self._floor, min(self._ceiling, self._current + delta))
+        asyncio.ensure_future(self._persist_state())
         return self._current
+
+    def set_neo4j_driver(self, driver: Any, instance_id: str = "") -> None:
+        """Wire Neo4j driver for persistence."""
+        self._neo4j_driver = driver
+        self._instance_id = instance_id
+
+    async def _persist_state(self) -> None:
+        """
+        Persist threshold state to Neo4j.
+
+        Stores percentile/floor/ceiling plus up to 500 recent salience samples
+        (enough to warm the distribution on restart without blowing up the node).
+        Scheduled fire-and-forget via asyncio.ensure_future from sync call sites.
+        """
+        if self._neo4j_driver is None or self._instance_id == "":
+            return
+        # Cap samples so the Neo4j property stays bounded.
+        samples = list(self._window)[-500:]
+        try:
+            async with self._neo4j_driver.session() as session:
+                await session.run(
+                    "MERGE (f:FoveaThresholdState {instance_id: $id})"
+                    " SET f.percentile = $percentile,"
+                    "     f.floor = $floor,"
+                    "     f.ceiling = $ceiling,"
+                    "     f.distribution_samples = $samples,"
+                    "     f.updated_at = datetime()",
+                    id=self._instance_id,
+                    percentile=self._percentile,
+                    floor=self._floor,
+                    ceiling=self._ceiling,
+                    samples=samples,
+                )
+                logger.debug("threshold_state_persisted", instance_id=self._instance_id)
+        except Exception as exc:
+            logger.warning("threshold_state_persist_failed", error=str(exc))
+
+    async def persist_params(self) -> None:
+        """Force-persist current params. Called after direct param mutations (e.g. adjust_threshold_param)."""
+        await self._persist_state()
+
+    async def restore_state_from_neo4j(self) -> None:
+        """
+        Restore tuned threshold parameters from Neo4j on startup.
+
+        If a (:FoveaThresholdState) node exists for this instance, loads
+        percentile/floor/ceiling and seeds the distribution window.
+        """
+        if self._neo4j_driver is None or self._instance_id == "":
+            return
+        try:
+            async with self._neo4j_driver.session() as session:
+                result = await session.run(
+                    "MATCH (f:FoveaThresholdState {instance_id: $id})"
+                    " RETURN f.percentile AS percentile,"
+                    "        f.floor AS floor,"
+                    "        f.ceiling AS ceiling,"
+                    "        f.distribution_samples AS samples",
+                    id=self._instance_id,
+                )
+                record = await result.single()
+            if record is None:
+                return
+            if record["percentile"] is not None:
+                self._percentile = float(record["percentile"])
+            if record["floor"] is not None:
+                self._floor = float(record["floor"])
+            if record["ceiling"] is not None:
+                self._ceiling = float(record["ceiling"])
+            raw_samples = record["samples"] or []
+            for s in raw_samples:
+                self._window.append(float(s))
+            logger.info(
+                "threshold_state_restored",
+                instance_id=self._instance_id,
+                percentile=self._percentile,
+                floor=self._floor,
+                ceiling=self._ceiling,
+                sample_count=len(raw_samples),
+            )
+        except Exception as exc:
+            logger.warning("threshold_state_restore_failed", error=str(exc))
 
 
 # ---------------------------------------------------------------------------

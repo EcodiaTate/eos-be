@@ -166,10 +166,18 @@ class PerceptionGateway:
         self._last_episode_id: str | None = None
         self._config = cfg
         self._started: bool = False
+        self._current_arousal: float = 0.4  # updated from ALLOSTATIC_SIGNAL
 
         # Health: track the last time run_cycle() was called so health()
         # can detect a stalled workspace loop.
         self._last_cycle_time: float = time.monotonic()
+
+        # Cross-system modulation state (set_* / nudge_* callers)
+        self._current_belief_confidence: float = 0.5   # updated by set_belief_state()
+        self._current_community_size: int = 1           # updated by set_community_size()
+        self._rhythm_state: str = "NEUTRAL"             # updated by set_rhythm_state()
+        self._affect_dominance: float = 0.5             # updated by nudge_dominance()
+        self._affect_valence: float = 0.5               # updated by nudge_valence()
 
         self._logger = logger.bind(system="fovea.gateway")
 
@@ -209,11 +217,36 @@ class PerceptionGateway:
         """
         if (
             len(self._workspace._percept_queue)
-            >= self._config.max_percept_queue_size
+            >= self._workspace._percept_queue.maxlen  # type: ignore[operator]
         ):
             self._logger.warning(
-                "percept_queue_full", channel=channel.value,
+                "percept_queue_full",
+                channel=channel.value,
+                queue_size=len(self._workspace._percept_queue),
+                arousal=round(self._current_arousal, 3),
             )
+            # Emit PERCEPT_DROPPED so Fovea/Nova know the organism is dropping percepts
+            if self._synapse is not None:
+                try:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType
+                    import asyncio as _asyncio
+                    _asyncio.ensure_future(
+                        self._synapse._event_bus.emit(
+                            SynapseEvent(
+                                event_type=SynapseEventType.PERCEPT_DROPPED,
+                                source_system="atune",
+                                data={
+                                    "dropped_salience": 0.0,  # salience unknown pre-scoring
+                                    "queue_size": len(self._workspace._percept_queue),
+                                    "arousal": self._current_arousal,
+                                    "channel": channel.value,
+                                    "percept_id": "",
+                                },
+                            )
+                        )
+                    )
+                except Exception:
+                    pass
             return None
 
         percept = await normalise(raw_input, channel, self._embed_fn)
@@ -252,13 +285,19 @@ class PerceptionGateway:
                 "gate_latency_us": annotated.gate_latency_us,
             }
 
-            eis_risk_level = annotated.composite_score
+            # compute_risk_salience_factor applies a configurable gain (RISK_SALIENCE_GAIN)
+            # and floor/ceiling clamp so that even moderate EIS flags push the risk
+            # dimension upward. The raw composite_score is preserved in eis_result
+            # metadata; this amplified value feeds Fovea's causal-dimension routing.
+            from systems.eis.integration import compute_risk_salience_factor as _eis_risk
+            eis_risk_level = _eis_risk(percept)
 
             self._logger.debug(
                 "eis_gate_passed",
                 percept_id=percept.id,
                 action=annotated.action.value,
                 composite_score=round(annotated.composite_score, 4),
+                eis_risk_level=round(eis_risk_level, 4),
             )
 
         # -- Emit PERCEPT_ARRIVED so Fovea/WorldModelAdapter can track timing --
@@ -404,6 +443,41 @@ class PerceptionGateway:
                 self._workspace._dynamic_threshold
                 + threshold_shift,
             )
+
+        # SystemLoad → threshold and buffer adaptation (D3 gap closure).
+        # High CPU/memory pressure raises the ignition threshold so only the
+        # most salient percepts enter the workspace (backpressure protection).
+        # A deep percept queue signals the pipeline is overwhelmed — shrink the
+        # buffer by nudging arousal downward so deque maxlen shrinks gracefully.
+        if system_load is not None:
+            # CPU / memory pressure → raise threshold to shed load
+            load_pressure = max(system_load.cpu_utilisation, system_load.memory_utilisation)
+            if load_pressure > 0.75:
+                # Map (0.75 → 0.0 raise) .. (1.0 → 0.05 raise)
+                overage = (load_pressure - 0.75) / 0.25  # [0, 1]
+                self._workspace._dynamic_threshold = min(
+                    0.85,
+                    self._workspace._dynamic_threshold + overage * 0.05,
+                )
+                self._logger.debug(
+                    "system_load_threshold_raised",
+                    cpu=round(system_load.cpu_utilisation, 2),
+                    memory=round(system_load.memory_utilisation, 2),
+                    new_threshold=round(self._workspace._dynamic_threshold, 4),
+                )
+            # Queue depth → arousal-scaled buffer shrink (sheds oldest percepts)
+            max_queue = self._config.max_percept_queue_size
+            if system_load.queue_depth > max_queue * 0.8:
+                depth_ratio = min(1.0, system_load.queue_depth / max(1, max_queue))
+                # Nudge arousal down so GlobalWorkspace._compute_buffer_sizes()
+                # returns smaller deque maxlens on the next update_arousal() call.
+                dampened_arousal = max(0.0, self._current_arousal - depth_ratio * 0.15)
+                self._workspace.update_arousal(dampened_arousal)
+                self._logger.debug(
+                    "system_load_buffer_dampened",
+                    queue_depth=system_load.queue_depth,
+                    arousal=round(dampened_arousal, 3),
+                )
 
         affect_for_broadcast = self._get_affect_for_broadcast(
             somatic_state,
@@ -674,6 +748,106 @@ class PerceptionGateway:
 
     def set_synapse(self, synapse: Any) -> None:
         self._synapse = synapse
+        try:
+            from systems.synapse.types import SynapseEventType
+            # Arousal-scaled buffer sizing
+            synapse._event_bus.subscribe(
+                SynapseEventType.ALLOSTATIC_SIGNAL,
+                self._on_allostatic_signal,
+            )
+            # Logos cognitive pressure → raise salience threshold at ≥0.85 load
+            synapse._event_bus.subscribe(
+                SynapseEventType.COGNITIVE_PRESSURE,
+                self._on_cognitive_pressure,
+            )
+            # VitalityCoordinator austerity → throttle throughput + emit ACK
+            synapse._event_bus.subscribe(
+                SynapseEventType.SYSTEM_MODULATION,
+                self._on_system_modulation,
+            )
+        except Exception:
+            pass
+        self._system_modulation_halted: bool = False
+
+    async def _on_allostatic_signal(self, event: Any) -> None:
+        """Update workspace buffer sizes when Soma arousal changes."""
+        try:
+            arousal = float(event.data.get("arousal", self._current_arousal))
+            self._current_arousal = max(0.0, min(1.0, arousal))
+            self._workspace.update_arousal(self._current_arousal)
+        except Exception:
+            pass
+
+    async def _on_cognitive_pressure(self, event: Any) -> None:
+        """Raise workspace ignition threshold when Logos budget pressure is high.
+
+        At ≥0.85 utilization, the organism is under compression pressure.  Raise the
+        ignition threshold so only high-salience percepts reach the global workspace,
+        reducing downstream processing cost.
+        """
+        try:
+            data: dict[str, Any] = getattr(event, "data", {}) or {}
+            pressure: float = float(data.get("total_pressure", 0.0))
+            if self._fovea is not None and hasattr(self._fovea, "adjust_threshold_param"):
+                if pressure >= 0.95:
+                    # Critical: push threshold up significantly
+                    self._fovea.adjust_threshold_param("threshold_percentile", 85.0)
+                elif pressure >= 0.85:
+                    # Elevated: moderate threshold increase
+                    self._fovea.adjust_threshold_param("threshold_percentile", 75.0)
+                elif pressure < 0.75:
+                    # Recovered: restore default
+                    self._fovea.adjust_threshold_param("threshold_percentile", 60.0)
+        except Exception:
+            pass
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """React to SYSTEM_MODULATION from VitalityCoordinator (Skia/Spec 29).
+
+        When gateway is in halt_systems or level is safe_mode/emergency, drop the
+        workspace buffer to minimum (arousal = 0.1) so the pipeline stays responsive
+        with minimal throughput.  Emits SYSTEM_MODULATION_ACK via FoveaService if
+        it is wired.
+        """
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            data: dict[str, Any] = getattr(event, "data", {}) or {}
+            halt_systems: list[str] = data.get("halt_systems", [])
+            level: str = str(data.get("level", "nominal"))
+            previously_halted = getattr(self, "_system_modulation_halted", False)
+
+            if "fovea" in halt_systems or "atune" in halt_systems or level in ("safe_mode", "emergency"):
+                self._system_modulation_halted = True
+                self._workspace.update_arousal(0.1)
+            elif not halt_systems and level == "nominal":
+                self._system_modulation_halted = False
+                self._workspace.update_arousal(self._current_arousal)
+
+            if getattr(self, "_system_modulation_halted", False) != previously_halted:
+                self._logger.info(
+                    "gateway_system_modulation_changed",
+                    halted=getattr(self, "_system_modulation_halted", False),
+                    level=level,
+                )
+
+            # Emit ACK via Synapse if available
+            if self._synapse is not None:
+                compliant = getattr(self, "_system_modulation_halted", False) or (not halt_systems and level == "nominal")
+                ack = SynapseEvent(
+                    event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                    data={
+                        "system_id": "fovea",
+                        "level": level,
+                        "compliant": compliant,
+                        "reason": "workspace_throttled" if getattr(self, "_system_modulation_halted", False) else None,
+                    },
+                )
+                try:
+                    await self._synapse._event_bus.emit(ack)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def set_soma(self, soma: Any) -> None:
         self._soma = soma
@@ -751,29 +925,409 @@ class PerceptionGateway:
     ) -> None:
         self._cache.community_vocabulary = vocab
 
-    # Retained for call-site compatibility (called from wiring, evo, synapse, thymos)
+    # ------------------------------------------------------------------
+    # Cross-system modulation API
+    # These were formerly no-op stubs. Each now applies real coupling.
+    # ------------------------------------------------------------------
+
     def set_belief_state(self, reader: Any) -> None:
-        pass
+        """
+        Step 1 — Precision modulation from Nova's belief state.
+
+        High-confidence beliefs → lower precision for confirming percepts
+        (already expected, less surprising).
+        Low-confidence beliefs → higher precision (uncertain, need attention).
+
+        Stores _current_belief_confidence and applies it inside
+        FoveaService via the weight learner's learning-salience threshold
+        and through the bridge's habituation engine increment.
+        """
+        try:
+            if reader is None:
+                return
+            # reader is a BeliefStateReader / Nova service — query average confidence
+            beliefs = None
+            if hasattr(reader, "get_current_beliefs"):
+                beliefs = reader.get_current_beliefs()
+            elif hasattr(reader, "beliefs"):
+                beliefs = reader.beliefs
+
+            if beliefs is None:
+                return
+
+            # Average confidence across the distribution
+            if isinstance(beliefs, dict):
+                confidences = [
+                    v if isinstance(v, float) else v.get("confidence", 0.5)
+                    for v in beliefs.values()
+                ]
+            elif hasattr(beliefs, "__iter__"):
+                confidences = [
+                    getattr(b, "confidence", 0.5) for b in beliefs
+                ]
+            else:
+                return
+
+            if not confidences:
+                return
+
+            avg_confidence = sum(confidences) / len(confidences)
+            self._current_belief_confidence = max(0.0, min(1.0, avg_confidence))
+
+            # High confidence → lower salience threshold (confirming percepts need
+            # less attention). Low confidence → raise it (surprises matter more).
+            # Map [0, 1] confidence to [-0.05, +0.05] threshold shift.
+            if self._fovea is not None:
+                # Invert: high confidence → lower threshold (more percepts pass)
+                threshold_shift = (0.5 - self._current_belief_confidence) * 0.10
+                learner = self._fovea.weight_learner
+                # Modulate learning salience threshold symmetrically
+                current_threshold = learner.get_learnable_params().get(
+                    "learning_salience_threshold", 0.1
+                )
+                new_threshold = max(0.01, min(0.5, current_threshold + threshold_shift * 0.1))
+                learner.adjust_param("learning_salience_threshold", new_threshold)
+
+            self._logger.debug(
+                "belief_state_applied",
+                avg_confidence=round(self._current_belief_confidence, 3),
+            )
+        except Exception:
+            pass
 
     def set_community_size(self, size: int) -> None:
-        pass
+        """
+        Step 6 — Social scaling.
+
+        Larger community → boost federation-convergence percepts (more
+        social signal is worth attending to).
+        Solo instance → suppress federation noise by damping source_error
+        weight so redundant peer messages don't crowd the workspace.
+        """
+        try:
+            if size < 0:
+                return
+            self._current_community_size = size
+
+            if self._fovea is None:
+                return
+
+            learner = self._fovea.weight_learner
+            current_weights = learner.weights  # read-only copy
+
+            # Map community size to a source-error weight multiplier.
+            # Solo (size ≤ 1): attenuate SOURCE weight toward floor (0.01)
+            # Large community (size ≥ 10): reinforce SOURCE weight toward ceiling (0.6)
+            if size <= 1:
+                # Suppress federation noise
+                target_source = max(0.04, current_weights.get("source", 0.13) * 0.80)
+            elif size >= 10:
+                # Boost convergence percepts
+                target_source = min(0.30, current_weights.get("source", 0.13) * 1.15)
+            else:
+                # Linear scale between solo and community
+                scale = size / 10.0
+                target_source = current_weights.get("source", 0.13) * (0.80 + 0.35 * scale)
+                target_source = max(0.04, min(0.30, target_source))
+
+            # Apply as a gentle nudge rather than a hard override
+            delta = target_source - current_weights.get("source", 0.13)
+            if abs(delta) > 0.001:
+                learner.adjust_param("learning_rate", learner.get_learnable_params()["learning_rate"])
+                # Directly set via on_world_model_updated feedback isn't available here;
+                # use the weight adjustment path through _weights directly.
+                learner._weights["source"] = target_source
+                learner._normalise_weights()
+
+            self._logger.debug(
+                "community_size_applied",
+                size=size,
+                source_weight=round(target_source, 4),
+            )
+        except Exception:
+            pass
 
     def set_rhythm_state(self, state: str) -> None:
-        pass
+        """
+        Step 2 — Processing mode adaptation from Synapse rhythm.
+
+        FLOW: narrow attention window — boost top percept, suppress distractors
+              → lower dynamic ignition threshold (only high-salience percepts pass)
+        STRESS: widen attention window — everything gets through, lower threshold
+              → raise ignition threshold floor, expand workspace buffer
+        BOREDOM: boost novelty weight, increase spontaneous recall probability
+        DEEP_PROCESSING: suppress new percepts, let workspace contents dominate
+              → raise ignition threshold significantly
+        """
+        try:
+            self._rhythm_state = state.upper() if state else "NEUTRAL"
+
+            if self._fovea is None:
+                return
+
+            bridge_threshold = self._fovea._bridge.dynamic_threshold
+
+            if self._rhythm_state == "FLOW":
+                # Narrow focus: raise threshold so only top percepts enter workspace
+                bridge_threshold.adjust(+0.06)
+                # Shrink workspace buffer slightly (less competition needed)
+                if self._workspace._percept_queue.maxlen is not None:
+                    self._workspace.update_arousal(
+                        max(0.0, self._current_arousal - 0.15)
+                    )
+
+            elif self._rhythm_state == "STRESS":
+                # Widen: lower threshold so more percepts reach workspace
+                bridge_threshold.adjust(-0.08)
+                # Expand buffers
+                self._workspace.update_arousal(
+                    min(1.0, self._current_arousal + 0.20)
+                )
+
+            elif self._rhythm_state == "BOREDOM":
+                # Boost novelty/content weight
+                learner = self._fovea.weight_learner
+                w = learner._weights
+                w["content"] = min(0.40, w.get("content", 0.18) * 1.20)
+                learner._normalise_weights()
+                # Increase spontaneous recall probability
+                self._workspace.adjust_param(
+                    "base_prob",
+                    min(0.08, self._workspace._spontaneous_base_prob * 1.30),
+                )
+
+            elif self._rhythm_state == "DEEP_PROCESSING":
+                # Suppress new arrivals: raise threshold so current workspace dominates
+                bridge_threshold.adjust(+0.12)
+                # Restore recall probability toward default
+                self._workspace.adjust_param("base_prob", 0.02)
+
+            self._logger.debug(
+                "rhythm_state_applied",
+                state=self._rhythm_state,
+                threshold=round(bridge_threshold.current, 4),
+            )
+        except Exception:
+            pass
 
     def nudge_dominance(self, delta: float) -> None:
-        pass
+        """
+        Step 3a — Affect-coupled attention: dominance axis.
+
+        High dominance (> 0.7): boost agency-related percepts
+            → reinforce ECONOMIC and CAUSAL error weights (action/outcome)
+        Low dominance (< 0.3): boost threat-related percepts
+            → reinforce CAUSAL and CATEGORY error weights (errors/degradation)
+        """
+        try:
+            self._affect_dominance = max(0.0, min(1.0, self._affect_dominance + delta))
+
+            if self._fovea is None:
+                return
+
+            learner = self._fovea.weight_learner
+            w = learner._weights
+            d = self._affect_dominance
+
+            if d > 0.7:
+                # Agency: boost economic + causal
+                strength = (d - 0.7) / 0.3  # 0 → 1
+                w["economic"] = min(0.40, w.get("economic", 0.12) * (1.0 + 0.15 * strength))
+                w["causal"] = min(0.35, w.get("causal", 0.08) * (1.0 + 0.10 * strength))
+            elif d < 0.3:
+                # Threat: boost causal + category
+                strength = (0.3 - d) / 0.3  # 0 → 1
+                w["causal"] = min(0.35, w.get("causal", 0.08) * (1.0 + 0.20 * strength))
+                w["category"] = min(0.50, w.get("category", 0.27) * (1.0 + 0.10 * strength))
+
+            learner._normalise_weights()
+            self._logger.debug(
+                "dominance_nudge_applied",
+                dominance=round(self._affect_dominance, 3),
+            )
+        except Exception:
+            pass
 
     def nudge_valence(self, delta: float) -> None:
-        pass
+        """
+        Step 3b — Affect-coupled attention: valence axis.
+
+        High valence (> 0.7): reduce threat sensitivity — things are going well
+            → attenuate CAUSAL and CATEGORY weights slightly
+        Low valence (< 0.3): boost threat sensitivity — something is wrong
+            → amplify CAUSAL and CATEGORY weights, lower ignition threshold
+        """
+        try:
+            self._affect_valence = max(0.0, min(1.0, self._affect_valence + delta))
+
+            if self._fovea is None:
+                return
+
+            learner = self._fovea.weight_learner
+            w = learner._weights
+            v = self._affect_valence
+
+            if v > 0.7:
+                # Positive valence: attenuate threat channels slightly
+                strength = (v - 0.7) / 0.3
+                w["causal"] = max(0.04, w.get("causal", 0.08) * (1.0 - 0.10 * strength))
+                w["category"] = max(0.10, w.get("category", 0.27) * (1.0 - 0.05 * strength))
+                # Raise ignition threshold slightly (less hair-trigger)
+                self._fovea._bridge.dynamic_threshold.adjust(+0.02 * strength)
+
+            elif v < 0.3:
+                # Negative valence: amplify threat sensitivity
+                strength = (0.3 - v) / 0.3
+                w["causal"] = min(0.40, w.get("causal", 0.08) * (1.0 + 0.25 * strength))
+                w["category"] = min(0.50, w.get("category", 0.27) * (1.0 + 0.15 * strength))
+                # Lower ignition threshold (more percepts reach workspace)
+                self._fovea._bridge.dynamic_threshold.adjust(-0.04 * strength)
+
+            learner._normalise_weights()
+            self._logger.debug(
+                "valence_nudge_applied",
+                valence=round(self._affect_valence, 3),
+            )
+        except Exception:
+            pass
 
     def apply_evo_adjustments(
         self, adjustments: dict[str, float],
     ) -> None:
-        pass
+        """
+        Step 4 — Feed Evo parameter adjustments to the learner.
+
+        Keys prefixed with ``atune.*`` or ``fovea.*`` are forwarded to the
+        appropriate subsystem. Unknown keys are silently ignored.
+
+        Audit-logs every applied adjustment.
+        """
+        try:
+            if not adjustments:
+                return
+
+            applied: list[str] = []
+
+            for key, value in adjustments.items():
+                # Strip common prefixes
+                param = key
+                for prefix in ("atune.", "fovea.", "workspace.", "threshold.", "habituation."):
+                    if key.startswith(prefix):
+                        param = key[len(prefix):]
+                        break
+
+                # Workspace curiosity params
+                if param in ("base_prob", "cooldown_cycles", "curiosity_boost"):
+                    self._workspace.adjust_param(param, value)
+                    applied.append(key)
+                    continue
+
+                if self._fovea is None:
+                    continue
+
+                # Fovea weight learner params
+                if self._fovea.weight_learner.adjust_param(param, value):
+                    applied.append(key)
+                    continue
+
+                # Fovea threshold params
+                if param in ("threshold_percentile", "threshold_floor", "threshold_ceiling"):
+                    # Map to FoveaService adjust_threshold_param
+                    if hasattr(self._fovea, "adjust_threshold_param"):
+                        self._fovea.adjust_threshold_param(param.replace("threshold_", ""), value)
+                        applied.append(key)
+                    continue
+
+                # Habituation params
+                if hasattr(self._fovea, "adjust_habituation_param"):
+                    if self._fovea.adjust_habituation_param(param, value):
+                        applied.append(key)
+
+            if applied:
+                self._logger.info(
+                    "evo_adjustments_applied",
+                    count=len(applied),
+                    params=applied,
+                )
+        except Exception:
+            self._logger.warning("evo_adjustments_failed", exc_info=True)
 
     def receive_belief_feedback(self, feedback: Any) -> None:
-        pass
+        """
+        Step 5 — Attention learning signal from Nova.
+
+        When Nova reports that a percept led to a good/bad decision:
+        - good outcome → reinforce the salience weights that promoted it
+        - bad outcome  → suppress the salience weights that promoted it
+
+        feedback is expected to have:
+            percept_id: str
+            outcome: "good" | "bad" | "positive" | "negative"
+            dominant_error_type: str | None   (optional hint)
+        """
+        try:
+            if feedback is None or self._fovea is None:
+                return
+
+            # Extract fields gracefully from dict or object
+            def _get(obj: Any, key: str, default: Any = None) -> Any:
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
+
+            percept_id = _get(feedback, "percept_id", "")
+            outcome = str(_get(feedback, "outcome", "")).lower()
+            dominant_hint = _get(feedback, "dominant_error_type", None)
+
+            positive = outcome in ("good", "positive", "success", "confirmed")
+            negative = outcome in ("bad", "negative", "failure", "refuted")
+
+            if not positive and not negative:
+                return
+
+            learner = self._fovea.weight_learner
+
+            if positive:
+                # Record as a curiosity hit so workspace curiosity rate improves
+                self._workspace.record_curiosity_outcome(percept_id, positive=True)
+
+                # Reinforce the dominant error type if we have a hint
+                if dominant_hint and dominant_hint in learner._weights:
+                    old = learner._weights[dominant_hint]
+                    learner._weights[dominant_hint] = min(
+                        learner._weight_ceiling,
+                        old + learner._learning_rate * 0.5,
+                    )
+                    learner._normalise_weights()
+                    learner._reinforcements += 1
+                    self._logger.debug(
+                        "belief_feedback_reinforced",
+                        percept_id=percept_id,
+                        dominant=dominant_hint,
+                        old=round(old, 4),
+                        new=round(learner._weights[dominant_hint], 4),
+                    )
+
+            elif negative:
+                self._workspace.record_curiosity_outcome(percept_id, positive=False)
+
+                if dominant_hint and dominant_hint in learner._weights:
+                    old = learner._weights[dominant_hint]
+                    learner._weights[dominant_hint] = max(
+                        learner._weight_floor,
+                        old - learner._false_alarm_decay * 2.0,
+                    )
+                    learner._normalise_weights()
+                    learner._decays += 1
+                    self._logger.debug(
+                        "belief_feedback_suppressed",
+                        percept_id=percept_id,
+                        dominant=dominant_hint,
+                        old=round(old, 4),
+                        new=round(learner._weights[dominant_hint], 4),
+                    )
+        except Exception:
+            self._logger.warning("belief_feedback_failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Health (Synapse HealthMonitor protocol)
@@ -810,6 +1364,13 @@ class PerceptionGateway:
             "threshold": round(
                 self._workspace.dynamic_threshold, 4,
             ),
+            "modulation": {
+                "belief_confidence": round(self._current_belief_confidence, 3),
+                "community_size": self._current_community_size,
+                "rhythm_state": self._rhythm_state,
+                "affect_dominance": round(self._affect_dominance, 3),
+                "affect_valence": round(self._affect_valence, 3),
+            },
         }
 
     @property

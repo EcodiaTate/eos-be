@@ -58,11 +58,21 @@ def format_for_training(
     if not user_content.strip() or not assistant_content.strip():
         return {}  # caller skips empty dicts
 
+    # Wrap reasoning scaffold in Qwen3-native <think> tags.
+    # Steps 1-4 are internal reasoning; Step 5 is the visible decision.
+    # This teaches the model to use its native CoT mechanism.
+    thinking, visible = _split_at_decision(assistant_content)
+    if thinking and visible:
+        final_assistant = f"<think>\n{thinking}\n</think>\n\n{visible}"
+    else:
+        # Fallback: wrap entire content in think tags with a brief visible summary
+        final_assistant = f"<think>\n{assistant_content}\n</think>\n\nDecision applied per reasoning above."
+
     return {
         "messages": [
             {"role": "system",    "content": _SYSTEM_PROMPT},
             {"role": "user",      "content": user_content},
-            {"role": "assistant", "content": assistant_content},
+            {"role": "assistant", "content": final_assistant},
         ],
         "stream_id":      stream_id,
         "quality_score":  example.get("quality_score", 0.0),
@@ -384,6 +394,26 @@ _FORMATTERS = {
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _split_at_decision(text: str) -> tuple[str, str]:
+    """
+    Split scaffold text into (thinking, visible_decision).
+
+    Steps 1-4 go inside <think> tags (internal reasoning).
+    Step 5 (Decision) becomes the visible output.
+    """
+    marker = "## Step 5:"
+    idx = text.find(marker)
+    if idx < 0:
+        # Try alternative markers
+        for alt in ("## Step 5 ", "## Decision", "Action:"):
+            idx = text.find(alt)
+            if idx >= 0:
+                break
+    if idx < 0:
+        return "", ""  # can't split — caller uses fallback
+    return text[:idx].rstrip(), text[idx:].strip()
 
 
 def _first_sentence(text: str | None, fallback: str = "see context") -> str:

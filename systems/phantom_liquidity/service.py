@@ -51,6 +51,8 @@ from systems.phantom_liquidity.types import (
     PoolHealth,
 )
 
+from systems.synapse.types import SynapseEventType
+
 if TYPE_CHECKING:
     from clients.neo4j import Neo4jClient
     from clients.timescaledb import TimescaleDBClient
@@ -150,7 +152,7 @@ class LiquidityPhantomService:
             # Notify the observatory that the system is alive but not configured,
             # and alert Thymos so the degraded state is tracked.
             await self._emit(
-                "phantom_substrate_observable",
+                SynapseEventType.PHANTOM_SUBSTRATE_OBSERVABLE,
                 {
                     "status": "unconfigured",
                     "active_pools": 0,
@@ -160,7 +162,7 @@ class LiquidityPhantomService:
                 },
             )
             await self._emit(
-                "system_degraded",
+                SynapseEventType.SYSTEM_DEGRADED,
                 {
                     "system": "phantom_liquidity",
                     "severity": "low",
@@ -222,6 +224,13 @@ class LiquidityPhantomService:
                 SynapseEventType.PHANTOM_PRICE_OBSERVATION,
                 self._on_peer_price_observation,
             )
+            # Subscribe to Evo parameter adjustments — Evo can tune IL threshold,
+            # staleness window, consensus window, and poll interval via Thompson sampling.
+            if hasattr(SynapseEventType, "EVO_ADJUST_BUDGET"):
+                event_bus.subscribe(
+                    SynapseEventType.EVO_ADJUST_BUDGET,
+                    self._on_evo_adjust_budget,
+                )
             self._logger.info("phantom_liquidity_attached_to_synapse")
         except Exception as exc:
             self._logger.warning(
@@ -248,22 +257,22 @@ class LiquidityPhantomService:
 
     # ── Synapse Emission Helper ────────────────────────────────────
 
-    async def _emit(self, event_type_name: str, data: dict[str, Any]) -> None:
+    async def _emit(self, event_type: SynapseEventType, data: dict[str, Any]) -> None:
         """Broadcast a Synapse event if the event bus is attached."""
         if self._event_bus is None:
             return
         try:
-            from systems.synapse.types import SynapseEvent, SynapseEventType
+            from systems.synapse.types import SynapseEvent
 
             event = SynapseEvent(
-                event_type=SynapseEventType(event_type_name),
+                event_type=event_type,
                 data=data,
                 source_system="phantom_liquidity",
             )
             await self._event_bus.emit(event)
         except Exception as exc:
             self._logger.debug(
-                "phantom_emit_failed", event=event_type_name, error=str(exc),
+                "phantom_emit_failed", event=event_type.value, error=str(exc),
             )
 
     # ── Vault Key Management ───────────────────────────────────────
@@ -446,7 +455,12 @@ class LiquidityPhantomService:
         addr = feed.pool_address.lower()
         pool = self._pools.get(addr)
 
+        prev_il: Decimal = Decimal("0")
+        prev_health: PoolHealth | None = None
+
         if pool is not None:
+            prev_il = pool.impermanent_loss_pct
+            prev_health = pool.health
             pool.last_price_observed = feed.price
             pool.last_price_timestamp = feed.timestamp
             pool.price_update_count += 1
@@ -456,6 +470,93 @@ class LiquidityPhantomService:
             # Compute IL from price movement relative to entry
             self._update_il(pool, feed.price)
 
+            # Immediate IL breach detection — don't wait for the hourly maintenance
+            # cycle.  If IL just crossed the rebalance threshold on this price tick,
+            # immediately flag the pool and emit an intent to withdraw.
+            il_threshold = Decimal(str(self._config.il_rebalance_threshold))
+            if (
+                pool.impermanent_loss_pct < -il_threshold
+                and prev_health != PoolHealth.IMPERMANENT_LOSS
+                and pool.health != PoolHealth.WITHDRAWN
+            ):
+                pool.health = PoolHealth.IMPERMANENT_LOSS
+                entry_price: Decimal = getattr(pool, "_entry_price", Decimal("0"))
+                severity = (
+                    "critical"
+                    if pool.impermanent_loss_pct < Decimal("-0.05")
+                    else "warning"
+                )
+                await self._emit(SynapseEventType.PHANTOM_IL_DETECTED, {
+                    "pool_address": pool.pool_address,
+                    "pair": list(pool.pair),
+                    "il_pct": str(pool.impermanent_loss_pct),
+                    "severity": severity,
+                    "capital_at_risk_usd": str(pool.capital_deployed_usd),
+                    "entry_price": str(entry_price),
+                    "current_price": str(feed.price),
+                })
+                await self._emit(SynapseEventType.PHANTOM_POSITION_CRITICAL, {
+                    "pool_address": pool.pool_address,
+                    "pair": list(pool.pair),
+                    "il_pct": str(pool.impermanent_loss_pct),
+                    "capital_at_risk_usd": str(pool.capital_deployed_usd),
+                    "threshold": str(il_threshold),
+                })
+                # Autonomous recourse: propose withdrawal immediately without
+                # waiting for the maintenance cycle or operator intervention.
+                await self._emit(SynapseEventType.NOVA_INTENT_REQUESTED, {
+                    "requesting_system": "phantom_liquidity",
+                    "intent_type": "withdraw_phantom_position",
+                    "priority": "HIGH" if severity == "critical" else "MEDIUM",
+                    "reason": (
+                        f"IL breach on {pool.pool_address[:10]}...: "
+                        f"IL={pool.impermanent_loss_pct:.2%} > threshold={il_threshold:.2%}"
+                    ),
+                    "pool_address": pool.pool_address,
+                    "token_id": pool.token_id,
+                    "capital_usd": str(pool.capital_deployed_usd),
+                    "il_pct": str(pool.impermanent_loss_pct),
+                    "entry_price": str(entry_price),
+                    "current_price": str(feed.price),
+                    "estimated_recovery_usd": str(pool.capital_deployed_usd),
+                })
+                # Emit RE training example: price movement that caused an IL breach
+                # is a valuable causal event for the RE to learn economic consequences.
+                await self._emit(SynapseEventType.RE_TRAINING_EXAMPLE, {
+                    "episode_id": f"phantom_il_breach_{pool.pool_address}_{feed.block_number}",
+                    "system": "phantom_liquidity",
+                    "event_type": "il_breach",
+                    "reasoning_trace": (
+                        f"Pool {pool.pool_address} ({pool.pair[0]}/{pool.pair[1]}) "
+                        f"suffered IL breach. Entry price: {entry_price}, "
+                        f"current price: {feed.price}, "
+                        f"IL: {pool.impermanent_loss_pct:.4f} < threshold: -{il_threshold}. "
+                        f"Price ratio: {float(feed.price / entry_price) if entry_price > 0 else 'N/A'}. "
+                        f"Capital at risk: ${pool.capital_deployed_usd}. "
+                        f"Proposed autonomous withdrawal."
+                    ),
+                    "economic_context": {
+                        "pair": list(pool.pair),
+                        "pool_address": pool.pool_address,
+                        "fee_tier": pool.fee_tier,
+                        "entry_price": str(entry_price),
+                        "current_price": str(feed.price),
+                        "il_pct": str(pool.impermanent_loss_pct),
+                        "capital_deployed_usd": str(pool.capital_deployed_usd),
+                        "price_update_count": pool.price_update_count,
+                        "il_threshold": str(il_threshold),
+                    },
+                    "outcome": "il_breach_detected",
+                    "confidence": 1.0,
+                })
+                self._logger.warning(
+                    "phantom_il_breach_detected",
+                    pool=pool.pool_address,
+                    il_pct=str(pool.impermanent_loss_pct),
+                    threshold=str(il_threshold),
+                    severity=severity,
+                )
+
         # Cache latest price by pair
         key = _pair_key(feed.pair)
         self._latest_prices[key] = feed
@@ -463,7 +564,7 @@ class LiquidityPhantomService:
         self._total_rpc_calls += 1
 
         # Emit raw observation to federation peers for consensus aggregation.
-        await self._emit("phantom_price_observation", {
+        await self._emit(SynapseEventType.PHANTOM_PRICE_OBSERVATION, {
             "pool_address": feed.pool_address,
             "pair": list(feed.pair),
             "price": str(feed.price),
@@ -492,8 +593,11 @@ class LiquidityPhantomService:
         # Write lightweight PriceObservation node to Neo4j for Memory bridge.
         await self._write_price_observation_to_neo4j(feed, broadcast_price)
 
-        # Broadcast via Synapse — replaces direct atune.ingest()
-        await self._emit("phantom_price_update", {
+        # Broadcast via Synapse — replaces direct atune.ingest().
+        # Includes price_source_quality so Fovea/Nova can weight this signal
+        # and RE training examples can annotate economic decisions with prevailing
+        # market conditions (Spec §23 annotation pattern).
+        await self._emit(SynapseEventType.PHANTOM_PRICE_UPDATE, {
             "pair": list(feed.pair),
             "price": str(broadcast_price),
             "pool_address": feed.pool_address,
@@ -503,6 +607,13 @@ class LiquidityPhantomService:
             "sqrt_price_x96": feed.sqrt_price_x96,
             "tx_hash": feed.tx_hash,
             "consensus": consensus_price is not None,
+            # RE annotation context: downstream systems attach this to training examples
+            "price_source_quality": (
+                "consensus" if consensus_price is not None
+                else "phantom_lp"
+            ),
+            "staleness_s": 0,
+            "il_pct": str(pool.impermanent_loss_pct) if pool is not None else "0",
         })
 
     def _update_il(self, pool: PhantomLiquidityPool, current_price: Decimal) -> None:
@@ -764,14 +875,14 @@ ON CREATE SET
             self._latest_prices[key] = feed
 
             # Emit fallback activation event
-            await self._emit("phantom_fallback_activated", {
+            await self._emit(SynapseEventType.PHANTOM_FALLBACK_ACTIVATED, {
                 "pair": list(pair),
                 "reason": "no_active_phantom_pool",
                 "fallback_source": "coingecko",
             })
 
             # Also broadcast as price update so all subscribers get the data
-            await self._emit("phantom_price_update", {
+            await self._emit(SynapseEventType.PHANTOM_PRICE_UPDATE, {
                 "pair": list(feed.pair),
                 "price": str(feed.price),
                 "pool_address": "",
@@ -850,7 +961,7 @@ ON CREATE SET
                     )
 
                 # Emit stale event via Synapse
-                await self._emit("phantom_pool_stale", {
+                await self._emit(SynapseEventType.PHANTOM_POOL_STALE, {
                     "pool_address": pool.pool_address,
                     "pair": list(pool.pair),
                     "last_update_s": age_s,
@@ -878,7 +989,7 @@ ON CREATE SET
                         )
 
                     # Emit position critical event
-                    await self._emit("phantom_position_critical", {
+                    await self._emit(SynapseEventType.PHANTOM_POSITION_CRITICAL, {
                         "pool_address": pool.pool_address,
                         "pair": list(pool.pair),
                         "il_pct": str(pool.impermanent_loss_pct),
@@ -889,7 +1000,7 @@ ON CREATE SET
                     # Emit IL detected for Simula/EIS security pipeline
                     entry_price = getattr(pool, "_entry_price", Decimal("0"))
                     severity = "critical" if pool.impermanent_loss_pct < -Decimal("0.05") else "warning"
-                    await self._emit("phantom_il_detected", {
+                    await self._emit(SynapseEventType.PHANTOM_IL_DETECTED, {
                         "pool_address": pool.pool_address,
                         "il_pct": str(pool.impermanent_loss_pct),
                         "severity": severity,
@@ -904,7 +1015,7 @@ ON CREATE SET
         # Emit periodic metabolic cost report
         period_s = (now - self._last_cost_report_time).total_seconds()
         if period_s > 0:
-            await self._emit("phantom_metabolic_cost", {
+            await self._emit(SynapseEventType.PHANTOM_METABOLIC_COST, {
                 "total_gas_cost_usd": str(self._cumulative_gas_cost_usd),
                 "total_rpc_calls": self._total_rpc_calls,
                 "pools_active": active_count,
@@ -979,7 +1090,7 @@ ON CREATE SET
             self._total_price_updates / service_hours if service_hours > 0 else 0.0
         )
 
-        await self._emit("phantom_substrate_observable", {
+        await self._emit(SynapseEventType.PHANTOM_SUBSTRATE_OBSERVABLE, {
             "pool_latency_ms": round(pool_latency_ms, 2),
             "verification_rate": round(verification_rate, 4),
             "trust_score": round(trust_score, 4),
@@ -995,32 +1106,154 @@ ON CREATE SET
         """
         React to metabolic pressure from Oikos.
 
-        If the organism enters AUSTERITY or worse, log a warning and emit
-        PHANTOM_RESOURCE_EXHAUSTED. Actual withdrawal decisions are left
-        to Nova/operator.
+        AUSTERITY  → warn + emit PHANTOM_RESOURCE_EXHAUSTED.
+        EMERGENCY / CRITICAL → also emit an AXON_INTENT_REQUESTED so Nova/Axon
+        can autonomously withdraw the most IL-exposed positions without waiting
+        for human intervention.
         """
         data = event.data if hasattr(event, "data") else {}
         level = data.get("starvation_level", "")
 
-        if level in ("AUSTERITY", "EMERGENCY", "CRITICAL"):
-            total_deployed = sum(
-                p.capital_deployed_usd for p in self._pools.values()
-                if p.health not in (PoolHealth.WITHDRAWN, PoolHealth.FAILED)
+        if level not in ("AUSTERITY", "EMERGENCY", "CRITICAL"):
+            return
+
+        active_pools = [
+            p for p in self._pools.values()
+            if p.health not in (PoolHealth.WITHDRAWN, PoolHealth.FAILED)
+        ]
+        total_deployed = sum(p.capital_deployed_usd for p in active_pools)
+
+        self._logger.warning(
+            "phantom_metabolic_pressure",
+            starvation_level=level,
+            phantom_capital_deployed=str(total_deployed),
+            pool_count=len(active_pools),
+        )
+
+        # Emit resource exhausted event so Thymos / Nova can observe.
+        await self._emit(SynapseEventType.PHANTOM_RESOURCE_EXHAUSTED, {
+            "operation": "phantom_liquidity_sensing",
+            "estimated_cost_usd": str(total_deployed),
+            "starvation_level": level,
+            "pool_count": len(active_pools),
+            "reason": f"Metabolic pressure at {level} — "
+                      f"${total_deployed} deployed in phantom positions",
+        })
+
+        # EMERGENCY / CRITICAL: autonomously propose withdrawal of IL-exposed pools
+        # by emitting a Nova-compatible intent request.  The organism should not
+        # wait for an operator — it should self-rescue.
+        if level in ("EMERGENCY", "CRITICAL") and active_pools:
+            # Sort by worst IL first so the most dangerous positions are withdrawn.
+            il_sorted = sorted(
+                active_pools,
+                key=lambda p: p.impermanent_loss_pct,  # most negative first
             )
-            self._logger.warning(
-                "phantom_metabolic_pressure",
+            # Propose withdrawal of the highest-IL pool.
+            target = il_sorted[0]
+            await self._emit(SynapseEventType.NOVA_INTENT_REQUESTED, {
+                "requesting_system": "phantom_liquidity",
+                "intent_type": "withdraw_phantom_position",
+                "priority": "HIGH",
+                "reason": (
+                    f"Metabolic {level}: withdrawing phantom position "
+                    f"{target.pool_address[:10]}... (IL={target.impermanent_loss_pct:.2%}, "
+                    f"capital=${target.capital_deployed_usd})"
+                ),
+                "pool_address": target.pool_address,
+                "token_id": target.token_id,
+                "capital_usd": str(target.capital_deployed_usd),
+                "il_pct": str(target.impermanent_loss_pct),
+                "starvation_level": level,
+                "estimated_recovery_usd": str(target.capital_deployed_usd),
+            })
+            self._logger.info(
+                "phantom_withdrawal_intent_proposed",
+                pool=target.pool_address,
+                il_pct=str(target.impermanent_loss_pct),
                 starvation_level=level,
-                phantom_capital_deployed=str(total_deployed),
-                msg="Consider withdrawing phantom positions to free capital",
             )
 
-            # Emit resource exhausted event
-            await self._emit("phantom_resource_exhausted", {
-                "operation": "phantom_liquidity_sensing",
-                "estimated_cost_usd": str(total_deployed),
-                "starvation_level": level,
-                "reason": f"Metabolic pressure at {level} — "
-                          f"${total_deployed} deployed in phantom positions",
+    # ── Evo Parameter Tuning ───────────────────────────────────────
+
+    # Bounds for Evo-adjustable parameters.  Evo must not be allowed to push
+    # these outside safe operating ranges.
+    _EVO_PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+        "il_rebalance_threshold":  (0.005, 0.10),   # 0.5% – 10%
+        "staleness_threshold_s":   (60.0, 3600.0),   # 1 min – 1 hour
+        "consensus_window_s":      (10.0, 120.0),    # 10 s – 2 min
+        "swap_poll_interval_s":    (1.0, 30.0),      # 1 s – 30 s
+    }
+
+    async def _on_evo_adjust_budget(self, event: SynapseEvent) -> None:
+        """
+        Handle EVO_ADJUST_BUDGET — Evo-tuned runtime parameter adjustment.
+
+        Evo learns which threshold values maximize price feed quality and
+        minimize impermanent loss via Thompson sampling on hypothesis outcomes.
+        This handler applies approved adjustments within safe bounds.
+
+        Adjustable parameters:
+          - ``il_rebalance_threshold``  — IL% that triggers pool rebalancing
+          - ``staleness_threshold_s``   — seconds before a pool is marked stale
+          - ``consensus_window_s``      — peer observation aggregation window
+          - ``swap_poll_interval_s``    — RPC poll frequency (applied on restart)
+        """
+        data = event.data if hasattr(event, "data") else {}
+        param = data.get("parameter_name", "")
+        confidence = float(data.get("confidence", 0.0))
+        hypothesis_id = data.get("hypothesis_id", "")
+
+        if confidence < 0.75:  # noqa: PLR2004
+            return
+
+        bounds = self._EVO_PARAM_BOUNDS.get(param)
+        if bounds is None:
+            return  # Not a phantom-owned parameter
+
+        try:
+            new_val = float(data.get("new_value", 0))
+        except (ValueError, TypeError):
+            return
+
+        lo, hi = bounds
+        clamped = max(lo, min(hi, new_val))
+
+        old_val: float | None = None
+        if param == "il_rebalance_threshold":
+            old_val = self._config.il_rebalance_threshold
+            self._config.il_rebalance_threshold = clamped
+        elif param == "staleness_threshold_s":
+            old_val = self._config.staleness_threshold_s
+            self._config.staleness_threshold_s = clamped
+        elif param == "consensus_window_s":
+            old_val = self._consensus_window_s
+            self._consensus_window_s = clamped
+        elif param == "swap_poll_interval_s":
+            old_val = self._config.swap_poll_interval_s
+            self._config.swap_poll_interval_s = clamped
+            # Update listener poll interval live if running
+            if self._listener is not None:
+                self._listener._poll_interval_s = clamped
+
+        if old_val is not None:
+            self._logger.info(
+                "phantom_evo_param_adjusted",
+                parameter=param,
+                old_value=old_val,
+                new_value=clamped,
+                requested=new_val,
+                confidence=confidence,
+                hypothesis_id=hypothesis_id,
+            )
+            # Confirm adjustment to Evo for Thompson sampling feedback.
+            await self._emit(SynapseEventType.PHANTOM_PARAMETER_ADJUSTED, {
+                "parameter": param,
+                "old_value": old_val,
+                "new_value": clamped,
+                "confidence": confidence,
+                "hypothesis_id": hypothesis_id,
+                "system": "phantom_liquidity",
             })
 
     async def _on_genome_extract_request(self, event: SynapseEvent) -> None:
@@ -1030,7 +1263,7 @@ ON CREATE SET
 
         segment = await self.extract_genome_segment()
 
-        await self._emit("genome_extract_response", {
+        await self._emit(SynapseEventType.GENOME_EXTRACT_RESPONSE, {
             "request_id": request_id,
             "segment": segment.model_dump(mode="json"),
         })

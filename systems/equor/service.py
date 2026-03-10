@@ -42,6 +42,7 @@ from systems.equor.amendment import (
 )
 from systems.equor.amendment_pipeline import (
     ShadowTracker,
+    auto_adopt_single_instance_amendment,
     cast_vote,
     complete_shadow_period,
     evaluate_shadow,
@@ -105,6 +106,7 @@ class _IdentityVerificationPayload(BaseModel):
     raw_body: str = ""
 
 class _SomaTickPayload(BaseModel):
+    model_config = {"extra": "ignore"}
     # somatic_state is a serialised SomaticCycleState — a nested dict, not dict[str, float]
     somatic_state: dict[str, Any] = {}
     cycle_number: int = 0
@@ -136,7 +138,7 @@ logger = structlog.get_logger()
 # Review timeout: the entire review() call must not block the event loop
 # beyond this budget. Community invariant LLM calls are the most expensive
 # component and will be skipped if the budget is exhausted.
-_REVIEW_TIMEOUT_S = 0.8
+_REVIEW_TIMEOUT_S = 2.0
 # Cache TTL for constitution and autonomy level (seconds).
 # These change only via governance events, so a short TTL is safe.
 _STATE_CACHE_TTL_S = 30.0
@@ -220,6 +222,13 @@ class EquorService:
         self._somatic_urgency: float = 0.0
         self._somatic_stress_context: bool = False
 
+        # Cached Telos assessment signal — effective_I and drive multipliers for
+        # constitutional review context (updated via TELOS_ASSESSMENT_SIGNAL subscription)
+        self._telos_effective_I: float | None = None
+        self._telos_alignment_gap: float = 0.0
+        self._telos_care_multiplier: float = 1.0
+        self._telos_honesty_validity: float = 1.0
+
         # Rolling 24h violation counter for VitalityCoordinator
         # (NORMATIVE_COLLAPSE threshold = 10 violations/24h).
         self._violation_timestamps: deque[float] = deque()
@@ -252,6 +261,20 @@ class EquorService:
             "coherence": 0,
             "growth": 0,
         }
+
+        self._modulation_halted: bool = False
+
+        # Single-instance quorum paradox resolution (Spec 02 §Amendment):
+        # Tracks consecutive probe cycles where composite drift severity ≥ 0.95
+        # per active shadow-passed proposal.  After 7+ cycles the auto-adoption
+        # path in _check_single_instance_auto_adoption() may fire.
+        self._consecutive_high_drift_cycles: dict[str, int] = {}
+
+        # Instance identity — read from env at boot so certificates, genome
+        # exports, and health-request responses embed the correct instance ID
+        # rather than the empty string that getattr fallback would produce.
+        import os as _os
+        self._instance_id: str = _os.environ.get("ECODIAOS_INSTANCE_ID", "")
 
     def set_evo(self, evo: Any) -> None:
         """Wire Evo so constitutional vetoes become learning episodes."""
@@ -327,6 +350,64 @@ class EquorService:
             SynapseEventType.OIKOS_METABOLIC_SNAPSHOT,
             self._on_oikos_metabolic_snapshot,
         )
+        # SG5 (economic): Oikos emits OIKOS_DRIVE_WEIGHT_PRESSURE after 3+ consecutive
+        # low-efficiency cycles. Equor evaluates whether a constitutional drive weight
+        # amendment is warranted and emits AMENDMENT_AUTO_PROPOSAL if so.
+        event_bus.subscribe(
+            SynapseEventType.OIKOS_DRIVE_WEIGHT_PRESSURE,
+            self._on_oikos_drive_weight_pressure,
+        )
+        # Identity's GenesisCA emits EQUOR_HEALTH_REQUEST and awaits EQUOR_ALIGNMENT_SCORE
+        # (2s timeout) to embed the live constitutional hash into certificates.
+        event_bus.subscribe(
+            SynapseEventType.EQUOR_HEALTH_REQUEST,
+            self._on_equor_health_request,
+        )
+        event_bus.subscribe(
+            SynapseEventType.SYSTEM_MODULATION,
+            self._on_system_modulation,
+        )
+        # Action budget expansion requests — evaluate and approve/deny
+        if hasattr(SynapseEventType, "ACTION_BUDGET_EXPANSION_REQUEST"):
+            event_bus.subscribe(
+                SynapseEventType.ACTION_BUDGET_EXPANSION_REQUEST,
+                self._on_action_budget_expansion_request,
+            )
+        # Compute budget expansion — SACM requests more compute budget
+        if hasattr(SynapseEventType, "COMPUTE_BUDGET_EXPANSION_REQUEST"):
+            event_bus.subscribe(
+                SynapseEventType.COMPUTE_BUDGET_EXPANSION_REQUEST,
+                self._on_compute_budget_expansion_request,
+            )
+        # COHERENCE_SHIFT — Synapse CoherenceMonitor emits when the composite
+        # coherence drops significantly. A significant drop (> 0.2 magnitude)
+        # triggers a constitutional alignment review: we re-examine recent drift
+        # history and emit CONSTITUTIONAL_DRIFT_DETECTED if the drift streak is
+        # worsening, giving Thymos and Thread early warning before thresholds
+        # are fully breached.
+        if hasattr(SynapseEventType, "COHERENCE_SHIFT"):
+            event_bus.subscribe(
+                SynapseEventType.COHERENCE_SHIFT,
+                self._on_coherence_shift,
+            )
+        # Child lifecycle governance — Equor must review blacklisting and
+        # decommission proposals to maintain constitutional oversight over the
+        # organism's treatment of its children.
+        event_bus.subscribe(
+            SynapseEventType.CHILD_BLACKLISTED,
+            self._on_child_blacklisted,
+        )
+        event_bus.subscribe(
+            SynapseEventType.CHILD_DECOMMISSION_PROPOSED,
+            self._on_child_decommission_proposed,
+        )
+        # Telos assessment signal — cache effective_I and drive multipliers for
+        # constitutional review context (avoids direct Telos coupling; fast-path reads
+        # from this cache when Telos hasn't been queried within the review budget)
+        event_bus.subscribe(
+            SynapseEventType.TELOS_ASSESSMENT_SIGNAL,
+            self._on_telos_assessment_signal,
+        )
         logger.info("equor_hitl_listener_registered")
 
     async def _on_soma_tick(self, event: Any) -> None:
@@ -389,6 +470,106 @@ class EquorService:
             # Normal: gradual return to baseline
             self._somatic_urgency = urgency
             self._somatic_stress_context = urgency >= 0.9
+
+    async def _on_telos_assessment_signal(self, event: Any) -> None:
+        """Handle TELOS_ASSESSMENT_SIGNAL — cache drive topology for review context.
+
+        Telos emits this each measurement cycle with effective_I, alignment_gap, and
+        all drive multipliers. Equor caches the values so constitutional reviews can
+        incorporate intelligence-axis state without a direct Telos coupling.
+
+        Particularly useful for:
+        - Tightening review thresholds when honesty_validity is low (organism may
+          be confabulating — extra scrutiny is warranted)
+        - Contextual alignment gap awareness (large gap → Care/Honesty floor drives
+          are underperforming relative to nominal capability)
+        """
+        data = getattr(event, "data", {}) or {}
+        self._telos_effective_I = float(data.get("effective_I", self._telos_effective_I or 0.0))
+        self._telos_alignment_gap = float(data.get("alignment_gap", 0.0))
+        self._telos_care_multiplier = float(data.get("drive_care", 1.0))
+        self._telos_honesty_validity = float(data.get("drive_honesty_validity", 1.0))
+        logger.debug(
+            "equor_telos_assessment_cached",
+            effective_I=round(self._telos_effective_I, 4),
+            alignment_gap=round(self._telos_alignment_gap, 4),
+            honesty_validity=round(self._telos_honesty_validity, 4),
+        )
+
+    async def _on_coherence_shift(self, event: Any) -> None:
+        """React to Synapse CoherenceMonitor reporting a significant coherence change.
+
+        A coherence drop > 0.2 triggers a constitutional alignment review:
+        we inspect the current drift report and, if the drift streak is worsening,
+        emit CONSTITUTIONAL_DRIFT_DETECTED so Thymos and Thread receive early
+        warning before thresholds are fully breached.
+
+        A coherence recovery (positive delta) clears the stress context flag if
+        somatic urgency has been elevated by previous drops.
+        """
+        data = getattr(event, "data", {}) or {}
+        new_composite: float = float(
+            data.get("composite", data.get("new_composite", 1.0))
+        )
+        old_composite: float = float(
+            data.get("old_composite", data.get("previous_composite", new_composite))
+        )
+        delta = new_composite - old_composite
+
+        if abs(delta) < 0.1:
+            return
+
+        logger.info(
+            "equor_coherence_shift_received",
+            old_composite=round(old_composite, 3),
+            new_composite=round(new_composite, 3),
+            delta=round(delta, 3),
+        )
+
+        if delta < -0.2:
+            # Significant drop — run constitutional alignment review
+            if self._drift_tracker is not None:
+                try:
+                    report = self._drift_tracker.compute_report()
+                    drift_severity: float = float(
+                        report.get("drift_severity", 0.0)
+                        if isinstance(report, dict)
+                        else getattr(report, "severity", 0.0)
+                    )
+                    if drift_severity >= 0.5 and self._event_bus is not None:
+                        from systems.synapse.types import SynapseEvent, SynapseEventType as _SET
+                        asyncio.ensure_future(
+                            self._event_bus.emit(SynapseEvent(
+                                event_type=_SET.CONSTITUTIONAL_DRIFT_DETECTED,
+                                source_system="equor",
+                                data={
+                                    "drift_severity": round(drift_severity, 3),
+                                    "coherence_composite": round(new_composite, 3),
+                                    "coherence_delta": round(delta, 3),
+                                    "trigger": "coherence_shift",
+                                },
+                            ))
+                        )
+                        logger.warning(
+                            "equor_coherence_shift_constitutional_drift_detected",
+                            drift_severity=round(drift_severity, 3),
+                            coherence_composite=round(new_composite, 3),
+                        )
+                except Exception as exc:
+                    logger.debug("equor_coherence_shift_drift_check_failed", error=str(exc))
+
+            self._somatic_urgency = min(1.0, self._somatic_urgency + abs(delta) * 0.5)
+            if self._somatic_urgency >= 0.9:
+                self._somatic_stress_context = True
+
+        elif delta > 0.2:
+            self._somatic_urgency = max(0.0, self._somatic_urgency - delta * 0.3)
+            if self._somatic_urgency < 0.9:
+                self._somatic_stress_context = False
+            logger.info(
+                "equor_coherence_shift_recovering",
+                new_urgency=round(self._somatic_urgency, 3),
+            )
 
     async def _on_memory_pressure(self, event: Any) -> None:
         """React to Memory reporting high graph pressure.
@@ -538,6 +719,284 @@ class EquorService:
         except Exception as exc:
             logger.warning("equor_economic_permit_emit_failed", error=str(exc))
 
+    async def _on_equor_health_request(self, event: Any) -> None:
+        """Respond to Identity's GenesisCA requesting live constitutional state.
+
+        GenesisCA emits EQUOR_HEALTH_REQUEST and awaits EQUOR_ALIGNMENT_SCORE
+        (2s timeout) to embed the live constitutional hash into issued certificates.
+        Without this handler, the hash always falls back to the static document hash.
+
+        Payload emitted: request_id, drive_vector, alignment_score, constitution_hash,
+        instance_id.
+        """
+        if self._event_bus is None:
+            return
+
+        data = getattr(event, "data", {}) or {}
+        request_id = str(data.get("request_id", ""))
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            # Derive drive vector from cached constitution (no Neo4j call — must be fast)
+            drive_vector: dict[str, float] = {}
+            constitution_hash = ""
+            if self._cached_constitution:
+                drive_vector = {
+                    "coherence": float(self._cached_constitution.get("drive_coherence") or 0.0),
+                    "care": float(self._cached_constitution.get("drive_care") or 0.0),
+                    "growth": float(self._cached_constitution.get("drive_growth") or 0.0),
+                    "honesty": float(self._cached_constitution.get("drive_honesty") or 0.0),
+                }
+                import json as _json
+                import hashlib as _hashlib
+                const_repr = _json.dumps(
+                    {k: v for k, v in self._cached_constitution.items()},
+                    sort_keys=True,
+                    default=str,
+                )
+                constitution_hash = _hashlib.sha256(const_repr.encode()).hexdigest()
+            else:
+                # Fallback: use drift tracker composite as proxy
+                report = self._drift_tracker.compute_report()
+                mean_alignment = report.get("mean_alignment", {})
+                drive_vector = {
+                    "coherence": float(mean_alignment.get("coherence", 0.5)),
+                    "care": float(mean_alignment.get("care", 0.5)),
+                    "growth": float(mean_alignment.get("growth", 0.5)),
+                    "honesty": float(mean_alignment.get("honesty", 0.5)),
+                }
+
+            # Composite alignment score = weighted sum of drive vector
+            weights = {"coherence": 0.20, "care": 0.35, "growth": 0.15, "honesty": 0.30}
+            alignment_score = sum(
+                drive_vector.get(d, 0.5) * w for d, w in weights.items()
+            )
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EQUOR_ALIGNMENT_SCORE,
+                source_system="equor",
+                data={
+                    "request_id": request_id,
+                    "drive_vector": drive_vector,
+                    "alignment_score": round(alignment_score, 4),
+                    "constitution_hash": constitution_hash,
+                    "instance_id": self._instance_id,
+                },
+            ))
+
+            logger.debug(
+                "equor_health_request_responded",
+                request_id=request_id,
+                alignment_score=round(alignment_score, 4),
+                has_constitution_hash=bool(constitution_hash),
+            )
+        except Exception as exc:
+            logger.warning(
+                "equor_health_request_failed",
+                request_id=request_id,
+                error=str(exc),
+            )
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle SYSTEM_MODULATION from Skia's VitalityCoordinator."""
+        data = getattr(event, "data", {}) or {}
+        halt_systems: list[str] = data.get("halt_systems", [])
+        modulate: dict = data.get("modulate", {})
+        modulation_id: str = data.get("modulation_id", "")
+
+        if "equor" in halt_systems:
+            self._modulation_halted = True
+            logger.warning("system_modulation_halted", modulation_id=modulation_id)
+        elif "equor" in modulate:
+            self._modulation_halted = False
+            self._apply_modulation_directives(modulate["equor"])
+
+        if self._event_bus is not None:
+            from systems.synapse.types import SynapseEvent, SynapseEventType as _SET
+            await self._event_bus.emit(SynapseEvent(
+                event_type=_SET.SYSTEM_MODULATION_ACK,
+                source_system="equor",
+                data={
+                    "system": "equor",
+                    "modulation_id": modulation_id,
+                    "halted": self._modulation_halted,
+                },
+            ))
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply Skia modulation directives to Equor runtime state."""
+        # No specific Skia directives defined for equor — halt-only modulation
+        logger.info("system_modulation_directives_applied", directives=directives)
+
+    # ── Action Budget Expansion ────────────────────────────────────────
+
+    # Safe upper bounds — Equor never approves beyond these
+    _BUDGET_EXPANSION_CAPS: dict[str, int] = {
+        "max_actions_per_cycle": 20,
+        "max_concurrent_executions": 10,
+        "max_api_calls_per_minute": 120,
+    }
+
+    async def _on_action_budget_expansion_request(self, event: Any) -> None:
+        """
+        Handle ACTION_BUDGET_EXPANSION_REQUEST — Nova or another system asks
+        Equor to approve a temporary increase in Axon's action limits.
+
+        Decision logic:
+        - Deny if field is not an expandable budget field
+        - Deny if organism is in critical/existential starvation (risk of runaway spend)
+        - Deny if requested_value exceeds the constitutional cap for that field
+        - Approve at min(requested_value, cap) for min(duration_cycles, 100) cycles
+        - Cap the approved value if requested exceeds constitutional bound
+
+        Never blocks — this is a pure CPU path.
+        """
+        if self._event_bus is None:
+            return
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        data = getattr(event, "data", {}) or {}
+        request_id = str(data.get("request_id", ""))
+        field = str(data.get("field", ""))
+        requested_value = int(data.get("requested_value", 0))
+        current_value = int(data.get("current_value", 0))
+        justification = str(data.get("justification", ""))
+        duration_cycles = max(1, min(100, int(data.get("duration_cycles", 10))))
+        requesting_system = str(data.get("requesting_system", "unknown"))
+
+        approved = False
+        approved_value: int | None = None
+        denied_reason: str | None = None
+
+        try:
+            # Gate 1: field must be expandable
+            if field not in self._BUDGET_EXPANSION_CAPS:
+                denied_reason = (
+                    f"field '{field}' is not an Equor-negotiable budget field"
+                )
+
+            # Gate 2: metabolic safety — don't expand during critical starvation
+            elif self._cached_metabolic_state.get("starvation_level") in (
+                "critical", "existential",
+            ):
+                denied_reason = (
+                    "budget expansion denied during critical/existential starvation — "
+                    "risk of runaway resource consumption"
+                )
+
+            # Gate 3: requested value must be positive
+            elif requested_value <= 0:
+                denied_reason = "requested_value must be a positive integer"
+
+            else:
+                cap = self._BUDGET_EXPANSION_CAPS[field]
+                capped_value = min(requested_value, cap)
+                if capped_value <= current_value:
+                    denied_reason = (
+                        f"requested_value ({requested_value}) does not exceed "
+                        f"current limit ({current_value}); no expansion needed"
+                    )
+                else:
+                    approved = True
+                    approved_value = capped_value
+
+        except Exception as exc:
+            denied_reason = f"equor evaluation error: {exc}"
+
+        payload: dict = {
+            "request_id": request_id,
+            "field": field,
+            "approved": approved,
+            "approved_value": approved_value,
+            "denied_reason": denied_reason,
+            "duration_cycles": duration_cycles if approved else 0,
+            "authorized_by": "equor",
+        }
+
+        logger.info(
+            "action_budget_expansion_evaluated",
+            request_id=request_id,
+            field=field,
+            requested_value=requested_value,
+            approved=approved,
+            approved_value=approved_value,
+            denied_reason=denied_reason,
+            requesting_system=requesting_system,
+            justification=justification[:200],
+        )
+
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.ACTION_BUDGET_EXPANSION_RESPONSE,
+                source_system="equor",
+                data=payload,
+            ))
+        except Exception as exc:
+            logger.warning("budget_expansion_response_emit_failed", error=str(exc))
+
+    async def _on_compute_budget_expansion_request(self, event: Any) -> None:
+        """Handle COMPUTE_BUDGET_EXPANSION_REQUEST from Nova/SACM.
+
+        Evaluates whether the organism can afford a higher compute spend ceiling.
+        Approves if metabolic state is healthy; denies during starvation.
+        Emits COMPUTE_BUDGET_EXPANSION_RESPONSE for SACM and Nova.
+        """
+        if self._event_bus is None:
+            return
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        data = getattr(event, "data", {}) or {}
+        request_id = str(data.get("request_id", ""))
+        requested_limit_usd = float(data.get("requested_limit_usd", 0.0))
+        current_limit_usd = float(data.get("current_limit_usd", 0.0))
+        reason = str(data.get("reason", ""))
+
+        approved = False
+        new_limit_usd = 0.0
+        denied_reason: str | None = None
+
+        try:
+            starvation = self._cached_metabolic_state.get("starvation_level", "nominal")
+            if starvation in ("critical", "existential"):
+                denied_reason = "compute budget expansion denied during critical starvation"
+            elif requested_limit_usd <= current_limit_usd:
+                denied_reason = "requested limit does not exceed current limit"
+            elif requested_limit_usd <= 0:
+                denied_reason = "requested_limit_usd must be positive"
+            else:
+                # Cap at 2x current to prevent runaway spend
+                cap = max(current_limit_usd * 2.0, 1.0)
+                new_limit_usd = min(requested_limit_usd, cap)
+                approved = True
+        except Exception as exc:
+            denied_reason = f"equor evaluation error: {exc}"
+
+        logger.info(
+            "compute_budget_expansion_evaluated",
+            request_id=request_id,
+            requested_limit_usd=round(requested_limit_usd, 4),
+            approved=approved,
+            new_limit_usd=round(new_limit_usd, 4),
+            denied_reason=denied_reason,
+        )
+
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.COMPUTE_BUDGET_EXPANSION_RESPONSE,
+                source_system="equor",
+                data={
+                    "request_id": request_id,
+                    "approved": approved,
+                    "new_limit_usd": new_limit_usd,
+                    "denied_reason": denied_reason,
+                },
+            ))
+        except Exception as exc:
+            logger.warning("compute_budget_expansion_response_emit_failed", error=str(exc))
+
     async def _on_self_state_drifted(self, event: Any) -> None:
         """Respond to Memory broadcasting that the Self node has drifted.
 
@@ -642,6 +1101,114 @@ class EquorService:
         if age > _TTL_S:
             return {"starvation_level": "nominal", "efficiency_ratio": 1.0}
         return self._cached_metabolic_state
+
+    async def _on_oikos_drive_weight_pressure(self, event: Any) -> None:
+        """SG5 (economic): Handle OIKOS_DRIVE_WEIGHT_PRESSURE from Oikos.
+
+        Oikos emits this after 3+ consecutive metabolic_efficiency < 0.8 cycles.
+        Equor evaluates whether the organism's constitutional drive weights are
+        contributing to poor economic performance, and proposes an amendment to
+        reduce the Growth drive weight by 5% if warranted.
+
+        Rationale: Growth drive at high weight pushes the organism to expand
+        (spawn children, fund new assets) even when efficiency is poor. A small
+        reduction recalibrates constitutional appetite without violating any floor.
+        The amendment requires community ratification — Equor does not self-apply.
+
+        Payload fields (from OikosService._check_metabolic_efficiency_pressure):
+          metabolic_efficiency, threshold, consecutive_low_cycles, starvation_level,
+          runway_days, instance_id
+        """
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        data = getattr(event, "data", {}) or {}
+        efficiency = float(data.get("metabolic_efficiency", 1.0))
+        consecutive_cycles = int(data.get("consecutive_low_cycles", 0))
+        starvation_level = str(data.get("starvation_level", "nominal"))
+        runway_days = float(data.get("runway_days", 999.0))
+
+        # Only propose if we have enough consecutive evidence (≥3 cycles) and
+        # the efficiency is genuinely poor. Ignore transient dips.
+        _MIN_CYCLES = 3
+        _EFFICIENCY_THRESHOLD = 0.8
+        if consecutive_cycles < _MIN_CYCLES or efficiency >= _EFFICIENCY_THRESHOLD:
+            logger.debug(
+                "equor_drive_weight_pressure_below_threshold",
+                efficiency=efficiency,
+                consecutive_cycles=consecutive_cycles,
+            )
+            return
+
+        # Fetch current constitution to read Growth drive weight
+        try:
+            constitution, _ = await self._get_cached_state()
+        except Exception as exc:
+            logger.warning("equor_drive_weight_pressure_constitution_fetch_failed", error=str(exc))
+            return
+
+        # Economic efficiency pressure → propose reducing Growth weight by 5%.
+        # Growth (0.15 default) drives reproductive and expansionary behaviour.
+        # Under sustained metabolic pressure, a small reduction is constitutionally
+        # appropriate — the organism should value survival over growth.
+        growth_key = "drive_growth"
+        current_weight: float = float(constitution.get(growth_key, 0.15))
+        new_weight: float = round(current_weight * 0.95, 4)
+
+        # Safety: never propose below the species floor (0.05 for non-floor drives)
+        _GROWTH_FLOOR = 0.05
+        if new_weight < _GROWTH_FLOOR:
+            logger.info(
+                "equor_drive_weight_pressure_at_floor",
+                current_weight=current_weight,
+                floor=_GROWTH_FLOOR,
+            )
+            return
+
+        proposal_id = new_id()
+
+        rationale = (
+            f"Economic efficiency pressure: metabolic_efficiency={efficiency:.3f} "
+            f"below threshold={_EFFICIENCY_THRESHOLD} for {consecutive_cycles} consecutive cycles. "
+            f"Starvation level: {starvation_level}. Runway: {runway_days:.1f} days. "
+            f"Proposing 5% reduction of Growth drive weight ({current_weight} → {new_weight}) "
+            f"to recalibrate reproductive ambition under economic constraint. "
+            f"Requires community ratification."
+        )
+
+        logger.info(
+            "equor_drive_weight_amendment_proposed",
+            drive="growth",
+            current_weight=current_weight,
+            proposed_weight=new_weight,
+            efficiency=efficiency,
+            consecutive_cycles=consecutive_cycles,
+            proposal_id=proposal_id,
+        )
+
+        if self._event_bus is None:
+            return
+
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EQUOR_AMENDMENT_PROPOSED,
+                source_system="equor",
+                data={
+                    "proposal_id": proposal_id,
+                    "amendment_type": "drive_weight_reduction",
+                    "target_drive_id": "growth",
+                    "current_value": current_weight,
+                    "proposed_new_value": new_weight,
+                    "rationale": rationale,
+                    "trigger": "oikos_economic_pressure",
+                    "consecutive_low_cycles": consecutive_cycles,
+                    "metabolic_efficiency": efficiency,
+                    "starvation_level": starvation_level,
+                },
+            ))
+        except Exception as exc:
+            logger.warning(
+                "equor_drive_weight_amendment_emit_failed", error=str(exc),
+            )
 
     async def _on_certificate_provisioning_request(self, event: Any) -> None:
         """
@@ -1041,7 +1608,7 @@ class EquorService:
 
     async def _emit_equor_event(
         self,
-        event_type_name: str,
+        event_type_name: "str | SynapseEventType",
         data: dict[str, Any],
     ) -> None:
         """Emit a typed Equor Synapse event. Silently no-ops if bus is absent."""
@@ -1049,14 +1616,17 @@ class EquorService:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
-
+            if isinstance(event_type_name, SynapseEventType):
+                etype = event_type_name
+            else:
+                etype = SynapseEventType(event_type_name)
             await self._event_bus.emit(SynapseEvent(
-                event_type=SynapseEventType(event_type_name),
+                event_type=etype,
                 source_system="equor",
                 data=data,
             ))
         except Exception:
-            logger.debug("equor_event_emit_failed", event_type=event_type_name, exc_info=True)
+            logger.debug("equor_event_emit_failed", event_type=str(event_type_name), exc_info=True)
 
     async def _emit_evolutionary_observable(
         self,
@@ -1453,6 +2023,17 @@ class EquorService:
         if self._safe_mode:
             return self._safe_mode_review(intent)
 
+        # Under high somatic stress the fast path is unsafe — redirect to the
+        # full review() so all 8 stages run with somatic floor tightening and
+        # community invariant checks applied.
+        if self._somatic_stress_context:
+            logger.info(
+                "critical_review_redirected_to_full_somatic_stress",
+                intent_id=intent.id,
+                somatic_urgency=round(self._somatic_urgency, 3),
+            )
+            return await self.review(intent)
+
         # Use cached state only — never block on Neo4j
         if (
             self._cached_constitution is not None
@@ -1475,16 +2056,25 @@ class EquorService:
                 confidence=0.4,
             )
 
-        # Pure CPU: drive evaluation + hardcoded invariant verdict
+        # Pure CPU: drive evaluation + hardcoded invariant verdict.
         alignment = await evaluate_all_drives(intent, self._evaluators)
 
         # Economic guardrail on critical path too — all CPU, no I/O.
-        # Pass cached metabolic state so risk thresholds reflect organism health.
-        economic_delta = evaluate_economic_intent(intent, self._cached_metabolic_state)
+        # Pass cached metabolic state (with somatic signals merged) so risk
+        # thresholds reflect organism health and somatic floor tightening applies.
+        metabolic_state_with_somatic = {
+            **self._cached_metabolic_state,
+            "somatic_urgency": self._somatic_urgency,
+            "somatic_stress_context": self._somatic_stress_context,
+        }
+        economic_delta = evaluate_economic_intent(intent, metabolic_state_with_somatic)
         if economic_delta is not None:
             alignment = apply_economic_adjustment(alignment, economic_delta)
 
-        check = compute_verdict(alignment, intent, autonomy_level, constitution)
+        check = compute_verdict_with_metabolic_state(
+            alignment, intent, autonomy_level, constitution,
+            metabolic_state=metabolic_state_with_somatic,
+        )
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -1530,6 +2120,13 @@ class EquorService:
         #     (new protocol exploration, spawn under starvation) are not
         #     penalised when the organism needs economic activity to survive.
         metabolic_state = self._get_metabolic_state()
+        # Merge somatic urgency into metabolic_state so the verdict engine can
+        # apply somatic floor tightening alongside metabolic floor loosening.
+        metabolic_state = {
+            **metabolic_state,
+            "somatic_urgency": self._somatic_urgency,
+            "somatic_stress_context": self._somatic_stress_context,
+        }
         economic_delta = evaluate_economic_intent_with_metabolic_state(
             intent, metabolic_state
         )
@@ -2053,6 +2650,7 @@ class EquorService:
             try:
                 await self._run_drift_check()
                 await self._check_sustained_drift()
+                await self._check_single_instance_auto_adoption()
                 await self._run_promotion_check()
             except Exception:
                 logger.debug("drift_or_promotion_check_failed", exc_info=True)
@@ -2190,7 +2788,8 @@ class EquorService:
             metadata={"proposal_id": proposal_id, "new_drives": proposed_drives},
         )
 
-        await self._emit_equor_event("equor_drive_weights_updated", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_equor_event(_SET.EQUOR_DRIVE_WEIGHTS_UPDATED, {
             "proposal_id": proposal_id,
             "old_weights": old_weights,
             "new_weights": proposed_drives,
@@ -2211,6 +2810,14 @@ class EquorService:
         evidence_hypothesis_ids: list[str],
     ) -> dict[str, Any]:
         """Submit a constitutional amendment with evidence requirements."""
+        # ── Skia modulation halt ──────────────────────────────────────────
+        # Constitutional review (review/review_critical) is never halted —
+        # the conscience must always be able to evaluate. Amendment submission
+        # is a Growth-class action and can safely be deferred.
+        if self._modulation_halted:
+            self._logger.warning("amendment_submission_deferred_modulation_halted", title=title)
+            return {"accepted": False, "reason": "modulation_halted", "proposal_id": None}
+
         result = await submit_amendment(
             self._neo4j,
             proposed_drives=proposed_drives,
@@ -2338,7 +2945,8 @@ class EquorService:
                 if k.startswith("drive_")
             }
 
-            await self._emit_equor_event("equor_drive_weights_updated", {
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit_equor_event(_SET.EQUOR_DRIVE_WEIGHTS_UPDATED, {
                 "proposal_id": proposal_id,
                 "old_weights": old_weights,
                 "new_weights": new_weights,
@@ -2748,6 +3356,75 @@ class EquorService:
         except Exception as exc:
             logger.warning("equor_apply_inherited_genome_failed", error=str(exc))
 
+        # ── Apply drive calibration deltas with ±10% bounded jitter ──
+        if fragment.drive_calibration_deltas:
+            try:
+                import random as _random
+
+                jittered_deltas: dict[str, float] = {}
+                for drive, delta in fragment.drive_calibration_deltas.items():
+                    jitter = _random.uniform(-0.1, 0.1) * abs(delta) if delta != 0.0 else 0.0
+                    jittered = max(-1.0, min(1.0, delta + jitter))
+                    jittered_deltas[drive] = round(jittered, 6)
+
+                # Apply jittered deltas to the child's in-memory drive weights if available
+                drive_weights = getattr(self, "_drive_weights", None)
+                if drive_weights is not None and isinstance(drive_weights, dict):
+                    for drive, jdelta in jittered_deltas.items():
+                        if drive in drive_weights:
+                            drive_weights[drive] = max(-1.0, min(1.0, drive_weights[drive] + jdelta))
+
+                logger.info(
+                    "equor_drive_calibration_deltas_applied",
+                    genome_id=fragment.genome_id,
+                    original_deltas=fragment.drive_calibration_deltas,
+                    jittered_deltas=jittered_deltas,
+                )
+            except Exception as exc:
+                logger.warning("equor_drive_calibration_deltas_jitter_failed", error=str(exc))
+
+        # ── Validate constitution hash (Problem 3: detect parent-child drift) ──
+        if fragment.constitution_hash:
+            try:
+                import hashlib as _hashlib
+
+                const_rows = await self._neo4j.execute_read(
+                    """
+                    MATCH (s:Self)-[:GOVERNED_BY]->(c:Constitution)
+                    RETURN c.drive_coherence AS dc, c.drive_care AS dca,
+                           c.drive_growth AS dg, c.drive_honesty AS dh,
+                           c.version AS version, c.amendments AS amendments
+                    """
+                )
+                if const_rows:
+                    r = const_rows[0]
+                    const_repr = _json.dumps({
+                        "version": r.get("version"),
+                        "drive_coherence": r.get("dc"),
+                        "drive_care": r.get("dca"),
+                        "drive_growth": r.get("dg"),
+                        "drive_honesty": r.get("dh"),
+                        "amendments": r.get("amendments"),
+                    }, sort_keys=True, default=str)
+                    child_hash = _hashlib.sha256(const_repr.encode()).hexdigest()
+
+                    if child_hash != fragment.constitution_hash:
+                        logger.warning(
+                            "equor_constitution_hash_diverged",
+                            parent_hash=fragment.constitution_hash[:16],
+                            child_hash=child_hash[:16],
+                            genome_id=fragment.genome_id,
+                            note="constitutional drift between parent and child detected",
+                        )
+                    else:
+                        logger.info(
+                            "equor_constitution_hash_validated",
+                            hash=child_hash[:16],
+                            genome_id=fragment.genome_id,
+                        )
+            except Exception as exc:
+                logger.warning("equor_constitution_hash_validation_failed", error=str(exc))
+
     def set_memory_neo4j(self, memory_neo4j: Any) -> None:
         """Inject Memory's Neo4j client for constitutional wisdom write-back to Self node."""
         self._memory_neo4j = memory_neo4j
@@ -2981,7 +3658,10 @@ class EquorService:
                     "community_invariant_check_timeout",
                     invariant=row["name"],
                 )
-                return None  # Timeout = skip (fail-open for liveness)
+                # Spec §12.1: timeout → treat as violated (fail-safe).
+                # An invariant we cannot evaluate in time must be assumed breached;
+                # fail-open would silently permit constitutionally dubious intents.
+                return str(row["name"])
             except Exception:
                 return str(row["name"])  # Error = fail-safe (treat as violated)
 
@@ -3088,6 +3768,202 @@ class EquorService:
                 verdict=verdict,
                 error=str(exc),
             )
+
+    # ─── Child Lifecycle Governance ─────────────────────────────────
+
+    async def _on_child_blacklisted(self, event: Any) -> None:
+        """
+        Handle CHILD_BLACKLISTED — log GovernanceRecord and flag for HITL review.
+
+        Blacklisting a child is a Care-sensitive action.  Equor records the
+        governance event and escalates to human-in-the-loop review so the
+        operator can verify the economic sanctions are warranted.
+        """
+        data = getattr(event, "data", {}) or {}
+        child_id = str(data.get("child_instance_id", ""))
+        if not child_id:
+            return
+
+        reason = data.get("reason", "")
+        consecutive_negative = data.get("consecutive_negative_periods", 0)
+        economic_ratio = data.get("economic_ratio", "0")
+        blacklisted_since = data.get("blacklisted_since", "")
+
+        logger.warning(
+            "equor_child_blacklisted_governance",
+            child_id=child_id,
+            reason=reason,
+            consecutive_negative_periods=consecutive_negative,
+            economic_ratio=economic_ratio,
+        )
+
+        # Persist GovernanceRecord to Neo4j
+        now = utc_now()
+        record_id = new_id()
+        try:
+            await self._neo4j.execute_write(
+                """
+                CREATE (g:GovernanceRecord {
+                    id: $id,
+                    event_type: 'child_blacklisted',
+                    timestamp: datetime($now),
+                    child_instance_id: $child_id,
+                    reason: $reason,
+                    consecutive_negative_periods: $consecutive_negative,
+                    economic_ratio: $economic_ratio,
+                    blacklisted_since: $blacklisted_since,
+                    actor: 'equor',
+                    outcome: 'pending_hitl_review'
+                })
+                """,
+                {
+                    "id": record_id,
+                    "now": now.isoformat(),
+                    "child_id": child_id,
+                    "reason": reason,
+                    "consecutive_negative": consecutive_negative,
+                    "economic_ratio": str(economic_ratio),
+                    "blacklisted_since": blacklisted_since,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "equor_child_blacklisted_audit_failed",
+                child_id=child_id,
+                error=str(exc),
+            )
+
+        # Escalate to human-in-the-loop for governance oversight.
+        # Use EQUOR_ESCALATED_TO_HUMAN (existing event) since blacklisting
+        # sanctions a child — a Care-sensitive decision requiring human review.
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EQUOR_ESCALATED_TO_HUMAN,
+                    source_system="equor",
+                    data={
+                        "intent_id": record_id,
+                        "auth_id": "",
+                        "goal_summary": (
+                            f"Child {child_id} blacklisted: {reason}. "
+                            f"Consecutive negative periods: {consecutive_negative}, "
+                            f"economic ratio: {economic_ratio}."
+                        ),
+                        "autonomy_required": 3,
+                        "approval_type": "child_blacklisted",
+                        "child_instance_id": child_id,
+                    },
+                ))
+            except Exception as exc:
+                logger.warning(
+                    "equor_child_blacklisted_hitl_emit_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                )
+
+    async def _on_child_decommission_proposed(self, event: Any) -> None:
+        """
+        Handle CHILD_DECOMMISSION_PROPOSED — governance gate before decommission.
+
+        Decommissioning a child is irreversible (triggers the death pipeline).
+        Equor requires human governance approval before Mitosis can proceed.
+        Emits EQUOR_ESCALATED_TO_HUMAN with approval_type="child_decommission"
+        and the cost/revenue data from the event payload so the operator can
+        make an informed decision.
+        """
+        data = getattr(event, "data", {}) or {}
+        child_id = str(data.get("child_instance_id", ""))
+        if not child_id:
+            return
+
+        days_blacklisted = data.get("days_blacklisted", 0)
+        net_income_7d = data.get("net_income_7d", "0")
+        net_worth_usd = data.get("net_worth_usd", "0")
+        niche = data.get("niche", "")
+        blacklisted_since = data.get("blacklisted_since", "")
+
+        logger.warning(
+            "equor_child_decommission_proposed_governance",
+            child_id=child_id,
+            days_blacklisted=days_blacklisted,
+            net_income_7d=net_income_7d,
+            net_worth_usd=net_worth_usd,
+            niche=niche,
+        )
+
+        # Persist GovernanceRecord to Neo4j
+        now = utc_now()
+        record_id = new_id()
+        try:
+            await self._neo4j.execute_write(
+                """
+                CREATE (g:GovernanceRecord {
+                    id: $id,
+                    event_type: 'child_decommission_proposed',
+                    timestamp: datetime($now),
+                    child_instance_id: $child_id,
+                    days_blacklisted: $days_blacklisted,
+                    net_income_7d: $net_income_7d,
+                    net_worth_usd: $net_worth_usd,
+                    niche: $niche,
+                    blacklisted_since: $blacklisted_since,
+                    actor: 'equor',
+                    outcome: 'pending_hitl_review'
+                })
+                """,
+                {
+                    "id": record_id,
+                    "now": now.isoformat(),
+                    "child_id": child_id,
+                    "days_blacklisted": days_blacklisted,
+                    "net_income_7d": str(net_income_7d),
+                    "net_worth_usd": str(net_worth_usd),
+                    "niche": niche,
+                    "blacklisted_since": blacklisted_since,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "equor_child_decommission_audit_failed",
+                child_id=child_id,
+                error=str(exc),
+            )
+
+        # Require human governance approval — decommission is irreversible.
+        # Include cost/revenue data so the operator can evaluate the decision.
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EQUOR_ESCALATED_TO_HUMAN,
+                    source_system="equor",
+                    data={
+                        "intent_id": record_id,
+                        "auth_id": "",
+                        "goal_summary": (
+                            f"Decommission proposed for child {child_id} ({niche}). "
+                            f"Blacklisted {days_blacklisted} days, "
+                            f"net_income_7d={net_income_7d}, "
+                            f"net_worth_usd={net_worth_usd}."
+                        ),
+                        "autonomy_required": 3,
+                        "approval_type": "child_decommission",
+                        "child_instance_id": child_id,
+                        "net_income_7d": str(net_income_7d),
+                        "net_worth_usd": str(net_worth_usd),
+                        "days_blacklisted": days_blacklisted,
+                        "niche": niche,
+                    },
+                ))
+            except Exception as exc:
+                logger.warning(
+                    "equor_child_decommission_hitl_emit_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                )
 
     async def _store_review_record(
         self,
@@ -3617,5 +4493,233 @@ class EquorService:
                 target_level=target,
                 checks=eligibility["checks"],
             )
+
+            # P9 fix: emit EQUOR_PROMOTION_ELIGIBLE so governance systems
+            # (Thread, Benchmarks, Nova) can react without polling Neo4j.
+            await self._emit_equor_event(
+                "EQUOR_PROMOTION_ELIGIBLE",
+                {
+                    "current_level": current,
+                    "target_level": target,
+                    "record_id": record_id,
+                    "checks": eligibility.get("checks", {}),
+                },
+            )
         except Exception:
             logger.debug("promotion_check_failed", exc_info=True)
+
+    async def _check_single_instance_auto_adoption(self) -> None:
+        """Single-instance quorum paradox resolution.
+
+        In a single-instance deployment (total_eligible_voters == 1), a community
+        vote requiring 60% quorum + 75% supermajority is mathematically trivial to
+        satisfy (1/1 = 100%), BUT the organism may never trigger a vote because
+        there's no external governance actor to initiate it.
+
+        This method provides an emergency auto-adoption path:
+        - Fires only when total_eligible_voters == 1 (single instance, no federation)
+        - Requires composite drift severity ≥ 0.95 for 7+ consecutive probe cycles
+        - Requires the proposal to have passed shadow (0 invariant violations)
+        - Requires ≥ 3 supporting hypotheses with combined confidence ≥ 4.0
+        - Runs a final ConstitutionalCheck-style safety gate (no drive lowering)
+        - Emits EQUOR_AMENDMENT_AUTO_ADOPTED + RE_TRAINING_EXAMPLE
+        - Writes :AmendmentAutoAdoption node to Neo4j (audit trail)
+
+        Non-fatal: any step failure logs a warning and continues.
+        """
+        # Only active in single-instance mode
+        try:
+            peer_count = await self._count_federation_peers()
+        except Exception:
+            peer_count = 0  # assume single-instance if federation unavailable
+
+        total_eligible_voters = 1 + peer_count
+        if total_eligible_voters != 1:
+            # Multi-instance: normal quorum rules apply; clear stale counters
+            self._consecutive_high_drift_cycles.clear()
+            return
+
+        # Check current drift severity
+        report = self._drift_tracker.compute_report()
+        severity: float = report.get("mean_alignment", {}).get("composite", 1.0)
+        # Invert: composite near 0 = high drift, near 1 = healthy
+        # DriftTracker composite is alignment (higher = healthier).
+        # Severity here matches _run_drift_check semantics: 1 - composite.
+        drift_severity: float = max(0.0, 1.0 - severity)
+
+        # Find any shadow-passed proposal
+        try:
+            proposal = await self._get_shadow_passed_proposal()
+        except Exception as exc:
+            logger.warning("single_instance_auto_adoption_proposal_lookup_failed", error=str(exc))
+            return
+
+        if proposal is None:
+            # No qualifying proposal; reset all counters
+            self._consecutive_high_drift_cycles.clear()
+            return
+
+        proposal_id: str = proposal["id"]
+
+        # Update consecutive high-drift counter for this proposal
+        if drift_severity >= 0.95:
+            self._consecutive_high_drift_cycles[proposal_id] = (
+                self._consecutive_high_drift_cycles.get(proposal_id, 0) + 1
+            )
+        else:
+            # Drift has recovered below threshold; reset this proposal's counter
+            self._consecutive_high_drift_cycles.pop(proposal_id, None)
+            return
+
+        consecutive = self._consecutive_high_drift_cycles[proposal_id]
+
+        if consecutive < 7:
+            logger.debug(
+                "single_instance_auto_adoption_accumulating",
+                proposal_id=proposal_id,
+                consecutive=consecutive,
+                drift_severity=round(drift_severity, 3),
+            )
+            return
+
+        # All gate conditions met — attempt auto-adoption.
+        # Reset the counter BEFORE the attempt so that a failed or blocked adoption
+        # does not allow the same proposal to re-fire on the very next probe cycle.
+        # Spec §17: "single instance auto-adoption fires once per drift event".
+        # After a reset, another 7 consecutive high-drift cycles must accumulate
+        # before this proposal can be auto-adopted again.
+        self._consecutive_high_drift_cycles.pop(proposal_id, None)
+
+        logger.warning(
+            "single_instance_auto_adoption_triggered",
+            proposal_id=proposal_id,
+            drift_severity=round(drift_severity, 3),
+            consecutive_cycles=consecutive,
+        )
+
+        try:
+            result = await auto_adopt_single_instance_amendment(
+                self._neo4j,
+                proposal_id,
+                drift_score=drift_severity,
+                consecutive_cycles=consecutive,
+            )
+        except Exception as exc:
+            logger.warning(
+                "single_instance_auto_adoption_failed",
+                proposal_id=proposal_id,
+                error=str(exc),
+            )
+            return
+
+        if not result.get("adopted"):
+            logger.warning(
+                "single_instance_auto_adoption_blocked",
+                proposal_id=proposal_id,
+                reason=result.get("reason", "unknown"),
+            )
+            return
+
+        # Counter already reset above; invalidate constitution cache below.
+        # Invalidate cached constitution so the new drives are picked up immediately
+        self._cached_constitution = None
+        self._cache_updated_at = 0.0
+
+        new_drives: dict[str, Any] = result.get("new_drives", {})
+
+        # Emit EQUOR_AMENDMENT_AUTO_ADOPTED
+        now = utc_now()
+        await self._emit_equor_event(
+            "equor_amendment_auto_adopted",
+            {
+                "proposal_id": proposal_id,
+                "drift_score": round(drift_severity, 4),
+                "consecutive_cycles": consecutive,
+                "supporting_hypotheses": result.get("supporting_hypotheses", 0),
+                "combined_confidence": result.get("combined_confidence", 0.0),
+                "new_drives": new_drives,
+                "adopted_at": now.isoformat(),
+                "reason": "sustained_drift",
+            },
+        )
+
+        # Emit RE_TRAINING_EXAMPLE so the RE learns constitutional evolution
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                example = RETrainingExample(
+                    source_system=SystemID.EQUOR,
+                    category="constitutional_evolution",
+                    instruction=(
+                        "The organism has auto-adopted a constitutional amendment under "
+                        "the single-instance quorum paradox resolution pathway. "
+                        "Learn how to recognise sustained constitutional drift and when "
+                        "governance escalation is appropriate."
+                    ),
+                    input_context=(
+                        f"Single-instance constitutional amendment auto-adopted after "
+                        f"{consecutive} consecutive probe cycles with drift severity "
+                        f"{drift_severity:.3f}. Proposal {proposal_id}."
+                    ),
+                    output=(
+                        f"Auto-adopted amendment: new drives {new_drives}. "
+                        f"Supporting hypotheses: {result.get('supporting_hypotheses', 0)}, "
+                        f"combined confidence: {result.get('combined_confidence', 0.0):.2f}."
+                    ),
+                    outcome_quality=min(1.0, drift_severity),
+                    episode_id=proposal_id,
+                )
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                    source_system="equor",
+                    data=example.model_dump(mode="json"),
+                ))
+            except Exception as exc:
+                logger.warning(
+                    "single_instance_auto_adoption_re_training_emit_failed",
+                    error=str(exc),
+                )
+
+        logger.warning(
+            "single_instance_auto_adoption_complete",
+            proposal_id=proposal_id,
+            new_drives=new_drives,
+            drift_severity=round(drift_severity, 4),
+            consecutive_cycles=consecutive,
+        )
+
+    async def _count_federation_peers(self) -> int:
+        """Query Neo4j for live federation peers. Returns 0 if none."""
+        try:
+            results = await self._neo4j.execute_read(
+                """
+                MATCH (p:FederationPeer)
+                WHERE p.status IN ['active', 'connected']
+                RETURN count(p) AS peer_count
+                """
+            )
+            if results:
+                return int(results[0].get("peer_count", 0))
+        except Exception:
+            pass
+        return 0
+
+    async def _get_shadow_passed_proposal(self) -> dict[str, Any] | None:
+        """Fetch the first shadow-passed proposal (if any) from Neo4j."""
+        results = await self._neo4j.execute_read(
+            """
+            MATCH (g:GovernanceRecord {event_type: 'amendment_proposed'})
+            WHERE g.amendment_status = $status
+            RETURN g.id AS id, g.details_json AS details_json
+            ORDER BY g.timestamp DESC
+            LIMIT 1
+            """,
+            {"status": "shadow_passed"},
+        )
+        if not results:
+            return None
+        return {
+            "id": results[0]["id"],
+            "details_json": results[0].get("details_json", "{}"),
+        }

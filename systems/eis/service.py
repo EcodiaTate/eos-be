@@ -233,6 +233,20 @@ class EISService:
         # ── Speciation: Metabolic gate (Task 7) ──
         self._metabolic_starvation: str = "nominal"  # tracks current starvation level
 
+        # ── VitalityCoordinator austerity gate ──
+        self._system_modulation_halted: bool = False  # set when Skia halts EIS
+
+        # ── Genome extractor (Mitosis immune memory inheritance) ──
+        # Instantiated lazily once _threat_library and _anomaly_detector are ready.
+        # SpawnChildExecutor accesses this via getattr(eis, "_genome_extractor", None).
+        from systems.eis.genome import EISGenomeExtractor  # noqa: PLC0415
+        self._genome_extractor: EISGenomeExtractor = EISGenomeExtractor(
+            threat_library=self._threat_library,
+            anomaly_detector=self._anomaly_detector,
+            quarantine_threshold=self._config.quarantine_threshold,
+            soma_quarantine_offset=self._soma_quarantine_offset,
+        )
+
         # ── Adaptive threshold calibration (split conformal prediction) ──
         # Feeds labelled examples from quarantine verdicts and periodically
         # recalibrates the composite quarantine threshold with a formal FPR
@@ -312,6 +326,24 @@ class EISService:
             _adapt(self._handle_metabolic_pressure),
         )
 
+        # Subscribe to EQUOR_HITL_APPROVED to trigger false-positive feedback
+        # autonomously when a human operator or Equor clears quarantined percepts.
+        # Equor emits EQUOR_HITL_APPROVED with approval_type="quarantine_cleared"
+        # and threat_pattern_ids=[...] so EIS can deprecate over-firing patterns
+        # without any direct API call.
+        synapse.subscribe(
+            _SET.EQUOR_HITL_APPROVED,
+            self._on_equor_hitl_approved,
+        )
+
+        # Subscribe to SYSTEM_MODULATION for VitalityCoordinator austerity.
+        # When EIS is in halt_systems or level is safe_mode/emergency, skip
+        # the expensive L5 quarantine (LLM) to conserve resources.
+        synapse.subscribe(
+            _SET.SYSTEM_MODULATION,
+            _adapt(self._on_system_modulation),
+        )
+
         self._logger.info(
             "eis_synapse_wired",
             subscriptions=[
@@ -320,6 +352,8 @@ class EISService:
                 _INTENT_REJECTED_EVENT,
                 "interoceptive_percept",
                 "metabolic_pressure",
+                "equor_hitl_approved",
+                "system_modulation",
                 "subscribe_all",
             ],
         )
@@ -336,10 +370,39 @@ class EISService:
         self._initialized = True
         self._logger.info("eis_service_initialized")
 
+        # ── Child-side: apply inherited immune memory from parent genome ──
+        # When spawned as a child instance, ECODIAOS_EIS_GENOME_PAYLOAD is set by
+        # the parent's LocalDockerSpawner. We deserialise the OrganGenomeSegment
+        # and seed the threat library + anomaly baselines so the child recognises
+        # known attack signatures from its very first percept cycle.
+        import asyncio
+        import os
+
+        _eis_genome_payload = os.environ.get("ECODIAOS_EIS_GENOME_PAYLOAD", "").strip()
+        _is_genesis = os.environ.get("ECODIAOS_IS_GENESIS_NODE", "false").lower() == "true"
+        if _eis_genome_payload and not _is_genesis:
+            try:
+                import json as _json
+                from primitives.genome import OrganGenomeSegment  # noqa: PLC0415
+                _segment_data = _json.loads(_eis_genome_payload)
+                _segment = OrganGenomeSegment.model_validate(_segment_data)
+                seeded = await self._genome_extractor.seed_from_genome_segment(_segment)
+                if seeded:
+                    self._logger.info(
+                        "eis_genome_inherited",
+                        parent_hash=_segment.payload_hash[:16],
+                        patterns=len(_segment.payload.get("threat_patterns", [])),
+                        baselines=len(_segment.payload.get("anomaly_baselines", {})),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "eis_genome_apply_failed",
+                    error=str(exc),
+                    note="Proceeding with empty immune memory — threat patterns must be learned from scratch",
+                )
+
         # Start daily self-probe so EIS emits at least one liveness event per day
         # even when the Genesis instance has no external percept input.
-        import asyncio
-
         asyncio.ensure_future(self._daily_self_probe_loop())
 
     async def shutdown(self) -> None:
@@ -1732,8 +1795,45 @@ class EISService:
 
     def _metabolic_allows_llm_quarantine(self) -> bool:
         """Check if metabolic state permits expensive LLM quarantine evaluation."""
-        # Under CRITICAL starvation: skip LLM quarantine, use fast-path only
-        return self._metabolic_starvation != "critical"
+        # Under CRITICAL starvation or VitalityCoordinator halt: skip LLM quarantine
+        return self._metabolic_starvation != "critical" and not self._system_modulation_halted
+
+    # ─── VitalityCoordinator austerity ────────────────────────────
+
+    async def _on_system_modulation(self, payload: dict[str, Any]) -> None:
+        """React to SYSTEM_MODULATION from VitalityCoordinator (Skia/Spec 29).
+
+        When EIS is in halt_systems or level is safe_mode/emergency, skip the
+        expensive L5 LLM quarantine so threat screening degrades gracefully instead
+        of stalling the pipeline. L1–L4 and L7–L9 remain active.
+        """
+        halt_systems: list[str] = payload.get("halt_systems", [])
+        level: str = payload.get("level", "nominal")
+        previously_halted = self._system_modulation_halted
+
+        if "eis" in halt_systems or level in ("safe_mode", "emergency"):
+            self._system_modulation_halted = True
+        elif not halt_systems and level == "nominal":
+            self._system_modulation_halted = False
+
+        if self._system_modulation_halted != previously_halted:
+            self._logger.info(
+                "eis_system_modulation_changed",
+                halted=self._system_modulation_halted,
+                level=level,
+                halt_systems=halt_systems,
+            )
+
+        compliant = self._system_modulation_halted or (not halt_systems and level == "nominal")
+        await self._synapse_emit(
+            SynapseEventType.SYSTEM_MODULATION_ACK,
+            {
+                "system_id": "eis",
+                "level": level,
+                "compliant": compliant,
+                "reason": "l5_quarantine_suspended" if self._system_modulation_halted else None,
+            },
+        )
 
     # ─── Task 8: False positive tracking ──────────────────────────
 
@@ -1783,6 +1883,38 @@ class EISService:
                 deprecated_count=deprecated_count,
                 total_patterns=len(self._threat_library._patterns),
             )
+
+    async def _on_equor_hitl_approved(self, event: Any) -> None:
+        """
+        Handler for EQUOR_HITL_APPROVED — autonomous false-positive feedback loop.
+
+        When Equor (or a human operator via SMS/TOTP) approves a clearance of
+        quarantined percepts, this handler calls handle_quarantine_cleared() so
+        EIS can retire over-firing threat patterns without any direct API call.
+
+        Expected event payload:
+          approval_type (str): must be "quarantine_cleared"
+          threat_pattern_ids (list[str]): pattern IDs to mark as false positives
+          cleared_by (str, optional): identity of the approving agent
+        """
+        payload = getattr(event, "data", event) if not isinstance(event, dict) else event
+        if payload.get("approval_type") != "quarantine_cleared":
+            return
+
+        pattern_ids: list[str] = payload.get("threat_pattern_ids", [])
+        if not pattern_ids:
+            return
+
+        cleared_by: str = str(payload.get("cleared_by", "equor_hitl"))
+        self._logger.info(
+            "eis_quarantine_cleared_via_hitl",
+            pattern_count=len(pattern_ids),
+            cleared_by=cleared_by,
+        )
+        await self.handle_quarantine_cleared(
+            threat_pattern_ids=pattern_ids,
+            cleared_by=cleared_by,
+        )
 
     # ─── Antibody pipeline (Spec §7) ──────────────────────────────
 

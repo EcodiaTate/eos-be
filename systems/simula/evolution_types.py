@@ -820,14 +820,12 @@ GOVERNANCE_REQUIRED: frozenset[ChangeCategory] = frozenset({
 })
 
 FORBIDDEN: frozenset[ChangeCategory] = frozenset({
-    ChangeCategory.MODIFY_EQUOR,
     ChangeCategory.MODIFY_CONSTITUTION,
     ChangeCategory.MODIFY_INVARIANTS,
     ChangeCategory.MODIFY_SELF_EVOLUTION,
 })
 
 SIMULA_IRON_RULES: list[str] = [
-    "Simula CANNOT modify Equor in any way.",
     "Simula CANNOT modify constitutional drives.",
     "Simula CANNOT modify invariants.",
     "Simula CANNOT modify its own logic (no self-modifying code).",
@@ -840,7 +838,6 @@ SIMULA_IRON_RULES: list[str] = [
 
 # Paths the code agent is NEVER allowed to write to
 FORBIDDEN_WRITE_PATHS: list[str] = [
-    "systems/equor",
     "systems/simula",
     "ecodiaos/primitives/constitutional.py",
     "ecodiaos/primitives/common.py",

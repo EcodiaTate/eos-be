@@ -754,6 +754,20 @@ class CertificateManager:
             expires_at=certificate.expires_at.isoformat(),
             renewal_count=certificate.renewal_count,
         )
+
+        # Notify Federation so it can update its cached certificate fingerprint.
+        # Fire-and-forget since install_certificate() is synchronous.
+        if self._event_bus is not None:
+            asyncio.ensure_future(self._emit_event(
+                "identity_certificate_rotated",
+                {
+                    "new_fingerprint": certificate.certificate_id,
+                    "certificate_type": certificate.certificate_type.value,
+                    "expires_at": certificate.expires_at.isoformat(),
+                    "instance_id": self._instance_id,
+                },
+            ))
+
         return True
 
     # --- Certificate Renewal (MEDIUM #9 + HIGH #5) ----------------------------
@@ -1206,6 +1220,7 @@ class CertificateManager:
                 "child_certificate_installed": SynapseEventType.CHILD_CERTIFICATE_INSTALLED,
                 "certificate_renewal_requested": SynapseEventType.CERTIFICATE_RENEWAL_REQUESTED,
                 "certificate_renewed": SynapseEventType.CERTIFICATE_RENEWED,
+                "identity_certificate_rotated": SynapseEventType.IDENTITY_CERTIFICATE_ROTATED,
                 "certificate_provisioning_request": SynapseEventType.CERTIFICATE_PROVISIONING_REQUEST,
                 "provisioning_requires_human_escalation": SynapseEventType.PROVISIONING_REQUIRES_HUMAN_ESCALATION,
             }

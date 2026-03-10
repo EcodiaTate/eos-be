@@ -99,6 +99,8 @@ class SkiaService:
 
         # Standalone worker heartbeat task
         self._heartbeat_task: asyncio.Task[None] | None = None
+        # Shadow worker ensure loop (embedded mode only)
+        self._shadow_worker_task: asyncio.Task[None] | None = None
 
         # Organism generation tracking (loaded from Neo4j on init)
         self._generation: int = 1
@@ -175,6 +177,18 @@ class SkiaService:
         data = getattr(event, "data", {}) or {}
         drive = data.get("drive", "unknown")
         mean_val = data.get("rolling_mean_72h", 0.0)
+
+        # Guard: reject events with missing/invalid drive name.
+        # "unknown" means the event data was malformed — not a real extinction.
+        _VALID_DRIVES = {"coherence", "care", "growth", "honesty"}
+        if drive not in _VALID_DRIVES:
+            self._log.warning(
+                "inv017_ignored_invalid_drive",
+                drive=drive,
+                rolling_mean_72h=mean_val,
+                reason="drive name not in constitutional drive set",
+            )
+            return
 
         self._log.critical(
             "inv017_drive_extinction_halt_triggered",
@@ -352,13 +366,23 @@ class SkiaService:
                 self._worker_heartbeat_loop(),
                 name="skia_worker_heartbeat",
             )
+        # Embedded mode: ensure shadow worker exists on a different provider.
+        # Runs async (non-blocking) so it doesn't delay startup.
+        if not self._standalone and self._config.enabled and self._restoration:
+            asyncio.create_task(
+                self._ensure_shadow_worker_loop(),
+                name="skia_shadow_worker_ensure",
+            )
 
     async def shutdown(self) -> None:
         """Graceful shutdown of all sub-components."""
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._heartbeat_task
+        # Cancel background tasks
+        for attr in ("_heartbeat_task", "_shadow_worker_task"):
+            task = getattr(self, attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         if self._vitality:
             await self._vitality.stop()
         if self._heartbeat:
@@ -371,13 +395,52 @@ class SkiaService:
             await self._pinata.close()
         self._log.info("skia_shutdown")
 
+    # ---- Shadow worker ensure loop (embedded mode) --------------------------
+
+    _SHADOW_WORKER_CHECK_INTERVAL_S = 6 * 3600.0  # Re-check every 6 hours
+
+    async def _ensure_shadow_worker_loop(self) -> None:
+        """
+        On startup (and every 6 hours), ensure a shadow worker is deployed on a
+        DIFFERENT provider.  Emits SKIA_SHADOW_WORKER_DEPLOYED on success or
+        SKIA_SHADOW_WORKER_MISSING on failure.
+
+        This eliminates the human dependency for resurrection: the shadow worker
+        is the autonomous "dead man's switch" that will detect main-instance death
+        and trigger restoration.
+        """
+        while True:
+            try:
+                if self._restoration is not None:
+                    ok = await self._restoration.ensure_shadow_worker()
+                    if ok:
+                        record = await self._restoration._get_shadow_worker_record()
+                        from systems.synapse.types import SynapseEventType as _SET
+                        await self._emit_event(_SET.SKIA_SHADOW_WORKER_DEPLOYED, {
+                            "instance_id": self._instance_id,
+                            "endpoint": record.get("endpoint", "") if record else "",
+                            "provider": record.get("provider", "") if record else "",
+                            "deployment_id": record.get("deployment_id", "") if record else "",
+                        })
+                    else:
+                        from systems.synapse.types import SynapseEventType as _SET
+                        await self._emit_event(_SET.SKIA_SHADOW_WORKER_MISSING, {
+                            "instance_id": self._instance_id,
+                            "error": "All shadow worker deployment attempts failed",
+                        })
+            except Exception as exc:
+                self._log.warning("shadow_worker_loop_error", error=str(exc))
+
+            await asyncio.sleep(self._SHADOW_WORKER_CHECK_INTERVAL_S)
+
     # ---- Standalone worker heartbeat loop -----------------------------------
 
     async def _worker_heartbeat_loop(self) -> None:
         """Periodically emit SKIA_HEARTBEAT to prove standalone worker liveness."""
         while True:
             try:
-                await self._emit_event("skia_heartbeat", {
+                from systems.synapse.types import SynapseEventType as _SET
+                await self._emit_event(_SET.SKIA_HEARTBEAT, {
                     "instance_id": self._instance_id,
                     "mode": "standalone",
                     "generation": self._generation,
@@ -491,7 +554,8 @@ class SkiaService:
         self._resurrection_approved.clear()
         self._resurrection_leader = ""
 
-        await self._emit_event("skia_resurrection_proposal", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.SKIA_RESURRECTION_PROPOSAL, {
             "instance_id": self._instance_id,
             "snapshot_cid": latest_cid,
             "snapshot_ts": time.time(),
@@ -542,14 +606,15 @@ class SkiaService:
             threshold_s=45,
         )
         # Notify Thymos — it can create an incident and attempt repair
-        await self._emit_event("skia_heartbeat_lost", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.SKIA_HEARTBEAT_LOST, {
             "instance_id": self._instance_id,
             "system": system_name,
             "severity": "CRITICAL",
             "reason": "critical_system_silent_45s",
         })
         # Modulation signal — request EMERGENCY mode for the affected system
-        await self._emit_event("system_modulation", {
+        await self._emit_event(_SET.SYSTEM_MODULATION, {
             "target_system": system_name,
             "austerity_level": "EMERGENCY",
             "reason": f"critical_system_silent: no heartbeat for 45s",
@@ -563,7 +628,8 @@ class SkiaService:
         self._log.error("organism_death_confirmed", instance_id=self._instance_id)
 
         # Emit event (if bus is available --- may not be in standalone mode)
-        await self._emit_event("skia_heartbeat_lost", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.SKIA_HEARTBEAT_LOST, {
             "instance_id": self._instance_id,
         })
 
@@ -573,7 +639,7 @@ class SkiaService:
 
         # Emit restoration triggered immediately — before coordination or metabolic gates,
         # so the observatory can track restoration attempts even if they are later blocked.
-        await self._emit_event("skia_restoration_triggered", {
+        await self._emit_event(_SET.SKIA_RESTORATION_TRIGGERED, {
             "instance_id": self._instance_id,
             "trigger": "heartbeat_confirmed_dead",
         })
@@ -601,7 +667,7 @@ class SkiaService:
                 self._log.info("resurrection_deferred_to_federation_leader")
                 return
 
-        await self._emit_event("skia_restoration_started", {
+        await self._emit_event(_SET.SKIA_RESTORATION_STARTED, {
             "instance_id": self._instance_id,
             "trigger": "heartbeat_confirmed_dead",
             "simultaneous_deaths": simultaneous_deaths,
@@ -627,7 +693,7 @@ class SkiaService:
         )
 
         # Emit metabolic cost report
-        await self._emit_event("metabolic_cost_report", {
+        await self._emit_event(_SET.METABOLIC_COST_REPORT, {
             "system_id": "skia",
             "operation": "restoration",
             "cost_usd": attempt.cost_usd_estimate or self._config.estimated_restoration_cost_usd,
@@ -638,7 +704,7 @@ class SkiaService:
             },
         })
 
-        await self._emit_event("skia_restoration_complete", {
+        await self._emit_event(_SET.SKIA_RESTORATION_COMPLETE, {
             "instance_id": self._instance_id,
             "outcome": attempt.outcome.value,
             "strategy": attempt.strategy.value,
@@ -647,7 +713,7 @@ class SkiaService:
         })
 
         # Also emit the legacy event for backwards compatibility
-        await self._emit_event("skia_restoration_completed", {
+        await self._emit_event(_SET.SKIA_RESTORATION_COMPLETED, {
             "instance_id": self._instance_id,
             "outcome": attempt.outcome.value,
             "strategy": attempt.strategy.value,
@@ -658,11 +724,77 @@ class SkiaService:
         # On successful restoration, record phylogenetic birth with mutation
         if attempt.outcome.value == "success":
             await self._record_spawned_instance(attempt.state_cid)
+            # Coma-recovery: write a crash-context record to Redis so the
+            # resurrected organism's Thymos can read it on boot and route it
+            # to Simula for Tier 4 novel-fix analysis.  This closes the F1 gap:
+            # previously the crash context (what killed the organism) was lost
+            # at process death; now it survives in Redis and is injected as an
+            # INCIDENT_DETECTED on the new instance's first Synapse connection.
+            await self._persist_crash_context_for_resurrection(
+                state_cid=attempt.state_cid or "",
+                trigger="heartbeat_confirmed_dead",
+            )
 
         # If restoration exhausted max attempts, trigger organism death
         if self._restoration.infrastructure_dead and self._vitality:
             await self._vitality.trigger_death_sequence(
                 "infrastructure_death: restoration exhausted all attempts"
+            )
+
+    # ---- Coma-recovery crash context ----------------------------------------
+
+    async def _persist_crash_context_for_resurrection(
+        self, *, state_cid: str, trigger: str
+    ) -> None:
+        """Persist crash context to Redis so the resurrected instance can diagnose it.
+
+        The dying organism writes a compact crash record under the key
+        ``skia:crash_context:{instance_id}``.  On next boot, the new instance
+        reads this key and emits an INCIDENT_DETECTED via Synapse so Thymos
+        routes it to Simula (Tier 4 novel-fix) for root-cause analysis.
+
+        TTL: 24 hours.  If the record is not consumed within 24 hours, it is
+        considered stale and dropped (the next death event will overwrite it).
+        """
+        if self._redis is None:
+            self._log.warning(
+                "crash_context_redis_unavailable",
+                reason="Redis not wired to SkiaService; crash context will not survive resurrection",
+            )
+            return
+
+        import json as _json
+        import time as _time
+
+        key = f"skia:crash_context:{self._instance_id}"
+        payload = {
+            "instance_id": self._instance_id,
+            "trigger": trigger,
+            "state_cid": state_cid,
+            "crashed_at_unix": _time.time(),
+            "incident_class": "CRASH",
+            "severity": "CRITICAL",
+            "description": (
+                f"Organism heartbeat confirmed dead (trigger={trigger!r}). "
+                "Resurrected from IPFS snapshot. Root-cause unknown — "
+                "Simula Tier 4 analysis requested."
+            ),
+            "source_system": "skia",
+            "request_simula_analysis": True,
+        }
+
+        try:
+            raw = self._redis.client
+            await raw.set(key, _json.dumps(payload), ex=86400)  # 24h TTL
+            self._log.info(
+                "crash_context_persisted",
+                key=key,
+                state_cid=state_cid[:16] if state_cid else "none",
+            )
+        except Exception as exc:
+            self._log.warning(
+                "crash_context_persist_failed",
+                error=str(exc),
             )
 
     # ---- Phylogenetic tracking + mutation ------------------------------------
@@ -723,7 +855,8 @@ class SkiaService:
             self._log.error("phylogenetic_record_failed", error=str(exc))
 
         # Emit ORGANISM_SPAWNED event
-        await self._emit_event("organism_spawned", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.ORGANISM_SPAWNED, {
             "instance_id": child_instance_id,
             "parent_instance_id": self._instance_id,
             "generation": new_generation,
@@ -750,7 +883,7 @@ class SkiaService:
         # cached Oikos reference, which reads runway_days.
         if self._vitality and self._vitality._oikos is not None:
             try:
-                state = self._vitality._oikos.current_economic_state
+                state = self._vitality._oikos.snapshot()
                 if state and hasattr(state, "runway_days"):
                     # If runway is critically low, warn but don't block
                     if state.runway_days < 1.0:
@@ -834,7 +967,8 @@ class SkiaService:
         duration_ms = (time.monotonic() - t0) * 1000
         result["duration_ms"] = round(duration_ms, 2)
 
-        await self._emit_event("skia_dry_run_complete", result)
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.SKIA_DRY_RUN_COMPLETE, result)
 
         self._log.info(
             "dry_run_complete",
@@ -939,8 +1073,12 @@ class SkiaService:
     # ---- Genome extraction for Evo ------------------------------------------
 
     def get_evolvable_parameters(self) -> dict[str, float]:
-        """Return all evolvable Skia parameters for genome extraction."""
-        return {
+        """Return all evolvable Skia parameters for genome extraction.
+
+        Includes both infrastructure params AND degradation rates — the organism's
+        entropy resistance is heritable and evolvable.
+        """
+        params = {
             "heartbeat_poll_interval_s": self._config.heartbeat_poll_interval_s,
             "heartbeat_failure_threshold": float(self._config.heartbeat_failure_threshold),
             "heartbeat_confirmation_checks": float(self._config.heartbeat_confirmation_checks),
@@ -951,6 +1089,10 @@ class SkiaService:
             "worker_heartbeat_interval_s": self._config.worker_heartbeat_interval_s,
             "pinata_max_retained_pins": float(self._config.pinata_max_retained_pins),
         }
+        # Include degradation rates — heritable entropy resistance
+        if self._vitality is not None:
+            params.update(self._vitality._degradation.get_evolvable_parameters())
+        return params
 
     # ---- Vitality system wiring ---------------------------------------------
 
@@ -1011,14 +1153,17 @@ class SkiaService:
             return False
         return await self._vitality.resurrect(trigger)
 
-    async def _emit_event(self, event_type_name: str, data: dict[str, Any]) -> None:
+    async def _emit_event(self, event_type_name: str | Any, data: dict[str, Any]) -> None:
         """Emit a Synapse event if the bus is available."""
         if not self._event_bus:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
-            et = SynapseEventType(event_type_name.lower())
+            if isinstance(event_type_name, SynapseEventType):
+                et = event_type_name
+            else:
+                et = SynapseEventType(event_type_name.lower())
             await self._event_bus.emit(SynapseEvent(
                 event_type=et,
                 data=data,

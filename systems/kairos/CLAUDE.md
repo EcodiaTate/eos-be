@@ -4,6 +4,8 @@
 
 Kairos mines the hierarchy of causal knowledge: correlations → causal rules → context-invariant rules → substrate-independent invariants. Each level up is exponentially more compressed and more generative. A single Tier 3 invariant generates predictions across every domain it touches.
 
+**Self-causality (new — 8 Mar 2026)**: Kairos also runs a lightweight internal causal tracker alongside the external pipeline. It samples 6 organism-internal variables each pipeline run, mines pairwise causal relationships within them, and emits `KAIROS_INTERNAL_INVARIANT` when a self-causal law is discovered (e.g. "prediction_error_rate increases coherence_decrease [lag: 1 pipeline run]"). Nova + Thread subscribe. This is how the organism discovers causal laws about *itself*, not just about the external world.
+
 ## Architecture
 
 ### 7-Stage Pipeline
@@ -53,7 +55,7 @@ Key fields added to `CausalInvariant`:
 
 ## Integration Surface
 
-### Events Emitted (17)
+### Events Emitted (18)
 
 | Event | Target | Purpose |
 |-------|--------|---------|
@@ -61,7 +63,7 @@ Key fields added to `CausalInvariant`:
 | `KAIROS_CAUSAL_DIRECTION_ACCEPTED` | Organism | Stage 2 confirmed direction |
 | `KAIROS_CONFOUNDER_DISCOVERED` | Organism | Stage 3 spurious edge found |
 | `KAIROS_INVARIANT_CANDIDATE` | Organism | Stage 5 strong/conditional invariant |
-| `KAIROS_INVARIANT_DISTILLED` | Organism | Phase C distillation complete |
+| `KAIROS_INVARIANT_DISTILLED` | Nova, Evo, **Thread** | Phase C distillation complete; Thread caches for causal attribution |
 | `KAIROS_TIER3_INVARIANT_DISCOVERED` | Nexus, Oneiros, Logos | Highest-priority event |
 | `KAIROS_COUNTER_INVARIANT_FOUND` | Organism | Phase D scope refinement |
 | `KAIROS_INTELLIGENCE_RATIO_STEP_CHANGE` | Telos | I-ratio jump detected |
@@ -74,8 +76,9 @@ Key fields added to `CausalInvariant`:
 | `CONSTITUTIONAL_REVIEW_REQUESTED` | Equor | Tier 3 constitutional review gate |
 | `NARRATIVE_MILESTONE` | Thread | Tier 3 discovery as narrative event |
 | `WORLD_MODEL_UPDATED` | Nova | Tier 3 policy-relevant world model update |
+| `KAIROS_INTERNAL_INVARIANT` | Thread, Nova | **NEW (8 Mar 2026)** Self-causal law discovered within organism's own dynamics |
 
-### Events Subscribed (7)
+### Events Subscribed (16)
 
 | Event | Source | Purpose |
 |-------|--------|---------|
@@ -86,15 +89,23 @@ Key fields added to `CausalInvariant`:
 | `WORLD_MODEL_UPDATED` | Logos | Bidirectional: re-evaluate invariants on model changes |
 | `COMPRESSION_BACKLOG_PROCESSED` | Oneiros | Consolidation feedback: cross-domain patterns |
 | `FEDERATION_INVARIANT_RECEIVED` | Federation/Nexus | Inbound invariant from peer — validated locally before acceptance |
+| `OIKOS_ECONOMIC_EPISODE` | Oikos | Economic causal data stream for EconomicCausalMiner |
+| `FOVEA_INTERNAL_PREDICTION_ERROR` | Fovea/SACM | Economic domain prediction errors as high-salience causal signals |
+| `PHANTOM_PRICE_OBSERVATION` | Phantom Liquidity | Market price time-series for economic correlation mining |
+| `GROUND_TRUTH_CANDIDATE` | Nexus | Level 3+ epistemic fragments seeded as causal candidates |
+| `EMPIRICAL_INVARIANT_CONFIRMED` | Nexus | Level 4 confirmation reinforces matching invariants, prevents decay |
+| `PERCEPT_ARRIVED` | Perception Gateway | Raw percept stream: high-salience percepts become causal candidates |
+| `EQUOR_DRIVE_WEIGHTS_UPDATED` | Equor | Constitutional drive shifts mined for causal structure |
+| `SOMATIC_DRIVE_VECTOR` | Soma | Organism drive state buffered as cross-context observations |
 
 ### Direct Wiring (set_* methods)
 
-- `set_event_bus(bus)` — Synapse pub/sub
-- `set_neo4j(neo4j)` — Neo4j client for persistence
-- `set_logos(logos_ingest)` — Logos KairosInvariantProtocol for world model ingestion
-- `set_nexus(nexus_share)` — Nexus fragment sharing for Tier 3 federation
-- `set_oneiros(oneiros)` — Oneiros REM seed injection on Tier 3 discoveries
-- `set_memory(memory)` — Memory system for `query_observations_for_testing()` and Stage 4 CausalNode BFS
+- `set_event_bus(bus)` — Synapse pub/sub (called at Phase 6)
+- `set_logos(logos_ingest)` — Logos KairosInvariantProtocol for world model ingestion (called at Phase 6)
+- `set_memory(memory)` — Memory system for `query_observations_for_testing()` and Stage 4 CausalNode BFS (called post-Phase 9)
+- `set_neo4j(neo4j)` — Neo4j client for persistence; triggers `initialize()` for startup restoration (called post-Phase 9)
+- `set_nexus(nexus_share)` — Nexus fragment sharing for Tier 3 federation (called post-Phase 9)
+- `set_oneiros(oneiros)` — Oneiros REM seed injection on Tier 3 discoveries (called at Phase 6 via `oneiros.set_kairos(kairos)`)
 
 ## Feedback Loops
 
@@ -191,12 +202,42 @@ Per-invariant accounting with:
 
 All 14 events now fire on every pipeline cycle when sufficient data is available.
 
-## Known Issues / Remaining Work
+## Implemented (2026-03-08 autonomy audit)
+
+### Critical Wiring Fixes
+- **Registry: memory/neo4j/nexus wiring** — `_init_kairos()` previously only wired `event_bus` and `logos`. Added post-Phase-9 wiring block in `registry.py` (after nexus creation): `kairos.set_memory(memory)`, `kairos.set_neo4j(infra.neo4j)`, `await kairos.initialize()` (restores invariants from Neo4j), `kairos.set_nexus(nexus)`. Without this, Kairos ran with zero observation data and no persistence.
+
+### New Subscriptions (5 added, now 16 total)
+- **`GROUND_TRUTH_CANDIDATE`** (Nexus SG-NEXUS): Handler `_on_ground_truth_candidate` — pre-seeds correlation miner with Level 3+ epistemic fragments as causal candidates. Closes Nexus→Kairos ground truth feedback loop.
+- **`EMPIRICAL_INVARIANT_CONFIRMED`** (Nexus SG-NEXUS): Handler `_on_empirical_invariant_confirmed` — reinforces matching invariant (`recency_weight=1.0`, `validated=True`), triggers tier re-evaluation. Level 4 confirmation prevents decay and accelerates promotion.
+- **`PERCEPT_ARRIVED`** (SG-PERCEPT): Handler `_on_percept_arrived` — converts high-salience percepts into correlation candidates. Closes the raw observation stream path specified in Spec XI as `PERCEPT_BROADCAST`.
+- **`EQUOR_DRIVE_WEIGHTS_UPDATED`** (SG-DRIVE): Handler `_on_drive_weights_updated` — converts significant drive weight deltas (≥0.05) into causal candidates. Mines constitutional causality.
+- **`SOMATIC_DRIVE_VECTOR`** (SG-SOMA): Handler `_on_somatic_drive_vector` — buffers organism drive state as cross-context observations (capped at 300). Merges into `observations_by_context` at pipeline start. Enables discovery of inter-drive causal relationships (e.g. low Coherence causes elevated Care response).
+
+### Bug Fixes
+- **`query_observations_for_testing`**: Replaced private `self._hierarchy._find()` with public `self._hierarchy.find_invariant()` (AV4 consistency fix).
+
+## Implemented (2026-03-08 self-causality)
+
+### Self-Causality Tracker — NEW
+- **`_run_self_causal_tracking()`** — called at end of every `run_pipeline()` after evolutionary metrics. Samples 6 internal variables and mines pairwise causal laws.
+- **6 tracked variables**: `prediction_error_rate` (causal_surprise_rate from health), `coherence` (mean I-ratio from ledger), `hypothesis_count` (hierarchy.total_count), `re_success_rate` (tier3/total_discoveries), `sleep_frequency` (consolidation count), `consolidation_depth` (events per pipeline run).
+- **Algorithm**: Rolling history (window=100), Pearson r at lag=1 (cause[:-1] → effect[1:]), threshold |r| > 0.35. Consistency test: 4 sub-windows, ≥50% must hold at r > 0.25 → accept as causal. Hold_rate update: emit `KAIROS_INTERNAL_INVARIANT` on discovery or hold_rate change > 0.1.
+- **`_emit_internal_invariant(entry)`** — emits `KAIROS_INTERNAL_INVARIANT` (new SynapseEventType). Payload: `invariant_id`, `cause_variable`, `effect_variable`, `direction`, `lag_cycles`, `hold_rate`, `correlation`, `abstract_form`, `discovery_run`, `sample_count`.
+- **`_internal_var_history`** — `dict[str, list[float]]`, rolling window per variable, max 100.
+- **`_internal_invariants`** — `dict[(cause, effect), dict]`, accepted internal causal laws.
+- **`IntelligenceContributionLedger.mean_i_ratio()`** — new method, mean intelligence ratio contribution across all tracked invariants.
+- **Health report updated**: `self_causality` section added to `health()` response — `variables_tracked`, `invariants_discovered`, `active_invariants`, `sample_window`.
+- **Nova subscribes** to `KAIROS_INTERNAL_INVARIANT` — organism learns its own causal dynamics; Thread subscribes for causal attribution cache.
+
+### Known Issues / Remaining Work
 
 - Memory `query_episodes()` API assumed but not yet confirmed against Memory system interface (used via `hasattr` guard in pipeline)
 - Curriculum learning and strategic priority scheduling not yet implemented — needs cognitive budget integration with Synapse
 - Abstract structure extraction is basic — only detects bidirectional and cross-domain novelty, not full pattern library
-- Nexus ground truth convergence feedback not yet subscribed — needs `GROUND_TRUTH_CANDIDATE` and `EMPIRICAL_INVARIANT_CONFIRMED` events
+- `SKIA_HEARTBEAT` / `SKIA_SNAPSHOT_COMPLETED` not subscribed — no direct Skia integration; Kairos relies on Thymos for survival signaling
+- RE-integrated abstraction raising (spec XII) not yet implemented — `_raise_abstraction_level()` uses heuristic keyword taxonomy rather than RE routing
+- Self-causality: `consolidation_depth` and `sleep_frequency` variables are raw event counters (ever-increasing), not rate-normalized — correlation mining may find spurious trends. Future: normalize to per-window counts.
 
 ## Config (KairosConfig)
 

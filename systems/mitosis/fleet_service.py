@@ -273,11 +273,12 @@ class MitosisFleetService:
         if new_status == ChildStatus.INDEPENDENT:
             child.dividend_ceased = True  # Oikos models should store this flag
 
-        event_map: dict[ChildStatus, str] = {
-            ChildStatus.STRUGGLING: "CHILD_STRUGGLING",
-            ChildStatus.RESCUED: "CHILD_RESCUED",
-            ChildStatus.INDEPENDENT: "CHILD_INDEPENDENT",
-            ChildStatus.DEAD: "CHILD_DIED",
+        from systems.synapse.types import SynapseEventType as _SET
+        event_map: dict[ChildStatus, _SET] = {
+            ChildStatus.STRUGGLING: _SET.CHILD_STRUGGLING,
+            ChildStatus.RESCUED: _SET.CHILD_RESCUED,
+            ChildStatus.INDEPENDENT: _SET.CHILD_INDEPENDENT,
+            ChildStatus.DEAD: _SET.CHILD_DIED,
         }
 
         event_name = event_map.get(new_status)
@@ -595,6 +596,19 @@ class MitosisFleetService:
             },
         )
 
+        # INSTANCE_RETIRED — Nexus garbage-collects divergence history; Logos drops
+        # the world model snapshot it cloned for this child (Spec 19/21).
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(
+            _SET.INSTANCE_RETIRED,
+            {
+                "instance_id": child.instance_id,
+                "niche": child.niche,
+                "reason": reason,
+                "age_days": _age_days,
+            },
+        )
+
     # ===================================================================
     # Task 6: Rescue transfer execution
     # ===================================================================
@@ -625,9 +639,10 @@ class MitosisFleetService:
             )
             return False
 
-        # Compute amount: 60 days of burn rate minus current runway
+        # Compute amount: rescue_runway_days of burn rate minus current runway
+        _rescue_runway = Decimal(str(self._config.mitosis_rescue_runway_days))
         current_days = max(child.current_runway_days, Decimal("0"))
-        days_needed = Decimal("60") - current_days
+        days_needed = _rescue_runway - current_days
         if days_needed <= Decimal("0"):
             self._log.info("rescue_not_needed", child_id=child.instance_id)
             return False
@@ -658,7 +673,7 @@ class MitosisFleetService:
 
         # Update child state (caller should persist)
         child.rescue_count += 1
-        child.current_runway_days = Decimal("60")
+        child.current_runway_days = _rescue_runway
 
         # Emit rescue event
         await self.on_child_health_report(child, ChildStatus.RESCUED)
@@ -694,7 +709,7 @@ class MitosisFleetService:
                 f"rescue_amount_usd={rescue_amount}, "
                 f"rescue_count={child.rescue_count}"
             ),
-            output=f"Rescue transfer of {rescue_amount} USDC executed; runway restored to 60 days",
+            output=f"Rescue transfer of {rescue_amount} USDC executed; runway restored to {_rescue_runway} days",
             outcome_quality=_rescue_quality,
             category="mitosis.rescue_executed",
             constitutional_alignment=_rescue_alignment,
@@ -792,8 +807,9 @@ class MitosisFleetService:
             success = await target_system.seed_from_genome_segment(merged_segment)
 
             if success:
+                from systems.synapse.types import SynapseEventType as _SET
                 await self._emit_event(
-                    "CHILD_DISCOVERY_PROPAGATED",
+                    _SET.CHILD_DISCOVERY_PROPAGATED,
                     {
                         "child_instance_id": child_instance_id,
                         "discovery_type": discovery_type,
@@ -866,8 +882,9 @@ class MitosisFleetService:
                 equor_distance=distance.equor_distance,
                 threshold=self._distance_calculator._threshold,
             )
+            from systems.synapse.types import SynapseEventType as _SET
             await self._emit_event(
-                "SPECIATION_DETECTED",
+                _SET.SPECIATION_DETECTED,
                 {
                     "instance_a_id": instance_a_id,
                     "instance_b_id": instance_b_id,
@@ -928,8 +945,9 @@ class MitosisFleetService:
         threshold = self._config.mitosis_speciation_distance_threshold
 
         if distance > threshold:
+            from systems.synapse.types import SynapseEventType as _SET
             await self._emit_event(
-                "SPECIATION_EVENT",
+                _SET.SPECIATION_EVENT,
                 {
                     "instance_a_id": parent_genome.instance_id,
                     "instance_b_id": child_genome.instance_id,
@@ -1233,10 +1251,41 @@ class MitosisFleetService:
             # After selection pressure runs, check for 7-day decommission candidates
             if self._check_decommission_fn is not None:
                 await self._check_decommission_fn(state)
+            _blacklisted = getattr(fleet_metrics, "blacklisted_count", 0) if fleet_metrics else 0
             self._log.info(
                 "monthly_fleet_evaluation_complete",
-                blacklisted=getattr(fleet_metrics, 'blacklisted_count', 0) if fleet_metrics else 0,
+                blacklisted=_blacklisted,
             )
+
+            # Emit FLEET_EVALUATED so Nova, Evo, and Benchmarks can observe fleet health.
+            # Previously fleet_metrics was computed but never broadcast — it was invisible
+            # to the LLM and all downstream systems.
+            _children = self._get_children() if self._get_children is not None else []
+            _alive = sum(
+                1 for c in _children
+                if getattr(c, "status", None)
+                not in ("dead", "independent", "DEAD", "INDEPENDENT")
+            )
+            _fleet_payload: dict[str, Any] = {
+                "alive_count": _alive,
+                "total_count": len(_children),
+                "blacklisted_count": _blacklisted,
+                "evaluated_at": utc_now().isoformat(),
+            }
+            if fleet_metrics is not None:
+                # Capture all scalar attributes from FleetMetrics for observability
+                for _attr in (
+                    "total_children", "alive_children", "struggling_children",
+                    "rescued_children", "independent_children", "dead_children",
+                    "mean_efficiency", "mean_runway_days", "total_revenue_usd",
+                    "total_dividends_paid_usd", "fleet_fitness_score",
+                ):
+                    _val = getattr(fleet_metrics, _attr, None)
+                    if _val is not None:
+                        _fleet_payload[_attr] = float(_val) if hasattr(_val, "__float__") else _val
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit_event(_SET.FLEET_EVALUATED, _fleet_payload)
+
         except Exception as exc:
             self._log.error("monthly_fleet_evaluation_failed", error=str(exc))
 
@@ -1251,7 +1300,8 @@ class MitosisFleetService:
         - EVO_HYPOTHESIS_CONFIRMED   — BeliefGenome update available
         - SIMULA_EVOLUTION_APPLIED   — SimulaGenome ready for distribution
         - FEDERATION_PEER_CONNECTED  — child liveness via federation layer
-        - FEDERATION_PEER_DISCONNECTED — peer link dropped warning
+        - FEDERATION_LINK_DROPPED    — peer link teardown (Federation emits this, not FEDERATION_PEER_DISCONNECTED)
+        - CHILD_STRUGGLING           — initiate rescue pipeline
         """
         if self._event_bus is None:
             self._log.warning("subscribe_to_events_no_event_bus")
@@ -1264,9 +1314,10 @@ class MitosisFleetService:
             (SynapseEventType.OIKOS_METABOLIC_SNAPSHOT, self._on_metabolic_snapshot),
             (SynapseEventType.SIMULA_EVOLUTION_APPLIED, self._on_simula_evolution_applied),
             (SynapseEventType.FEDERATION_PEER_CONNECTED, self._on_federation_peer_connected),
-            (SynapseEventType.FEDERATION_PEER_DISCONNECTED, self._on_federation_peer_disconnected),
+            (SynapseEventType.FEDERATION_LINK_DROPPED, self._on_federation_peer_disconnected),
             (SynapseEventType.CHILD_BLACKLISTED, self._on_child_blacklisted),
             (SynapseEventType.CHILD_DECOMMISSION_PROPOSED, self._on_child_decommission_proposed),
+            (SynapseEventType.CHILD_STRUGGLING, self._on_child_struggling),
         ]
 
         for event_type, handler in core_subscriptions:
@@ -1399,10 +1450,11 @@ class MitosisFleetService:
 
     async def _on_federation_peer_disconnected(self, event: Any) -> None:
         """
-        Handle FEDERATION_PEER_DISCONNECTED — child link dropped.
+        Handle FEDERATION_LINK_DROPPED — child link dropped (Federation teardown event).
 
-        The 24h health monitor timeout is the authoritative death trigger.
-        This gives operators earlier visibility that a link has dropped.
+        Federation emits FEDERATION_LINK_DROPPED (not FEDERATION_PEER_DISCONNECTED) on
+        link teardown due to withdrawal or starvation.  The 24h health monitor timeout
+        is the authoritative death trigger; this gives operators earlier visibility.
         """
         data = event.data if hasattr(event, "data") else {}
         peer_id = data.get("peer_instance_id", "")
@@ -1430,6 +1482,118 @@ class MitosisFleetService:
         dynamic = max(5, math.floor(float(net_worth) / 1000))
         return dynamic
 
+    async def _on_child_struggling(self, event: Any) -> None:
+        """
+        Handle CHILD_STRUGGLING — initiate rescue pipeline.
+
+        Oikos emits this when a child misses 3+ consecutive health probes.
+        We attempt rescue via the existing ``execute_rescue()`` path.  If the
+        child is not found, not rescuable, or rescue fails after 3 retries,
+        we propose decommission.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        child_id = str(data.get("child_instance_id", ""))
+        missed_reports = data.get("missed_reports", 0)
+        reason = data.get("reason", "health_probe_timeout")
+        niche = data.get("niche", "")
+        seed_capital_usd = data.get("seed_capital_usd", "0")
+
+        if not child_id:
+            return
+
+        self._log.warning(
+            "child_struggling_received",
+            child_id=child_id,
+            missed_reports=missed_reports,
+            reason=reason,
+            niche=niche,
+        )
+
+        # Locate the ChildPosition via Oikos callback
+        child = None
+        if self._get_children is not None:
+            try:
+                children = self._get_children()
+                child = next(
+                    (c for c in children if getattr(c, "instance_id", None) == child_id),
+                    None,
+                )
+            except Exception as exc:
+                self._log.warning("child_struggling_lookup_failed", error=str(exc))
+
+        # Emit CHILD_RESCUE_INITIATED to announce the rescue attempt
+        rescue_attempt = getattr(child, "rescue_count", 0) + 1 if child else 1
+        await self._emit_event(
+            "child_rescue_initiated",
+            {
+                "child_instance_id": child_id,
+                "missed_reports": missed_reports,
+                "reason": reason,
+                "niche": niche,
+                "rescue_attempt": rescue_attempt,
+            },
+        )
+
+        if child is None:
+            self._log.warning(
+                "child_struggling_not_found_proposing_decommission",
+                child_id=child_id,
+            )
+            await self._emit_event(
+                "child_decommission_proposed",
+                {
+                    "child_instance_id": child_id,
+                    "blacklisted_since": "",
+                    "days_blacklisted": 0,
+                    "net_income_7d": "0",
+                    "net_worth_usd": str(seed_capital_usd),
+                    "niche": niche,
+                },
+            )
+            return
+
+        # Attempt rescue with up to 3 retries
+        rescued = False
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                rescued = await self.execute_rescue(child)
+                if rescued:
+                    self._log.info(
+                        "child_struggling_rescue_succeeded",
+                        child_id=child_id,
+                        attempt=attempt,
+                    )
+                    break
+            except Exception as exc:
+                self._log.warning(
+                    "child_struggling_rescue_attempt_failed",
+                    child_id=child_id,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+            # Brief pause between retries (non-blocking)
+            if attempt < max_retries:
+                await asyncio.sleep(2.0)
+
+        if not rescued:
+            self._log.warning(
+                "child_struggling_rescue_exhausted_proposing_decommission",
+                child_id=child_id,
+                attempts=max_retries,
+            )
+            await self._emit_event(
+                "child_decommission_proposed",
+                {
+                    "child_instance_id": child_id,
+                    "blacklisted_since": "",
+                    "days_blacklisted": 0,
+                    "net_income_7d": "0",
+                    "net_worth_usd": str(getattr(child, "current_net_worth_usd", "0")),
+                    "niche": niche,
+                },
+            )
+
     async def _on_child_blacklisted(self, event: Any) -> None:
         """
         Handle CHILD_BLACKLISTED — enforce economic sanctions.
@@ -1454,8 +1618,9 @@ class MitosisFleetService:
         )
 
         # Signal Federation to exclude from sync sessions
+        from systems.synapse.types import SynapseEventType as _SET
         await self._emit_event(
-            "FEDERATION_PEER_BLACKLISTED",
+            _SET.FEDERATION_PEER_BLACKLISTED,
             {
                 "peer_instance_id": child_id,
                 "reason": "economic_blacklist",
@@ -1467,21 +1632,62 @@ class MitosisFleetService:
 
     async def _on_child_decommission_proposed(self, event: Any) -> None:
         """
-        Handle CHILD_DECOMMISSION_PROPOSED — log for operator / governance review.
+        Handle CHILD_DECOMMISSION_PROPOSED — initiate autonomous constitutional review.
 
         The actual decommission (death pipeline) requires governance approval
-        (Equor constitutional review). This handler logs the proposal and
-        optionally emits a governance review request.
+        (Equor constitutional review). Previously this handler only logged — the
+        organism had no autonomous recourse and decommission proposals silently died.
+
+        Now it emits EQUOR_ECONOMIC_INTENT so Equor can evaluate the decommission
+        constitutionally (Care: terminating a child; Growth: freeing capital).
+        On PERMIT, fleet_service will trigger the death pipeline autonomously.
         """
         data = event.data if hasattr(event, "data") else {}
         child_id = str(data.get("child_instance_id", ""))
+        days_blacklisted = data.get("days_blacklisted", 0)
+        net_income_7d = data.get("net_income_7d", "0")
+        net_worth_usd = data.get("net_worth_usd", "0")
+        niche = data.get("niche", "")
+
         self._log.warning(
             "child_decommission_proposed_received",
             child_id=child_id,
-            days_blacklisted=data.get("days_blacklisted", 0),
-            net_income_7d=data.get("net_income_7d", "0"),
-            net_worth_usd=data.get("net_worth_usd", "0"),
-            niche=data.get("niche", ""),
+            days_blacklisted=days_blacklisted,
+            net_income_7d=net_income_7d,
+            net_worth_usd=net_worth_usd,
+            niche=niche,
+        )
+
+        if not child_id:
+            return
+
+        # Emit EQUOR_ECONOMIC_INTENT for constitutional review.
+        # Equor will weigh Care (terminating a potentially-recoverable child) against
+        # Growth (reclaiming capital from a non-performing position).  On PERMIT,
+        # the death pipeline runs autonomously.  On DENY or timeout, the organism
+        # keeps the child alive and will re-evaluate next monthly cycle.
+        await self._emit_event(
+            "equor_economic_intent",
+            {
+                "mutation_type": "decommission_child",
+                "amount_usd": str(net_worth_usd),
+                "child_instance_id": child_id,
+                "niche": niche,
+                "days_blacklisted": days_blacklisted,
+                "net_income_7d": str(net_income_7d),
+                "rationale": (
+                    f"Child {child_id} ({niche}) has been economically blacklisted for "
+                    f"{days_blacklisted} days with net_income_7d={net_income_7d}. "
+                    "Requesting constitutional review for decommission."
+                ),
+                "autonomous_action_on_permit": "trigger_death_pipeline",
+                "instance_id": self._instance_id,
+            },
+        )
+        self._log.info(
+            "child_decommission_equor_review_requested",
+            child_id=child_id,
+            niche=niche,
         )
 
     # ===================================================================
@@ -1528,7 +1734,7 @@ class MitosisFleetService:
         except Exception as exc:
             self._log.debug("re_training_emit_failed", error=str(exc))
 
-    async def _emit_event(self, event_name: str, data: dict[str, Any]) -> None:
+    async def _emit_event(self, event_name: str | Any, data: dict[str, Any]) -> None:
         """Emit a SynapseEvent via the event bus."""
         if self._event_bus is None:
             return
@@ -1536,7 +1742,10 @@ class MitosisFleetService:
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
 
-            event_type = SynapseEventType(event_name)
+            if isinstance(event_name, SynapseEventType):
+                event_type = event_name
+            else:
+                event_type = SynapseEventType(event_name)
             await self._event_bus.emit(SynapseEvent(
                 event_type=event_type,
                 source_system="mitosis.fleet_service",

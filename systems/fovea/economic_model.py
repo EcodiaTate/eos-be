@@ -38,13 +38,23 @@ _SOURCE_STALE_CYCLES = 6
 class _SourceTracker:
     """Per-revenue-source prediction tracker."""
 
-    def __init__(self, source: str) -> None:
+    def __init__(
+        self,
+        source: str,
+        *,
+        ema_alpha: float = _EMA_ALPHA,
+        stale_cycles: int = _SOURCE_STALE_CYCLES,
+        min_observations: int = _MIN_OBSERVATIONS,
+    ) -> None:
         self.source = source
         self.predicted: float = 0.0          # EMA prediction for this source
         self.last_actual: float = 0.0        # Most recent actual from Oikos
         self.observation_count: int = 0
         self.cycles_since_update: int = 0    # Staleness counter
         self._history: deque[float] = deque(maxlen=_TREND_WINDOW)
+        self._alpha: float = ema_alpha
+        self._stale_cycles: int = stale_cycles
+        self._min_observations: int = min_observations
 
     def update(self, actual: float) -> float:
         """Update with a new actual value; return normalised prediction error [0, 1]."""
@@ -64,7 +74,7 @@ class _SourceTracker:
         normalised = min(1.0, raw_error / denominator)
 
         # Update EMA prediction AFTER computing the error for this cycle.
-        self.predicted = _EMA_ALPHA * actual + (1.0 - _EMA_ALPHA) * self.predicted
+        self.predicted = self._alpha * actual + (1.0 - self._alpha) * self.predicted
         return normalised
 
     def age(self) -> None:
@@ -72,7 +82,7 @@ class _SourceTracker:
         self.cycles_since_update += 1
         # Gradually decay our expectation toward zero so stale sources don't
         # produce persistent phantom errors.
-        if self.cycles_since_update > _SOURCE_STALE_CYCLES:
+        if self.cycles_since_update > self._stale_cycles:
             self.predicted *= 0.9
 
     @property
@@ -95,7 +105,7 @@ class _SourceTracker:
 
     @property
     def is_sufficiently_observed(self) -> bool:
-        return self.observation_count >= _MIN_OBSERVATIONS
+        return self.observation_count >= self._min_observations
 
 
 class EconomicPredictionModel:
@@ -137,7 +147,68 @@ class EconomicPredictionModel:
         # Count of observations (gate for premature error signals)
         self._observation_count: int = 0
 
+        # ── LEARNABLE economic model parameters (Evo/Simula can tune) ──
+        self._ema_alpha: float = _EMA_ALPHA
+        self._min_observations: int = _MIN_OBSERVATIONS
+        self._trend_window: int = _TREND_WINDOW
+        self._source_stale_cycles: int = _SOURCE_STALE_CYCLES
+        self._composite_weights: dict[str, float] = {
+            "revenue": 0.35,
+            "efficiency": 0.25,
+            "trend": 0.25,
+            "worst_source": 0.15,
+        }
+
         self._logger = logger.bind(component="economic_prediction_model")
+
+    # ── LEARNABLE parameter API (AUTONOMY) ──
+
+    def adjust_param(self, name: str, value: float) -> bool:
+        """Adjust an economic model parameter. Called by Evo ADJUST_BUDGET."""
+        if name == "ema_alpha":
+            self._ema_alpha = max(0.01, min(0.99, value))
+        elif name == "min_observations":
+            self._min_observations = max(1, min(20, int(value)))
+        elif name == "trend_window":
+            self._trend_window = max(2, min(50, int(value)))
+        elif name == "source_stale_cycles":
+            self._source_stale_cycles = max(1, min(50, int(value)))
+        elif name.startswith("composite_weight_"):
+            weight_key = name[len("composite_weight_"):]
+            if weight_key in self._composite_weights:
+                self._composite_weights[weight_key] = max(0.0, min(1.0, value))
+                # Re-normalise composite weights
+                total = sum(self._composite_weights.values())
+                if total > 0:
+                    for k in self._composite_weights:
+                        self._composite_weights[k] /= total
+            else:
+                return False
+        else:
+            return False
+        logger.info("economic_param_adjusted", name=name, value=round(value, 4))
+        return True
+
+    def get_learnable_params(self) -> dict[str, float]:
+        """Return all learnable economic model parameters for introspection."""
+        params: dict[str, float] = {
+            "ema_alpha": self._ema_alpha,
+            "min_observations": float(self._min_observations),
+            "trend_window": float(self._trend_window),
+            "source_stale_cycles": float(self._source_stale_cycles),
+        }
+        for k, v in self._composite_weights.items():
+            params[f"composite_weight_{k}"] = v
+        return params
+
+    def export_learnable_params(self) -> dict[str, float]:
+        """Export for genome inheritance."""
+        return self.get_learnable_params()
+
+    def import_learnable_params(self, params: dict[str, float]) -> None:
+        """Import from parent genome."""
+        for name, value in params.items():
+            self.adjust_param(name, value)
 
     # ------------------------------------------------------------------
     # Primary update entry point
@@ -175,7 +246,12 @@ class EconomicPredictionModel:
             except (TypeError, ValueError):
                 continue
             if source_key not in self._source_trackers:
-                self._source_trackers[source_key] = _SourceTracker(source_key)
+                self._source_trackers[source_key] = _SourceTracker(
+                    source_key,
+                    ema_alpha=self._ema_alpha,
+                    stale_cycles=self._source_stale_cycles,
+                    min_observations=self._min_observations,
+                )
             tracker = self._source_trackers[source_key]
             src_error = tracker.update(amount_f)
             if tracker.is_sufficiently_observed and src_error > worst_error:
@@ -211,22 +287,24 @@ class EconomicPredictionModel:
         self._trend_error = self._compute_trend_error()
 
         # Update EMA predictions
+        alpha = self._ema_alpha
         self._predicted_revenue_24h = (
-            _EMA_ALPHA * revenue_24h + (1.0 - _EMA_ALPHA) * self._predicted_revenue_24h
+            alpha * revenue_24h + (1.0 - alpha) * self._predicted_revenue_24h
         )
         self._predicted_costs_24h = (
-            _EMA_ALPHA * costs_24h + (1.0 - _EMA_ALPHA) * self._predicted_costs_24h
+            alpha * costs_24h + (1.0 - alpha) * self._predicted_costs_24h
         )
         self._predicted_efficiency = (
-            _EMA_ALPHA * efficiency + (1.0 - _EMA_ALPHA) * self._predicted_efficiency
+            alpha * efficiency + (1.0 - alpha) * self._predicted_efficiency
         )
 
         # Composite error: weighted combination of revenue, efficiency, trend, worst-source
+        cw = self._composite_weights
         composite = max(
-            self._revenue_error * 0.35
-            + self._efficiency_error * 0.25
-            + self._trend_error * 0.25
-            + worst_error * 0.15,
+            self._revenue_error * cw["revenue"]
+            + self._efficiency_error * cw["efficiency"]
+            + self._trend_error * cw["trend"]
+            + worst_error * cw["worst_source"],
             0.0,
         )
         composite = min(1.0, composite)
@@ -250,7 +328,12 @@ class EconomicPredictionModel:
         to update the per-source EMA between Oikos vitality snapshots.
         """
         if source not in self._source_trackers:
-            self._source_trackers[source] = _SourceTracker(source)
+            self._source_trackers[source] = _SourceTracker(
+                source,
+                ema_alpha=self._ema_alpha,
+                stale_cycles=self._source_stale_cycles,
+                min_observations=self._min_observations,
+            )
         self._source_trackers[source].update(amount)
 
     # ------------------------------------------------------------------
@@ -275,7 +358,7 @@ class EconomicPredictionModel:
     @property
     def is_warmed_up(self) -> bool:
         """True once enough observations exist for meaningful errors."""
-        return self._observation_count >= _MIN_OBSERVATIONS
+        return self._observation_count >= self._min_observations
 
     # ------------------------------------------------------------------
     # Internal helpers

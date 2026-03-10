@@ -177,3 +177,16 @@ class DescentStage:
             },
         )
         await self._event_bus.emit(event)
+
+        # Wire ORGANISM_SLEEP — Axon, Identity, SACM, Simula subscribe to this.
+        # SLEEP_INITIATED is Oneiros-internal; ORGANISM_SLEEP is the organism-wide signal.
+        organism_sleep_event = SynapseEvent(
+            event_type=SynapseEventType.ORGANISM_SLEEP,
+            source_system="oneiros",
+            data={
+                "trigger": checkpoint.trigger.value,
+                "checkpoint_id": checkpoint.id,
+                "scheduled_duration_s": target_duration_s,
+            },
+        )
+        await self._event_bus.emit(organism_sleep_event)

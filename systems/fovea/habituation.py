@@ -103,6 +103,14 @@ class HabituationEngine:
         self._dishabituated_count: int = 0
         self._habituation_complete_count: int = 0
 
+        # ── LEARNABLE habituation parameters (Evo/Simula can tune) ──
+        self._increment: float = _HABITUATION_INCREMENT
+        self._max_habituation: float = _MAX_HABITUATION
+        self._dishabituation_threshold: float = _DISHABITUATION_THRESHOLD
+        self._dishabituation_amplification: float = _DISHABITUATION_AMPLIFICATION
+        self._history_window: int = _HISTORY_WINDOW
+        self._complete_threshold: float = _HABITUATION_COMPLETE_THRESHOLD
+
         # Neo4j persistence (batched writes)
         self._instance_id = instance_id
         self._neo4j_driver = neo4j_driver
@@ -110,6 +118,47 @@ class HabituationEngine:
         self._changes_since_persist: int = 0
 
         self._logger = logger.bind(component="habituation")
+
+    # ── LEARNABLE parameter API (AUTONOMY) ──
+
+    def adjust_param(self, name: str, value: float) -> bool:
+        """Adjust a habituation parameter. Called by Evo ADJUST_BUDGET."""
+        if name == "increment":
+            self._increment = max(0.001, min(0.5, value))
+        elif name == "max_habituation":
+            self._max_habituation = max(0.1, min(1.0, value))
+        elif name == "dishabituation_threshold":
+            self._dishabituation_threshold = max(0.05, min(2.0, value))
+        elif name == "dishabituation_amplification":
+            self._dishabituation_amplification = max(1.0, min(5.0, value))
+        elif name == "history_window":
+            self._history_window = max(3, min(100, int(value)))
+        elif name == "complete_threshold":
+            self._complete_threshold = max(0.3, min(1.0, value))
+        else:
+            return False
+        logger.info("habituation_param_adjusted", name=name, value=round(value, 4))
+        return True
+
+    def get_learnable_params(self) -> dict[str, float]:
+        """Return all learnable habituation parameters for introspection."""
+        return {
+            "increment": self._increment,
+            "max_habituation": self._max_habituation,
+            "dishabituation_threshold": self._dishabituation_threshold,
+            "dishabituation_amplification": self._dishabituation_amplification,
+            "history_window": float(self._history_window),
+            "complete_threshold": self._complete_threshold,
+        }
+
+    def export_learnable_params(self) -> dict[str, float]:
+        """Export for genome inheritance."""
+        return self.get_learnable_params()
+
+    def import_learnable_params(self, params: dict[str, float]) -> None:
+        """Import from parent genome."""
+        for name, value in params.items():
+            self.adjust_param(name, value)
 
     @property
     def entry_count(self) -> int:
@@ -153,7 +202,7 @@ class HabituationEngine:
 
         # First encounter with this error profile
         if signature not in self._error_history:
-            self._error_history[signature] = deque(maxlen=_HISTORY_WINDOW)
+            self._error_history[signature] = deque(maxlen=self._history_window)
             self._habituation_levels[signature] = 0.0
             self._error_history[signature].append(base_salience)
             error.habituation_level = 0.0
@@ -171,14 +220,14 @@ class HabituationEngine:
             else:
                 magnitude_surprise = base_salience
 
-            if magnitude_surprise > _DISHABITUATION_THRESHOLD:
+            if magnitude_surprise > self._dishabituation_threshold:
                 self._habituation_levels[signature] = 0.0
-                self._error_history[signature] = deque(maxlen=_HISTORY_WINDOW)
+                self._error_history[signature] = deque(maxlen=self._history_window)
                 self._dishabituated_count += 1
                 # Reset habituation-complete flag on dis-habituation
                 stats.habituation_complete_emitted = False
 
-                amplified = min(base_salience * _DISHABITUATION_AMPLIFICATION, 1.0)
+                amplified = min(base_salience * self._dishabituation_amplification, 1.0)
                 error.habituation_level = 0.0
                 error.habituated_salience = amplified
 
@@ -200,7 +249,7 @@ class HabituationEngine:
 
         # Normal case: update history and increase habituation
         history.append(base_salience)
-        new_habituation = min(habituation + _HABITUATION_INCREMENT, _MAX_HABITUATION)
+        new_habituation = min(habituation + self._increment, self._max_habituation)
         self._habituation_levels[signature] = new_habituation
         self._habituated_count += 1
 
@@ -219,7 +268,7 @@ class HabituationEngine:
         # Check for habituation-complete: fully habituated, never led to update
         complete_info: HabituationCompleteInfo | None = None
         if (
-            new_habituation > _HABITUATION_COMPLETE_THRESHOLD
+            new_habituation > self._complete_threshold
             and not stats.habituation_complete_emitted
             and stats.times_led_to_update == 0
         ):

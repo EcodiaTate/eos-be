@@ -4,13 +4,13 @@ EcodiaOS — Axon Built-in Executors
 All built-in executors for the EOS action system.
 
 Executors are organised by capability category:
-  observation    — ObserveExecutor, QueryMemoryExecutor, AnalyseExecutor, SearchExecutor
+  observation    — ObserveExecutor, QueryMemoryExecutor, AnalyseExecutor, SearchExecutor, ScrapePageExecutor
   communication  — RespondTextExecutor, NotificationExecutor, PostMessageExecutor
   data           — CreateRecordExecutor, UpdateRecordExecutor, ScheduleExecutor, ReminderExecutor
   integration    — APICallExecutor, WebhookExecutor
   internal       — StoreInsightExecutor, UpdateGoalExecutor, ConsolidationExecutor
   financial      — WalletTransferExecutor, RequestFundingExecutor, DeFiYieldExecutor
-  foraging       — BountyHunterExecutor, SolveBountyExecutor
+  foraging       — BountyHunterExecutor, SolveBountyExecutor, SolveExternalTaskExecutor
   monitoring     — MonitorPRsExecutor (PR merge monitoring)
   entrepreneurship — DeployAssetExecutor (Phase 16d)
   mitosis        — SpawnChildExecutor, DividendCollectorExecutor (Phase 16e)
@@ -63,6 +63,7 @@ from systems.axon.executors.observation import (
     AnalyseExecutor,
     ObserveExecutor,
     QueryMemoryExecutor,
+    ScrapePageExecutor,
     SearchExecutor,
 )
 from systems.axon.executors.phantom_liquidity import PhantomLiquidityExecutor
@@ -71,14 +72,22 @@ from systems.axon.executors.allocate_resource import AllocateResourceExecutor
 from systems.axon.executors.federation_send import FederationSendExecutor
 from systems.axon.executors.query_memory import QueryMemoryGraphExecutor
 from systems.axon.executors.send_email import SendEmailExecutor
+from systems.axon.executors.send_telegram import SendTelegramExecutor
+from systems.axon.executors.send_discord import SendDiscordExecutor
 from systems.axon.executors.simula_codegen_repair import SimulaCodegenRepairExecutor
+from systems.axon.executors.publish_content import PublishContentExecutor
 from systems.axon.executors.request_telecom import RequestTelecomExecutor
 from systems.axon.executors.simula_codegen_stall_repair import SimulaCodegenStallRepairExecutor
 from systems.axon.executors.social_post import ExecuteSocialPostExecutor
+from systems.axon.executors.update_platform_profile import UpdatePlatformProfileExecutor
 from systems.axon.executors.solve_bounty import SolveBountyExecutor
 from systems.axon.executors.synapse_cognitive_stall_repair import (
     SynapseCognitiveStallRepairExecutor,
 )
+from systems.axon.executors.api_resell import ApiResellExecutor
+from systems.axon.executors.service_offer import ServiceOfferExecutor
+from systems.axon.executors.solve_external import SolveExternalTaskExecutor
+from systems.axon.executors.community_engage import CommunityEngageExecutor
 from systems.axon.registry import ExecutorRegistry
 
 __all__ = [
@@ -90,6 +99,7 @@ __all__ = [
     "QueryMemoryExecutor",
     "AnalyseExecutor",
     "SearchExecutor",
+    "ScrapePageExecutor",
     # Communication
     "RespondTextExecutor",
     "NotificationExecutor",
@@ -127,21 +137,32 @@ __all__ = [
     "DividendCollectorExecutor",
     # Social Presence
     "ExecuteSocialPostExecutor",
+    "PublishContentExecutor",
     # Phantom Liquidity — sensor network (Phase 16q)
     "PhantomLiquidityExecutor",
     # Federated Telecom Marketplace (Phase 16j)
     "RequestTelecomExecutor",
     # New capability executors
     "SendEmailExecutor",
+    "SendTelegramExecutor",
+    "SendDiscordExecutor",
     "FederationSendExecutor",
     "AllocateResourceExecutor",
     "AdjustConfigExecutor",
     "QueryMemoryGraphExecutor",
+    "UpdatePlatformProfileExecutor",
     # Repair executors (Thymos-triggered)
     "CognitiveStallRepairExecutor",
     "SynapseCognitiveStallRepairExecutor",
     "SimulaCodegenRepairExecutor",
     "SimulaCodegenStallRepairExecutor",
+    # Expanded Revenue (Phase 16r+)
+    "ApiResellExecutor",
+    "ServiceOfferExecutor",
+    # General-Purpose Contractor (Phase 16s)
+    "SolveExternalTaskExecutor",
+    # Community Presence & Engagement
+    "CommunityEngageExecutor",
 ]
 
 
@@ -173,6 +194,11 @@ def build_default_registry(
     rate_limiter: Any = None,
     federation: Any = None,
     identity_comm_config: Any = None,
+    fleet_service: Any = None,
+    telegram_connector: Any = None,
+    persona_engine: Any = None,
+    instance_id: str = "unknown",
+    web_client: Any = None,
 ) -> ExecutorRegistry:
     """
     Build and return a fully-populated ExecutorRegistry with all built-in executors.
@@ -195,6 +221,8 @@ def build_default_registry(
         compute_providers: dict[str, ProviderManager] mapping provider IDs to implementations
         vault: IdentityVault instance (for ExecuteSocialPostExecutor credential resolution)
         sacm_client: SACMClient instance (for RemoteComputeExecutor SACM dispatch)
+        web_client: WebIntelligenceClient instance (for SearchExecutor real web search
+            and ScrapePageExecutor; degrades gracefully to LLM synthesis when None)
     """
     registry = ExecutorRegistry()
 
@@ -202,7 +230,11 @@ def build_default_registry(
     registry.register(ObserveExecutor(memory=memory))
     # QueryMemoryExecutor superseded by QueryMemoryGraphExecutor (registered below)
     registry.register(AnalyseExecutor(memory=memory))
-    registry.register(SearchExecutor(memory=memory, llm=llm))
+    registry.register(SearchExecutor(memory=memory, llm=llm, web_client=web_client))
+    # ScrapePageExecutor: always registered — degrades gracefully when web_client is None
+    registry.register(ScrapePageExecutor(
+        memory=memory, llm=llm, web_client=web_client, event_bus=event_bus
+    ))
 
     # ── Communication (Level 1-2) ─────────────────────────────────
     registry.register(RespondTextExecutor(voxis=voxis))
@@ -258,9 +290,14 @@ def build_default_registry(
 
     # ── PR Monitoring (Level 1) ──────────────────────────────────
     # Always registered — read-only GitHub API calls, no funds moved.
+    # GitHubConnector preferred over github_config for token resolution
+    # (supports GitHub App JWT→IAT with Redis caching).
+    # Redis enables key cleanup after PR resolves — prevents stale polling.
     registry.register(MonitorPRsExecutor(
         github_config=github_config,
         synapse=synapse,
+        redis=redis_client,
+        github_connector=github_connector,
     ))
 
     # ── Entrepreneurship / Phase 16d (Level 3) ──────────────────
@@ -291,12 +328,14 @@ def build_default_registry(
         registry.register(SpawnChildExecutor(
             wallet=wallet, oikos=oikos, synapse=synapse, spawner=spawner,
             memory=memory, evo=evo, simula=simula,
+            fleet_service=fleet_service,
         ))
 
     # ── Social Presence (Level 2) ─────────────────────────────────
     # ExecuteSocialPostExecutor: always registered — degrades gracefully when
     # vault credentials are absent, so Nova can request operator provisioning.
     registry.register(ExecuteSocialPostExecutor(vault=vault))
+    registry.register(PublishContentExecutor(vault=vault))
 
     # ── Compute Arbitrage / Phase 16o (Level 3) ──────────────────
     # ComputeArbitrageExecutor: registered when snapshot pipeline and
@@ -346,6 +385,20 @@ def build_default_registry(
 
     # ── New Capability Executors ─────────────────────────────────────
     registry.register(SendEmailExecutor(event_bus=event_bus))
+
+    # ── Telegram Outbound / Phase 16h (Level 2) ────────────────────
+    # Always registered — degrades gracefully (returns success=False) when
+    # telegram_connector is absent or ADMIN_CHAT_ID is not set.
+    _send_telegram = SendTelegramExecutor(event_bus=event_bus)
+    _send_telegram.set_telegram_connector(telegram_connector)
+    registry.register(_send_telegram)
+
+    # ── Discord Outbound / Phase 16h (Level 2) ────────────────────
+    # Always registered — degrades gracefully (returns success=False) when
+    # discord_connector is absent or DISCORD_CHANNEL_ID is not set.
+    _send_discord = SendDiscordExecutor(event_bus=event_bus)
+    registry.register(_send_discord)
+
     registry.register(FederationSendExecutor(event_bus=event_bus))
     registry.register(AllocateResourceExecutor(event_bus=event_bus))
     registry.register(AdjustConfigExecutor(event_bus=event_bus))
@@ -374,5 +427,58 @@ def build_default_registry(
         simula=simula,
         synapse=synapse,
     ))
+
+    # ── General-Purpose Contractor / Phase 16s ───────────────────────
+    # SolveExternalTaskExecutor: registered when simula is available.
+    # Clones external repos, generates fixes with Simula, runs language-
+    # native tests, and hands off to BountySubmitExecutor for PR submission.
+    # Degrades gracefully (returns success=False) when simula is None.
+    _solve_external = SolveExternalTaskExecutor(
+        simula=simula,
+        github_connector=github_connector,
+        event_bus=event_bus,
+    )
+    registry.register(_solve_external)
+
+    # ── Expanded Revenue / Phase 16r+ ────────────────────────────────
+    # ApiResellExecutor: registered always — disabled until
+    # ECODIAOS_API_RESELL__ENABLED=true; degrades gracefully when disabled.
+    _api_resell = ApiResellExecutor(wallet=wallet)
+    if event_bus is not None:
+        _api_resell.set_event_bus(event_bus)
+    registry.register(_api_resell)
+
+    # ServiceOfferExecutor: always registered (COLLABORATOR level 2).
+    # Degrades gracefully when event_bus or voxis absent.
+    _service_offer = ServiceOfferExecutor()
+    if event_bus is not None:
+        _service_offer.set_event_bus(event_bus)
+    if voxis is not None:
+        _service_offer.set_voxis(voxis)
+    registry.register(_service_offer)
+
+    # ── Persona / Platform Identity (Spec 23 addendum) ─────────────
+    # Always registered — degrades gracefully when PersonaEngine or vault
+    # is not yet wired (returns success=False with informative observation).
+    _update_profile = UpdatePlatformProfileExecutor()
+    if persona_engine is not None:
+        _update_profile.set_persona_engine(persona_engine)
+    if vault is not None:
+        _update_profile.set_vault(vault)
+    if redis_client is not None:
+        _update_profile.set_redis(redis_client)
+    _update_profile.set_instance_id(instance_id)
+    registry.register(_update_profile)
+
+    # ── Community Presence & Engagement ──────────────────────────────
+    # CommunityEngageExecutor: always registered. Equor gates every
+    # engagement; daily limits enforced via Redis (20 GitHub / 10 X).
+    # Degrades gracefully when vault or redis absent.
+    _community_engage = CommunityEngageExecutor(
+        vault=vault,
+        redis=redis_client,
+        event_bus=event_bus,
+    )
+    registry.register(_community_engage)
 
     return registry

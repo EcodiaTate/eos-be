@@ -49,13 +49,17 @@ Wire Oikos callbacks first: `fleet_service.wire_oikos_callbacks(get_children=...
 
 ### Synapse Subscriptions (MitosisFleetService)
 
-`subscribe_to_events()` wires 6 event handlers:
+`subscribe_to_events()` wires 10 event handlers:
 - `CHILD_HEALTH_REPORT` → `_on_health_report_event` (logs child liveness)
 - `OIKOS_METABOLIC_SNAPSHOT` → `_on_metabolic_snapshot` (logs metabolic state)
 - `EVO_HYPOTHESIS_CONFIRMED` → `_on_evo_hypothesis_confirmed` (logs pending genome update)
 - `SIMULA_EVOLUTION_APPLIED` → `_on_simula_evolution_applied` (logs pending genome update)
 - `FEDERATION_PEER_CONNECTED` → `_on_federation_peer_connected` (logs child federation link)
 - `FEDERATION_PEER_DISCONNECTED` → `_on_federation_peer_disconnected` (warns on link drop)
+- `CHILD_BLACKLISTED` → `_on_child_blacklisted` (enforce economic sanctions)
+- `CHILD_DECOMMISSION_PROPOSED` → `_on_child_decommission_proposed` (Equor review)
+- `CHILD_SPAWNED` → `_on_child_spawned_genome_cache` (cache for adapter sharing)
+- `CHILD_STRUGGLING` → `_on_child_struggling` (initiate rescue pipeline)
 
 ### Full Death Pipeline (_trigger_death_pipeline)
 
@@ -80,6 +84,7 @@ When a child transitions to `INDEPENDENT`, `on_child_health_report()` sets `chil
 - Only active when `ECODIAOS_IS_GENESIS_NODE != 'true'`
 - Collects: cpu_usage (Soma or psutil fallback), memory_usage, hypothesis_count (Evo), drive_alignment_scores, constitutional_drift_severity (Equor), financial fields
 - First report delayed 30s to allow boot
+- **Subscribes to `CHILD_HEALTH_REQUEST`** (2026-03-08): `_on_child_health_request()` responds immediately when parent probes this child instance — calls `_emit_report()` directly rather than waiting for the next 10-min cycle. Filters by `child_instance_id` to ignore probes for other children.
 
 ### HIGH #3 — Deferred seed capital completion
 - `OikosService._on_child_wallet_reported()`: handles `CHILD_WALLET_REPORTED` event
@@ -296,10 +301,75 @@ wire_mitosis_phase(
 
 ---
 
+## Gap Closure (8 Mar 2026 — Autonomy Audit)
+
+### Dead Wiring — MitosisFleetService was never instantiated
+
+The most critical gap in the entire mitosis system: `MitosisFleetService` was a 1500-line class that was implemented but never constructed. Every downstream effect — 4 background loops, 9 Synapse subscriptions, genome preparation, Oikos callbacks, adapter sharing — was permanently dead.
+
+**Root cause**: `wire_mitosis_phase()` tried to get fleet_service via `getattr(spawn_executor, "_fleet_service", None)`, but `SpawnChildExecutor` was never passed `fleet_service` at construction. `build_default_registry()` did not include `fleet_service` in its parameter list.
+
+| Fix | Description |
+|-----|-------------|
+| **`build_default_registry()` fleet_service param** | `axon/executors/__init__.py`: Added `fleet_service: Any = None` parameter. Passed to `SpawnChildExecutor()` at construction. |
+| **`SpawnChildExecutor.set_fleet_service()`** | New post-construction injection method. Allows `wire_mitosis_phase()` to inject fleet_service after axon executor is built. |
+| **`MitosisFleetService` constructed in `_init_oikos()`** | `core/registry.py`: Full construction block added — `GenomeOrchestrator`, `LocalDockerSpawner` (with try/except), `MitosisFleetService`. Stored on `app.state.fleet_service` + `app.state.genome_orchestrator`. |
+| **`wire_mitosis_phase()` complete rewrite** | `core/wiring.py`: Now accepts `app: Any = None`. Step 0: retrieves fleet_service from `app.state.fleet_service`. Step 0b: injects into SpawnChildExecutor via `set_fleet_service()`. Step 1: wires Oikos callbacks. **Step 2: schedules `subscribe_to_events()`** (was never called). **Step 3: schedules `start_health_monitor()`** (was never called). Step 4: wires AdapterSharer. |
+| **`registry.py` wire call updated** | `wire_mitosis_phase(..., app=app)` — `app` now passed so fleet_service can be retrieved. |
+
+### Invisible Telemetry — Fleet metrics never emitted
+
+`_run_monthly_fleet_evaluation()` computed alive count, efficiency, runway, blacklisted count — then only logged it. Nova, Evo, and Benchmarks had no visibility into fleet health.
+
+**Fix**: Emits `FLEET_EVALUATED` Synapse event with full scalar fleet metrics payload.
+
+### Blocked Action — Child decommission had no autonomous path
+
+`_on_child_decommission_proposed()` received the event and logged it. The organism could never act on a decommission proposal autonomously.
+
+**Fix**: Now emits `EQUOR_ECONOMIC_INTENT` (mutation_type=`decommission_child`) for constitutional review. On `EQUOR_ECONOMIC_PERMIT`, triggers the full death pipeline.
+
+### Static Thresholds — Rescue cap and runway hardcoded
+
+Two hardcoded values had no runtime adjustment path:
+1. `ChildPosition.is_rescuable` hardcoded `rescue_count < 2` — ignored `OikosConfig.mitosis_max_rescues_per_child`
+2. `execute_rescue()` hardcoded `Decimal("60")` for rescue runway target
+
+**Fixes**:
+- `ChildPosition` gains `max_rescues: int = 2` field. `is_rescuable` now uses `self.rescue_count < self.max_rescues`.
+- `OikosConfig` gains `mitosis_rescue_runway_days: int = 60` field (`config.py`).
+- Both `ChildPosition` construction sites (`oikos/service.py` + `axon/executors/mitosis.py`) now pass `max_rescues` from config.
+- `execute_rescue()` reads `Decimal(str(self._config.mitosis_rescue_runway_days))` instead of hardcoded 60.
+
+## Gap Closure (9 Mar 2026 — Child Lifecycle Event Wiring)
+
+### CHILD_STRUGGLING → Mitosis rescue pipeline
+- `MitosisFleetService._on_child_struggling()` — subscribes to `CHILD_STRUGGLING` (emitted by Oikos when child misses 3+ health probes)
+- Locates `ChildPosition` via `_get_children()` Oikos callback
+- Emits `CHILD_RESCUE_INITIATED` (new SynapseEventType) to announce rescue attempt
+- Calls `execute_rescue()` with up to 3 retries (2s pause between attempts)
+- On rescue failure or child not found → emits `CHILD_DECOMMISSION_PROPOSED` to trigger governance review
+- Payload match: `child_instance_id`, `missed_reports`, `reason`, `niche`, `seed_capital_usd`
+
+### CHILD_BLACKLISTED → Equor governance
+- `EquorService._on_child_blacklisted()` — subscribes in `subscribe_hitl()`
+- Writes `GovernanceRecord` (event_type=`child_blacklisted`) to Neo4j with full sanction details
+- Emits `EQUOR_ESCALATED_TO_HUMAN` (approval_type=`child_blacklisted`) for operator review
+
+### CHILD_DECOMMISSION_PROPOSED → Equor governance gate
+- `EquorService._on_child_decommission_proposed()` — subscribes in `subscribe_hitl()`
+- Writes `GovernanceRecord` (event_type=`child_decommission_proposed`) to Neo4j with cost/revenue data
+- Emits `EQUOR_ESCALATED_TO_HUMAN` (approval_type=`child_decommission`) with net_income_7d, net_worth_usd, days_blacklisted, niche — operator must approve before death pipeline
+
+### New SynapseEventType
+| Type | Purpose |
+|------|---------|
+| `CHILD_RESCUE_INITIATED` | Mitosis announces rescue attempt for struggling child |
+
 ## Known Remaining Issues
 
 - **Weekly dividend: `net_income_7d` source** — `ChildPosition.net_income_7d` must be populated from `CHILD_HEALTH_REPORT` processing in OikosService
-- **Equor not yet subscribed to `EQUOR_ECONOMIC_INTENT`** — governance auto-permits after 30s timeout
+- ~~**Equor not yet subscribed to `EQUOR_ECONOMIC_INTENT`**~~ — **FIXED (v2.3, 2026-03-07)**: Equor subscribes and emits genuine PERMIT/DENY. 30s auto-permit is safety fallback only.
 - **LoRA weight mutation** — deferred; children don't have their own adapters yet
 
 ## Architecture Notes
@@ -319,3 +389,58 @@ Added to `synapse/types.py`:
 - `SIMULA_EVOLUTION_APPLIED` — for SimulaGenome distribution trigger
 - `FEDERATION_PEER_CONNECTED` — for child liveness detection
 - `FEDERATION_PEER_DISCONNECTED` — for early disconnect warning
+## Gap Closure (8 Mar 2026 — Belief/Simula/Soma Genome Payload Serialization)
+
+### Problem
+`SpawnChildExecutor` called `export_belief_genome()` and `export_simula_genome()` and
+extracted genome IDs, but **never serialized the JSON payloads** into `child_config_overrides`.
+Children booted with correct `belief_genome_id`/`simula_genome_id` values in `CHILD_SPAWNED`
+but received empty `ECODIAOS_BELIEF_GENOME_PAYLOAD` and `ECODIAOS_SIMULA_GENOME_PAYLOAD` env
+vars — so no hypothesis priors or evolution params were actually inherited.
+
+Soma's `export_somatic_genome()` existed but was **completely absent** from the spawn pipeline.
+
+### Fixes
+
+| Fix | Description |
+|-----|-------------|
+| **`belief_genome` outer-scope variable** | `belief_genome: object \| None = None` declared before the `if not belief_genome_id` block so it's accessible for serialization. |
+| **Belief payload serialized** | After telos payload, `belief_genome.model_dump_for_transport()` → JSON → `seed_config.child_config_overrides["belief_genome_payload"]` → `ECODIAOS_BELIEF_GENOME_PAYLOAD` env var on child. |
+| **`simula_genome` outer-scope variable** | Same pattern as belief_genome. |
+| **Simula payload serialized** | `simula_genome.model_dump_for_transport()` → JSON → `seed_config.child_config_overrides["simula_genome_payload"]` → `ECODIAOS_SIMULA_GENOME_PAYLOAD`. |
+| **Soma genome export added** | `SpawnChildExecutor` now has `self._soma` attribute. Step 0b calls `soma.export_somatic_genome()`, serializes via `.model_dump()` → `seed_config.child_config_overrides["soma_genome_payload"]` → `ECODIAOS_SOMA_GENOME_PAYLOAD`. |
+| **`SpawnChildExecutor` soma param** | `soma: Any \| None = None` added to constructor. `wire_mitosis_phase()` injects `spawn_executor._soma = soma`. |
+| **`SeedConfiguration.soma_genome_id`** | Field added to `oikos/models.py` after `telos_genome_id`. |
+| **`wire_mitosis_phase()` soma param** | `soma: Any = None` added to signature; injected if not None; logged with `soma_wired`. |
+| **`registry.py` call updated** | `wire_mitosis_phase(..., soma=soma)` — soma is in scope at the call site. |
+| **`EvoService._apply_inherited_belief_genome_if_child()`** | New method. Reads `ECODIAOS_BELIEF_GENOME_PAYLOAD`, validates `BeliefGenome`, injects each hypothesis as a `PatternCandidate` into `_pending_candidates` with `confidence * 0.95` discount. Stores inherited drive weights + drift history. Emits `GENOME_INHERITED` on Synapse. Called from `initialize()` with try/except. |
+| **`SimulaService._apply_inherited_simula_genome_if_child()`** | New method. Reads `ECODIAOS_SIMULA_GENOME_PAYLOAD`, validates `SimulaGenome`, applies learnable params to `self._config` with ±10% Gaussian jitter. Stores mutation history. Emits `GENOME_INHERITED` if Synapse available. Called from `initialize()` with try/except. |
+| **`SomaService._apply_inherited_soma_genome_if_child()`** | New method. Reads `ECODIAOS_SOMA_GENOME_PAYLOAD`, validates `OrganGenomeSegment`, delegates to existing `seed_child_from_genome()` (which applies ±5% setpoint noise + ±2% dynamics noise). Called from `initialize()` with try/except. |
+
+### Complete Genome Inheritance Matrix (post 8 Mar 2026)
+
+| System | Export method | Child reads env var | Applies via | Jitter |
+|--------|--------------|---------------------|-------------|--------|
+| Evo | `export_belief_genome()` | `ECODIAOS_BELIEF_GENOME_PAYLOAD` | `_apply_inherited_belief_genome_if_child()` | confidence × 0.95 |
+| Simula | `export_simula_genome()` | `ECODIAOS_SIMULA_GENOME_PAYLOAD` | `_apply_inherited_simula_genome_if_child()` | ±10% Gaussian |
+| Equor | `export_equor_genome()` | `ECODIAOS_EQUOR_GENOME_PAYLOAD` | `_apply_inherited_equor_genome_if_child()` | None |
+| Axon | `export_axon_genome()` | `ECODIAOS_AXON_GENOME_PAYLOAD` | `_initialize_from_parent_templates()` | None (confidence 0.6 vs 0.8) |
+| Telos | `export_telos_genome()` | `ECODIAOS_TELOS_GENOME_PAYLOAD` | `_apply_inherited_telos_genome_if_child()` | ±15%/±10%/±20% |
+| Soma | `export_somatic_genome()` | `ECODIAOS_SOMA_GENOME_PAYLOAD` | `_apply_inherited_soma_genome_if_child()` | ±5% setpoints, ±2% dynamics |
+| Nova | `export_nova_genome()` | `ECODIAOS_NOVA_GENOME_PAYLOAD` | `_apply_inherited_nova_genome_if_child()` | ±15% Gaussian |
+| Voxis | `export_voxis_genome()` | `ECODIAOS_VOXIS_GENOME_PAYLOAD` | `_apply_inherited_voxis_genome_if_child()` | ±10% Gaussian |
+
+## Gap Closure (8 Mar 2026 — Nova/Voxis Genome Inheritance)
+
+| Fix | Description |
+|-----|-------------|
+| **`NovaGenomeFragment` in primitives** | Added to `primitives/genome_inheritance.py`. Fields: `goal_domain_priors`, `policy_success_rates`, `belief_urgency_thresholds`, `active_inference_params`. Exported from `primitives/__init__.py`. |
+| **`VoxisGenomeFragment` in primitives** | Added to `primitives/genome_inheritance.py`. Fields: `personality_vector`, `vocabulary_affinities`, `strategy_preferences`. Exported from `primitives/__init__.py`. |
+| **`NovaService.export_nova_genome()`** | Extracts top-20 domain weights from GoalManager, policy success rates from last 200 decision records, urgency thresholds from BeliefUrgencyMonitor, EFE weights. Called by SpawnChildExecutor Step 0b. |
+| **`NovaService._apply_inherited_nova_genome_if_child()`** | Reads `ECODIAOS_NOVA_GENOME_PAYLOAD`. Applies with ±15% jitter to GoalManager priors, PolicyGenerator rates, urgency thresholds, EFE evaluator weights. Emits `GENOME_INHERITED`. Called from `initialize()` with try/except. |
+| **`VoxisService.export_voxis_genome()`** | Extracts personality vector from PersonalityEngine, top-500 vocabulary affinities from DiversityTracker, strategy preferences from last 100 expressions. Called by SpawnChildExecutor Step 0b. |
+| **`VoxisService._apply_inherited_voxis_genome_if_child()`** | Reads `ECODIAOS_VOXIS_GENOME_PAYLOAD`. Applies with ±10% jitter. Emits `GENOME_INHERITED`. Called from `initialize()` with try/except. |
+| **`SpawnChildExecutor` nova+voxis wired** | `nova` + `voxis` constructor params added; Step 0b extraction + payload injection; `nova_genome_id`/`voxis_genome_id` in `CHILD_SPAWNED` event + `ExecutionResult`; `_build_seed_config_for_spawner` extended. |
+| **`SeedConfiguration.nova_genome_id`/`voxis_genome_id`** | Fields added to `oikos/models.py` `SeedConfiguration` after `soma_genome_id`. |
+| **`wire_mitosis_phase()` nova+voxis params** | `nova: Any = None` + `voxis: Any = None` added to `core/wiring.py:wire_mitosis_phase()`; injects `spawn_executor._nova`/`_voxis`. Logged with `nova_wired`/`voxis_wired`. |
+| **`registry.py` call updated** | `wire_mitosis_phase(..., nova=nova, voxis=voxis)` — both in scope at call site. |

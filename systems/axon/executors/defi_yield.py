@@ -59,7 +59,16 @@ YIELD_FLOOR_APY = Decimal("0.02")
 
 _SUPPORTED_ACTIONS = frozenset({"deposit", "withdraw"})
 
-_SUPPORTED_PROTOCOLS = frozenset({"aave", "morpho"})
+# Phase 16d: expanded protocol coverage
+# aave        — Aave V3 on Base (supply/borrow lending)
+# morpho      — Morpho Blue MetaMorpho USDC vault
+# aerodrome   — Aerodrome concentrated liquidity AMM (earns AERO rewards)
+# moonwell    — Moonwell lending/borrowing (earns WELL rewards)
+# extra_finance — Extra Finance leveraged yield (conservative mode, max 2×)
+# beefy       — Beefy auto-compounding vault aggregator
+_SUPPORTED_PROTOCOLS = frozenset({
+    "aave", "morpho", "aerodrome", "moonwell", "extra_finance", "beefy"
+})
 
 # Base mainnet (chain ID 8453) contract addresses
 # Aave V3 Pool -- the canonical supply/withdraw entrypoint on Base
@@ -67,6 +76,21 @@ _AAVE_V3_POOL_BASE = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
 
 # Morpho Blue MetaMorpho USDC vault on Base
 _MORPHO_VAULT_BASE = "0xc1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca"
+
+# Aerodrome Finance Router on Base (USDC/USDT stable pool)
+# Uses ERC-4626 compatible StablePool vault interface for USDC deposits
+_AERODROME_ROUTER_BASE = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
+# Aerodrome USDC/USDT stable gauge (auto-staking via router)
+_AERODROME_GAUGE_BASE = "0x4F09bAb2f0E15e2A078A227FE1537665F55b8360"
+
+# Moonwell mUSDC on Base (ERC-4626 compatible mToken)
+_MOONWELL_MUSDC_BASE = "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22"
+
+# Extra Finance Lend Pool on Base (ERC-4626 deposit, conservative mode)
+_EXTRA_FINANCE_LEND_BASE = "0xBB505c54D71E9e599Cb8435b4F0cEEc05fC71cbD"
+
+# Beefy BeefyVaultV7 USDC vault on Base (ERC-4626 compatible)
+_BEEFY_USDC_VAULT_BASE = "0x67c764b0e9F19Af46dfBFe4e7f7C7dFf02A7eEE1"
 
 # USDC on Base
 _USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -222,7 +246,8 @@ class DeFiYieldExecutor(Executor):
 
     action_type = "defi_yield"
     description = (
-        "Deploy or withdraw idle USDC into DeFi yield protocols (Aave/Morpho) "
+        "Deploy or withdraw idle USDC into DeFi yield protocols "
+        "(Aave/Morpho/Aerodrome/Moonwell/ExtraFinance/Beefy) "
         "on Base L2 -- resting metabolism for idle capital (Level 3)"
     )
 
@@ -278,7 +303,8 @@ class DeFiYieldExecutor(Executor):
             )
         if protocol not in _SUPPORTED_PROTOCOLS:
             return ValidationResult.fail(
-                f"protocol must be one of: {', '.join(sorted(_SUPPORTED_PROTOCOLS))}",
+                f"protocol must be one of: {', '.join(sorted(_SUPPORTED_PROTOCOLS))} "
+                f"(aave/morpho for lending; aerodrome/moonwell/extra_finance/beefy for AMM/auto-compounding)",
                 protocol="unsupported value",
             )
 
@@ -372,9 +398,40 @@ class DeFiYieldExecutor(Executor):
             if protocol == "aave":
                 tx_hash = await self._execute_aave(action, amount_raw_int, context)
                 contract = _AAVE_V3_POOL_BASE
-            else:
+            elif protocol == "morpho":
                 tx_hash = await self._execute_morpho(action, amount_raw_int, context)
                 contract = _MORPHO_VAULT_BASE
+            elif protocol == "aerodrome":
+                tx_hash = await self._execute_erc4626(
+                    action, amount_raw_int, context,
+                    vault_address=_AERODROME_GAUGE_BASE,
+                    protocol_name="aerodrome",
+                )
+                contract = _AERODROME_GAUGE_BASE
+            elif protocol == "moonwell":
+                tx_hash = await self._execute_erc4626(
+                    action, amount_raw_int, context,
+                    vault_address=_MOONWELL_MUSDC_BASE,
+                    protocol_name="moonwell",
+                )
+                contract = _MOONWELL_MUSDC_BASE
+            elif protocol == "extra_finance":
+                # Extra Finance uses ERC-4626 interface in conservative (lend-only) mode.
+                # Leveraged mode is explicitly NOT used — Max leverage = 1× (simple deposit).
+                tx_hash = await self._execute_erc4626(
+                    action, amount_raw_int, context,
+                    vault_address=_EXTRA_FINANCE_LEND_BASE,
+                    protocol_name="extra_finance",
+                )
+                contract = _EXTRA_FINANCE_LEND_BASE
+            else:
+                # beefy — ERC-4626 compatible auto-compounding vault
+                tx_hash = await self._execute_erc4626(
+                    action, amount_raw_int, context,
+                    vault_address=_BEEFY_USDC_VAULT_BASE,
+                    protocol_name="beefy",
+                )
+                contract = _BEEFY_USDC_VAULT_BASE
         except Exception as exc:
             return self._handle_execution_error(exc, action, amount_str, protocol, context)
 
@@ -540,6 +597,64 @@ class DeFiYieldExecutor(Executor):
             tx_hash = await self._send_tx(
                 cdp, account, network, _MORPHO_VAULT_BASE, withdraw_data,
             )
+
+        return tx_hash
+
+    async def _execute_erc4626(
+        self,
+        action: str,
+        amount_raw: int,
+        context: ExecutionContext,
+        vault_address: str,
+        protocol_name: str,
+    ) -> str:
+        """
+        Generic ERC-4626 vault deposit or withdraw.
+
+        Used for Aerodrome, Moonwell, Extra Finance (conservative), and Beefy —
+        all of which expose the standard ERC-4626 interface for USDC deposits.
+
+        Extra Finance: conservative (lend-only) mode — no leverage is applied.
+        Aerodrome: deposits into the USDC/USDT stable gauge via ERC-4626 wrapper.
+        """
+        wallet = self._wallet
+        assert wallet is not None
+
+        account = wallet._require_account()
+        cdp = wallet._require_cdp()
+        network = wallet.network
+        owner_address = wallet.address
+
+        if action == "deposit":
+            # Step 1: Approve vault to spend USDC
+            approve_data = _build_approve_calldata(vault_address, amount_raw)
+            self._logger.debug(
+                f"defi_yield_{protocol_name}_approve",
+                spender=vault_address,
+                amount_raw=amount_raw,
+                execution_id=context.execution_id,
+            )
+            await self._send_tx(cdp, account, network, _USDC_BASE, approve_data)
+
+            # Step 2: Deposit into ERC-4626 vault
+            deposit_data = _build_erc4626_deposit_calldata(amount_raw, owner_address)
+            self._logger.debug(
+                f"defi_yield_{protocol_name}_deposit",
+                amount_raw=amount_raw,
+                execution_id=context.execution_id,
+            )
+            tx_hash = await self._send_tx(cdp, account, network, vault_address, deposit_data)
+        else:
+            # Withdraw from ERC-4626 vault
+            withdraw_data = _build_erc4626_withdraw_calldata(
+                amount_raw, owner_address, owner_address,
+            )
+            self._logger.debug(
+                f"defi_yield_{protocol_name}_withdraw",
+                amount_raw=amount_raw,
+                execution_id=context.execution_id,
+            )
+            tx_hash = await self._send_tx(cdp, account, network, vault_address, withdraw_data)
 
         return tx_hash
 

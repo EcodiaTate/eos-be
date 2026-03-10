@@ -45,8 +45,8 @@ from clients.token_budget import BudgetTier, TokenBudget
 if TYPE_CHECKING:
     from telemetry.llm_metrics import LLMMetricsCollector
 
-# Signature: (caller_id: str, input_tokens: int, output_tokens: int) -> float
-MetabolicCallback = Callable[[str, int, int], float]
+# Signature: (caller_id: str, input_tokens: int, output_tokens: int, provider: str) -> float
+MetabolicCallback = Callable[[str, int, int, str], float]
 
 # Signature: (had_error: bool) -> None — reports inference outcome to RollbackMonitor
 InferenceErrorCallback = Callable[[bool], None]
@@ -177,6 +177,19 @@ class OptimizedLLMProvider(LLMProvider):
 
     # ─── Internal helpers ────────────────────────────────────────
 
+    def _detect_provider_tag(self) -> str:
+        """Detect the provider tag from the inner LLMProvider type."""
+        from clients.llm import VLLMProvider, OllamaProvider, BedrockProvider
+
+        if isinstance(self._inner, VLLMProvider):
+            return "vllm"
+        if isinstance(self._inner, OllamaProvider):
+            return "ollama"
+        if isinstance(self._inner, BedrockProvider):
+            return "bedrock"
+        # Default: Anthropic direct or OpenAI — use default pricing
+        return ""
+
     def _report_metabolic_cost(
         self,
         caller_id: str,
@@ -191,12 +204,14 @@ class OptimizedLLMProvider(LLMProvider):
         """
         if not self._metabolic_callback or (input_tokens == 0 and output_tokens == 0):
             return
-        cost_usd = self._metabolic_callback(caller_id, input_tokens, output_tokens)
+        provider = self._detect_provider_tag()
+        cost_usd = self._metabolic_callback(caller_id, input_tokens, output_tokens, provider)
         self._logger.debug(
             "metabolic_cost_logged",
             system=caller_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            provider=provider or "default",
             cost_usd=round(cost_usd, 6),
         )
 

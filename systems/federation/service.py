@@ -154,6 +154,14 @@ class FederationService:
         self._simula: Any = None  # Wired post-init
         self._oikos: Any = None  # Wired post-init
 
+        # ── Work Pooling subsystems (built in initialize()) ──────────────
+        self._task_delegation: Any = None   # TaskDelegationManager
+        self._bounty_splitter: Any = None   # BountySplitter
+        self._resource_sharing: Any = None  # ResourceSharingManager
+        self._yield_pool: Any = None        # YieldPoolManager
+        self._marketplace: Any = None       # FederationMarketplace
+        self._work_router: Any = None       # WorkRouter
+
         # Active federation links (link_id → FederationLink)
         self._links: dict[str, FederationLink] = {}
 
@@ -180,6 +188,12 @@ class FederationService:
 
         # Sleep-certified knowledge IDs — only these are eligible for outbound sharing
         self._sleep_certified_knowledge: set[str] = set()
+
+        # Runtime-adjustable thresholds — defaults match the original hardcoded values.
+        # Evo can tune these via set_metabolic_gate_threshold() / set_colleague_trust_floor()
+        # based on organism-wide metabolic pressure and observed federation outcomes.
+        self._metabolic_gate_threshold: float = 0.1   # Below → trust upgrades blocked
+        self._colleague_trust_floor: float = 20.0     # Minimum score for COLLEAGUE+ sharing
 
     def set_certificate_manager(self, cert_mgr: Any) -> None:
         """Wire CertificateManager for inbound certificate validation."""
@@ -211,6 +225,8 @@ class FederationService:
         self._simula = simula
         if self._ingestion:
             self._ingestion._simula = simula
+        if self._bounty_splitter:
+            self._bounty_splitter.set_simula(simula)
         self._logger.info("simula_wired_to_federation")
 
     def set_equor(self, equor: Any) -> None:
@@ -232,6 +248,8 @@ class FederationService:
         self._oikos = oikos
         if self._ingestion:
             self._ingestion._oikos = oikos
+        if self._yield_pool:
+            self._yield_pool.set_oikos(oikos)
         self._logger.info("oikos_wired_to_federation")
 
     def set_event_bus(self, event_bus: Any) -> None:
@@ -242,14 +260,49 @@ class FederationService:
         event_bus.subscribe(SynapseEventType.ECONOMIC_STATE_UPDATED, self._on_economic_state_updated)
         event_bus.subscribe(SynapseEventType.IDENTITY_CERTIFICATE_ROTATED, self._on_identity_certificate_rotated)
         event_bus.subscribe(SynapseEventType.INCIDENT_DETECTED, self._on_incident_detected)
+        # INCIDENT_RESOLVED clears heightened trust scrutiny so link upgrades can resume.
+        # Without this subscription _incident_heightened_scrutiny is set permanently True
+        # on the first incident and trust upgrades are blocked forever.
+        if hasattr(SynapseEventType, "INCIDENT_RESOLVED"):
+            event_bus.subscribe(SynapseEventType.INCIDENT_RESOLVED, self._on_incident_resolved)
         event_bus.subscribe(SynapseEventType.ONEIROS_CONSOLIDATION_COMPLETE, self._on_oneiros_consolidation_complete)
         # Subscribe to own privacy violation events so we can apply trust reset
         event_bus.subscribe(SynapseEventType.FEDERATION_PRIVACY_VIOLATION, self._on_privacy_violation)
         # Skia resurrection proposals — coordinate leader election and emit approval
         event_bus.subscribe(SynapseEventType.SKIA_RESURRECTION_PROPOSAL, self._on_skia_resurrection_proposal)
+        # Nexus certified schemas ready for cross-instance sharing
+        if hasattr(SynapseEventType, "NEXUS_CERTIFIED_FOR_FEDERATION"):
+            event_bus.subscribe(
+                SynapseEventType.NEXUS_CERTIFIED_FOR_FEDERATION,
+                self._on_nexus_certified_for_federation,
+            )
+        # Nexus world model fragment share → store in Memory + emit FEDERATION_KNOWLEDGE_RECEIVED
+        # Closes Nexus known issue #10: inbound Synapse event path previously had no subscriber.
+        event_bus.subscribe(
+            SynapseEventType.WORLD_MODEL_FRAGMENT_SHARE,
+            self._on_world_model_fragment_share,
+        )
         # Propagate bus to ingestion pipeline (may be wired before or after initialize())
         if self._ingestion:
             self._ingestion._event_bus = event_bus
+        # Propagate bus to work pooling subsystems (may be wired before initialize())
+        for sub in (
+            self._task_delegation,
+            self._bounty_splitter,
+            self._resource_sharing,
+            self._yield_pool,
+            self._marketplace,
+            self._work_router,
+        ):
+            if sub is not None and hasattr(sub, "set_event_bus"):
+                sub.set_event_bus(event_bus)
+        # Subscribe to BOUNTY_PAID so BountySplitter can distribute sub-rewards
+        if hasattr(SynapseEventType, "BOUNTY_PAID"):
+            event_bus.subscribe(SynapseEventType.BOUNTY_PAID, self._on_bounty_paid)
+        # Notify federated peers when this organism begins sleep — enables coordinated
+        # consolidation timing across the federation (Spec §XIV).
+        if hasattr(SynapseEventType, "SLEEP_INITIATED"):
+            event_bus.subscribe(SynapseEventType.SLEEP_INITIATED, self._on_sleep_initiated)
         self._logger.info("event_bus_wired_to_federation")
 
     async def _on_metabolic_pressure(self, event: Any) -> None:
@@ -269,11 +322,12 @@ class FederationService:
             self._logger.info("federation_starvation_level_changed", old=old, new=level)
             if level == "critical":
                 # Suspend all active links
+                from systems.synapse.types import SynapseEventType
                 for link_id, link in list(self._links.items()):
                     if link.status == FederationLinkStatus.ACTIVE:
                         link.status = FederationLinkStatus.SUSPENDED
                         asyncio.ensure_future(self._emit_synapse_event(
-                            "federation_link_dropped",
+                            SynapseEventType.FEDERATION_LINK_DROPPED,
                             {
                                 "link_id": link_id,
                                 "remote_instance_id": link.remote_instance_id,
@@ -316,6 +370,27 @@ class FederationService:
             severity=data.get("severity", ""),
         )
 
+    async def _on_incident_resolved(self, event: Any) -> None:
+        """Clear heightened trust scrutiny when Thymos resolves an incident.
+
+        Closes the permanent-block gap: _incident_heightened_scrutiny was set True on
+        INCIDENT_DETECTED but never cleared, causing trust upgrades to be blocked forever
+        after the first incident regardless of resolution.
+
+        Emits an evolutionary observable so Nova/Telos can observe the restoration.
+        """
+        self._incident_heightened_scrutiny = False
+        data = getattr(event, "data", {}) or {}
+        self._logger.info(
+            "incident_scrutiny_cleared",
+            incident_id=data.get("incident_id", ""),
+            resolution=data.get("resolution", ""),
+        )
+        asyncio.ensure_future(self._emit_evolutionary_observable(
+            "incident_scrutiny_cleared", 1.0, is_novel=False,
+            metadata={"incident_id": data.get("incident_id", "")},
+        ))
+
     async def _on_privacy_violation(self, event: Any) -> None:
         """
         React to a detected privacy violation by a federated peer.
@@ -357,6 +432,38 @@ class FederationService:
             remote_instance_id=remote_instance_id,
             new_trust_level=link.trust_level.name,
             new_trust_score=link.trust_score,
+        )
+
+    async def _on_sleep_initiated(self, event: Any) -> None:
+        """SLEEP_INITIATED → broadcast FEDERATION_SLEEP_SYNC to all active peers.
+
+        Allows federated peers to coordinate their own sleep timing for
+        synchronised cross-instance memory consolidation (Spec §XIV).
+        Only emits when at least one ACTIVE link exists.
+        """
+        data = getattr(event, "data", {}) or {}
+        active_links = [
+            lnk for lnk in self._links.values()
+            if lnk.status == FederationLinkStatus.ACTIVE
+        ]
+        if not active_links:
+            return
+        from primitives.common import utc_now
+
+        from systems.synapse.types import SynapseEventType
+        asyncio.ensure_future(self._emit_synapse_event(
+            SynapseEventType.FEDERATION_SLEEP_SYNC,
+            {
+                "instance_id": self._instance_id,
+                "proposed_sleep_time_utc": utc_now().isoformat(),
+                "trigger": data.get("trigger", "cognitive_pressure"),
+                "priority": data.get("priority", 0.5),
+                "active_peer_count": len(active_links),
+            },
+        ))
+        self._logger.info(
+            "federation_sleep_sync_broadcast",
+            active_peers=len(active_links),
         )
 
     async def _on_oneiros_consolidation_complete(self, event: Any) -> None:
@@ -417,8 +524,9 @@ class FederationService:
                 auto_approving_in_s=10,
             )
             await _asyncio.sleep(10.0)
+            from systems.synapse.types import SynapseEventType
             asyncio.ensure_future(self._emit_synapse_event(
-                "federation_resurrection_approved",
+                SynapseEventType.FEDERATION_RESURRECTION_APPROVED,
                 {
                     "leader_instance_id": proposing_instance_id,
                     "snapshot_cid": snapshot_cid,
@@ -498,8 +606,9 @@ class FederationService:
 
         # Emit approval regardless of quorum — if quorum failed, still approve so the
         # organism can resurrect autonomously (survival imperative outweighs coordination).
+        from systems.synapse.types import SynapseEventType
         asyncio.ensure_future(self._emit_synapse_event(
-            "federation_resurrection_approved",
+            SynapseEventType.FEDERATION_RESURRECTION_APPROVED,
             {
                 "leader_instance_id": proposing_instance_id,
                 "snapshot_cid": best_cid or snapshot_cid,
@@ -508,6 +617,192 @@ class FederationService:
                 "auto_approved": not quorum_met,
             },
         ))
+
+    async def _on_nexus_certified_for_federation(self, event: Any) -> None:
+        """
+        Handle NEXUS_CERTIFIED_FOR_FEDERATION — initiate knowledge sharing with peers.
+
+        Nexus emits this event immediately after ONEIROS_CONSOLIDATION_COMPLETE when
+        one or more local schemas become sleep-certified and ready for cross-instance
+        sharing. Payload carries:
+          - instance_id: str           — emitting instance
+          - schema_ids: list[str]      — certified schema IDs
+          - consolidation_cycle_id: str
+          - certified_fragment_count: int
+
+        Handler:
+        1. Mark the certified schema_ids as sleep-certified so knowledge.py's privacy
+           filter allows them in outbound IIEP sessions.
+        2. Emit FEDERATION_KNOWLEDGE_SHARED on the Synapse bus so all subscribers
+           (Thread, Benchmarks, Evo, Alive) observe the sharing event.
+        3. Trigger fragment shares to any active links that have sufficient trust
+           (COLLEAGUE+ as per Spec §VIII sharing gate) — fire-and-forget.
+        """
+        data = getattr(event, "data", {}) or {}
+        schema_ids: list[str] = data.get("schema_ids", []) or []
+        consolidation_cycle_id = str(data.get("consolidation_cycle_id", ""))
+        certified_count = int(data.get("certified_fragment_count", len(schema_ids)))
+
+        if not schema_ids:
+            return
+
+        # Mark schemas as sleep-certified for outbound gating
+        for sid in schema_ids:
+            self._sleep_certified_knowledge.add(sid)
+
+        self._logger.info(
+            "nexus_certified_schemas_federation_ready",
+            schema_count=len(schema_ids),
+            certified_fragment_count=certified_count,
+            consolidation_cycle_id=consolidation_cycle_id,
+        )
+
+        # Broadcast FEDERATION_KNOWLEDGE_SHARED so the organism observes this
+        # epistemic milestone — Thread records it as narrative growth, Benchmarks
+        # tracks it as an epistemic KPI event.
+        from systems.synapse.types import SynapseEventType
+        asyncio.ensure_future(self._emit_synapse_event(
+            SynapseEventType.FEDERATION_KNOWLEDGE_SHARED,
+            {
+                "instance_id": self._instance_id,
+                "schema_ids": schema_ids,
+                "certified_fragment_count": certified_count,
+                "consolidation_cycle_id": consolidation_cycle_id,
+                "trigger": "nexus_certified",
+                "knowledge_type": "world_model_fragment",
+                "active_link_count": len(self.active_links),
+            },
+        ))
+
+        # Trigger fragment shares to active links — each share is independent;
+        # failures on one link do not block others.
+        from systems.synapse.types import SynapseEvent
+        for link in self.active_links:
+            # Trust gate: COLLEAGUE+ (trust_score ≥ _colleague_trust_floor per 5-level system).
+            # Threshold is runtime-adjustable via set_colleague_trust_floor().
+            if link.trust_score < self._colleague_trust_floor:
+                continue
+            for schema_id in schema_ids:
+                asyncio.ensure_future(self._share_certified_schema_to_link(
+                    schema_id=schema_id,
+                    link=link,
+                    consolidation_cycle_id=consolidation_cycle_id,
+                ))
+
+    async def _share_certified_schema_to_link(
+        self,
+        schema_id: str,
+        link: Any,
+        consolidation_cycle_id: str,
+    ) -> None:
+        """Fire-and-forget: attempt to share a single certified schema to one link."""
+        try:
+            # Delegate to the knowledge exchange manager if available.
+            # If send_fragment is not exposed at this layer, fall back to logging.
+            if self._knowledge is not None and hasattr(self._knowledge, "send_certified_schema"):
+                await self._knowledge.send_certified_schema(
+                    schema_id=schema_id,
+                    link=link,
+                    consolidation_cycle_id=consolidation_cycle_id,
+                )
+            else:
+                self._logger.debug(
+                    "nexus_certified_schema_share_deferred",
+                    schema_id=schema_id,
+                    link_id=getattr(link, "link_id", "unknown"),
+                    reason="knowledge_manager_send_not_available",
+                )
+        except Exception as exc:
+            self._logger.warning(
+                "nexus_certified_schema_share_failed",
+                schema_id=schema_id,
+                link_id=getattr(link, "link_id", "unknown"),
+                error=str(exc),
+            )
+
+    async def _on_world_model_fragment_share(self, event: Any) -> None:
+        """Handle WORLD_MODEL_FRAGMENT_SHARE from Nexus — store fragment + emit FEDERATION_KNOWLEDGE_RECEIVED.
+
+        Nexus emits this when broadcasting a sleep-certified world model fragment.
+        Federation's role: record the fragment in Memory (via the knowledge exchange manager)
+        then emit FEDERATION_KNOWLEDGE_RECEIVED so subscribers (Thymos, Evo, Thread) can react.
+
+        Self-loop guard: skip if the emitting instance is this instance (local share, not inbound).
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            sender_instance_id: str = str(data.get("sender_instance_id", ""))
+            fragment_id: str = str(data.get("fragment_id", ""))
+            session_id: str = str(data.get("session_id", ""))
+            sleep_certified: bool = bool(data.get("sleep_certified", False))
+            domain_labels: list[str] = data.get("domain_labels", [])
+
+            # Skip self-originated shares — Nexus emits for outbound tracking, not inbound ingestion
+            if sender_instance_id == self._instance_id:
+                return
+
+            self._logger.debug(
+                "federation_world_model_fragment_received",
+                sender_instance_id=sender_instance_id,
+                fragment_id=fragment_id,
+                sleep_certified=sleep_certified,
+            )
+
+            # Store fragment reference via knowledge manager if available
+            if self._knowledge is not None and hasattr(self._knowledge, "record_received_fragment"):
+                try:
+                    await self._knowledge.record_received_fragment(
+                        fragment_id=fragment_id,
+                        sender_instance_id=sender_instance_id,
+                        session_id=session_id,
+                        domain_labels=domain_labels,
+                        sleep_certified=sleep_certified,
+                    )
+                except Exception:
+                    pass  # Non-fatal — knowledge manager may not support this yet
+
+            # Emit FEDERATION_KNOWLEDGE_RECEIVED so Thymos/Evo/Thread react
+            from systems.synapse.types import SynapseEventType
+            asyncio.ensure_future(self._emit_synapse_event(
+                SynapseEventType.FEDERATION_KNOWLEDGE_RECEIVED,
+                {
+                    "link_id": session_id,
+                    "remote_instance_id": sender_instance_id,
+                    "knowledge_type": "world_model_fragment",
+                    "fragment_id": fragment_id,
+                    "sleep_certified": sleep_certified,
+                    "domain_labels": domain_labels,
+                    "item_count": 1,
+                },
+            ))
+
+        except Exception as exc:
+            self._logger.debug("world_model_fragment_share_handler_error", error=str(exc))
+
+    async def _on_bounty_paid(self, event: Any) -> None:
+        """
+        When a bounty is paid out, distribute sub-rewards to contributing peers.
+
+        This closes the BountySplitter payment loop: after the parent instance
+        receives the full bounty reward, it distributes the peer shares.
+        """
+        if self._bounty_splitter is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            bounty_id = str(data.get("bounty_id", ""))
+            paid_usdc_raw = str(data.get("amount_usdc", "0"))
+            if not bounty_id:
+                return
+            from decimal import Decimal
+            paid_usdc = Decimal(paid_usdc_raw)
+            await self._bounty_splitter.on_bounty_paid(
+                bounty_id=bounty_id,
+                paid_usdc=paid_usdc,
+                trusted_links=self.active_links,
+            )
+        except Exception as exc:
+            self._logger.warning("bounty_paid_handler_error", error=str(exc))
 
     async def _emit_evolutionary_observable(
         self,
@@ -583,7 +878,7 @@ class FederationService:
 
     async def _emit_synapse_event(
         self,
-        event_type_name: str,
+        event_type_name: "str | SynapseEventType",
         data: dict[str, Any],
     ) -> None:
         """Emit a typed Synapse event. Fire-and-forget — never blocks federation."""
@@ -592,8 +887,12 @@ class FederationService:
             return
         try:
             from systems.synapse.types import SynapseEvent, SynapseEventType
+            if isinstance(event_type_name, SynapseEventType):
+                etype = event_type_name
+            else:
+                etype = SynapseEventType(event_type_name)
             event = SynapseEvent(
-                event_type=SynapseEventType(event_type_name),
+                event_type=etype,
                 source_system="federation",
                 data=data,
             )
@@ -616,16 +915,18 @@ class FederationService:
         old_level = link.trust_level
         self._trust.update_trust(link, interaction)
 
-        # Metabolic gate: prevent trust upgrade if metabolically bankrupt
+        # Metabolic gate: prevent trust upgrade if metabolically bankrupt.
+        # Threshold is runtime-adjustable via set_metabolic_gate_threshold().
         if (
             link.trust_level.value > old_level.value
-            and self._metabolic_efficiency < 0.1
+            and self._metabolic_efficiency < self._metabolic_gate_threshold
         ):
             link.trust_level = old_level
             self._logger.info(
                 "trust_upgrade_blocked_metabolic",
                 link_id=link.id,
                 metabolic_efficiency=self._metabolic_efficiency,
+                threshold=self._metabolic_gate_threshold,
             )
 
         # Incident gate: prevent trust upgrade during heightened scrutiny
@@ -640,8 +941,9 @@ class FederationService:
             )
 
         if link.trust_level != old_level:
+            from systems.synapse.types import SynapseEventType
             asyncio.ensure_future(self._emit_synapse_event(
-                "federation_trust_updated",
+                SynapseEventType.FEDERATION_TRUST_UPDATED,
                 {
                     "link_id": link.id,
                     "remote_instance_id": link.remote_instance_id,
@@ -817,6 +1119,57 @@ class FederationService:
             event_bus=self._event_bus,  # For FEDERATION_PRIVACY_VIOLATION emission
         )
 
+        # ── Work Pooling subsystems ───────────────────────────────────────
+        from systems.federation.task_delegation import TaskDelegationManager
+        from systems.federation.bounty_splitting import BountySplitter
+        from systems.federation.resource_sharing import ResourceSharingManager
+        from systems.federation.yield_pool import YieldPoolManager
+        from systems.federation.marketplace import FederationMarketplace
+        from systems.federation.work_router import WorkRouter
+
+        self._task_delegation = TaskDelegationManager(
+            instance_id=self._instance_id,
+            wallet=self._wallet,
+        )
+        self._bounty_splitter = BountySplitter(
+            instance_id=self._instance_id,
+            delegation=self._task_delegation,
+        )
+        if self._simula:
+            self._bounty_splitter.set_simula(self._simula)
+
+        self._resource_sharing = ResourceSharingManager(
+            instance_id=self._instance_id,
+            wallet=self._wallet,
+            delegation=self._task_delegation,
+        )
+        self._yield_pool = YieldPoolManager(
+            instance_id=self._instance_id,
+            wallet=self._wallet,
+        )
+        if self._oikos:
+            self._yield_pool.set_oikos(self._oikos)
+
+        self._marketplace = FederationMarketplace(
+            instance_id=self._instance_id,
+            redis=self._redis,
+        )
+        self._work_router = WorkRouter(instance_id=self._instance_id)
+
+        # Wire event bus to work pooling subsystems if already available
+        if self._event_bus:
+            self._task_delegation.set_event_bus(self._event_bus)
+            self._bounty_splitter.set_event_bus(self._event_bus)
+            self._resource_sharing.set_event_bus(self._event_bus)
+            self._yield_pool.set_event_bus(self._event_bus)
+            self._marketplace.set_event_bus(self._event_bus)
+            self._work_router.set_event_bus(self._event_bus)
+
+        # Start marketplace Redis subscription
+        asyncio.ensure_future(self._marketplace.start())
+
+        self._logger.info("work_pooling_subsystems_initialized")
+
         # Load persisted links from Redis
         await self._load_links()
 
@@ -943,6 +1296,10 @@ class FederationService:
 
         # Persist link state
         await self._persist_links()
+
+        # Stop marketplace Redis subscription
+        if self._marketplace:
+            await self._marketplace.stop()
 
         # Close all channels
         if self._channels:
@@ -1195,13 +1552,25 @@ class FederationService:
         )
 
         # ── Synapse: FEDERATION_LINK_ESTABLISHED ──
+        from systems.synapse.types import SynapseEventType
         asyncio.ensure_future(self._emit_synapse_event(
-            "federation_link_established",
+            SynapseEventType.FEDERATION_LINK_ESTABLISHED,
             {
                 "link_id": link.id,
                 "remote_instance_id": remote_id,
                 "remote_name": handshake_resp.responder_name,
                 "elapsed_ms": elapsed_ms,
+            },
+        ))
+
+        # ── Co-emit FEDERATION_TOPOLOGY_CHANGED (link added) ──
+        asyncio.ensure_future(self._emit_synapse_event(
+            SynapseEventType.FEDERATION_TOPOLOGY_CHANGED,
+            {
+                "change_type": "link_added",
+                "link_id": link.id,
+                "remote_instance_id": remote_id,
+                "active_link_count": len(self._links),
             },
         ))
 
@@ -1504,13 +1873,36 @@ class FederationService:
 
         # ── Synapse: FEDERATION_LINK_DROPPED ──
         duration_s = (utc_now() - link.established_at).total_seconds()
+        from systems.synapse.types import SynapseEventType
         asyncio.ensure_future(self._emit_synapse_event(
-            "federation_link_dropped",
+            SynapseEventType.FEDERATION_LINK_DROPPED,
             {
                 "link_id": link_id,
                 "remote_instance_id": link.remote_instance_id,
                 "reason": "withdrawn",
                 "duration_s": duration_s,
+            },
+        ))
+
+        # ── Co-emit FEDERATION_PEER_DISCONNECTED (canonical disconnect event) ──
+        asyncio.ensure_future(self._emit_synapse_event(
+            SynapseEventType.FEDERATION_PEER_DISCONNECTED,
+            {
+                "link_id": link_id,
+                "remote_instance_id": link.remote_instance_id,
+                "reason": "withdrawn",
+                "duration_s": duration_s,
+            },
+        ))
+
+        # ── Co-emit FEDERATION_TOPOLOGY_CHANGED (link removed) ──
+        asyncio.ensure_future(self._emit_synapse_event(
+            SynapseEventType.FEDERATION_TOPOLOGY_CHANGED,
+            {
+                "change_type": "link_removed",
+                "link_id": link_id,
+                "remote_instance_id": link.remote_instance_id,
+                "active_link_count": len(self._links),
             },
         ))
 
@@ -1635,8 +2027,9 @@ class FederationService:
 
         # ── Synapse: FEDERATION_KNOWLEDGE_SHARED ──
         if response.granted and response.knowledge:
+            from systems.synapse.types import SynapseEventType
             asyncio.ensure_future(self._emit_synapse_event(
-                "federation_knowledge_shared",
+                SynapseEventType.FEDERATION_KNOWLEDGE_SHARED,
                 {
                     "link_id": link.id,
                     "remote_instance_id": link.remote_instance_id,
@@ -1760,9 +2153,10 @@ class FederationService:
         self._record_interaction(interaction)
 
         # ── Synapse: FEDERATION_ASSISTANCE_ACCEPTED / DECLINED ──
+        from systems.synapse.types import SynapseEventType
         if response.accepted:
             asyncio.ensure_future(self._emit_synapse_event(
-                "federation_assistance_accepted",
+                SynapseEventType.FEDERATION_ASSISTANCE_ACCEPTED,
                 {
                     "link_id": link.id,
                     "remote_instance_id": link.remote_instance_id,
@@ -1772,7 +2166,7 @@ class FederationService:
             ))
         else:
             asyncio.ensure_future(self._emit_synapse_event(
-                "federation_assistance_declined",
+                SynapseEventType.FEDERATION_ASSISTANCE_DECLINED,
                 {
                     "link_id": link.id,
                     "remote_instance_id": link.remote_instance_id,
@@ -1897,6 +2291,23 @@ class FederationService:
 
         accepted, reason = self._threat_intel.handle_inbound_advisory(advisory, link)
 
+        # Emit THREAT_ADVISORY_RECEIVED so Oikos/Thymos can react
+        if accepted:
+            from systems.synapse.types import SynapseEventType
+            if hasattr(SynapseEventType, "THREAT_ADVISORY_RECEIVED"):
+                asyncio.ensure_future(self._emit_synapse_event(
+                    SynapseEventType.THREAT_ADVISORY_RECEIVED,
+                    {
+                        "source_instance_id": source_instance_id,
+                        "advisory_id": getattr(advisory, "advisory_id", ""),
+                        "threat_type": getattr(advisory, "threat_type", "unknown"),
+                        "severity": getattr(advisory, "severity", "unknown"),
+                        "malicious_addresses": getattr(advisory, "malicious_addresses", []),
+                        "reason": reason[:200] if reason else "",
+                        "trust_level": link.trust_level.name,
+                    },
+                ))
+
         # ── RE training: threat evaluation decision ──
         asyncio.ensure_future(self._emit_re_training_example(
             category="threat_evaluation",
@@ -1962,6 +2373,21 @@ class FederationService:
         envelope = await self._exchange.prepare_push(link, all_payloads)
         if envelope is None:
             return None
+
+        # Emit FEDERATION_SESSION_STARTED so Nexus can trigger fragment exchange
+        from systems.synapse.types import SynapseEventType
+        if hasattr(SynapseEventType, "FEDERATION_SESSION_STARTED"):
+            asyncio.ensure_future(self._emit_synapse_event(
+                SynapseEventType.FEDERATION_SESSION_STARTED,
+                {
+                    "session_id": envelope.id,
+                    "remote_instance_id": link.remote_instance_id,
+                    "trust_level": link.trust_level.name,
+                    "timestamp": utc_now().isoformat(),
+                    "direction": "outbound",
+                    "payload_count": len(envelope.payloads),
+                },
+            ))
 
         # Send via channel
         receipt = await channel.send_exchange(envelope)
@@ -2126,6 +2552,21 @@ class FederationService:
             )
 
         if envelope.direction == ExchangeDirection.PUSH:
+            # Emit FEDERATION_SESSION_STARTED for inbound sharing session
+            from systems.synapse.types import SynapseEventType
+            if hasattr(SynapseEventType, "FEDERATION_SESSION_STARTED"):
+                asyncio.ensure_future(self._emit_synapse_event(
+                    SynapseEventType.FEDERATION_SESSION_STARTED,
+                    {
+                        "session_id": envelope.id,
+                        "remote_instance_id": link.remote_instance_id,
+                        "trust_level": link.trust_level.name,
+                        "timestamp": utc_now().isoformat(),
+                        "direction": "inbound",
+                        "payload_count": len(envelope.payloads),
+                    },
+                ))
+
             # Process inbound payloads through ingestion pipeline
             receipt = await self._ingestion.process_envelope(envelope, link)
 
@@ -2172,8 +2613,9 @@ class FederationService:
                 )
 
                 # ── Synapse: FEDERATION_KNOWLEDGE_RECEIVED ──
+                from systems.synapse.types import SynapseEventType as _SET_kr
                 asyncio.ensure_future(self._emit_synapse_event(
-                    "federation_knowledge_received",
+                    _SET_kr.FEDERATION_KNOWLEDGE_RECEIVED,
                     {
                         "link_id": link.id,
                         "remote_instance_id": envelope.sender_instance_id,
@@ -2193,8 +2635,9 @@ class FederationService:
                     and p.confidence >= 0.9
                 ]
                 if invariant_payloads:
+                    from systems.synapse.types import SynapseEventType as _SET
                     asyncio.ensure_future(self._emit_synapse_event(
-                        "federation_invariant_received",
+                        _SET.FEDERATION_INVARIANT_RECEIVED,
                         {
                             "link_id": link.id,
                             "remote_instance_id": envelope.sender_instance_id,
@@ -2223,6 +2666,57 @@ class FederationService:
             return response_envelope
 
         return None
+
+    def set_metabolic_gate_threshold(self, threshold: float) -> None:
+        """Adjust the metabolic efficiency threshold below which trust upgrades are blocked.
+
+        Default: 0.1 (bankrupt-only block). Raise during sustained austerity so the
+        organism conserves relationship investment until metabolic health recovers.
+        Clamped to [0.0, 1.0].
+
+        References: Spec 11b §X (population dynamics, metabolic gate)
+        """
+        self._metabolic_gate_threshold = max(0.0, min(1.0, threshold))
+        self._logger.info(
+            "metabolic_gate_threshold_updated",
+            new_threshold=self._metabolic_gate_threshold,
+        )
+
+    def set_colleague_trust_floor(self, floor: float) -> None:
+        """Adjust the minimum trust score required for COLLEAGUE+-gated knowledge sharing.
+
+        Default: 20.0. Raise to require deeper relationship before sharing certified
+        schemas; lower to accelerate knowledge propagation across young links.
+        Clamped to [0.0, 100.0].
+
+        References: Spec 11b §VIII (sharing gate: COLLEAGUE+)
+        """
+        self._colleague_trust_floor = max(0.0, min(100.0, floor))
+        self._logger.info(
+            "colleague_trust_floor_updated",
+            new_floor=self._colleague_trust_floor,
+        )
+
+    def set_re_quality_threshold(self, threshold: float) -> None:
+        """Adjust the RE semantic quality threshold for inbound HYPOTHESIS payloads.
+
+        Exposes the ingestion pipeline's _re_quality_threshold for runtime tuning
+        by Evo based on observed accept/defer rates.  Clamped to [0.0, 1.0].
+
+        References: Spec 11b §XII §2
+        """
+        clamped = max(0.0, min(1.0, threshold))
+        if self._ingestion is not None:
+            self._ingestion._re_quality_threshold = clamped
+        self._logger.info(
+            "re_quality_threshold_updated",
+            old=getattr(self._ingestion, "_re_quality_threshold", None),
+            new=clamped,
+        )
+        asyncio.ensure_future(self._emit_evolutionary_observable(
+            "re_quality_threshold_adjusted", clamped, is_novel=False,
+            metadata={"new_threshold": clamped},
+        ))
 
     def set_eis(self, eis: Any) -> None:
         """Wire EIS for IIEP ingestion taint analysis."""
@@ -2382,8 +2876,9 @@ class FederationService:
                     for v in receipt.payload_verdicts.values()
                 )
                 if not rejected:
+                    from systems.synapse.types import SynapseEventType
                     asyncio.ensure_future(self._emit_synapse_event(
-                        "world_model_fragment_share",
+                        SynapseEventType.WORLD_MODEL_FRAGMENT_SHARE,
                         {
                             "link_id": link_id,
                             "remote_instance_id": link.remote_instance_id,
@@ -2462,6 +2957,61 @@ class FederationService:
             )
             return None
 
+    # ─── Work Pooling — Public API ───────────────────────────────────
+
+    @property
+    def task_delegation(self) -> Any:
+        """Access TaskDelegationManager for offering/handling delegated tasks."""
+        return self._task_delegation
+
+    @property
+    def bounty_splitter(self) -> Any:
+        """Access BountySplitter for multi-instance bounty co-solving."""
+        return self._bounty_splitter
+
+    @property
+    def resource_sharing(self) -> Any:
+        """Access ResourceSharingManager for compute offloading."""
+        return self._resource_sharing
+
+    @property
+    def yield_pool(self) -> Any:
+        """Access YieldPoolManager for federated capital pooling."""
+        return self._yield_pool
+
+    @property
+    def marketplace(self) -> Any:
+        """Access FederationMarketplace for posting/bidding on tasks."""
+        return self._marketplace
+
+    def route_work(
+        self,
+        bounty_payload: dict[str, Any],
+    ) -> FederationLink | None:
+        """
+        Route a bounty to the best-specialised trusted peer.
+
+        Returns the FederationLink to offer the task to, or None if no
+        suitable peer is available.  Uses WorkRouter's Nexus-aware
+        specialisation scoring.
+        """
+        if self._work_router is None:
+            return None
+        return self._work_router.route_bounty(
+            bounty_payload=bounty_payload,
+            trusted_links=self.active_links,
+        )
+
+    def record_task_outcome(
+        self,
+        instance_id: str,
+        domain: str,
+        success: bool,
+    ) -> None:
+        """Feed task outcome back into WorkRouter for empirical learning."""
+        if self._work_router:
+            self._work_router.record_outcome(instance_id, domain, success)
+
     # ─── Trust Decay (called periodically) ──────────────────────────
 
     async def apply_trust_decay(self) -> None:
@@ -2518,6 +3068,12 @@ class FederationService:
             "exchange": self._exchange.stats if self._exchange else {},
             "ingestion": self._ingestion.stats if self._ingestion else {},
             "privacy": self._privacy.stats if self._privacy else {},
+            "task_delegation": self._task_delegation.stats if self._task_delegation else {},
+            "bounty_splitter": self._bounty_splitter.stats if self._bounty_splitter else {},
+            "resource_sharing": self._resource_sharing.stats if self._resource_sharing else {},
+            "yield_pool": self._yield_pool.stats if self._yield_pool else {},
+            "marketplace": self._marketplace.stats if self._marketplace else {},
+            "work_router": self._work_router.stats if self._work_router else {},
             "interaction_history_size": len(self._interaction_history),
             "links": [
                 {

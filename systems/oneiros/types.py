@@ -788,3 +788,36 @@ class WakeStatePreparation(EOSBaseModel):
     genome_update_prepared: bool = False
     input_channels_resumed: bool = False
     average_intelligence_improvement_per_cycle: float = 0.0
+
+
+# ─── Sleep Performance Measurement ──────────────────────────────
+
+
+class SleepOutcome(EOSBaseModel):
+    """
+    Post-sleep performance comparison result.
+
+    Captures the KPI delta between pre-sleep baseline and the post-sleep
+    stabilised state (measured after 100 wake cycles). The verdict drives
+    adaptive threshold adjustment and Evo hypothesis generation.
+    """
+
+    sleep_cycle_id: str = ""
+    sleep_duration_ms: int = 0
+    stages_completed: list[str] = Field(default_factory=list)
+
+    # Per-KPI delta: (post - pre) / pre as a fraction (positive = improvement)
+    kpi_deltas: dict[str, float] = Field(default_factory=dict)
+
+    # Aggregate signals
+    net_improvement: float = 0.0    # mean of positive deltas
+    net_degradation: float = 0.0    # |mean of negative deltas|
+
+    # Verdict
+    verdict: str = "neutral"        # "beneficial" | "neutral" | "harmful"
+
+    # Adaptive threshold info
+    pressure_threshold_adjusted: bool = False
+    new_pressure_threshold: float = 0.85
+
+    timestamp: datetime = Field(default_factory=utc_now)

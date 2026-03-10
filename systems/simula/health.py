@@ -40,8 +40,9 @@ import importlib.util
 import shlex
 import sys
 import time
+import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
@@ -68,6 +69,13 @@ if TYPE_CHECKING:
     from systems.simula.verification.static_analysis import StaticAnalysisBridge
     from systems.simula.verification.symbolic_execution import SymbolicExecutionEngine
     from systems.simula.verification.z3_bridge import Z3Bridge
+
+
+# Error type literals for BuildErrorTrainingSignal
+_BuildErrorType = Literal[
+    "syntax", "import", "runtime", "verification_timeout",
+    "proof_failed", "sandbox_escape",
+]
 
 logger = structlog.get_logger().bind(system="simula.health")
 
@@ -139,7 +147,102 @@ class HealthChecker:
         self._symbolic_execution: SymbolicExecutionEngine | None = None
         self._symbolic_execution_blocking: bool = True
         self._symbolic_execution_domains: list[str] = []
+        # Thompson sampling router for proof strategy prioritization (wired by service.py)
+        self._reasoning_router: Any = None
+        # Synapse bus for emitting RE_TRAINING_EXAMPLE on build errors (wired by service.py)
+        self._synapse: Any = None
         self._log = logger
+
+    def set_synapse(self, synapse: Any) -> None:
+        """Inject the SynapseService so build-error RE training signals can be emitted."""
+        self._synapse = synapse
+
+    # ── Build-error RE training signal ────────────────────────────────────────
+
+    def _emit_build_error_training_signal(
+        self,
+        *,
+        generated_code: str,
+        prompt_used: str,
+        error_type: _BuildErrorType,
+        error_message: str,
+        error_traceback: str | None,
+        strategy_used: str,
+        lesson: str,
+        proposal: EvolutionProposal | None = None,
+    ) -> None:
+        """
+        Fire-and-forget a RE_TRAINING_EXAMPLE with outcome_quality=0.0 whenever
+        generated or mutated code fails a build check.
+
+        Wrapped entirely in try/except — must never raise or delay the caller.
+        Uses asyncio.create_task so it doesn't block the health check pipeline.
+        """
+        bus = getattr(self._synapse, "_event_bus", None) if self._synapse else None
+        if bus is None:
+            return
+
+        proposal_id = getattr(proposal, "id", "") if proposal else ""
+        category_str = getattr(getattr(proposal, "category", None), "value", "") if proposal else ""
+
+        async def _emit() -> None:
+            try:
+                from decimal import Decimal
+
+                from primitives.common import DriveAlignmentVector
+                from primitives.re_training import RETrainingExample
+                from primitives.common import SystemID
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                # Truncate fields to avoid oversized events
+                safe_code = generated_code[:4000] if generated_code else ""
+                safe_prompt = prompt_used[:2000] if prompt_used else ""
+                safe_error = error_message[:1000] if error_message else ""
+                safe_tb = (error_traceback[:1500] if error_traceback else "")
+                safe_lesson = lesson[:500] if lesson else ""
+
+                reasoning_trace = (
+                    f"error_type={error_type}\n"
+                    f"strategy={strategy_used}\n"
+                    f"error={safe_error}\n"
+                    + (f"traceback={safe_tb}\n" if safe_tb else "")
+                    + f"lesson={safe_lesson}"
+                )
+
+                example = RETrainingExample(
+                    source_system=SystemID.SIMULA,
+                    episode_id=proposal_id,
+                    instruction=safe_prompt or f"Generate code for proposal {proposal_id}",
+                    input_context=(
+                        f"category={category_str} "
+                        f"strategy={strategy_used} "
+                        f"error_type={error_type}"
+                    ),
+                    output=safe_code,
+                    outcome_quality=0.0,
+                    category="build_error",
+                    reasoning_trace=reasoning_trace,
+                    alternatives_considered=[error_type],
+                    cost_usd=Decimal("0"),
+                    latency_ms=0,
+                    constitutional_alignment=DriveAlignmentVector(),
+                    domain="software",
+                    skill_area="code_generation",
+                    domain_difficulty="expert",
+                )
+                await bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                    source_system="simula.health",
+                    data=example.model_dump(mode="json"),
+                ))
+            except Exception:
+                pass  # Never let emission errors affect the health check
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_emit())
+        except RuntimeError:
+            pass  # No running loop (sync context) — skip silently
 
     async def check(
         self,
@@ -155,6 +258,21 @@ class HealthChecker:
         syntax_errors = await self._check_syntax(files_written)
         if syntax_errors:
             self._log.warning("health_syntax_failed", errors=syntax_errors)
+            self._emit_build_error_training_signal(
+                generated_code="\n".join(
+                    _read_file_safe(f) for f in files_written if f.endswith(".py")
+                ),
+                prompt_used=getattr(proposal, "description", "") if proposal else "",
+                error_type="syntax",
+                error_message="; ".join(syntax_errors),
+                error_traceback=None,
+                strategy_used="health_check_phase1",
+                lesson=(
+                    "Generated Python code contained syntax errors. "
+                    "Always produce valid Python syntax."
+                ),
+                proposal=proposal,
+            )
             return HealthCheckResult(healthy=False, issues=syntax_errors)
         self._log.info("health_syntax_passed", files=len(files_written))
 
@@ -162,6 +280,22 @@ class HealthChecker:
         import_errors = await self._check_imports(files_written)
         if import_errors:
             self._log.warning("health_import_failed", errors=import_errors)
+            self._emit_build_error_training_signal(
+                generated_code="\n".join(
+                    _read_file_safe(f) for f in files_written if f.endswith(".py")
+                ),
+                prompt_used=getattr(proposal, "description", "") if proposal else "",
+                error_type="import",
+                error_message="; ".join(import_errors),
+                error_traceback=None,
+                strategy_used="health_check_phase2",
+                lesson=(
+                    "Generated code imported modules that do not exist or are not "
+                    "resolvable. Use only primitives.*, systems.synapse.types, and "
+                    "stdlib imports in generated EOS modules."
+                ),
+                proposal=proposal,
+            )
             return HealthCheckResult(healthy=False, issues=import_errors)
         self._log.info("health_import_passed", files=len(files_written))
 
@@ -174,9 +308,39 @@ class HealthChecker:
             )
         except (asyncio.TimeoutError, TimeoutError):
             self._log.error("health_tests_timeout", timeout_s=_test_budget)
+            self._emit_build_error_training_signal(
+                generated_code="\n".join(
+                    _read_file_safe(f) for f in files_written if f.endswith(".py")
+                ),
+                prompt_used=getattr(proposal, "description", "") if proposal else "",
+                error_type="verification_timeout",
+                error_message=f"Unit tests timed out after {_test_budget:.0f}s",
+                error_traceback=None,
+                strategy_used="health_check_phase3_pytest",
+                lesson=(
+                    "Generated code caused unit tests to time out. "
+                    "Avoid infinite loops, blocking I/O, or hanging operations."
+                ),
+                proposal=proposal,
+            )
             return HealthCheckResult(healthy=False, issues=["Unit tests timed out"])
         if not tests_passed:
             self._log.warning("health_tests_failed", output=test_output[:500])
+            self._emit_build_error_training_signal(
+                generated_code="\n".join(
+                    _read_file_safe(f) for f in files_written if f.endswith(".py")
+                ),
+                prompt_used=getattr(proposal, "description", "") if proposal else "",
+                error_type="runtime",
+                error_message=f"Unit test suite failed",
+                error_traceback=test_output[:1500],
+                strategy_used="health_check_phase3_pytest",
+                lesson=(
+                    "Generated code broke existing unit tests. "
+                    "Changes must preserve all pre-existing test invariants."
+                ),
+                proposal=proposal,
+            )
             return HealthCheckResult(
                 healthy=False,
                 issues=[f"Unit test suite failed:\n{test_output[:1000]}"],
@@ -254,6 +418,29 @@ class HealthChecker:
                     "health_formal_verification_failed",
                     blocking=formal_result.blocking_issues,
                 )
+                # Determine which strategy produced the blocking failure
+                _fv_strategy = "dafny"
+                if formal_result.dafny is not None and not getattr(formal_result.dafny, "passed", True):
+                    _fv_strategy = "dafny"
+                elif formal_result.z3 is not None:
+                    _fv_strategy = "z3"
+                elif formal_result.static_analysis is not None:
+                    _fv_strategy = "static"
+                self._emit_build_error_training_signal(
+                    generated_code="\n".join(
+                        _read_file_safe(f) for f in files_written if f.endswith(".py")
+                    ),
+                    prompt_used=getattr(proposal, "description", "") if proposal else "",
+                    error_type="proof_failed",
+                    error_message="; ".join(formal_result.blocking_issues),
+                    error_traceback=None,
+                    strategy_used=_fv_strategy,
+                    lesson=(
+                        f"Generated code failed {_fv_strategy} formal verification. "
+                        "The mutation violated a formally provable contract or invariant."
+                    ),
+                    proposal=proposal,
+                )
                 return HealthCheckResult(
                     healthy=False,
                     issues=[
@@ -271,21 +458,45 @@ class HealthChecker:
             self._log.info("health_formal_verification_passed")
 
         # 5. Lean 4 proof verification (Stage 4A) — 10% of health_check_timeout_s, minimum 10s
+        # Skipped entirely in shallow verification mode (metabolic pressure)
+        _shallow = getattr(self, "_shallow_verification_mode", False)
         _lean_budget = max(self._health_check_timeout_s * 0.10, 10.0)
-        try:
-            lean_result = await asyncio.wait_for(
-                self._run_lean_verification(files_written, proposal),
-                timeout=_lean_budget,
-            )
-        except (asyncio.TimeoutError, TimeoutError):
-            self._log.warning("health_lean_verify_timeout", timeout_s=_lean_budget)
+        if _shallow:
+            self._log.info("health_lean_skipped_shallow_mode")
             lean_result = None
+        else:
+            try:
+                lean_result = await asyncio.wait_for(
+                    self._run_lean_verification(files_written, proposal),
+                    timeout=_lean_budget,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                self._log.warning("health_lean_verify_timeout", timeout_s=_lean_budget)
+                lean_result = None
         if lean_result is not None:
             if lean_result.status.value == "failed" and self._lean_blocking:
                 self._log.warning(
                     "health_lean_verification_failed",
                     status=lean_result.status.value,
                     attempts=len(lean_result.attempts),
+                )
+                self._emit_build_error_training_signal(
+                    generated_code="\n".join(
+                        _read_file_safe(f) for f in files_written if f.endswith(".py")
+                    ),
+                    prompt_used=getattr(proposal, "description", "") if proposal else "",
+                    error_type="proof_failed",
+                    error_message=(
+                        f"Lean 4 proof verification failed after "
+                        f"{len(lean_result.attempts)} attempts"
+                    ),
+                    error_traceback=None,
+                    strategy_used="lean",
+                    lesson=(
+                        "Generated code could not be formally proved correct by Lean 4. "
+                        "The mutation may violate a critical safety property."
+                    ),
+                    proposal=proposal,
                 )
                 return HealthCheckResult(
                     healthy=False,
@@ -304,20 +515,49 @@ class HealthChecker:
             )
 
         # 6. Formal guarantees (Stage 6D + 6E) — 10% of health_check_timeout_s, minimum 10s
+        # Skipped entirely in shallow verification mode (metabolic pressure)
         _fg_budget = max(self._health_check_timeout_s * 0.10, 10.0)
-        try:
-            fg_result = await asyncio.wait_for(
-                self._run_formal_guarantees(files_written, proposal),
-                timeout=_fg_budget,
-            )
-        except (asyncio.TimeoutError, TimeoutError):
-            self._log.warning("health_formal_guarantees_timeout", timeout_s=_fg_budget)
+        if _shallow:
+            self._log.info("health_formal_guarantees_skipped_shallow_mode")
             fg_result = None
+        else:
+            try:
+                fg_result = await asyncio.wait_for(
+                    self._run_formal_guarantees(files_written, proposal),
+                    timeout=_fg_budget,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                self._log.warning("health_formal_guarantees_timeout", timeout_s=_fg_budget)
+                fg_result = None
         if fg_result is not None:
             if fg_result.blocking_issues:
                 self._log.warning(
                     "health_formal_guarantees_failed",
                     blocking=fg_result.blocking_issues,
+                )
+                # Determine which Phase 6 sub-check failed
+                _fg_strategy = "symbolic"
+                if fg_result.symbolic_execution is not None and getattr(
+                    fg_result.symbolic_execution, "counterexamples", None
+                ):
+                    _fg_strategy = "symbolic"
+                elif fg_result.egraph is not None:
+                    _fg_strategy = "egraph"
+                self._emit_build_error_training_signal(
+                    generated_code="\n".join(
+                        _read_file_safe(f) for f in files_written if f.endswith(".py")
+                    ),
+                    prompt_used=getattr(proposal, "description", "") if proposal else "",
+                    error_type="proof_failed",
+                    error_message="; ".join(fg_result.blocking_issues),
+                    error_traceback=None,
+                    strategy_used=_fg_strategy,
+                    lesson=(
+                        f"Generated code failed Stage 6 {_fg_strategy} check. "
+                        "Mission-critical properties (budget, access control, risk scoring) "
+                        "were violated or semantic equivalence could not be proved."
+                    ),
+                    proposal=proposal,
                 )
                 return HealthCheckResult(
                     healthy=False,
@@ -783,6 +1023,38 @@ class HealthChecker:
         z3_result = None
         static_result = None
 
+        # ── Thompson-sampled strategy selection under metabolic pressure ──
+        # In shallow verification mode, only run the highest-ranked strategy
+        # (by Thompson sampling) instead of all in parallel. Saves compute
+        # while preferring strategies with the best historical success rate.
+        shallow = getattr(self, "_shallow_verification_mode", False)
+        allowed_strategies: set[str] | None = None  # None = run all
+
+        if shallow and self._reasoning_router is not None:
+            # Determine which strategies are actually available
+            available: list[str] = []
+            if (
+                self._dafny is not None
+                and self._llm is not None
+                and proposal is not None
+                and proposal.category in DAFNY_TRIGGERABLE_CATEGORIES
+            ):
+                available.append("dafny")
+            if self._z3 is not None and self._llm is not None and proposal is not None:
+                available.append("z3")
+            if self._static_analysis is not None:
+                available.append("static_analysis")
+
+            if available:
+                ranked = self._reasoning_router.rank_strategies(available)
+                # In shallow mode, pick only the top strategy
+                allowed_strategies = {ranked[0]}
+                self._log.info(
+                    "shallow_verification_router_selection",
+                    selected=ranked[0],
+                    ranked=ranked,
+                )
+
         # Build parallel tasks
         tasks: dict[str, asyncio.Task[object]] = {}
 
@@ -792,6 +1064,7 @@ class HealthChecker:
             and self._llm is not None
             and proposal is not None
             and proposal.category in DAFNY_TRIGGERABLE_CATEGORIES
+            and (allowed_strategies is None or "dafny" in allowed_strategies)
         ):
             tasks["dafny"] = asyncio.create_task(
                 self._run_dafny_verification(proposal),
@@ -802,13 +1075,16 @@ class HealthChecker:
             self._z3 is not None
             and self._llm is not None
             and proposal is not None
+            and (allowed_strategies is None or "z3" in allowed_strategies)
         ):
             tasks["z3"] = asyncio.create_task(
                 self._run_z3_verification(proposal, files_written),
             )
 
         # Static analysis: run for all Python files
-        if self._static_analysis is not None:
+        if self._static_analysis is not None and (
+            allowed_strategies is None or "static_analysis" in allowed_strategies
+        ):
             tasks["static"] = asyncio.create_task(
                 self._static_analysis.run_all(files_written),
             )
@@ -1261,3 +1537,21 @@ class HealthChecker:
         except Exception as exc:
             self._log.warning("symbolic_execution_error", error=str(exc))
             return None
+
+
+# ── Module-level helpers ────────────────────────────────────────────────────────
+
+
+def _read_file_safe(filepath: str, max_bytes: int = 8000) -> str:
+    """Read a file's contents safely, returning empty string on any error.
+
+    Used when assembling generated_code payloads for build-error training signals.
+    Truncates to max_bytes to avoid oversized Synapse events.
+    """
+    try:
+        content = Path(filepath).read_text(encoding="utf-8", errors="replace")
+        if len(content) > max_bytes:
+            return content[:max_bytes] + "\n# ... (truncated)"
+        return content
+    except Exception:
+        return ""

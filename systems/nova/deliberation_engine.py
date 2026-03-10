@@ -123,6 +123,8 @@ class DeliberationEngine:
         self._slow_timeout = slow_path_timeout_ms / 1000.0
         self._last_equor_check: ConstitutionalCheck | None = None
         self._logger = logger.bind(system="nova.deliberation_engine")
+        # Optional callable that returns causal laws summary string for LLM context.
+        self._causal_laws_provider: Any = None
 
         # Allostatic EFE threshold modulation (updated by update_somatic_thresholds())
         # Stored as *deltas* applied to the module-level defaults at assessment time.
@@ -152,6 +154,14 @@ class DeliberationEngine:
         self._current_soma_signal: Any = None
         # Soma trajectory-based do-nothing EFE delta (independent of urgency override)
         self._do_nothing_efe_delta: float = 0.0
+        # Organism telemetry summary — injected into slow-path prompt every 50 cycles.
+        # Updated atomically by set_organism_summary(); never None after first telemetry.
+        self._organism_summary: str = ""
+        # Novel action callback — fired when the selected policy contains a
+        # propose_novel_action step.  Signature:
+        #   async (goal: Goal, step_parameters: dict) -> None
+        # Wired by NovaService after initialize() via set_novel_action_cb().
+        self._novel_action_cb: Any | None = None
 
     @property
     def fe_budget(self) -> FreeEnergyBudget:
@@ -183,6 +193,15 @@ class DeliberationEngine:
         """Called by NovaService when constitution changes."""
         self._drive_weights = weights
 
+    def set_causal_laws_provider(self, provider: Any) -> None:
+        """
+        Wire a callable that returns the current causal laws summary string.
+
+        Called by NovaService after initialize(). Provider signature:
+        ``() -> str`` (e.g. ``nova_service.get_causal_knowledge_summary``).
+        """
+        self._causal_laws_provider = provider
+
     def set_telos(self, telos: Any) -> None:
         """Wire Telos so policy EFE scoring can account for effective_I impact."""
         self._telos = telos
@@ -192,6 +211,10 @@ class DeliberationEngine:
         """Wire Logos so policy generation adapts to world model state."""
         self._logos = logos
         self._logger.info("logos_wired_to_deliberation_engine")
+
+    def set_organism_summary(self, summary: str) -> None:
+        """Update cached organism-state summary for injection into slow-path prompts."""
+        self._organism_summary = summary
 
     def modulate_policy_k_from_pressure(self, cognitive_pressure: float) -> None:
         """
@@ -326,6 +349,17 @@ class DeliberationEngine:
         immune system tracks constitutional gate unavailability.
         """
         self._equor_failure_cb = cb
+
+    def set_novel_action_cb(self, cb: Any) -> None:
+        """
+        Wire an async callback invoked when the selected policy contains a
+        propose_novel_action step.
+
+        Signature: async (goal: Goal, step_parameters: dict) -> None
+        NovaService uses this to emit NOVEL_ACTION_REQUESTED onto the Synapse
+        bus so Simula can generate the executor.
+        """
+        self._novel_action_cb = cb
 
     @property
     def last_equor_check(self) -> ConstitutionalCheck | None:
@@ -889,14 +923,25 @@ class DeliberationEngine:
 
                 # ── Extract situation summary for policy generation ──
                 situation = _extract_situation_summary(broadcast)
+                # Append organism state so the LLM deliberates with full awareness.
+                if self._organism_summary:
+                    situation = (
+                        f"{situation}\n[Organism] {self._organism_summary}"
+                    )
 
                 # ── Generate candidate policies (up to 3000ms) ──
+                causal_laws = (
+                    self._causal_laws_provider()
+                    if self._causal_laws_provider is not None
+                    else ""
+                )
                 candidates = await self._policy_gen.generate_candidates(
                     goal=goal,
                     situation_summary=situation,
                     beliefs=belief_state,
                     affect=affect,
                     memory_traces=memory_traces,
+                    causal_laws_summary=causal_laws,
                 )
 
                 if not candidates:
@@ -1022,6 +1067,32 @@ class DeliberationEngine:
                 for policy, efe_score in scored:
                     if policy.id == "do_nothing":
                         continue  # Skip do-nothing — if we're here, we want to act
+
+                    # ── Novel action interception ──
+                    # If the selected policy contains a propose_novel_action step,
+                    # fire the callback (which emits NOVEL_ACTION_REQUESTED) and
+                    # continue to the next policy — the current cycle takes
+                    # do-nothing while Simula generates the executor asynchronously.
+                    novel_step = next(
+                        (s for s in policy.steps if s.action_type == "propose_novel_action"),
+                        None,
+                    )
+                    if novel_step is not None:
+                        if self._novel_action_cb is not None:
+                            try:
+                                asyncio.ensure_future(
+                                    self._novel_action_cb(goal, novel_step.parameters)
+                                )
+                                self._logger.info(
+                                    "propose_novel_action_intercepted",
+                                    policy=policy.name,
+                                    action_name=novel_step.parameters.get("action_name", ""),
+                                )
+                            except Exception as exc:
+                                self._logger.warning(
+                                    "novel_action_cb_fire_failed", error=str(exc)
+                                )
+                        continue  # Do not submit this policy to Equor; fall through
 
                     intent = _policy_to_intent(
                         policy,

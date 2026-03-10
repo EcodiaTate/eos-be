@@ -107,12 +107,29 @@ class FastPathExecutor:
             max_capital=intent.max_capital,
         )
 
-        # ── Gate 1: Template still active? ─────────────────────────
+        # ── Gate 1: Template still active and fresh? ────────────────
+        # Use get() for O(1) lookup but apply staleness check ourselves —
+        # drives may have changed since template registration.
         template = self._templates.get(intent.template_id)
         if template is None or not template.active:
             return self._fail(
                 intent, execution_id, start,
                 error=f"Template '{intent.template_id}' not found or inactive",
+            )
+
+        # Reject stale templates: drives or invariants may have shifted since
+        # the last Equor review.  60s matches TemplateLibrary._STALENESS_WINDOW_S.
+        from primitives.common import utc_now as _utc_now
+        _age_s = (_utc_now() - template.last_approved_at).total_seconds()
+        _FAST_PATH_MAX_AGE_S = 60.0
+        if _age_s > _FAST_PATH_MAX_AGE_S:
+            return self._fail(
+                intent, execution_id, start,
+                error=(
+                    f"Template '{intent.template_id}' is stale "
+                    f"({_age_s:.0f}s since last Equor review; max {_FAST_PATH_MAX_AGE_S:.0f}s). "
+                    "Equor must re-evaluate the template before it can be used."
+                ),
             )
 
         # ── Gate 2: Capital ceiling ────────────────────────────────

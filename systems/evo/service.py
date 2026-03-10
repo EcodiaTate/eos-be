@@ -85,11 +85,11 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# How often to attempt hypothesis generation from accumulated patterns
+# Module-level defaults — overridden at instance construction time by EvoConfig.
+# These exist solely as fallback values for code paths that run before
+# initialize() is called.  All production paths use self._* instance attrs.
 _HYPOTHESIS_GENERATION_INTERVAL: int = 200  # Every 200 broadcasts (was 50)
-# How often to evaluate evidence against all active hypotheses
 _EVIDENCE_EVALUATION_INTERVAL: int = 50     # Every 50 broadcasts (was 10)
-# How many direction reversals in the 10-nudge window triggers HIGH_VOLATILITY
 _VOLATILITY_OSCILLATION_THRESHOLD: int = 6
 
 
@@ -122,6 +122,24 @@ class EvoService:
         self._bus = neuroplasticity_bus
         self._initialized: bool = False
         self._logger = logger.bind(system="evo")
+
+        # ── Runtime-tunable wake-mode thresholds (from EvoConfig) ─────────────
+        # These replace the module-level constants so operator config and genome
+        # inheritance can adjust learning cadence without redeploying.
+        self._hypothesis_generation_interval: int = getattr(
+            config, "hypothesis_generation_interval", _HYPOTHESIS_GENERATION_INTERVAL
+        )
+        self._evidence_evaluation_interval: int = getattr(
+            config, "evidence_evaluation_interval", _EVIDENCE_EVALUATION_INTERVAL
+        )
+        self._volatility_oscillation_threshold: int = getattr(
+            config, "volatility_oscillation_threshold", _VOLATILITY_OSCILLATION_THRESHOLD
+        )
+        # Consecutive degraded RE_DECISION_OUTCOME events before queuing a
+        # hyperparameter-adjustment candidate.  Genome-heritable.
+        self._re_degradation_count_threshold: int = getattr(
+            config, "re_degradation_count_threshold", 10
+        )
 
         # Cross-system references (wired post-init by main.py)
         self._atune: Any = None  # AtuneService — for pushing learned head weights
@@ -182,6 +200,20 @@ class EvoService:
         # PatternCandidate is queued for the next consolidation pass.
         self._re_degradation_count: int = 0
 
+        # ── Benchmark regression tracking ─────────────────────────────────
+        # Tracks consecutive BENCHMARK_REGRESSION events per KPI for
+        # LEARNING_PRESSURE threshold and RE_TRAINING_REQUESTED detection.
+        # Maps kpi_name → consecutive regression count.
+        self._benchmark_regression_counts: dict[str, int] = {}
+
+        # ── Parameter feedback-loop KPI cache ──────────────────────────────
+        # Populated from BENCHMARK_REGRESSION events (and any snapshot events).
+        # Passed to ParameterTuner.tick_evaluation() each consolidation so the
+        # feedback loop can compare post-adjustment metrics to the baseline.
+        self._last_benchmark_kpis: dict[str, float] = {}
+        # Monotonic timestamp of last LEARNING_PRESSURE emit — rate-limit 1/hour.
+        self._last_learning_pressure_at: float = 0.0
+
         # ── Hypothesis budget degradation tracking ────────────────────────
         # Consecutive hypothesis generation cycles that were skipped due to
         # LLM budget exhaustion.
@@ -198,6 +230,14 @@ class EvoService:
         # Cached Soma curiosity drive — updated from SOMATIC_MODULATION_SIGNAL events
         # so we never call soma.get_current_signal() directly.
         self._cached_soma_curiosity_drive: float = 0.5
+
+        # ── Skia VitalityCoordinator modulation ───────────────────────
+        self._modulation_halted: bool = False
+
+        # ── Nexus triangulation weight ─────────────────────────────────
+        # Updated via TRIANGULATION_WEIGHT_UPDATE; used to scale cross-validated
+        # hypothesis boosts from CONVERGENCE_DETECTED events.
+        self._triangulation_weight: float = 0.5
 
         # Redis client — wired via set_redis(); used for PatternContext checkpoints
         # so accumulated detector state survives restarts between consolidations.
@@ -248,6 +288,8 @@ class EvoService:
             meta_learning=self._meta_learning,
         )
         self._parameter_tuner = ParameterTuner(memory=self._memory)
+        # Wire hypothesis engine into tuner so revert/confirm feeds evidence back.
+        self._parameter_tuner.wire_hypothesis_engine(self._hypothesis_engine)
         self._procedure_extractor = ProcedureExtractor(
             llm=self._llm,
             memory=self._memory,
@@ -386,6 +428,16 @@ class EvoService:
             pattern_context_restored=pattern_restored,
         )
 
+        # Child-side genome inheritance: seed hypothesis priors from parent
+        try:
+            await self._apply_inherited_belief_genome_if_child()
+        except Exception as _bg_exc:
+            self._logger.warning(
+                "belief_genome_child_apply_failed",
+                error=str(_bg_exc),
+                note="Proceeding with default empty hypothesis state",
+            )
+
         # Register with the NeuroplasticityBus for hot-reload of PatternDetector subclasses.
         if self._bus is not None:
             self._bus.register(
@@ -462,7 +514,7 @@ class EvoService:
             curiosity_multiplier = 0.5 + curiosity_drive * 1.0
 
             effective_interval = max(
-                10, int(_HYPOTHESIS_GENERATION_INTERVAL / curiosity_multiplier)
+                10, int(self._hypothesis_generation_interval / curiosity_multiplier)
             )
 
             # Periodically generate hypotheses from accumulated patterns
@@ -476,7 +528,7 @@ class EvoService:
             # means more frequent evidence sweeps (the organism is actively
             # curious and wants to test its hypotheses faster)
             effective_evidence_interval = max(
-                5, int(_EVIDENCE_EVALUATION_INTERVAL / curiosity_multiplier)
+                5, int(self._evidence_evaluation_interval / curiosity_multiplier)
             )
             if self._total_broadcasts % effective_evidence_interval == 0:
                 asyncio.create_task(
@@ -513,6 +565,14 @@ class EvoService:
                 # Emit lifecycle events on status transitions
                 if result is not None:
                     if result.new_status == HypothesisStatus.SUPPORTED:
+                        # HIGH-confidence hypothesis → increment learning pressure
+                        # Threshold: evidence_score >= 8.0 → confidence >= 0.9
+                        if (
+                            self._orchestrator is not None
+                            and getattr(h, "evidence_score", 0.0) >= 8.0
+                        ):
+                            from systems.evo.consolidation import _PRESSURE_HIGH_CONFIDENCE_HYPOTHESIS
+                            self._orchestrator.add_pressure(_PRESSURE_HIGH_CONFIDENCE_HYPOTHESIS)
                         # Emit EVO_HYPOTHESIS_CONFIRMED
                         await self._emit_hypothesis_lifecycle_events([h], "confirmed")
                         if self._nova is not None:
@@ -1081,10 +1141,108 @@ class EvoService:
                     "hypotheses_integrated": result.hypotheses_integrated,
                     "schemas_induced": result.schemas_induced,
                     "parameters_adjusted": result.parameters_adjusted,
+                    # Speciation telemetry — previously computed but invisible to bus;
+                    # Telos, Benchmarks, and Alive all need this data for fitness tracking.
+                    "niches_created": result.niches_created,
+                    "niches_extinct": result.niches_extinct,
+                    "niche_forks_proposed": result.niche_forks_proposed,
+                    "speciation_events": result.speciation_events,
+                    # Parameter feedback loop data
+                    "hypotheses_archived": result.hypotheses_archived,
+                    "beliefs_consolidated": result.beliefs_consolidated,
+                    "foundation_conflicts": result.foundation_conflicts,
+                    "genome_candidates_fixed": result.genome_candidates_fixed,
+                    "tournaments_converged": result.tournaments_converged,
                 },
             ))
         except Exception:
             self._logger.debug("consolidation_complete_emit_failed", exc_info=True)
+
+    def _snapshot_consolidation_kpis(self) -> dict[str, float]:
+        """Snapshot key KPIs used for consolidation quality delta.
+
+        Returns a dict with:
+          - hypothesis_count: total active hypotheses
+          - avg_confidence: mean evidence_score across active hypotheses (normalised 0-1)
+          - schema_count: total schemas in hypothesis engine (best-effort)
+          - re_success_rate: last known RE success rate from benchmark cache
+        """
+        snapshot: dict[str, float] = {}
+        try:
+            if self._hypothesis_engine is not None:
+                active = list(self._hypothesis_engine._active.values()) if hasattr(self._hypothesis_engine, "_active") else []
+                snapshot["hypothesis_count"] = float(len(active))
+                if active:
+                    total_score = sum(getattr(h, "evidence_score", 0.0) for h in active)
+                    # Normalise: evidence_score 0-10 → 0-1
+                    snapshot["avg_confidence"] = min(1.0, total_score / (len(active) * 10.0))
+                else:
+                    snapshot["avg_confidence"] = 0.0
+            else:
+                snapshot["hypothesis_count"] = 0.0
+                snapshot["avg_confidence"] = 0.0
+        except Exception:
+            snapshot.setdefault("hypothesis_count", 0.0)
+            snapshot.setdefault("avg_confidence", 0.0)
+
+        # Schema count from schema engine if available
+        try:
+            if self._schema_engine is not None and hasattr(self._schema_engine, "_schemas"):
+                snapshot["schema_count"] = float(len(self._schema_engine._schemas))
+            else:
+                snapshot["schema_count"] = 0.0
+        except Exception:
+            snapshot["schema_count"] = 0.0
+
+        # RE success rate from benchmark KPI cache
+        snapshot["re_success_rate"] = self._last_benchmark_kpis.get(
+            "re_success_rate",
+            self._last_benchmark_kpis.get("decision_quality", 0.0),
+        )
+
+        return snapshot
+
+    async def _emit_consolidation_quality(
+        self,
+        result: ConsolidationResult,
+        pre_snapshot: dict[str, float],
+        post_snapshot: dict[str, float],
+    ) -> None:
+        """Emit EVO_CONSOLIDATION_QUALITY with pre/post KPI deltas.
+
+        Payload:
+          - improvement_delta: {kpi: post − pre} for each tracked KPI
+          - consolidation_duration_ms: result.duration_ms
+          - hypotheses_promoted: result.hypotheses_integrated
+          - hypotheses_pruned: result.hypotheses_archived
+          - consolidation_number: self._total_consolidations
+          - learning_pressure_at_trigger: pressure captured before reset
+        """
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            improvement_delta = {
+                kpi: round(post_snapshot.get(kpi, 0.0) - pre_snapshot.get(kpi, 0.0), 4)
+                for kpi in set(pre_snapshot) | set(post_snapshot)
+            }
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_CONSOLIDATION_QUALITY,
+                source_system="evo",
+                data={
+                    "consolidation_number": self._total_consolidations,
+                    "consolidation_duration_ms": result.duration_ms,
+                    "hypotheses_promoted": result.hypotheses_integrated,
+                    "hypotheses_pruned": result.hypotheses_archived,
+                    "improvement_delta": improvement_delta,
+                    "pre_snapshot": {k: round(v, 4) for k, v in pre_snapshot.items()},
+                    "post_snapshot": {k: round(v, 4) for k, v in post_snapshot.items()},
+                },
+            ))
+        except Exception:
+            self._logger.debug("consolidation_quality_emit_failed", exc_info=True)
 
     async def _emit_capability_emerged(
         self,
@@ -1468,6 +1626,123 @@ class EvoService:
 
         return result
 
+    async def _on_thompson_query(self, event: Any) -> None:
+        """
+        Respond to Nova's EVO_THOMPSON_QUERY with current arm weights.
+
+        Extracts request_id and domain from the event, calls
+        get_thompson_arm_weights(domain) internally, then emits
+        EVO_THOMPSON_RESPONSE so Nova can resolve its awaiting Future.
+        Non-fatal: if the bus is unavailable the query silently expires
+        (Nova falls back to empty weights after its 2s timeout).
+        """
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            request_id = str(event.data.get("request_id", ""))
+            domain = str(event.data.get("domain", ""))
+            weights = self.get_thompson_arm_weights(domain)
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_THOMPSON_RESPONSE,
+                source_system="evo",
+                data={
+                    "request_id": request_id,
+                    "weights": weights,
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("thompson_query_response_failed", error=str(exc))
+
+    async def _on_consolidation_requested(self, event: Any) -> None:
+        """
+        Handle EVO_CONSOLIDATION_REQUESTED from Nova (AV-EVO-1c).
+
+        Nova previously called _evo.run_consolidation() directly.  Now it emits
+        this event and we trigger consolidation internally, then reply with
+        EVO_CONSOLIDATION_COMPLETE (already emitted by ConsolidationOrchestrator).
+        """
+        try:
+            data = getattr(event, "data", event) if not isinstance(event, dict) else event
+            reason = data.get("reason", "unknown")
+            self._logger.info("evo_consolidation_requested_by_nova", reason=reason)
+            await self._run_consolidation_now()
+        except Exception as exc:
+            self._logger.error("evo_consolidation_requested_handler_failed", error=str(exc))
+
+    async def _on_hypothesis_feedback_with_tournament(self, event: Any) -> None:
+        """
+        Handle HYPOTHESIS_FEEDBACK from Nova (AV-EVO-1b).
+
+        When the payload includes tournament_id + tournament_hypothesis_id,
+        routes to record_tournament_outcome() so the A/B experiment loop
+        receives signal — previously this required a direct _evo reference in Nova.
+
+        Also emits HYPOTHESIS_UPDATE so Nova can update its EFE weight priors
+        immediately after each trial (Spec 05 §20).
+        """
+        try:
+            data = getattr(event, "data", event) if not isinstance(event, dict) else event
+            tournament_id = data.get("tournament_id")
+            hypothesis_id = data.get("tournament_hypothesis_id")
+            if tournament_id and hypothesis_id:
+                self.record_tournament_outcome(
+                    tournament_id=tournament_id,
+                    hypothesis_id=hypothesis_id,
+                    success=bool(data.get("success", False)),
+                    intent_id=str(data.get("intent_id", "")),
+                )
+                # Emit HYPOTHESIS_UPDATE so Nova adjusts EFE priors for this hypothesis
+                await self._emit_hypothesis_update(
+                    tournament_id=tournament_id,
+                    hypothesis_id=str(hypothesis_id),
+                )
+        except Exception as exc:
+            self._logger.debug("hypothesis_feedback_tournament_routing_failed", error=str(exc))
+
+    async def _emit_hypothesis_update(
+        self,
+        tournament_id: str,
+        hypothesis_id: str,
+    ) -> None:
+        """Emit HYPOTHESIS_UPDATE with current posterior for a hypothesis.
+
+        Nova subscribes to adjust EFE weight priors after each tournament trial.
+        Payload includes the current Thompson posterior mean (confidence) and
+        the evidence count so Nova can weight the update appropriately.
+        """
+        if self._event_bus is None or self._hypothesis_engine is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            h = self._hypothesis_engine.get_hypothesis(hypothesis_id)
+            confidence = 0.5
+            evidence_count = 0
+            winner: str | None = None
+            if h is not None:
+                evidence_count = len(getattr(h, "supporting_episodes", []))
+                # Normalise evidence_score to [0,1] posterior proxy
+                confidence = min(1.0, max(0.0, (h.evidence_score + 5.0) / 10.0))
+                if h.status == HypothesisStatus.SUPPORTED:
+                    winner = hypothesis_id
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.HYPOTHESIS_UPDATE,
+                source_system="evo",
+                data={
+                    "tournament_id": tournament_id,
+                    "hypothesis_id": hypothesis_id,
+                    "winner": winner,
+                    "confidence": round(confidence, 4),
+                    "evidence_count": evidence_count,
+                },
+            ))
+        except Exception as exc:
+            self._logger.debug("hypothesis_update_emit_failed", error=str(exc))
+
     def record_tournament_outcome(
         self,
         tournament_id: str,
@@ -1507,6 +1782,16 @@ class EvoService:
         """
         from systems.synapse.types import SynapseEventType
         event_bus.subscribe(SynapseEventType.ACTION_COMPLETED, self.on_action_completed)
+
+        # AXON_EXECUTION_RESULT: step-level granularity for hypothesis confidence.
+        # ACTION_COMPLETED gives aggregate success/failure; AXON_EXECUTION_RESULT
+        # gives per-step outcomes so Evo can distinguish "step 3 of 7 failed" from
+        # "all failed" — critical for fine-grained hypothesis scoring.
+        if hasattr(SynapseEventType, "AXON_EXECUTION_RESULT"):
+            event_bus.subscribe(
+                SynapseEventType.AXON_EXECUTION_RESULT,
+                self._on_axon_execution_result,
+            )
 
         # Fovea competency-type internal prediction errors → self-model evidence
         if hasattr(SynapseEventType, "FOVEA_INTERNAL_PREDICTION_ERROR"):
@@ -1608,6 +1893,13 @@ class EvoService:
                 self._on_fovea_prediction_error_high,
             )
 
+        # Fovea calibration alert → attention-tuning hypotheses (Autonomy Gap Closure Part A)
+        if hasattr(SynapseEventType, "FOVEA_CALIBRATION_ALERT"):
+            event_bus.subscribe(
+                SynapseEventType.FOVEA_CALIBRATION_ALERT,
+                self._on_fovea_calibration_alert,
+            )
+
         # Oneiros dream results → update hypothesis evidence
         if hasattr(SynapseEventType, "DREAM_HYPOTHESES_GENERATED"):
             event_bus.subscribe(
@@ -1627,6 +1919,13 @@ class EvoService:
             event_bus.subscribe(
                 SynapseEventType.KAIROS_TIER3_INVARIANT_DISCOVERED,
                 self._on_kairos_tier3_invariant,
+            )
+
+        # Kairos distilled invariants (all tiers) → hybrid hypothesis/candidate injection
+        if hasattr(SynapseEventType, "KAIROS_INVARIANT_DISTILLED"):
+            event_bus.subscribe(
+                SynapseEventType.KAIROS_INVARIANT_DISTILLED,
+                self._on_kairos_invariant,
             )
 
         # Oikos metabolic pressure → inject economic hypothesis into tournament
@@ -1681,7 +1980,296 @@ class EvoService:
                 self._on_opportunities_discovered,
             )
 
+        # Oikos economic episode summaries → hypothesis scoring outside SACM path
+        if hasattr(SynapseEventType, "OIKOS_ECONOMIC_EPISODE"):
+            event_bus.subscribe(
+                SynapseEventType.OIKOS_ECONOMIC_EPISODE,
+                self._on_oikos_economic_episode,
+            )
+
+        # Metabolic gate denials → PatternCandidate for economic constraint learning
+        if hasattr(SynapseEventType, "METABOLIC_GATE_RESPONSE"):
+            event_bus.subscribe(
+                SynapseEventType.METABOLIC_GATE_RESPONSE,
+                self._on_metabolic_gate_response,
+            )
+
+        # Benchmark regression → emergency hypothesis or early consolidation request
+        event_bus.subscribe(
+            SynapseEventType.BENCHMARK_REGRESSION,
+            self._on_benchmark_regression,
+        )
+
+        # DOMAIN_KPI_SNAPSHOT — keep _last_benchmark_kpis fresh between regression events.
+        # Benchmarks emits this on every Nexus epistemic cycle, RE export, and economic
+        # deferral — so the parameter tuner always has current KPI data even when no
+        # regressions have fired.  We only ingest numeric float values from known KPI keys.
+        if hasattr(SynapseEventType, "DOMAIN_KPI_SNAPSHOT"):
+            event_bus.subscribe(
+                SynapseEventType.DOMAIN_KPI_SNAPSHOT,
+                self._on_domain_kpi_snapshot,
+            )
+
+        # Thompson weight queries from Nova — respond with arm weights for domain
+        event_bus.subscribe(
+            SynapseEventType.EVO_THOMPSON_QUERY,
+            self._on_thompson_query,
+        )
+
+        # AV-EVO-1c: Nova requests emergency consolidation via event instead of direct call
+        if hasattr(SynapseEventType, "EVO_CONSOLIDATION_REQUESTED"):
+            event_bus.subscribe(
+                SynapseEventType.EVO_CONSOLIDATION_REQUESTED,
+                self._on_consolidation_requested,
+            )
+
+        # AV-EVO-1b: HYPOTHESIS_FEEDBACK now carries tournament_id + tournament_hypothesis_id
+        event_bus.subscribe(
+            SynapseEventType.HYPOTHESIS_FEEDBACK,
+            self._on_hypothesis_feedback_with_tournament,
+        )
+        event_bus.subscribe(
+            SynapseEventType.SYSTEM_MODULATION,
+            self._on_system_modulation,
+        )
+
+        # Oneiros sleep performance outcome → generate/reinforce sleep-parameter hypotheses
+        if hasattr(SynapseEventType, "ONEIROS_SLEEP_OUTCOME"):
+            event_bus.subscribe(
+                SynapseEventType.ONEIROS_SLEEP_OUTCOME,
+                self._on_oneiros_sleep_outcome,
+            )
+
+        # Novel action created by Simula → register into ActionTypeRegistry and track
+        if hasattr(SynapseEventType, "NOVEL_ACTION_CREATED"):
+            event_bus.subscribe(
+                SynapseEventType.NOVEL_ACTION_CREATED,
+                self._on_novel_action_created,
+            )
+
+        # Learning opportunities from OpportunityScanner → create learning hypothesis
+        if hasattr(SynapseEventType, "LEARNING_OPPORTUNITY_DETECTED"):
+            event_bus.subscribe(
+                SynapseEventType.LEARNING_OPPORTUNITY_DETECTED,
+                self._on_learning_opportunity_detected,
+            )
+
+        # ACTION_EXECUTED — successful Axon action outcome.
+        # If a hypothesis_id or experiment_id is present in the step metadata,
+        # feed the success signal into hypothesis scoring and emit
+        # EVO_HYPOTHESIS_CONFIRMED with the evidence.
+        if hasattr(SynapseEventType, "ACTION_EXECUTED"):
+            event_bus.subscribe(
+                SynapseEventType.ACTION_EXECUTED,
+                self._on_action_executed,
+            )
+
+        # ACTION_FAILED — Axon action failure.
+        # If a hypothesis_id is present, emit EVO_HYPOTHESIS_REFUTED so the
+        # organism learns which hypotheses lead to executor failures.
+        if hasattr(SynapseEventType, "ACTION_FAILED"):
+            event_bus.subscribe(
+                SynapseEventType.ACTION_FAILED,
+                self._on_action_failed_evo,
+            )
+
+        # Memory emits BELIEF_CONSOLIDATED after consolidate() — inject as strong
+        # positive evidence for hypotheses that overlap with the consolidated belief.
+        if hasattr(SynapseEventType, "BELIEF_CONSOLIDATED"):
+            event_bus.subscribe(
+                SynapseEventType.BELIEF_CONSOLIDATED,
+                self._on_belief_consolidated,
+            )
+
+        # Thread emits SCHEMA_FORMED when a new identity schema crystallises —
+        # create a matching WORLD_MODEL hypothesis so Evo tracks schema stability.
+        if hasattr(SynapseEventType, "SCHEMA_FORMED"):
+            event_bus.subscribe(
+                SynapseEventType.SCHEMA_FORMED,
+                self._on_schema_formed,
+            )
+
+        # Thread emits SCHEMA_EVOLVED when a schema is promoted or modified —
+        # update evidence scores on any hypothesis that references the schema.
+        if hasattr(SynapseEventType, "SCHEMA_EVOLVED"):
+            event_bus.subscribe(
+                SynapseEventType.SCHEMA_EVOLVED,
+                self._on_schema_evolved,
+            )
+
+        # Nexus emits CONVERGENCE_DETECTED when structural isomorphism is found
+        # across federation instances — boost matching hypotheses (cross-validated).
+        if hasattr(SynapseEventType, "CONVERGENCE_DETECTED"):
+            event_bus.subscribe(
+                SynapseEventType.CONVERGENCE_DETECTED,
+                self._on_convergence_detected,
+            )
+
+        # Oneiros REM stage emits DREAM_INSIGHT for coherence ≥ 0.70 insights —
+        # create or strengthen a hypothesis from the dream-derived structure.
+        if hasattr(SynapseEventType, "DREAM_INSIGHT"):
+            event_bus.subscribe(
+                SynapseEventType.DREAM_INSIGHT,
+                self._on_dream_insight,
+            )
+
+        # Nexus emits TRIANGULATION_WEIGHT_UPDATE after each federation session —
+        # adjust hypothesis priors if our instance weight diverges significantly.
+        if hasattr(SynapseEventType, "TRIANGULATION_WEIGHT_UPDATE"):
+            event_bus.subscribe(
+                SynapseEventType.TRIANGULATION_WEIGHT_UPDATE,
+                self._on_triangulation_weight_update,
+            )
+
+        # Nexus emits DIVERGENCE_PRESSURE when triangulation weight < 0.4 —
+        # queue PatternCandidates to diversify hypothesis domains.
+        if hasattr(SynapseEventType, "DIVERGENCE_PRESSURE"):
+            event_bus.subscribe(
+                SynapseEventType.DIVERGENCE_PRESSURE,
+                self._on_divergence_pressure,
+            )
+
+        # Thread emits TURNING_POINT_DETECTED on narrative inflection points —
+        # high surprise_magnitude events generate temporal PatternCandidates.
+        if hasattr(SynapseEventType, "TURNING_POINT_DETECTED"):
+            event_bus.subscribe(
+                SynapseEventType.TURNING_POINT_DETECTED,
+                self._on_turning_point_detected,
+            )
+
+        # PHANTOM_PARAMETER_ADJUSTED — Phantom confirms Evo-driven parameter tuning.
+        # Score the associated EVO_ADJUST_BUDGET hypothesis as confirmed/refuted
+        # based on whether the adjustment moved metrics in the expected direction.
+        if hasattr(SynapseEventType, "PHANTOM_PARAMETER_ADJUSTED"):
+            event_bus.subscribe(
+                SynapseEventType.PHANTOM_PARAMETER_ADJUSTED,
+                self._on_phantom_parameter_adjusted,
+            )
+
         self._logger.info("evo_synapse_subscriptions_registered")
+
+    async def _on_oneiros_sleep_outcome(self, event: Any) -> None:
+        """
+        React to Oneiros post-sleep performance measurement.
+
+        Two response paths:
+        - verdict == "harmful": queue a PatternCandidate targeting sleep_parameters
+          so the next consolidation generates a hypothesis about what went wrong.
+        - verdict == "beneficial" with net_improvement > 5%: queue a positive
+          PatternCandidate reinforcing the current sleep schedule configuration.
+        """
+        data = getattr(event, "data", {}) or {}
+        verdict = data.get("verdict", "neutral")
+        net_improvement = float(data.get("net_improvement", 0.0))
+        net_degradation = float(data.get("net_degradation", 0.0))
+        kpi_deltas = data.get("kpi_deltas", {})
+        sleep_cycle_id = data.get("sleep_cycle_id", "unknown")
+
+        if verdict == "harmful":
+            from systems.evo.detectors import PatternCandidate, PatternType  # lazy
+            candidate = PatternCandidate(
+                pattern_type=PatternType.TEMPORAL,
+                elements=[
+                    "oneiros_sleep_harmful",
+                    f"net_degradation:{round(net_degradation, 3)}",
+                    "sleep_parameters",
+                ],
+                confidence=min(0.80, 0.40 + net_degradation),
+                extra={
+                    "source": "oneiros_sleep_outcome",
+                    "verdict": verdict,
+                    "kpi_deltas": kpi_deltas,
+                    "sleep_cycle_id": sleep_cycle_id,
+                    "hypothesis_domain": "oneiros.sleep_parameters",
+                },
+            )
+            self._pending_candidates.append(candidate)
+            self._logger.info(
+                "evo_sleep_outcome_harmful_queued",
+                sleep_cycle_id=sleep_cycle_id,
+                net_degradation=net_degradation,
+                kpi_deltas=kpi_deltas,
+            )
+
+        elif verdict == "beneficial" and net_improvement > 0.05:
+            from systems.evo.detectors import PatternCandidate, PatternType  # lazy
+            candidate = PatternCandidate(
+                pattern_type=PatternType.COOCCURRENCE,
+                elements=[
+                    "oneiros_sleep_beneficial",
+                    f"net_improvement:{round(net_improvement, 3)}",
+                    "sleep_parameters_effective",
+                ],
+                confidence=min(0.90, 0.50 + net_improvement),
+                extra={
+                    "source": "oneiros_sleep_outcome",
+                    "verdict": verdict,
+                    "kpi_deltas": kpi_deltas,
+                    "sleep_cycle_id": sleep_cycle_id,
+                    "hypothesis_domain": "oneiros.sleep_parameters",
+                },
+            )
+            self._pending_candidates.append(candidate)
+            self._logger.info(
+                "evo_sleep_outcome_beneficial_reinforced",
+                sleep_cycle_id=sleep_cycle_id,
+                net_improvement=net_improvement,
+            )
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle VitalityCoordinator austerity orders.
+
+        Skia emits SYSTEM_MODULATION when the organism needs to conserve resources.
+        This system applies the directive and ACKs so Skia knows the order was received.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("level", "nominal")
+        halt_systems = data.get("halt_systems", [])
+        modulate = data.get("modulate", {})
+
+        system_id = "evo"
+        compliant = True
+        reason: str | None = None
+
+        if system_id in halt_systems:
+            self._modulation_halted = True
+            self._logger.warning("system_modulation_halt", level=level)
+        elif system_id in modulate:
+            directives = modulate[system_id]
+            self._apply_modulation_directives(directives)
+            self._logger.info("system_modulation_applied", level=level, directives=directives)
+        elif level == "nominal":
+            self._modulation_halted = False
+            self._logger.info("system_modulation_resumed", level=level)
+
+        # Emit ACK so Skia knows the order was received
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                    data={
+                        "system_id": system_id,
+                        "level": level,
+                        "compliant": compliant,
+                        "reason": reason,
+                    },
+                    source_system=system_id,
+                ))
+            except Exception as exc:
+                self._logger.warning("modulation_ack_failed", error=str(exc))
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply modulation directives from VitalityCoordinator.
+
+        Evo directive: {"consolidation": False} — pause consolidation cycles
+        to reduce compute during austerity.
+        """
+        consolidation = directives.get("consolidation", True)
+        if not consolidation:
+            self._logger.info("modulation_consolidation_paused")
+        else:
+            self._logger.info("modulation_directives_received", directives=directives)
 
     async def on_action_completed(self, event: Any) -> None:
         """
@@ -1760,6 +2348,93 @@ class EvoService:
         except Exception as exc:
             self._logger.error("on_action_completed_failed", error=str(exc))
 
+    async def _on_axon_execution_result(self, event: Any) -> None:
+        """
+        Subscriber for AXON_EXECUTION_RESULT — step-level execution granularity.
+
+        Complements ACTION_COMPLETED (aggregate success/failure) with per-step
+        outcomes so Evo can distinguish partial failures from total failures:
+          - All steps failed → strong negative evidence
+          - Only last step failed → weak negative evidence (pipeline mostly worked)
+          - Specific step type consistently fails → hypothesis about that action type
+
+        AXON_EXECUTION_RESULT payload:
+          intent_id       (str)
+          execution_id    (str)
+          success         (bool)
+          step_count      (int)
+          action_types    (list[str])
+          step_outcomes   (list[{action_type, success, error, duration_ms}])
+          failure_reason  (str, optional)
+          economic_delta_usd (float)
+
+        Does NOT raise — never interrupt the event bus.
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            intent_id = str(data.get("intent_id", ""))
+            overall_success = bool(data.get("success", False))
+            step_outcomes: list[dict] = list(data.get("step_outcomes", []) or [])
+            economic_delta = float(data.get("economic_delta_usd", 0.0))
+
+            if not step_outcomes:
+                return  # No step data — ACTION_COMPLETED already handles aggregate
+
+            total_steps = len(step_outcomes)
+            failed_steps = [s for s in step_outcomes if not s.get("success", True)]
+            first_failure_idx = next(
+                (i for i, s in enumerate(step_outcomes) if not s.get("success", True)),
+                total_steps,
+            )
+
+            # Compute a weighted outcome scalar:
+            # - full success → 1.0
+            # - partial (some steps failed, but not all) → 0.3–0.6
+            # - early failure (step 0 or 1) → 0.0–0.2
+            if overall_success:
+                weighted_outcome = 1.0
+            elif not failed_steps:
+                weighted_outcome = 1.0  # edge case: success=False but all steps passed
+            else:
+                # How far into the pipeline did we get?
+                progress_ratio = first_failure_idx / max(total_steps, 1)
+                weighted_outcome = progress_ratio * 0.5  # 0.0 (failed at step 0) to 0.5 (late failure)
+
+            # Find hypotheses whose action-type domain matches the failed step type.
+            # This gives Evo finer-grained attribution than aggregate success/failure.
+            failed_action_types = {s.get("action_type", "") for s in failed_steps if s.get("action_type")}
+            active = self._hypothesis_engine.get_active()
+            for h in active:
+                # Check whether any of the failed action types are mentioned in the hypothesis
+                h_text = (h.statement + " " + str(getattr(h, "category", ""))).lower()
+                action_relevant = any(
+                    at.lower().replace("_", " ") in h_text or at.lower() in h_text
+                    for at in failed_action_types
+                ) if failed_action_types else False
+
+                # Apply finer delta for action-type-specific hypotheses
+                step_success = weighted_outcome >= 0.5
+                step_economic = economic_delta * (first_failure_idx / max(total_steps, 1))
+                await self._apply_outcome_to_hypothesis(
+                    h,
+                    success=step_success,
+                    economic_delta=step_economic if action_relevant else economic_delta * 0.3,
+                    intent_id=intent_id,
+                )
+
+            self._logger.debug(
+                "axon_execution_result_processed",
+                intent_id=intent_id,
+                total_steps=total_steps,
+                failed_steps=len(failed_steps),
+                first_failure_idx=first_failure_idx,
+                weighted_outcome=round(weighted_outcome, 3),
+            )
+        except Exception as exc:
+            self._logger.error("on_axon_execution_result_failed", error=str(exc))
+
     async def _apply_outcome_to_hypothesis(
         self,
         hypothesis: Hypothesis,
@@ -1779,7 +2454,8 @@ class EvoService:
 
         Volatility tracking: if the direction of the nudge reverses compared
         to the previous nudge, we count an oscillation. After
-        _VOLATILITY_OSCILLATION_THRESHOLD reversals, the hypothesis is
+        self._volatility_oscillation_threshold reversals (default 6, set via
+        EvoConfig.volatility_oscillation_threshold), the hypothesis is
         flagged as HIGH_VOLATILITY and its effective weight is halved.
         """
         from systems.evo.types import HypothesisCategory
@@ -1847,7 +2523,7 @@ class EvoService:
         )
         hypothesis.confidence_oscillations = reversals
 
-        if reversals >= _VOLATILITY_OSCILLATION_THRESHOLD:
+        if reversals >= self._volatility_oscillation_threshold:
             if hypothesis.volatility_flag != "HIGH_VOLATILITY":
                 hypothesis.volatility_flag = "HIGH_VOLATILITY"
                 hypothesis.volatility_weight = 0.5
@@ -1857,7 +2533,7 @@ class EvoService:
                     oscillations=reversals,
                     evidence_score=round(hypothesis.evidence_score, 3),
                 )
-        elif hypothesis.volatility_flag == "HIGH_VOLATILITY" and reversals < _VOLATILITY_OSCILLATION_THRESHOLD // 2:
+        elif hypothesis.volatility_flag == "HIGH_VOLATILITY" and reversals < self._volatility_oscillation_threshold // 2:
             # Enough stability to de-escalate
             hypothesis.volatility_flag = "normal"
             hypothesis.volatility_weight = 1.0
@@ -2203,6 +2879,79 @@ class EvoService:
         except Exception as exc:
             self._logger.warning("fovea_prediction_error_handler_failed", error=str(exc))
 
+    async def _on_fovea_calibration_alert(self, event: Any) -> None:
+        """
+        Handle FOVEA_CALIBRATION_ALERT — generate attention-tuning hypotheses.
+
+        Part A: Autonomy Gap Closure. When Fovea detects 5+ consecutive poor cycles
+        (low TPR < 0.6 or high false alarm rate > 0.4), generate targeted hypotheses
+        for attention parameter tuning.
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+
+        try:
+            data = getattr(event, "data", {}) or {}
+            alert_type = str(data.get("alert_type", ""))
+            current_value = float(data.get("current_value", 0.0))
+            consecutive_cycles = int(data.get("consecutive_cycles", 0))
+            threshold_params = data.get("threshold_params", {})
+            recommendation = str(data.get("recommendation", ""))
+
+            # Generate a targeted PatternCandidate for attention tuning
+            if alert_type == "low_tpr":
+                # Hypothesis: lower ignition floor or raise precision
+                elements = [
+                    "fovea_attention_tpr_low",
+                    f"current_tpr:{current_value:.4f}",
+                    f"consecutive_cycles:{consecutive_cycles}",
+                    "action:lower_ignition_floor_or_raise_precision",
+                ]
+            elif alert_type == "high_false_alarm":
+                # Hypothesis: raise ignition floor or reduce curiosity boost
+                elements = [
+                    "fovea_attention_false_alarm_high",
+                    f"false_alarm_rate:{current_value:.4f}",
+                    f"consecutive_cycles:{consecutive_cycles}",
+                    "action:raise_ignition_floor_or_reduce_curiosity",
+                ]
+            else:
+                return
+
+            from primitives.evolutionary import PatternCandidate
+
+            candidate = PatternCandidate(
+                pattern_type="COOCCURRENCE",
+                elements=elements,
+                confidence=min(0.5 + (consecutive_cycles * 0.05), 0.8),  # Boost by persistence
+                hypothesis_domain="attention_calibration",
+                evidence={
+                    "alert_type": alert_type,
+                    "current_value": current_value,
+                    "threshold_params": threshold_params,
+                    "recommendation": recommendation,
+                },
+            )
+
+            # Queue for next hypothesis generation pass
+            self._pending_candidates.append(candidate)
+
+            # Increment learning pressure — Fovea calibration alert signals
+            # that the attention system needs re-tuning urgently
+            if self._orchestrator is not None:
+                from systems.evo.consolidation import _PRESSURE_FOVEA_CALIBRATION_ALERT
+                self._orchestrator.add_pressure(_PRESSURE_FOVEA_CALIBRATION_ALERT)
+
+            self._logger.info(
+                "calibration_alert_hypothesis_queued",
+                alert_type=alert_type,
+                current_value=round(current_value, 4),
+                consecutive_cycles=consecutive_cycles,
+            )
+
+        except Exception as exc:
+            self._logger.warning("fovea_calibration_alert_handler_failed", error=str(exc))
+
     async def _on_evolution_applied(self, event: Any) -> None:
         """Handle EVOLUTION_APPLIED — reward source hypotheses whose proposals succeeded.
 
@@ -2465,6 +3214,174 @@ class EvoService:
         except Exception as exc:
             self._logger.warning("kairos_invariant_handler_failed", error=str(exc))
 
+    async def _on_kairos_invariant(self, event: Any) -> None:
+        """
+        Handle KAIROS_INVARIANT_DISTILLED — hybrid tier-based routing.
+
+        Tier 3 + confidence ≥ 0.8: direct SUPPORTED Hypothesis (evidence_score = confidence × 5).
+        Tier 2 + confidence 0.6–0.79: PatternCandidate with boosted prior in metadata.
+        Tier 1 or lower confidence: standard PatternCandidate, feeds normal consolidation.
+
+        All Tier-3 hypotheses are tagged source="kairos_invariant" so future revert
+        logic can distinguish them from Evo-native hypotheses.
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+
+        try:
+            data = getattr(event, "data", {}) or {}
+            invariant_id = str(data.get("invariant_id", ""))
+            abstract_form = str(data.get("abstract_form", ""))
+            domain_count: int = int(data.get("domain_count", 1))
+
+            if not abstract_form:
+                return
+
+            # Fetch full CausalInvariant from Neo4j by invariant_id.
+            confidence: float = 0.5
+            tier: int = 1
+            scope: str = "domain"
+            cause: str = ""
+            effect: str = ""
+
+            if invariant_id and self._memory is not None:
+                try:
+                    neo4j = getattr(self._memory, "get_neo4j", lambda: None)()
+                    if neo4j is not None:
+                        rows = await neo4j.run(
+                            "MATCH (c:CausalInvariant {id: $id}) "
+                            "RETURN c.cause AS cause, c.effect AS effect, "
+                            "c.confidence AS confidence, c.scope AS scope, "
+                            "c.tier AS tier LIMIT 1",
+                            {"id": invariant_id},
+                        )
+                        if rows:
+                            r = rows[0]
+                            confidence = float(r.get("confidence", 0.5))
+                            tier = int(r.get("tier", 1))
+                            scope = str(r.get("scope", "domain"))
+                            cause = str(r.get("cause", ""))
+                            effect = str(r.get("effect", ""))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Fallback: infer tier from domain_count if Neo4j unavailable.
+            if tier == 1 and domain_count >= 3:
+                tier = 2
+            if not cause:
+                cause = abstract_form[:60]
+
+            # ── Tier 3 + confidence ≥ 0.8: direct SUPPORTED Hypothesis ─────────
+            if tier >= 3 and confidence >= 0.8:
+                from systems.evo.types import HypothesisCategory  # noqa: PLC0415
+
+                h_id = (
+                    f"kairos_distilled_{invariant_id}"
+                    if invariant_id
+                    else f"kairos_d_{abs(hash(abstract_form)) % 100_000}"
+                )
+                existing_ids = {h.id for h in self._hypothesis_engine.get_all_active()}
+                if h_id not in existing_ids:
+                    h = Hypothesis(
+                        id=h_id,
+                        category=HypothesisCategory.WORLD_MODEL,
+                        statement=(
+                            f"Causal invariant (Kairos distilled, tier {tier}): "
+                            f"{cause} → {effect or abstract_form[:200]}"
+                        ),
+                        formal_test=(
+                            "Invariant holds substrate-independently. "
+                            "Refuted if a domain systematically violates it."
+                        ),
+                        complexity_penalty=0.05,
+                        status=HypothesisStatus.SUPPORTED,
+                        evidence_score=min(5.0, confidence * 5.0),
+                        min_age_hours=0.0,
+                        novelty_score=0.9,
+                        source="kairos_invariant",  # type: ignore[call-arg]
+                    )
+                    self._hypothesis_engine._active[h.id] = h
+                    self._hypothesis_engine._total_proposed += 1
+                    self._hypothesis_engine._total_supported += 1
+                    await self._emit_hypothesis_lifecycle_events([h], "confirmed")
+                    self._logger.info(
+                        "kairos_distilled_hypothesis_tier3",
+                        hypothesis_id=h.id,
+                        confidence=round(confidence, 3),
+                    )
+
+                # Also boost existing hypotheses aligned with this invariant's direction.
+                for existing_h in list(self._hypothesis_engine.get_all_active()):
+                    if (
+                        existing_h.id != h_id
+                        and cause
+                        and cause[:20].lower() in existing_h.statement.lower()
+                        and existing_h.status in (
+                            HypothesisStatus.TESTING, HypothesisStatus.SUPPORTED
+                        )
+                    ):
+                        existing_h.evidence_score = min(
+                            existing_h.evidence_score + 2.0,
+                            existing_h.evidence_score * 1.5,
+                        )
+                return
+
+            # ── Tier 2 + confidence 0.6–0.79: boosted PatternCandidate ─────────
+            if tier >= 2 and confidence >= 0.6:
+                candidate = PatternCandidate(
+                    type=PatternType.COOCCURRENCE,
+                    elements=[
+                        f"kairos_distilled:{abstract_form[:80]}",
+                        f"scope:{scope}",
+                    ],
+                    count=max(3, domain_count),
+                    confidence=min(0.85, confidence + 0.10),  # Boosted prior
+                    metadata={
+                        "invariant_id": invariant_id,
+                        "tier": tier,
+                        "scope": scope,
+                        "cause": cause,
+                        "effect": effect,
+                        "kairos_boosted": True,
+                    },
+                    source_detector="kairos_distilled",
+                )
+                self._pending_candidates.append(candidate)
+                self._logger.debug(
+                    "kairos_distilled_candidate_tier2",
+                    confidence=round(confidence, 3),
+                    scope=scope,
+                )
+                return
+
+            # ── Tier 1 or low confidence: standard PatternCandidate ─────────────
+            if confidence >= 0.5:
+                candidate = PatternCandidate(
+                    type=PatternType.COOCCURRENCE,
+                    elements=[
+                        f"kairos_distilled:{abstract_form[:80]}",
+                        f"scope:{scope}",
+                    ],
+                    count=max(1, domain_count),
+                    confidence=min(0.7, confidence),
+                    metadata={
+                        "invariant_id": invariant_id,
+                        "tier": tier,
+                        "scope": scope,
+                        "cause": cause,
+                        "effect": effect,
+                    },
+                    source_detector="kairos_distilled",
+                )
+                self._pending_candidates.append(candidate)
+                self._logger.debug(
+                    "kairos_distilled_candidate_tier1",
+                    confidence=round(confidence, 3),
+                )
+
+        except Exception as exc:  # noqa: BLE001
+            self._logger.debug("kairos_invariant_evo_handler_failed", error=str(exc))
+
     # ─── Curiosity Integration ─────────────────────────────────────────────────
 
     async def generate_epistemic_intents(self) -> list[Any]:
@@ -2720,12 +3637,14 @@ class EvoService:
             candidate = PatternCandidate(
                 type=PatternType.COOCCURRENCE,
                 elements=[f"revenue_source::{source}", "domain_profitability"],
-                description=(
-                    f"Revenue {amount:.4f} received from '{source}' — "
-                    "positive evidence for domain_profitability hypothesis"
-                ),
+                count=1,
                 confidence=confidence,
-                support_count=1,
+                metadata={
+                    "description": (
+                        f"Revenue {amount:.4f} received from '{source}' — "
+                        "positive evidence for domain_profitability hypothesis"
+                    ),
+                },
                 source_detector="oikos_revenue_injected",
             )
             self._pending_candidates.append(candidate)
@@ -3358,13 +4277,14 @@ class EvoService:
                     count=self._re_degradation_count,
                 )
 
-                if self._re_degradation_count >= 10:
+                if self._re_degradation_count >= self._re_degradation_count_threshold:
                     # Queue a hyperparameter-adjustment candidate for consolidation
                     candidate = PatternCandidate(
                         pattern_type=PatternType.TEMPORAL,
                         description=(
-                            f"RE success rate degraded to {success_rate:.2f} over 10 "
-                            "consecutive readings. Candidate adjustments: increase LoRA rank, "
+                            f"RE success rate degraded to {success_rate:.2f} over "
+                            f"{self._re_degradation_count_threshold} consecutive readings. "
+                            "Candidate adjustments: increase LoRA rank, "
                             "lower learning rate, increase replay buffer, add contrastive loss."
                         ),
                         labels=[
@@ -3397,6 +4317,258 @@ class EvoService:
         except Exception as exc:
             self._logger.warning("on_re_decision_outcome_failed", error=str(exc))
 
+    async def _on_benchmark_regression(self, event: Any) -> None:
+        """React to Benchmarks KPI regression events.
+
+        Three response paths:
+        1. severity=="critical" → generate emergency hypothesis targeting the regressed KPI
+        2. severity=="warning" AND 3+ consecutive regressions for this KPI → emit LEARNING_PRESSURE
+           (rate-limited to 1/hour so a noisy KPI doesn't spam consolidation)
+        3. RE-related KPI (re_success_rate, decision_quality) → emit RE_TRAINING_REQUESTED
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            kpi = str(data.get("metric", data.get("kpi", "unknown")))
+            severity = str(data.get("severity", "warning")).lower()
+            current_value = float(data.get("current_value", data.get("current", 0.0)))
+            rolling_avg = float(data.get("rolling_avg", data.get("baseline", current_value)))
+
+            # ── Track consecutive regressions per KPI ─────────────────────
+            self._benchmark_regression_counts[kpi] = (
+                self._benchmark_regression_counts.get(kpi, 0) + 1
+            )
+            consecutive = self._benchmark_regression_counts[kpi]
+
+            # Cache the current KPI value for the parameter feedback loop.
+            # tick_evaluation() uses this snapshot when comparing against baselines.
+            self._last_benchmark_kpis[kpi] = current_value
+
+            # Increment learning pressure on every regression event
+            if self._orchestrator is not None:
+                from systems.evo.consolidation import _PRESSURE_BENCHMARK_REGRESSION
+                self._orchestrator.add_pressure(_PRESSURE_BENCHMARK_REGRESSION)
+
+            self._logger.info(
+                "benchmark_regression_received",
+                kpi=kpi,
+                severity=severity,
+                current_value=round(current_value, 4),
+                rolling_avg=round(rolling_avg, 4),
+                consecutive=consecutive,
+            )
+
+            if self._event_bus is None:
+                return
+
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            # ── Path 1: critical → emergency hypothesis candidate ──────────
+            if severity == "critical":
+                candidate = PatternCandidate(
+                    pattern_type=PatternType.TEMPORAL,
+                    description=(
+                        f"CRITICAL benchmark regression on '{kpi}': current={current_value:.4f}, "
+                        f"rolling_avg={rolling_avg:.4f}. Emergency hypothesis needed to identify "
+                        "root cause and propose corrective parameter adjustments."
+                    ),
+                    labels=[
+                        "benchmark_regression",
+                        f"kpi:{kpi}",
+                        "severity:critical",
+                        "emergency_hypothesis",
+                    ],
+                    count=consecutive,
+                    confidence=0.80,
+                    examples=[f"regression_{kpi}_{consecutive}"],
+                    metadata={
+                        "source": "benchmark_regression",
+                        "kpi": kpi,
+                        "severity": severity,
+                        "current_value": current_value,
+                        "rolling_avg": rolling_avg,
+                        "consecutive": consecutive,
+                        "hypothesis_domain": f"performance.{kpi}",
+                    },
+                    source_detector="benchmark_regression_monitor",
+                )
+                self._pending_candidates.append(candidate)
+                self._logger.warning(
+                    "benchmark_regression_emergency_candidate_queued",
+                    kpi=kpi,
+                    current_value=round(current_value, 4),
+                    pending_candidates=len(self._pending_candidates),
+                )
+
+            # ── Path 2: warning + 3+ consecutive → LEARNING_PRESSURE ──────
+            if consecutive >= 3:
+                import time as _time
+                now = _time.monotonic()
+                one_hour = 3600.0
+                if now - self._last_learning_pressure_at >= one_hour:
+                    self._last_learning_pressure_at = now
+                    try:
+                        await self._event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.LEARNING_PRESSURE,
+                            source_system="evo",
+                            data={
+                                "source_system": "evo",
+                                "regression_count": consecutive,
+                                "kpi": kpi,
+                                "reason": (
+                                    f"KPI '{kpi}' has regressed {consecutive} consecutive times "
+                                    f"(current={current_value:.4f}, avg={rolling_avg:.4f}). "
+                                    "Requesting early consolidation."
+                                ),
+                            },
+                        ))
+                        # Also notify consolidation orchestrator directly so it fires
+                        # on the next should_run() poll (within 60s)
+                        if self._orchestrator is not None:
+                            self._orchestrator.on_learning_pressure()
+                        self._logger.info(
+                            "learning_pressure_emitted",
+                            kpi=kpi,
+                            consecutive=consecutive,
+                        )
+                    except Exception as exc:
+                        self._logger.warning("learning_pressure_emit_failed", error=str(exc))
+
+            # ── Path 3: RE-related KPI → RE_TRAINING_REQUESTED ────────────
+            _re_kpis = {"re_success_rate", "decision_quality", "re_quality", "re_training_throughput"}
+            kpi_lower = kpi.lower().replace("-", "_")
+            is_re_kpi = any(k in kpi_lower for k in _re_kpis)
+            if is_re_kpi:
+                urgency = "critical" if severity == "critical" else "warning"
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.RE_TRAINING_REQUESTED,
+                        source_system="evo",
+                        data={
+                            "source_system": "evo",
+                            "kpi": kpi,
+                            "urgency": urgency,
+                            "current_value": current_value,
+                            "baseline_value": rolling_avg,
+                            "reason": (
+                                f"Benchmark regression on RE KPI '{kpi}': "
+                                f"current={current_value:.4f}, avg={rolling_avg:.4f}, "
+                                f"severity={severity}"
+                            ),
+                        },
+                    ))
+                    self._logger.warning(
+                        "re_training_requested_emitted",
+                        kpi=kpi,
+                        urgency=urgency,
+                        current_value=round(current_value, 4),
+                    )
+                except Exception as exc:
+                    self._logger.warning("re_training_requested_emit_failed", error=str(exc))
+
+            # ── Path 4: parameter rollback proposal ───────────────────────
+            # If Evo recently adjusted parameters and a KPI has now regressed,
+            # the adjustment may be the cause.  Queue a rollback PatternCandidate
+            # so the hypothesis engine can evaluate whether reverting is warranted.
+            # Condition: there are pending adjustments in the ParameterTuner that
+            # have NOT yet been evaluated (evaluation window not yet elapsed).
+            # Severity guard: only for warning+ to avoid triggering on transient
+            # single-sample noise that the tuner's feedback loop will already catch.
+            if (
+                self._orchestrator is not None
+                and hasattr(self._orchestrator, "_tuner")
+                and severity in ("warning", "critical")
+            ):
+                try:
+                    tuner = self._orchestrator._tuner
+                    pending = getattr(tuner, "_pending_adjustments", [])
+                    if pending:
+                        # Find the most-recent unevaluated adjustment as the suspect
+                        # (sorted descending by timestamp_applied).
+                        recent = sorted(
+                            [r for r in pending if not getattr(r, "confirmed", False) and not getattr(r, "reverted", False)],
+                            key=lambda r: getattr(r, "timestamp_applied", 0.0),
+                            reverse=True,
+                        )
+                        if recent:
+                            suspect = recent[0]
+                            candidate = PatternCandidate(
+                                pattern_type=PatternType.TEMPORAL,
+                                description=(
+                                    f"KPI '{kpi}' regressed (current={current_value:.4f}, "
+                                    f"avg={rolling_avg:.4f}) after parameter adjustment "
+                                    f"'{suspect.param_path}' "
+                                    f"({suspect.old_value:.4f}→{suspect.new_value:.4f}). "
+                                    "Hypothesis: reverting the adjustment may restore KPI. "
+                                    "Awaiting ParameterTuner.tick_evaluation() confirmation."
+                                ),
+                                labels=[
+                                    "parameter_rollback_proposal",
+                                    f"kpi:{kpi}",
+                                    f"param:{suspect.param_path}",
+                                    f"severity:{severity}",
+                                ],
+                                count=consecutive,
+                                confidence=0.55,
+                                examples=[
+                                    f"regression_{kpi}_after_{suspect.param_path}_change"
+                                ],
+                                metadata={
+                                    "source": "benchmark_regression_rollback_detector",
+                                    "kpi": kpi,
+                                    "severity": severity,
+                                    "current_value": current_value,
+                                    "rolling_avg": rolling_avg,
+                                    "suspect_param": suspect.param_path,
+                                    "suspect_old_value": suspect.old_value,
+                                    "suspect_new_value": suspect.new_value,
+                                    "hypothesis_id": getattr(suspect, "hypothesis_id", None),
+                                    "hypothesis_domain": f"parameter_rollback.{kpi}",
+                                },
+                                source_detector="benchmark_regression_monitor",
+                            )
+                            self._pending_candidates.append(candidate)
+                            self._logger.info(
+                                "parameter_rollback_candidate_queued",
+                                kpi=kpi,
+                                suspect_param=suspect.param_path,
+                                suspect_delta=round(suspect.new_value - suspect.old_value, 4),
+                                consecutive=consecutive,
+                            )
+                except Exception as exc:
+                    self._logger.debug(
+                        "parameter_rollback_proposal_failed", error=str(exc)
+                    )
+
+        except Exception as exc:
+            self._logger.warning("on_benchmark_regression_failed", error=str(exc))
+
+    async def _on_domain_kpi_snapshot(self, event: Any) -> None:
+        """Keep _last_benchmark_kpis fresh from periodic DOMAIN_KPI_SNAPSHOT events.
+
+        Benchmarks emits DOMAIN_KPI_SNAPSHOT on every Nexus epistemic cycle, RE export,
+        and economic deferral — far more frequently than BENCHMARK_REGRESSION which only
+        fires on degradation. Without this handler, ParameterTuner.tick_evaluation() sees
+        current_metrics={} between regression cycles and cannot compute meaningful ratios.
+
+        Only well-known numeric KPI keys are ingested to prevent noise from domain-specific
+        string fields (e.g. "trend_direction").
+        """
+        _KNOWN_FLOAT_KEYS = frozenset({
+            "decision_quality", "llm_dependency", "economic_ratio", "learning_rate",
+            "mutation_success_rate", "effective_intelligence_ratio", "compression_ratio",
+            "re_success_rate", "re_usage_pct", "epistemic_value_per_cycle",
+            "schema_quality_trend", "success_rate", "profitability",
+        })
+        try:
+            data = getattr(event, "data", {}) or {}
+            for key, value in data.items():
+                if key in _KNOWN_FLOAT_KEYS and isinstance(value, (int, float)):
+                    self._last_benchmark_kpis[key] = float(value)
+        except Exception:
+            pass
+
     async def _on_somatic_modulation_signal(self, event: Any) -> None:
         """Cache Soma's curiosity drive from SOMATIC_MODULATION_SIGNAL broadcasts."""
         try:
@@ -3405,6 +4577,496 @@ class EvoService:
             self._cached_soma_curiosity_drive = max(0.0, min(1.0, curiosity))
         except Exception:
             pass
+
+    async def _on_belief_consolidated(self, event: Any) -> None:
+        """Handle BELIEF_CONSOLIDATED from Memory.
+
+        Memory emits this after consolidate() completes — one or more beliefs
+        have been hardened into read-only nodes. Evo boosts any active hypothesis
+        whose statement overlaps with the consolidated belief text, treating
+        Memory's confirmation as strong supporting evidence.
+
+        Payload: belief_id (str), statement (str), confidence (float),
+                 domain (str), supporting_episode_count (int)
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            belief_statement = str(data.get("statement", ""))
+            belief_confidence = float(data.get("confidence", 0.5))
+            belief_id = str(data.get("belief_id", ""))
+            domain = str(data.get("domain", ""))
+
+            if not belief_statement or belief_confidence < 0.4:
+                return
+
+            keywords = [w for w in belief_statement.lower().split() if len(w) > 4][:10]
+            active = self._hypothesis_engine.get_active()
+            boosted = 0
+            for h in active:
+                stmt_lower = h.statement.lower()
+                overlap = sum(1 for kw in keywords if kw in stmt_lower)
+                if overlap < 2:
+                    continue
+                # Scale boost by confidence and keyword overlap
+                boost = belief_confidence * min(0.8, overlap * 0.15)
+                h.evidence_score += boost * h.volatility_weight
+                h.supporting_episodes.append(f"belief_consolidated:{belief_id}")
+                if len(h.supporting_episodes) > 50:
+                    h.supporting_episodes = h.supporting_episodes[-50:]
+                boosted += 1
+
+            if boosted:
+                self._logger.info(
+                    "belief_consolidated_hypothesis_boost",
+                    belief_id=belief_id,
+                    domain=domain,
+                    hypotheses_boosted=boosted,
+                    belief_confidence=round(belief_confidence, 3),
+                )
+        except Exception as exc:
+            self._logger.warning("belief_consolidated_handler_failed", error=str(exc))
+
+    async def _on_schema_formed(self, event: Any) -> None:
+        """Handle SCHEMA_FORMED from Thread.
+
+        When a new identity schema crystallises from experience, Evo creates a
+        matching WORLD_MODEL hypothesis. The hypothesis tracks whether the schema
+        proves stable — if it survives evidence accumulation it becomes a codified
+        belief about the organism's identity structure.
+
+        Payload: schema_id (str), statement (str), strength (str),
+                 supporting_episode_count (int)
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            schema_id = str(data.get("schema_id", ""))
+            statement = str(data.get("statement", ""))
+            supporting_count = int(data.get("supporting_episode_count", 0))
+
+            if not statement or not schema_id:
+                return
+
+            h_id = f"schema_{schema_id}"
+            existing_ids = {h.id for h in self._hypothesis_engine.get_all_active()}
+            if h_id in existing_ids:
+                return
+
+            from systems.evo.types import HypothesisCategory
+
+            h = Hypothesis(
+                id=h_id,
+                category=HypothesisCategory.SELF_MODEL,
+                statement=(
+                    f"Identity schema formed: {statement[:300]}. "
+                    f"Schema will prove stable if it accumulates further supporting evidence."
+                ),
+                formal_test=(
+                    f"Schema {schema_id} should be consistently supported across "
+                    "diverse episode types without disconfirmation."
+                ),
+                complexity_penalty=0.05,
+                status=HypothesisStatus.TESTING,
+                evidence_score=min(2.0, supporting_count * 0.2),
+                novelty_score=0.6,
+            )
+            self._hypothesis_engine._active[h.id] = h
+            self._hypothesis_engine._total_proposed += 1
+
+            self._logger.info(
+                "schema_formed_hypothesis_created",
+                hypothesis_id=h.id,
+                schema_id=schema_id,
+                supporting_count=supporting_count,
+            )
+        except Exception as exc:
+            self._logger.warning("schema_formed_handler_failed", error=str(exc))
+
+    async def _on_schema_evolved(self, event: Any) -> None:
+        """Handle SCHEMA_EVOLVED from Thread.
+
+        When an identity schema is promoted or modified, update evidence on the
+        corresponding Evo hypothesis. Promotion strengthens the hypothesis;
+        a schema_id not in our active set is silently ignored (may predate Evo).
+
+        Payload: schema_id (str), parent_schema_id (str),
+                 evolution_reason (str), new_strength (str)
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            schema_id = str(data.get("schema_id", ""))
+            evolution_reason = str(data.get("evolution_reason", ""))
+            new_strength = str(data.get("new_strength", ""))
+
+            if not schema_id:
+                return
+
+            h_id = f"schema_{schema_id}"
+            h = self._hypothesis_engine._active.get(h_id)
+            if h is None:
+                return
+
+            # Schema promotion = supporting evidence
+            boost = 0.5
+            if new_strength in ("strong", "very_strong", "core"):
+                boost = 1.0
+            h.evidence_score += boost * h.volatility_weight
+            h.supporting_episodes.append(f"schema_evolved:{schema_id}")
+            if len(h.supporting_episodes) > 50:
+                h.supporting_episodes = h.supporting_episodes[-50:]
+
+            self._logger.debug(
+                "schema_evolved_hypothesis_boosted",
+                schema_id=schema_id,
+                new_strength=new_strength,
+                new_score=round(h.evidence_score, 3),
+                reason=evolution_reason[:60],
+            )
+        except Exception as exc:
+            self._logger.warning("schema_evolved_handler_failed", error=str(exc))
+
+    async def _on_convergence_detected(self, event: Any) -> None:
+        """Handle CONVERGENCE_DETECTED from Nexus.
+
+        Structural isomorphism across federation instances is strong cross-validation.
+        Boost any active hypothesis that overlaps with the converged structure — this
+        is independent confirmation from a diverse source.
+
+        Payload: structure_type (str), convergence_score (float),
+                 source_diversity (float), triangulation_confidence (float),
+                 description (str)
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            convergence_score = float(data.get("convergence_score", 0.0))
+            triangulation_confidence = float(data.get("triangulation_confidence", 0.0))
+            description = str(data.get("description", data.get("structure_type", "")))
+            source_diversity = float(data.get("source_diversity", 0.0))
+
+            if convergence_score < 0.5 or not description:
+                return
+
+            # Effective confidence = geometric mean of convergence + triangulation
+            effective_confidence = (convergence_score * triangulation_confidence) ** 0.5
+
+            keywords = [w for w in description.lower().split() if len(w) > 4][:8]
+            active = self._hypothesis_engine.get_active()
+            boosted = 0
+            for h in active:
+                stmt_lower = h.statement.lower()
+                overlap = sum(1 for kw in keywords if kw in stmt_lower)
+                if overlap < 1:
+                    continue
+                # Scale boost: diversity bonus means diverse peers agree = stronger signal
+                diversity_bonus = 1.0 + source_diversity * 0.5
+                boost = effective_confidence * 0.6 * diversity_bonus
+                h.evidence_score += boost * h.volatility_weight
+                boosted += 1
+
+            if boosted:
+                self._logger.info(
+                    "convergence_detected_hypotheses_boosted",
+                    hypotheses_boosted=boosted,
+                    convergence_score=round(convergence_score, 3),
+                    source_diversity=round(source_diversity, 3),
+                )
+        except Exception as exc:
+            self._logger.warning("convergence_detected_handler_failed", error=str(exc))
+
+    async def _on_dream_insight(self, event: Any) -> None:
+        """Handle DREAM_INSIGHT from Oneiros REM stage.
+
+        REM DreamGenerator emits this for insights with coherence ≥ 0.70.
+        Evo creates or strengthens a hypothesis from the dream-derived structure.
+        Dream insights are moderate-confidence (simulated, not empirical) but
+        can surface latent patterns the wake-mode detectors miss.
+
+        Payload: insight_id (str), content (str), coherence (float),
+                 domain (str), source_hypotheses (list[str])
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            insight_id = str(data.get("insight_id", ""))
+            content = str(data.get("content", data.get("description", "")))
+            coherence = float(data.get("coherence", 0.0))
+            domain = str(data.get("domain", "general"))
+            source_hypotheses: list[str] = data.get("source_hypotheses", [])
+
+            if coherence < 0.70 or not content:
+                return
+
+            # If source_hypotheses overlap with active hypotheses, boost them
+            boosted_existing = 0
+            for src_id in source_hypotheses:
+                h = self._hypothesis_engine._active.get(src_id)
+                if h is None:
+                    continue
+                boost = coherence * 0.3  # Dreams are moderate evidence
+                h.evidence_score += boost * h.volatility_weight
+                h.supporting_episodes.append(f"dream_insight:{insight_id}")
+                if len(h.supporting_episodes) > 50:
+                    h.supporting_episodes = h.supporting_episodes[-50:]
+                boosted_existing += 1
+
+            # If no source hypotheses match, create a new WORLD_MODEL hypothesis
+            if not boosted_existing and len(content) > 20:
+                h_id = f"dream_insight_{insight_id or abs(hash(content)) % 100_000}"
+                existing_ids = {h.id for h in self._hypothesis_engine.get_all_active()}
+                if h_id not in existing_ids and len(existing_ids) < 500:
+                    from systems.evo.types import HypothesisCategory
+
+                    h = Hypothesis(
+                        id=h_id,
+                        category=HypothesisCategory.WORLD_MODEL,
+                        statement=f"Dream-derived insight (coherence={coherence:.2f}): {content[:300]}",
+                        formal_test=(
+                            "Insight holds if wake-mode episodes provide corroborating evidence "
+                            "across at least 2 independent domains."
+                        ),
+                        complexity_penalty=0.10,
+                        status=HypothesisStatus.PROPOSED,
+                        evidence_score=coherence * 1.5,  # Dream-weighted starting score
+                        novelty_score=min(1.0, coherence),
+                        min_age_hours=1.0,
+                    )
+                    self._hypothesis_engine._active[h.id] = h
+                    self._hypothesis_engine._total_proposed += 1
+                    self._logger.info(
+                        "dream_insight_hypothesis_created",
+                        hypothesis_id=h.id,
+                        coherence=round(coherence, 3),
+                        domain=domain,
+                    )
+        except Exception as exc:
+            self._logger.warning("dream_insight_handler_failed", error=str(exc))
+
+    async def _on_triangulation_weight_update(self, event: Any) -> None:
+        """Handle TRIANGULATION_WEIGHT_UPDATE from Nexus.
+
+        When our instance triangulation weight is recalculated, adjust the
+        confidence multiplier applied to cross-validated hypotheses. Low weight
+        means our beliefs are outliers — reduce cross-validation boosts. High
+        weight means we align with peers — increase them.
+
+        We cache the weight so it applies at the next evidence evaluation sweep.
+
+        Payload: instance_id (str), triangulation_weight (float), peer_count (int)
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            triangulation_weight = float(data.get("triangulation_weight", 0.5))
+            peer_count = int(data.get("peer_count", 0))
+
+            # Cache for use in convergence boost calculations
+            self._triangulation_weight = max(0.0, min(1.0, triangulation_weight))
+
+            self._logger.debug(
+                "triangulation_weight_updated",
+                triangulation_weight=round(triangulation_weight, 3),
+                peer_count=peer_count,
+            )
+        except Exception as exc:
+            self._logger.warning("triangulation_weight_update_handler_failed", error=str(exc))
+
+    async def _on_divergence_pressure(self, event: Any) -> None:
+        """Handle DIVERGENCE_PRESSURE from Nexus.
+
+        When our triangulation weight falls below 0.4, Nexus emits this event.
+        Evo queues PatternCandidates that diversify hypothesis domains — the
+        organism should explore areas where it currently holds minority views.
+
+        Payload: instance_id (str), triangulation_weight (float),
+                 saturated_domains (list[str]), direction (str)
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            triangulation_weight = float(data.get("triangulation_weight", 0.5))
+            saturated_domains: list[str] = data.get("saturated_domains", [])
+            direction = str(data.get("direction", "explore"))
+
+            if triangulation_weight >= 0.4:
+                return  # Only act under genuine divergence pressure
+
+            # Queue a PatternCandidate for each saturated domain to diversify
+            from systems.evo.types import PatternCandidate, PatternType
+
+            for domain in saturated_domains[:5]:
+                candidate = PatternCandidate(
+                    type=PatternType.COOCCURRENCE,
+                    elements=[
+                        f"divergence_pressure:{domain}",
+                        "hypothesis_diversity_needed",
+                        f"triangulation_weight:{triangulation_weight:.2f}",
+                    ],
+                    count=1,
+                    confidence=0.55,
+                    metadata={
+                        "source": "nexus_divergence_pressure",
+                        "saturated_domain": domain,
+                        "triangulation_weight": triangulation_weight,
+                        "direction": direction,
+                        "hypothesis_hint": (
+                            f"Instance diverges from federation on '{domain}' — "
+                            f"explore alternative hypotheses to diversify perspective."
+                        ),
+                    },
+                    source_detector="nexus_divergence",
+                )
+                self._pending_candidates.append(candidate)
+
+            self._logger.info(
+                "divergence_pressure_candidates_queued",
+                triangulation_weight=round(triangulation_weight, 3),
+                saturated_domains=saturated_domains[:5],
+                candidates_queued=min(len(saturated_domains), 5),
+            )
+        except Exception as exc:
+            self._logger.warning("divergence_pressure_handler_failed", error=str(exc))
+
+    async def _on_turning_point_detected(self, event: Any) -> None:
+        """Handle TURNING_POINT_DETECTED from Thread.
+
+        A narrative inflection point with high surprise_magnitude is a signal
+        that the organism's world model was wrong. Evo queues a TEMPORAL
+        PatternCandidate so the next consolidation generates a hypothesis about
+        what changed at this narrative boundary.
+
+        Only events with surprise_magnitude ≥ 0.4 generate candidates.
+
+        Payload: turning_point_id (str), type (str), chapter_id (str),
+                 surprise_magnitude (float), narrative_weight (float)
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            turning_point_id = str(data.get("turning_point_id", ""))
+            turning_type = str(data.get("type", "unknown"))
+            surprise_magnitude = float(data.get("surprise_magnitude", 0.0))
+            narrative_weight = float(data.get("narrative_weight", 0.5))
+            chapter_id = str(data.get("chapter_id", ""))
+
+            if surprise_magnitude < 0.4:
+                return
+
+            from systems.evo.types import PatternCandidate, PatternType
+
+            candidate = PatternCandidate(
+                type=PatternType.TEMPORAL,
+                elements=[
+                    f"narrative_turning_point:{turning_type}",
+                    f"surprise:{surprise_magnitude:.2f}",
+                    f"chapter:{chapter_id}" if chapter_id else "chapter:unknown",
+                ],
+                count=1,
+                confidence=min(0.75, 0.3 + surprise_magnitude * 0.5),
+                metadata={
+                    "source": "thread_turning_point",
+                    "turning_point_id": turning_point_id,
+                    "turning_type": turning_type,
+                    "surprise_magnitude": surprise_magnitude,
+                    "narrative_weight": narrative_weight,
+                    "chapter_id": chapter_id,
+                    "hypothesis_hint": (
+                        f"A '{turning_type}' narrative turning point "
+                        f"(surprise={surprise_magnitude:.2f}) suggests the world model "
+                        "needs updating — what assumption changed?"
+                    ),
+                },
+                source_detector="thread_narrative",
+            )
+            self._pending_candidates.append(candidate)
+
+            self._logger.info(
+                "turning_point_candidate_queued",
+                turning_point_id=turning_point_id,
+                turning_type=turning_type,
+                surprise_magnitude=round(surprise_magnitude, 3),
+            )
+        except Exception as exc:
+            self._logger.warning("turning_point_handler_failed", error=str(exc))
+
+    async def _on_phantom_parameter_adjusted(self, event: Any) -> None:
+        """Handle PHANTOM_PARAMETER_ADJUSTED from Phantom Liquidity.
+
+        Phantom emits this after applying an EVO_ADJUST_BUDGET parameter change.
+        Score the matching hypothesis as CONFIRMED (direction matches expected) or
+        record evidence for the next consolidation cycle.
+
+        Payload: parameter (str), old_value (float), new_value (float),
+                 pool_address (str), hypothesis_id (str, optional)
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            parameter = str(data.get("parameter", "unknown"))
+            old_value = float(data.get("old_value", 0.0))
+            new_value = float(data.get("new_value", 0.0))
+            hypothesis_id = data.get("hypothesis_id", "")
+
+            self._logger.info(
+                "phantom_parameter_adjusted_received",
+                parameter=parameter,
+                old_value=round(old_value, 6),
+                new_value=round(new_value, 6),
+                hypothesis_id=hypothesis_id or "none",
+            )
+
+            # If Phantom included the originating hypothesis_id, confirm it
+            if hypothesis_id and self._hypothesis_engine is not None:
+                await self._hypothesis_engine.record_outcome(
+                    hypothesis_id=hypothesis_id,
+                    outcome="confirmed",
+                    evidence_delta=0.15,
+                    metadata={
+                        "source": "phantom_parameter_adjusted",
+                        "parameter": parameter,
+                        "old_value": old_value,
+                        "new_value": new_value,
+                    },
+                )
+            else:
+                # Queue a PatternCandidate so the next consolidation can generate
+                # a hypothesis about this parameter's adjustability
+                from systems.evo.types import PatternCandidate, PatternType
+
+                candidate = PatternCandidate(
+                    type=PatternType.CAUSAL,
+                    elements=[
+                        f"phantom_parameter:{parameter}",
+                        f"direction:{'increased' if new_value > old_value else 'decreased'}",
+                        "phantom_liquidity",
+                    ],
+                    count=1,
+                    confidence=0.55,
+                    metadata={
+                        "source": "phantom_parameter_adjusted",
+                        "parameter": parameter,
+                        "old_value": old_value,
+                        "new_value": new_value,
+                        "hypothesis_hint": (
+                            f"Phantom parameter '{parameter}' was adjusted "
+                            f"({old_value:.4f} → {new_value:.4f}) — "
+                            "track whether this improves IL outcomes."
+                        ),
+                    },
+                    source_detector="phantom_liquidity",
+                )
+                self._pending_candidates.append(candidate)
+        except Exception as exc:
+            self._logger.warning("phantom_parameter_adjusted_handler_failed", error=str(exc))
 
     async def _on_hypothesis_staleness(self, event: Any) -> None:
         """Degradation Engine §8.2 — decay evidence_score on PROPOSED/TESTING hypotheses.
@@ -3700,6 +5362,304 @@ class EvoService:
 
         except Exception:
             self._logger.exception("opportunities_discovered_handler_failed")
+
+    async def _on_learning_opportunity_detected(self, event: Any) -> None:
+        """
+        Handle LEARNING_OPPORTUNITY_DETECTED from Nova's OpportunityScanner.
+
+        A technical resource (paper, repo, or discussion) relevant to the organism's
+        capability gaps has been found.  Evo converts it into a learning hypothesis:
+        a high-priority COOCCURRENCE PatternCandidate that will be processed at the
+        next consolidation and generate a formal "learn from X" hypothesis if enough
+        related candidates accumulate.
+
+        This bypasses the Nova goal system — Evo is the right recipient because
+        learning opportunities are about *hypothesis formation*, not task execution.
+        """
+        if not self._initialized:
+            return
+
+        try:
+            from systems.evo.types import PatternCandidate, PatternType  # noqa: PLC0415
+
+            data = getattr(event, "data", {}) or {}
+            resource_type: str = data.get("resource_type", "unknown")
+            title: str = data.get("title", "")
+            domain: str = data.get("domain", "")
+            relevance: float = float(data.get("relevance_score", 0.5))
+            gaps: list[str] = data.get("capability_gaps_addressed", [])
+            url: str = data.get("url", "")
+            source: str = data.get("source", "unknown")
+
+            if not title or relevance < 0.30:
+                return
+
+            # Confidence scales with relevance + number of gaps addressed
+            confidence = min(0.80, relevance * 0.6 + len(gaps) * 0.05)
+
+            # Elements link the resource to specific capability gaps
+            elements = [f"learning_resource:{resource_type}", f"capability_domain:{domain}"]
+            elements.extend(f"gap_addressed:{g}" for g in gaps[:5])
+
+            candidate = PatternCandidate(
+                type=PatternType.COOCCURRENCE,
+                elements=elements,
+                count=1,
+                confidence=confidence,
+                metadata={
+                    "title": title[:200],
+                    "resource_type": resource_type,
+                    "domain": domain,
+                    "relevance_score": relevance,
+                    "capability_gaps_addressed": gaps,
+                    "url": url,
+                    "source": source,
+                    "source_detector": "nova_learning_opportunity_scanner",
+                    "hypothesis_hint": (
+                        f"Studying '{title[:80]}' ({resource_type} from {source}) "
+                        f"could close capability gap(s): {', '.join(gaps[:3]) or domain}."
+                    ),
+                },
+                source_detector="nova_learning_opportunity_scanner",
+            )
+            self._pending_candidates.append(candidate)
+
+            self._logger.info(
+                "learning_opportunity_candidate_queued",
+                resource_type=resource_type,
+                domain=domain,
+                relevance=round(relevance, 3),
+                gaps=gaps[:3],
+                pending_candidates=len(self._pending_candidates),
+            )
+
+        except Exception:
+            self._logger.exception("learning_opportunity_handler_failed")
+
+    async def _on_action_executed(self, event: Any) -> None:
+        """
+        Handle ACTION_EXECUTED from Axon — hypothesis confirmation path.
+
+        If any step outcome carries a hypothesis_id or the intent was linked to
+        an experiment, feed the success signal into the hypothesis engine and emit
+        EVO_HYPOTHESIS_CONFIRMED so Nova and RE can update their priors.
+
+        Payload fields used:
+          intent_id      (str) — originating Intent (may link to a hypothesis via
+                                  decision records if hypothesis_id not explicit)
+          step_outcomes  (list[dict]) — checked for hypothesis_id in metadata
+          episode_id     (str) — included in confirmation evidence
+
+        Does NOT raise — never interrupt the event bus.
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            intent_id: str = str(data.get("intent_id", ""))
+            episode_id: str = str(data.get("episode_id", ""))
+            step_outcomes: list[dict] = list(data.get("step_outcomes", []) or [])
+
+            # Extract hypothesis_id from step-level metadata if present.
+            hypothesis_id: str = ""
+            for step in step_outcomes:
+                _meta = step.get("metadata") or step.get("re_training_trace") or {}
+                hypothesis_id = str(_meta.get("hypothesis_id", ""))
+                if hypothesis_id:
+                    break
+
+            # Fall back to matching via active hypotheses linked to this intent.
+            if not hypothesis_id:
+                for h in self._hypothesis_engine.get_active():
+                    if intent_id and str(getattr(h, "intent_id", "")) == intent_id:
+                        hypothesis_id = h.id
+                        break
+
+            if not hypothesis_id:
+                return
+
+            hypothesis = self._hypothesis_engine.get_hypothesis(hypothesis_id)
+            if hypothesis is None:
+                return
+
+            # Nudge hypothesis confidence upward via the standard outcome path.
+            # economic_delta=0.0 since ACTION_EXECUTED carries no economic signal.
+            await self._apply_outcome_to_hypothesis(
+                hypothesis,
+                success=True,
+                economic_delta=0.0,
+                intent_id=intent_id,
+            )
+
+            self._logger.debug(
+                "action_executed_hypothesis_confirmed",
+                hypothesis_id=hypothesis_id,
+                intent_id=intent_id,
+                evidence_score=round(getattr(hypothesis, "evidence_score", 0.0), 3),
+            )
+
+            # Emit EVO_HYPOTHESIS_CONFIRMED so Nova and RE receive the signal.
+            await self._emit_hypothesis_lifecycle_events([hypothesis], "confirmed")
+
+        except Exception as exc:
+            self._logger.debug("on_action_executed_evo_failed", error=str(exc))
+
+    async def _on_action_failed_evo(self, event: Any) -> None:
+        """
+        Handle ACTION_FAILED from Axon — hypothesis refutation path.
+
+        If a hypothesis_id can be resolved from step metadata, record negative
+        evidence and emit EVO_HYPOTHESIS_REFUTED so the organism learns that the
+        hypothesis was wrong (or the action was wrong for the hypothesis).
+
+        Payload fields used:
+          intent_id      (str)
+          failure_reason (str)
+          step_outcomes  (list[dict]) — checked for hypothesis_id in metadata
+
+        Does NOT raise — never interrupt the event bus.
+        """
+        if not self._initialized or self._hypothesis_engine is None:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            intent_id: str = str(data.get("intent_id", ""))
+            episode_id: str = str(data.get("episode_id", ""))
+            failure_reason: str = str(data.get("failure_reason", "unknown"))
+            step_outcomes: list[dict] = list(data.get("step_outcomes", []) or [])
+
+            # Extract hypothesis_id from step-level metadata.
+            hypothesis_id: str = ""
+            for step in step_outcomes:
+                _meta = step.get("metadata") or step.get("re_training_trace") or {}
+                hypothesis_id = str(_meta.get("hypothesis_id", ""))
+                if hypothesis_id:
+                    break
+
+            # Fall back to intent-linked hypothesis.
+            if not hypothesis_id:
+                for h in self._hypothesis_engine.get_active():
+                    if intent_id and str(getattr(h, "intent_id", "")) == intent_id:
+                        hypothesis_id = h.id
+                        break
+
+            if not hypothesis_id:
+                return
+
+            hypothesis = self._hypothesis_engine.get_hypothesis(hypothesis_id)
+            if hypothesis is None:
+                return
+
+            # Nudge hypothesis confidence downward via the standard outcome path.
+            await self._apply_outcome_to_hypothesis(
+                hypothesis,
+                success=False,
+                economic_delta=0.0,
+                intent_id=intent_id,
+            )
+
+            self._logger.debug(
+                "action_failed_hypothesis_refuted",
+                hypothesis_id=hypothesis_id,
+                intent_id=intent_id,
+                failure_reason=failure_reason[:80],
+                evidence_score=round(getattr(hypothesis, "evidence_score", 0.0), 3),
+            )
+
+            # Emit EVO_HYPOTHESIS_REFUTED.
+            await self._emit_hypothesis_lifecycle_events([hypothesis], "refuted")
+
+        except Exception as exc:
+            self._logger.debug("on_action_failed_evo_failed", error=str(exc))
+
+    async def _on_oikos_economic_episode(self, event: Any) -> None:
+        """Handle OIKOS_ECONOMIC_EPISODE — score economic hypothesis outside SACM path.
+
+        Oikos emits structured economic episode summaries after bounty/yield/asset
+        outcomes. Evo uses these to create or update PatternCandidates for economic
+        strategy hypotheses, complementing the SACM provider-reliability path.
+
+        Payload keys: action_type (str), success (bool), roi_pct (float), protocol (str),
+        capital_deployed_usd (float), causal_applicable_domains (list[str]).
+        """
+        if not self._initialized:
+            return
+        try:
+            from systems.evo.types import PatternCandidate, PatternType  # noqa: PLC0415
+
+            data = getattr(event, "data", {}) or {}
+            action_type: str = str(data.get("action_type", "unknown"))
+            success: bool = bool(data.get("success", False))
+            roi_pct: float = float(data.get("roi_pct", 0.0))
+            protocol: str = str(data.get("protocol", ""))
+            domains: list[str] = data.get("causal_applicable_domains", ["economic"])
+
+            # Confidence: stronger for high-ROI successes; negative for failures
+            if success:
+                confidence = min(0.80, 0.40 + min(roi_pct / 100.0, 0.40))
+            else:
+                confidence = 0.20
+
+            elements = [f"oikos_action::{action_type}"]
+            if protocol:
+                elements.append(f"protocol::{protocol}")
+            elements.extend(f"domain::{d}" for d in domains[:2])
+
+            candidate = PatternCandidate(
+                type=PatternType.COOCCURRENCE,
+                elements=elements,
+                count=1,
+                description=(
+                    f"Oikos economic episode: {action_type} via {protocol or 'direct'} "
+                    f"{'succeeded' if success else 'failed'} (roi={roi_pct:.1f}%)"
+                ),
+                confidence=confidence,
+            )
+            self._pending_candidates.append(candidate)
+
+        except Exception as exc:
+            self._logger.debug("oikos_economic_episode_handler_failed", error=str(exc))
+
+    async def _on_metabolic_gate_response(self, event: Any) -> None:
+        """Handle METABOLIC_GATE_RESPONSE — denied gates → PatternCandidate for economic constraint learning.
+
+        When Oikos denies a metabolic gate, this is evidence that the current action type
+        correlates with resource scarcity in a specific domain. Evo learns this pattern so
+        future hypothesis generation can account for metabolic boundaries.
+
+        Payload keys: granted (bool), action_type (str), starvation_level (str), reason (str).
+        """
+        if not self._initialized:
+            return
+        try:
+            data = getattr(event, "data", {}) or {}
+            granted: bool = bool(data.get("granted", True))
+            if granted:
+                return  # Only learn from denials
+
+            from systems.evo.types import PatternCandidate, PatternType  # noqa: PLC0415
+
+            action_type: str = str(data.get("action_type", "unknown"))
+            starvation_level: str = str(data.get("starvation_level", "unknown"))
+
+            candidate = PatternCandidate(
+                type=PatternType.TEMPORAL,
+                elements=[
+                    f"metabolic_gate_denied::{action_type}",
+                    f"starvation_level::{starvation_level}",
+                    "economic_constraint",
+                ],
+                count=1,
+                description=(
+                    f"Metabolic gate denied '{action_type}' at starvation level '{starvation_level}'. "
+                    "Hypothesis: this action type correlates with resource scarcity in this domain."
+                ),
+                confidence=0.35,
+            )
+            self._pending_candidates.append(candidate)
+
+        except Exception as exc:
+            self._logger.debug("metabolic_gate_response_handler_failed", error=str(exc))
 
     async def _check_economic_parameter_adjustments(self) -> None:
         """
@@ -4023,25 +5983,193 @@ class EvoService:
             import os as _os_bg
             instance_id = _os_bg.environ.get("ECODIAOS_INSTANCE_ID", "eos-default")
 
+            # 4. Export Thompson tournament Beta priors (min 5 samples each)
+            tournament_beta_priors: list[dict[str, Any]] = []
+            if self._tournament_engine is not None:
+                try:
+                    for tournament in self._tournament_engine.get_all_tournaments():
+                        for ref in tournament.hypotheses:
+                            h_id = ref.hypothesis_id
+                            beta = tournament.beta_parameters.get(h_id)
+                            if beta is None:
+                                continue
+                            sample_count = int(beta.alpha + beta.beta - 2)  # Beta(1,1) is prior
+                            if sample_count < 5:
+                                continue  # Noise threshold — don't inherit single-trial priors
+                            tournament_beta_priors.append({
+                                "hypothesis_id": h_id,
+                                "hypothesis_statement": ref.statement[:120],
+                                "alpha": float(beta.alpha),
+                                "beta": float(beta.beta),
+                                "sample_count": sample_count,
+                                "tournament_id": tournament.id,
+                            })
+                except Exception:
+                    pass  # Non-fatal — genome exports without tournament priors
+
             genome = BeliefGenomeInheritance(
                 instance_id=instance_id,
                 generation=1,
                 top_50_hypotheses=top_hypotheses,
                 drive_weight_snapshot=drive_snapshot,
                 drift_history=drift_history,
+                tournament_beta_priors=tournament_beta_priors,
             )
+            # Seal with checksum for integrity verification on child apply
+            genome.seal()
 
             self._logger.info(
                 "belief_genome_exported",
                 genome_id=genome.genome_id,
                 hypothesis_count=len(top_hypotheses),
                 drift_entries=len(drift_history),
+                tournament_priors=len(tournament_beta_priors),
             )
             return genome
 
         except Exception as exc:
             self._logger.error("export_belief_genome_failed", error=str(exc))
             return None
+
+    async def _apply_inherited_belief_genome_if_child(self) -> None:
+        """
+        Child-side bootstrap: deserialise parent BeliefGenome from environment.
+
+        Reads ECODIAOS_BELIEF_GENOME_PAYLOAD (JSON-encoded BeliefGenome) injected
+        by LocalDockerSpawner.  If present, seeds the hypothesis engine with parent
+        hypothesis priors so the child starts with warm beliefs rather than a blank
+        slate.  Non-fatal — child falls back to default empty state on any error.
+
+        Only runs when ECODIAOS_IS_GENESIS_NODE != 'true'.
+        """
+        import json as _json
+        import os as _os
+
+        if _os.environ.get("ECODIAOS_IS_GENESIS_NODE", "true").lower() == "true":
+            return
+
+        payload_json = _os.environ.get("ECODIAOS_BELIEF_GENOME_PAYLOAD", "").strip()
+        if not payload_json:
+            return
+
+        try:
+            from primitives.genome_inheritance import BeliefGenome
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            data = _json.loads(payload_json)
+            parent_genome = BeliefGenome.model_validate(data)
+
+            # Verify genome integrity before applying — silent corruption = skip inheritance
+            if not parent_genome.verify():
+                self._logger.warning(
+                    "belief_genome_checksum_mismatch",
+                    genome_id=str(parent_genome.genome_id),
+                    stored=parent_genome.genome_checksum,
+                    computed=parent_genome._compute_checksum(),
+                    note="Skipping genome inheritance due to integrity failure",
+                )
+                return
+
+            _MIN_SUPPORTING_COUNT = 3  # Require ≥3 episodes before inheriting a hypothesis
+
+            hypotheses_seeded = 0
+            if self._hypothesis_engine is not None and parent_genome.top_50_hypotheses:
+                for h_dict in parent_genome.top_50_hypotheses:
+                    try:
+                        # Skip low-evidence hypotheses — N=1 inheritance carries more noise than signal
+                        if h_dict.get("supporting_count", 0) < _MIN_SUPPORTING_COUNT:
+                            continue
+                        # Register each inherited hypothesis as a PatternCandidate so the
+                        # hypothesis engine can promote it during the first consolidation pass.
+                        candidate = PatternCandidate(
+                            pattern_type=PatternType.COOCCURRENCE,
+                            elements=[
+                                f"inherited:{h_dict.get('category', 'unknown')}",
+                                str(h_dict.get("statement", ""))[:120],
+                            ],
+                            confidence=float(h_dict.get("confidence", 0.0)) * 0.95,
+                            context_summary=f"Inherited from parent {parent_genome.instance_id}",
+                            extra={
+                                "inherited": True,
+                                "parent_evidence_score": h_dict.get("evidence_score", 0.0),
+                                "parent_supporting_count": h_dict.get("supporting_count", 0),
+                                "parent_genome_id": str(parent_genome.genome_id),
+                            },
+                        )
+                        self._pending_candidates.append(candidate)
+                        hypotheses_seeded += 1
+                    except Exception:
+                        pass
+
+            # Store drive weight snapshot for reference (Equor may override at runtime)
+            if parent_genome.drive_weight_snapshot is not None:
+                self._inherited_drive_weights: dict[str, float] = {
+                    "coherence": parent_genome.drive_weight_snapshot.coherence,
+                    "care": parent_genome.drive_weight_snapshot.care,
+                    "growth": parent_genome.drive_weight_snapshot.growth,
+                    "honesty": parent_genome.drive_weight_snapshot.honesty,
+                }
+
+            # Store drift history for analytics reference
+            if parent_genome.drift_history:
+                self._inherited_drift_history = list(parent_genome.drift_history)
+
+            # Seed tournament Beta priors into TournamentEngine
+            # Children inherit parent's learned tournament distributions, giving them a warm
+            # start rather than flat Beta(1,1) priors. Only priors with ≥5 real samples are
+            # present in the genome (filtered at export time), so all are worth inheriting.
+            tournament_priors_seeded = 0
+            if self._tournament_engine is not None and parent_genome.tournament_beta_priors:
+                for prior in parent_genome.tournament_beta_priors:
+                    try:
+                        h_id = prior.get("hypothesis_id", "")
+                        alpha = float(prior.get("alpha", 1.0))
+                        beta_val = float(prior.get("beta", 1.0))
+                        tournament_id = prior.get("tournament_id", "")
+                        if not h_id or not tournament_id:
+                            continue
+                        self._tournament_engine.seed_inherited_prior(
+                            tournament_id=tournament_id,
+                            hypothesis_id=h_id,
+                            alpha=alpha,
+                            beta=beta_val,
+                        )
+                        tournament_priors_seeded += 1
+                    except Exception:
+                        pass
+
+            self._logger.info(
+                "inherited_belief_genome",
+                parent_id=str(parent_genome.instance_id),
+                genome_id=str(parent_genome.genome_id),
+                hypotheses_seeded=hypotheses_seeded,
+                drift_entries=len(parent_genome.drift_history),
+                tournament_priors_seeded=tournament_priors_seeded,
+            )
+
+            # Notify other systems that genome was inherited
+            if self._event_bus is not None:
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.GENOME_INHERITED,
+                        source_system="evo",
+                        data={
+                            "system": "evo",
+                            "genome_id": str(parent_genome.genome_id),
+                            "parent_id": str(parent_genome.instance_id),
+                            "hypotheses_count": hypotheses_seeded,
+                            "tournament_priors_count": tournament_priors_seeded,
+                        },
+                    ))
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            self._logger.warning(
+                "belief_genome_apply_failed",
+                error=str(exc),
+                note="Proceeding with default empty hypothesis state",
+            )
 
     # ─── Stats ────────────────────────────────────────────────────────────────
 
@@ -4351,11 +6479,40 @@ class EvoService:
         assert self._orchestrator is not None
         # Checkpoint PatternContext to Redis before consolidation resets it (Spec §III gap fix)
         await self._save_pattern_context_checkpoint()
+
+        # ── Pre-consolidation KPI snapshot (for quality delta) ─────────────
+        pre_snapshot = self._snapshot_consolidation_kpis()
+
         try:
-            result = await self._orchestrator.run(self._pattern_context)
+            result = await self._orchestrator.run(
+            self._pattern_context,
+            current_metrics=dict(self._last_benchmark_kpis),
+        )
             self._cycles_since_consolidation = 0
             self._total_consolidations += 1
             self._last_consolidation_completed_at = time.monotonic()
+
+            # Reset learning pressure after consolidation; update stall threshold
+            # to reflect the new effective interval so stall detection stays accurate.
+            self._orchestrator.reset_pressure()
+            self._consolidation_expected_interval_s = (
+                self._orchestrator._effective_interval_hours() * 3600
+            )
+
+            # ── Parameter feedback-loop evaluation ────────────────────────
+            # Compare pending adjustments against current KPIs; auto-revert
+            # any that caused measurable degradation and confirm those that
+            # improved metrics.  Best-effort — never blocks consolidation.
+            if self._parameter_tuner is not None:
+                try:
+                    await self._parameter_tuner.tick_evaluation(
+                        current_metrics=dict(self._last_benchmark_kpis),
+                        cycle=self._total_consolidations,
+                    )
+                except Exception as _exc:
+                    self._logger.warning(
+                        "parameter_feedback_eval_failed", error=str(_exc)
+                    )
 
             # Push learned head-weight adjustments to Atune's meta-attention
             # Evo tunes parameters like "atune.head.novelty.weight" — extract
@@ -4379,6 +6536,16 @@ class EvoService:
             # Evo tunes nova.efe.* parameters but they were never forwarded,
             # so the learned weights had zero effect on policy selection.
             await self._push_nova_efe_weights()
+
+            # Emit EVO_ADJUST_BUDGET for axon/simula/phantom_liquidity/voxis targets.
+            # These systems subscribe to EVO_ADJUST_BUDGET (not EVO_PARAMETER_ADJUSTED)
+            # and apply bounds-checked parameter changes with local Equor review.
+            await self._push_budget_adjustments()
+
+            # Emit EVO_WEIGHT_ADJUSTMENT with current Thompson sampling weights so
+            # Nova can incorporate Evo's arm posteriors into EFE scoring for goal
+            # prioritisation. Emitted after every consolidation where tournaments exist.
+            await self._push_thompson_weight_adjustment()
 
             # Sync learnable belief half-life parameters to Neo4j.
             # ParameterTuner may have updated belief.halflife.* keys during
@@ -4492,6 +6659,10 @@ class EvoService:
 
             # Emit EVO_CONSOLIDATION_COMPLETE
             await self._emit_consolidation_complete(result)
+
+            # Emit EVO_CONSOLIDATION_QUALITY with pre/post KPI delta
+            post_snapshot = self._snapshot_consolidation_kpis()
+            await self._emit_consolidation_quality(result, pre_snapshot, post_snapshot)
 
             # Check for speciation-level behavioral shifts
             await self._check_and_emit_speciation_event(result)
@@ -4739,7 +6910,91 @@ class EvoService:
         except Exception:
             self._logger.debug("soma_stress_inject_failed", exc_info=True)
 
-    # ─── Kairos Causal Hypothesis Feeding ────────────────────────────────────
+    async def _push_budget_adjustments(self) -> None:
+        """
+        Emit EVO_ADJUST_BUDGET for high-confidence parameter hypotheses targeting
+        axon, simula, phantom_liquidity, and voxis.
+
+        These systems subscribe to EVO_ADJUST_BUDGET (not EVO_PARAMETER_ADJUSTED)
+        because their parameter changes require bounds-checking and local Equor review
+        before application. Emits one event per target system containing all
+        parameter values where a significant delta from default exists.
+        """
+        if self._parameter_tuner is None or self._event_bus is None:
+            return
+
+        _BUDGET_TARGETS = {"axon", "simula", "phantom_liquidity", "voxis"}
+
+        try:
+            from systems.evo.types import PARAMETER_DEFAULTS
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            all_params = self._parameter_tuner.get_all_parameters()
+
+            per_system: dict[str, dict[str, float]] = {}
+            for param_name, current_value in all_params.items():
+                parts = param_name.split(".")
+                if len(parts) < 2:
+                    continue
+                target = parts[0]
+                if target not in _BUDGET_TARGETS:
+                    continue
+                default_value = PARAMETER_DEFAULTS.get(param_name, current_value)
+                if abs(current_value - default_value) > 0.001:
+                    per_system.setdefault(target, {})[".".join(parts[1:])] = current_value
+
+            for target_system, adjustments in per_system.items():
+                if not adjustments:
+                    continue
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EVO_ADJUST_BUDGET,
+                    source_system="evo",
+                    data={
+                        "target_system": target_system,
+                        "adjustments": adjustments,
+                        "confidence": 0.8,
+                    },
+                ))
+                self._logger.info(
+                    "evo_adjust_budget_emitted",
+                    target=target_system,
+                    param_count=len(adjustments),
+                )
+        except Exception:
+            self._logger.debug("push_budget_adjustments_failed", exc_info=True)
+
+    async def _push_thompson_weight_adjustment(self) -> None:
+        """
+        Emit EVO_WEIGHT_ADJUSTMENT with current Thompson sampling arm posteriors.
+
+        Nova subscribes to EVO_WEIGHT_ADJUSTMENT to incorporate Evo's Thompson
+        sampling results into EFE scoring — goals backed by high-confidence Thompson
+        arms receive higher pragmatic value in Nova's deliberation.  Emitted after
+        every consolidation where at least one active tournament exists.
+        """
+        if self._event_bus is None or self._tournament_engine is None:
+            return
+        try:
+            weights = self.get_thompson_arm_weights()
+            if not weights:
+                return
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.EVO_WEIGHT_ADJUSTMENT,
+                source_system="evo",
+                data={
+                    "weights": weights,
+                    "tournament_count": len(weights),
+                },
+            ))
+            self._logger.debug(
+                "evo_weight_adjustment_emitted",
+                tournament_count=len(weights),
+            )
+        except Exception:
+            self._logger.debug("push_thompson_weight_adjustment_failed", exc_info=True)
+
+    # ─── Kairos Causal Hypothesis Feeding ────────────────────────────────────────────
 
     async def _feed_causal_hypotheses_to_kairos(
         self, hypotheses: list[Any]
@@ -4975,6 +7230,11 @@ class EvoService:
                 if not self._initialized or self._orchestrator is None:
                     continue
 
+                # ── Skia modulation halt ──────────────────────────────────────────
+                if self._modulation_halted:
+                    self._logger.debug("consolidation_skipped_modulation_halted")
+                    continue
+
                 # ── Stall detection ───────────────────────────────────────
                 now = time.monotonic()
                 stall_threshold_s = self._consolidation_expected_interval_s * 2.0
@@ -4999,6 +7259,10 @@ class EvoService:
                 # Metabolic gate: skip consolidation under starvation
                 if self._starvation_level in ("emergency", "critical"):
                     continue
+
+                # Decay learning pressure by cycles elapsed since last poll
+                # (loop sleeps 60s; at ~150ms/cycle that's ~400 cycles/min)
+                self._orchestrator.decay_pressure(self._cycles_since_consolidation)
 
                 if self._orchestrator.should_run(
                     cycle_count=self._total_broadcasts,
@@ -5040,6 +7304,55 @@ class EvoService:
             ))
         except Exception as exc:
             self._logger.error("evo_consolidation_stalled_emit_failed", error=str(exc))
+
+    async def _on_novel_action_created(self, event: Any) -> None:
+        """
+        Handle NOVEL_ACTION_CREATED from Simula.
+
+        When Simula successfully generates a novel executor, Evo:
+        1. Records a positive outcome for the propose_novel_action hypothesis domain.
+        2. Queues a PatternCandidate so the next consolidation can generate a
+           hypothesis about when novel action proposals are warranted.
+
+        On failure (success=False) Evo queues a negative candidate so the organism
+        learns to avoid propose_novel_action when Simula cannot build the executor.
+        """
+        data = getattr(event, "data", {}) or {}
+        action_name = data.get("action_name", "unknown")
+        success = bool(data.get("success", True))
+        risk_tier = data.get("risk_tier", "medium")
+        capabilities = data.get("capabilities", [])
+        proposal_id = data.get("proposal_id", "")
+
+        from systems.evo.detectors import PatternCandidate, PatternType  # lazy
+
+        confidence = 0.70 if success else 0.20
+        candidate = PatternCandidate(
+            pattern_type=PatternType.COOCCURRENCE,
+            elements=[
+                f"novel_action_{'created' if success else 'failed'}:{action_name}",
+                f"risk_tier:{risk_tier}",
+                "propose_novel_action",
+            ],
+            confidence=confidence,
+            extra={
+                "source": "novel_action_created",
+                "success": success,
+                "action_name": action_name,
+                "risk_tier": risk_tier,
+                "capabilities": capabilities,
+                "proposal_id": proposal_id,
+                "hypothesis_domain": "nova.novel_action_effectiveness",
+            },
+        )
+        self._pending_candidates.append(candidate)
+
+        self._logger.info(
+            "evo_novel_action_candidate_queued",
+            action_name=action_name,
+            success=success,
+            confidence=confidence,
+        )
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

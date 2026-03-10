@@ -76,6 +76,14 @@ logger = structlog.get_logger()
 
 _CONSOLIDATION_INTERVAL_HOURS: int = 6
 _CONSOLIDATION_CYCLE_THRESHOLD: int = 10_000
+_CONSOLIDATION_MIN_INTERVAL_HOURS: float = 1.0  # Floor: never consolidate more than once/hour
+
+# Learning pressure increment constants
+_PRESSURE_HIGH_CONFIDENCE_HYPOTHESIS: float = 0.1   # New SUPPORTED hypothesis w/ evidence ≥ 8.0
+_PRESSURE_BENCHMARK_REGRESSION: float = 0.2         # BENCHMARK_REGRESSION event
+_PRESSURE_FOVEA_CALIBRATION_ALERT: float = 0.15     # FOVEA_CALIBRATION_ALERT event
+_PRESSURE_LEARNING_PRESSURE_EVENT: float = 0.3      # LEARNING_PRESSURE event
+_PRESSURE_DECAY_PER_100_CYCLES: float = 0.05        # Natural cooldown
 
 
 class ConsolidationOrchestrator:
@@ -137,28 +145,142 @@ class ConsolidationOrchestrator:
         self._last_run_at = utc_now() - timedelta(hours=_CONSOLIDATION_INTERVAL_HOURS)
         self._total_runs: int = 0
 
+        # ── Early consolidation (LEARNING_PRESSURE) ────────────────────────
+        # Set to True by on_learning_pressure() when Benchmarks regressions
+        # accumulate. Checked in should_run() alongside the 6h / 10K gates.
+        # Minimum 1 hour since last run + ≥5 pending hypotheses required.
+        self._early_consolidation_requested: bool = False
+
+        # ── Adaptive learning pressure ──────────────────────────────────────
+        # Scalar 0.0–1.0 encoding how urgently the organism needs to consolidate.
+        # Incremented by signals (HIGH-confidence hypotheses, benchmark regressions,
+        # Fovea calibration alerts, LEARNING_PRESSURE events); decays 0.05 per 100
+        # cycles; reset to 0.0 after each consolidation.
+        # Used to shorten the effective consolidation interval:
+        #   effective_interval_hours = max(1.0, 6.0 × (1.0 − pressure))
+        self._learning_pressure: float = 0.0
+        # Cycle counter for decay accounting (updated by decay_pressure())
+        self._pressure_cycle_counter: int = 0
+
+    # ── Learning pressure API ───────────────────────────────────────────────
+
+    def add_pressure(self, delta: float) -> None:
+        """Increment learning pressure (capped at 1.0).
+
+        Called by EvoService when high-signal learning events are observed.
+        """
+        self._learning_pressure = min(1.0, self._learning_pressure + delta)
+        self._logger.debug(
+            "learning_pressure_increased",
+            delta=round(delta, 3),
+            pressure=round(self._learning_pressure, 3),
+        )
+
+    def decay_pressure(self, cycles_elapsed: int) -> None:
+        """Apply natural pressure decay — 0.05 per 100 cycles.
+
+        Call this each time the consolidation loop polls (every 60 s / ~N cycles).
+        """
+        if cycles_elapsed <= 0 or self._learning_pressure <= 0.0:
+            return
+        decay = _PRESSURE_DECAY_PER_100_CYCLES * (cycles_elapsed / 100.0)
+        self._learning_pressure = max(0.0, self._learning_pressure - decay)
+
+    @property
+    def learning_pressure(self) -> float:
+        """Current learning pressure scalar (0.0 – 1.0)."""
+        return self._learning_pressure
+
+    def _effective_interval_hours(self) -> float:
+        """Dynamic consolidation interval based on current learning pressure.
+
+        At pressure=0.0: 6 hours (default)
+        At pressure=0.5: 3 hours
+        At pressure=1.0: 1 hour (minimum)
+        """
+        return max(
+            _CONSOLIDATION_MIN_INTERVAL_HOURS,
+            _CONSOLIDATION_INTERVAL_HOURS * (1.0 - self._learning_pressure),
+        )
+
+    def on_learning_pressure(self) -> None:
+        """Signal from Evo service that a LEARNING_PRESSURE event was received.
+
+        Increments pressure and sets the early-consolidation flag so the next
+        should_run() check can fire ahead of the normal interval (subject to
+        1h minimum gap and ≥5 pending hypotheses guard).
+        """
+        self.add_pressure(_PRESSURE_LEARNING_PRESSURE_EVENT)
+        self._early_consolidation_requested = True
+        self._logger.info(
+            "early_consolidation_requested_via_learning_pressure",
+            pressure=round(self._learning_pressure, 3),
+        )
+
     def should_run(self, cycle_count: int, cycles_since_last: int) -> bool:
         """
         Return True if consolidation is due.
         Triggers on:
-          - 6 hours elapsed since last run
+          - effective_interval_hours elapsed since last run (pressure-scaled, min 1h)
           - 10,000 cognitive cycles since last run
+          - LEARNING_PRESSURE flag AND ≥1h since last run AND ≥5 pending hypotheses
+            (early_consolidation_requested is cleared after returning True)
         """
         hours_elapsed = (utc_now() - self._last_run_at).total_seconds() / 3600
-        if hours_elapsed >= _CONSOLIDATION_INTERVAL_HOURS:
+        effective_interval = self._effective_interval_hours()
+        if hours_elapsed >= effective_interval:
+            self._logger.debug(
+                "consolidation_interval_elapsed",
+                hours_elapsed=round(hours_elapsed, 2),
+                effective_interval=round(effective_interval, 2),
+                pressure=round(self._learning_pressure, 3),
+            )
             return True
-        return cycles_since_last >= _CONSOLIDATION_CYCLE_THRESHOLD
+        if cycles_since_last >= _CONSOLIDATION_CYCLE_THRESHOLD:
+            return True
+        # Early consolidation gate: only fire if at least 1 hour has elapsed
+        # (prevents hammering consolidation on every single regression event)
+        # and hypotheses_pending is checked by caller via `cycle_count` proxy —
+        # callers that pass pending hypothesis count as cycle_count satisfy ≥5.
+        if self._early_consolidation_requested and hours_elapsed >= _CONSOLIDATION_MIN_INTERVAL_HOURS and cycle_count >= 5:
+            self._early_consolidation_requested = False
+            self._logger.info(
+                "early_consolidation_triggered",
+                hours_since_last=round(hours_elapsed, 2),
+                pending_hypotheses=cycle_count,
+                pressure=round(self._learning_pressure, 3),
+            )
+            return True
+        return False
 
-    async def run(self, pattern_context: PatternContext) -> ConsolidationResult:
+    def reset_pressure(self) -> None:
+        """Reset learning pressure to 0.0 after a consolidation completes."""
+        prev = self._learning_pressure
+        self._learning_pressure = 0.0
+        self._logger.debug("learning_pressure_reset", prev_pressure=round(prev, 3))
+
+    async def run(
+        self,
+        pattern_context: PatternContext,
+        current_metrics: dict[str, float] | None = None,
+    ) -> ConsolidationResult:
         """
         Execute the full 8-phase consolidation pipeline.
         Returns a ConsolidationResult summary.
+
+        Args:
+            pattern_context: Online pattern accumulator from EvoService.
+            current_metrics: Optional KPI snapshot from Benchmarks.  Passed to
+                             ParameterTuner.apply_adjustment() so the feedback
+                             loop has a valid baseline for each new adjustment.
 
         Never raises — all phases handle their own exceptions.
         """
         self._logger.info("consolidation_starting")
         start = time.monotonic()
         result = ConsolidationResult(triggered_at=utc_now())
+        # Store for use in Phase 5 without threading through every helper.
+        self._current_metrics: dict[str, float] = dict(current_metrics) if current_metrics else {}
 
         # ── Phase 1: Memory Consolidation ────────────────────────────────────
         await self._phase_memory_consolidation()
@@ -202,6 +324,31 @@ class ConsolidationOrchestrator:
         result.speciation_events = len(speciation_result.events)
         result.ring_species_detected = speciation_result.ring_species_detected
 
+        # Emit EVO_NICHE_EXTINCT for any niches that died this cycle.
+        # Previously only logged; now broadcast on the bus so Telos, Benchmarks,
+        # Thread, and Alive can react to specific cognitive organ loss.
+        if speciation_result.niches_extinct > 0 and self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                total_remaining = (
+                    len(self._niche_registry.get_alive_niches())
+                    if self._niche_registry is not None
+                    else -1
+                )
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.EVO_NICHE_EXTINCT,
+                    source_system="evo",
+                    data={
+                        "extinct_count": speciation_result.niches_extinct,
+                        "niche_ids": speciation_result.extinct_niche_ids,
+                        "consolidation_number": self._total_runs,
+                        "total_niches_remaining": total_remaining,
+                    },
+                ))
+            except Exception:
+                logger.debug("evo_niche_extinct_emit_failed", exc_info=True)
+
         # ── Phase 2.95: Niche Forking (Cognitive Organogenesis) ───────────────
         forking_result = await self._phase_niche_forking()
         result.niche_forks_proposed = forking_result.proposals_generated
@@ -221,6 +368,12 @@ class ConsolidationOrchestrator:
         adj_count, total_delta = await self._phase_parameter_optimisation()
         result.parameters_adjusted = adj_count
         result.total_parameter_delta = total_delta
+
+        # ── Phase 5.5: Benchmark Threshold Calibration ────────────────────────
+        # Emit BENCHMARK_THRESHOLD_UPDATE so Benchmarks adapts its evaluation
+        # sensitivity to the organism's current learning/metabolic state.
+        # Non-fatal: any failure is swallowed inside the helper.
+        await self._emit_benchmark_threshold_calibration(adj_count, total_delta)
 
         # ── Phase 6: Self-Model Update ────────────────────────────────────────
         await self._phase_self_model_update()
@@ -713,6 +866,22 @@ class ConsolidationOrchestrator:
                     mdl_gain=round(result.mdl_total_gain_bits, 2),
                     duration_ms=result.duration_ms,
                 )
+                # Broadcast each induced schema so Thread + Logos can react.
+                if total > 0 and self._event_bus is not None:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                    for element in result.elements:
+                        await self._event_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.SCHEMA_INDUCED,
+                            source_system="evo.schema_induction",
+                            data={
+                                "schema_id": element.name,
+                                "description": element.description,
+                                "domain": element.kind,
+                                "instance_count": element.instance_count,
+                                "mdl_score": round(element.mdl_gain_bits, 4),
+                            },
+                        ))
                 return total
             except Exception as exc:
                 self._logger.error(
@@ -738,6 +907,20 @@ class ConsolidationOrchestrator:
             success = await self._apply_schema_induction(schema)
             if success:
                 schemas_induced += 1
+                if self._event_bus is not None:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.SCHEMA_INDUCED,
+                        source_system="evo.schema_induction",
+                        data={
+                            "schema_id": h.proposed_mutation.target,
+                            "description": h.statement,
+                            "domain": "entity_type",
+                            "instance_count": max(1, int(h.evidence_score)),
+                            "mdl_score": round(h.evidence_score, 4),
+                        },
+                    ))
 
         return schemas_induced
 
@@ -828,11 +1011,121 @@ class ConsolidationOrchestrator:
         applied = 0
         total_delta = 0.0
         for adj in candidates:
-            await self._tuner.apply_adjustment(adj)
+            await self._tuner.apply_adjustment(
+                adj,
+                current_metrics=getattr(self, "_current_metrics", {}),
+                cycle=self._total_runs,
+            )
             applied += 1
             total_delta += abs(adj.delta)
 
         return applied, total_delta
+
+    async def _emit_benchmark_threshold_calibration(
+        self,
+        adj_count: int,
+        total_delta: float,
+    ) -> None:
+        """Phase 5.5: Emit BENCHMARK_THRESHOLD_UPDATE after parameter optimisation.
+
+        Evo recalibrates Benchmarks' detection sensitivity every consolidation cycle
+        based on current organism KPI state.  This closes the autonomy loop:
+
+          Evo adjusts thresholds → Benchmarks adapts evaluation criteria →
+          regressions feed back to Evo → Evo proposes corrective hypotheses.
+
+        Calibration rules (all best-effort, non-fatal):
+          re_progress_min_improvement_pct
+            • High learning_rate (≥ 0.8) → lower to 3.0% (detect small RE gains)
+            • Low learning_rate  (< 0.3) → raise to 7.0% (reduce noise)
+            • Otherwise keep at default 5.0%
+          metabolic_degradation_fraction
+            • Stressed economy (economic_ratio < 1.1) → lower to 0.07 (detect sooner)
+            • Healthy economy  (economic_ratio ≥ 1.5) → raise to 0.15 (reduce false positives)
+            • Otherwise keep at default 0.10
+
+        Only emits when the computed values differ from last-emitted values by ≥ 0.5
+        (re_progress) or ≥ 0.01 (metabolic) to avoid spamming Benchmarks on every
+        consolidation with identical payloads.
+        """
+        if self._event_bus is None:
+            return
+
+        current_metrics: dict[str, float] = getattr(self, "_current_metrics", {}) or {}
+        learning_rate = float(current_metrics.get("learning_rate", 0.5))
+        economic_ratio = float(current_metrics.get("economic_ratio", 1.0))
+
+        # Compute target re_progress_min_improvement_pct
+        if learning_rate >= 0.8:
+            re_pct = 3.0   # Fast learner — be sensitive to even small RE gains
+        elif learning_rate < 0.3:
+            re_pct = 7.0   # Slow / stalled — reduce noisy RE progress alerts
+        else:
+            re_pct = 5.0   # Default
+
+        # Compute target metabolic_degradation_fraction
+        if economic_ratio < 1.1:
+            met_frac = 0.07  # Tight economy — detect metabolic degradation sooner
+        elif economic_ratio >= 1.5:
+            met_frac = 0.15  # Comfortable — tolerate more variance before alarming
+        else:
+            met_frac = 0.10  # Default
+
+        # Deduplicate: only emit when values have shifted meaningfully
+        last_re_pct = getattr(self, "_last_emitted_re_pct", None)
+        last_met_frac = getattr(self, "_last_emitted_met_frac", None)
+        re_changed = last_re_pct is None or abs(re_pct - last_re_pct) >= 0.5
+        met_changed = last_met_frac is None or abs(met_frac - last_met_frac) >= 0.01
+
+        if not re_changed and not met_changed:
+            return
+
+        reason_parts = []
+        if adj_count > 0:
+            reason_parts.append(
+                f"consolidation_phase5_applied_{adj_count}_adjustments_delta={total_delta:.4f}"
+            )
+        if re_changed:
+            reason_parts.append(
+                f"learning_rate={learning_rate:.3f}_→_re_pct={re_pct}"
+            )
+        if met_changed:
+            reason_parts.append(
+                f"economic_ratio={economic_ratio:.3f}_→_met_frac={met_frac}"
+            )
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.BENCHMARK_THRESHOLD_UPDATE,
+                source_system="evo",
+                data={
+                    "re_progress_min_improvement_pct": re_pct,
+                    "metabolic_degradation_fraction": met_frac,
+                    "source": "evo",
+                    "reason": "; ".join(reason_parts) or "periodic_consolidation_calibration",
+                    "learning_rate": learning_rate,
+                    "economic_ratio": economic_ratio,
+                    "adj_count": adj_count,
+                    "total_delta": round(total_delta, 4),
+                    "consolidation_number": self._total_runs,
+                },
+            ))
+            self._last_emitted_re_pct = re_pct
+            self._last_emitted_met_frac = met_frac
+            self._logger.info(
+                "benchmark_threshold_calibration_emitted",
+                re_pct=re_pct,
+                met_frac=met_frac,
+                learning_rate=round(learning_rate, 3),
+                economic_ratio=round(economic_ratio, 3),
+                adj_count=adj_count,
+            )
+        except Exception as exc:
+            self._logger.debug(
+                "benchmark_threshold_calibration_emit_failed", error=str(exc)
+            )
 
     async def _phase_self_model_update(self) -> None:
         """Phase 6: Recompute self-model from recent outcome episodes."""

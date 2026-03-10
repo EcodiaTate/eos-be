@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 _CIRCUIT_BREAKER_THRESHOLD = 5
-_PROBE_TIMEOUT_S = 5.0
+_PROBE_TIMEOUT_S = 15.0
 _GENERATE_TIMEOUT_S = 30.0
 
 
@@ -63,10 +63,14 @@ class ReasoningEngineService(LLMProvider):
         model_name: str | None = None,
         synapse: Any = None,
     ) -> None:
-        self._url = (
+        _raw_url = (
             vllm_url
             or os.environ.get("ECODIAOS_RE_VLLM_URL", "http://localhost:8001/v1")
         ).rstrip("/")
+        # Ensure URL ends with /v1 — vLLM OpenAI-compatible API lives at /v1/*
+        if not _raw_url.endswith("/v1"):
+            _raw_url = _raw_url + "/v1"
+        self._url = _raw_url
         self._model = model_name or os.environ.get(
             "ECODIAOS_RE_MODEL", "ecodiaos-reasoning"
         )
@@ -76,6 +80,10 @@ class ReasoningEngineService(LLMProvider):
         self._available: bool = False
         self._consecutive_failures: int = 0
         self._circuit_open: bool = False
+        self._reprobe_task: asyncio.Task[None] | None = None
+        self._reprobe_interval_s = float(
+            os.environ.get("ECODIAOS_RE_REPROBE_INTERVAL_S", "120")
+        )
 
         self._client = httpx.AsyncClient(
             base_url=self._url,
@@ -129,13 +137,19 @@ class ReasoningEngineService(LLMProvider):
                         wanted=self._model,
                         available=model_ids,
                     )
-        except (httpx.ConnectError, httpx.TimeoutException, TimeoutError):
+        except (httpx.ConnectError, httpx.TimeoutException, TimeoutError) as exc:
             self._logger.info(
                 "reasoning_engine_unavailable",
                 reason="vLLM not reachable — Claude-only mode",
+                error=str(exc),
             )
         except Exception as exc:
-            self._logger.warning("reasoning_engine_probe_failed", error=str(exc))
+            self._logger.warning(
+                "reasoning_engine_probe_failed",
+                error=str(exc),
+                type=type(exc).__name__,
+                exc_info=True,
+            )
 
         await self._load_thompson()
 
@@ -354,6 +368,29 @@ class ReasoningEngineService(LLMProvider):
             self._on_failure(str(exc))
             raise
 
+    # ─── Embeddings ─────────────────────────────────────────────────────
+
+    async def encode(self, texts: list[str]) -> list[list[float]]:
+        """
+        Encode texts to embeddings via vLLM embeddings endpoint.
+        Returns list of float vectors. Falls back to empty list on failure.
+        Used by Pillar 2 novelty distance calculation.
+        """
+        if not texts or not self._available:
+            return []
+        try:
+            async with asyncio.timeout(10.0):
+                resp = await self._client.post(
+                    "/embeddings",
+                    json={"model": self._model, "input": texts},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return [item["embedding"] for item in data.get("data", [])]
+        except Exception as exc:
+            self._logger.debug("reasoning_engine.encode_failed", error=str(exc))
+            return []
+
     # ─── Thompson sampling persistence ─────────────────────────────────
 
     # Source constants used by Nova's PolicyGenerator for Thompson routing.
@@ -425,9 +462,10 @@ class ReasoningEngineService(LLMProvider):
         """
         Load a LoRA adapter onto the running vLLM server.
 
-        vLLM exposes POST /v1/load_lora_adapter for dynamic adapter injection.
-        This is used by the CLoRA fine-tuning pipeline to hot-swap learned
-        adapters without restarting the inference server.
+        Tries POST /v1/load_lora_adapter for dynamic injection. If the endpoint
+        returns 404/405 (not available in this vLLM build), falls back to
+        client-side tracking — assumes adapter was loaded at startup via
+        --lora-modules flag.
         """
         payload = {
             "lora_name": adapter_id,
@@ -437,31 +475,129 @@ class ReasoningEngineService(LLMProvider):
             async with asyncio.timeout(30.0):
                 resp = await self._client.post("/load_lora_adapter", json=payload)
                 resp.raise_for_status()
-            self._active_adapter_id = adapter_id
             self._logger.info(
-                "re_adapter_loaded",
+                "re_adapter_loaded_dynamic",
                 adapter_id=adapter_id,
                 path=adapter_path,
             )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (404, 405):
+                self._logger.info(
+                    "re_dynamic_lora_not_available",
+                    adapter_id=adapter_id,
+                    hint="Adapter must be loaded at vLLM startup via --lora-modules",
+                )
+            else:
+                self._logger.error("re_adapter_load_failed", adapter_id=adapter_id, error=str(exc))
+                raise
         except Exception as exc:
             self._logger.error("re_adapter_load_failed", adapter_id=adapter_id, error=str(exc))
             raise
+        self._active_adapter_id = adapter_id
 
     async def unload_adapter(self) -> None:
         """Unload the active LoRA adapter, reverting to base model weights."""
+        name = getattr(self, "_active_adapter_id", None)
+        if not name:
+            return
         try:
-            name = getattr(self, "_active_adapter_id", None)
-            if name:
-                async with asyncio.timeout(10.0):
-                    resp = await self._client.post(
-                        "/unload_lora_adapter", json={"lora_name": name}
-                    )
-                    resp.raise_for_status()
-            self._active_adapter_id = None
-            self._logger.info("re_adapter_unloaded")
+            async with asyncio.timeout(10.0):
+                resp = await self._client.post(
+                    "/unload_lora_adapter", json={"lora_name": name}
+                )
+                resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (404, 405):
+                self._logger.info(
+                    "re_dynamic_lora_unload_not_available",
+                    adapter_name=name,
+                    hint="Adapter was loaded at startup — restart vLLM to unload",
+                )
+            else:
+                self._logger.warning("re_adapter_unload_failed", error=str(exc))
         except Exception as exc:
             self._logger.warning("re_adapter_unload_failed", error=str(exc))
+        self._active_adapter_id = None
+        self._logger.info("re_adapter_unloaded")
 
     @property
     def active_adapter_id(self) -> str | None:
         return getattr(self, "_active_adapter_id", None)
+
+    # ─── Circuit breaker reprobe ─────────────────────────────────────
+
+    def start_reprobe_loop(self) -> None:
+        """
+        Start a background task that periodically reprobes vLLM when the
+        circuit is open. This handles the case where vLLM restarts (e.g.
+        adapter_watcher restarting it with a new adapter) while the circuit
+        breaker is open — the organism auto-discovers the recovered RE.
+        """
+        if self._reprobe_task is not None:
+            return
+        self._reprobe_task = asyncio.ensure_future(self._reprobe_loop())
+        self._logger.info(
+            "re_reprobe_loop_started",
+            interval_s=self._reprobe_interval_s,
+        )
+
+    async def stop_reprobe_loop(self) -> None:
+        """Cancel the reprobe background task."""
+        if self._reprobe_task is not None:
+            self._reprobe_task.cancel()
+            try:
+                await self._reprobe_task
+            except asyncio.CancelledError:
+                pass
+            self._reprobe_task = None
+
+    async def _reprobe_loop(self) -> None:
+        """
+        Background loop: when circuit is open or RE unavailable, periodically
+        probe /v1/models to detect recovery. Also detects model changes (e.g.
+        adapter_watcher restarted vLLM with a new adapter name).
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._reprobe_interval_s)
+            except asyncio.CancelledError:
+                return
+
+            # Only reprobe when the circuit is open or RE was never available
+            if self._available and not self._circuit_open:
+                continue
+
+            try:
+                async with asyncio.timeout(_PROBE_TIMEOUT_S):
+                    resp = await self._client.get("/models")
+                    resp.raise_for_status()
+                    data: dict[str, Any] = resp.json()
+                    model_ids = [m.get("id", "") for m in data.get("data", [])]
+
+                    if self._model in model_ids:
+                        was_open = self._circuit_open
+                        was_unavailable = not self._available
+                        self._available = True
+                        self._consecutive_failures = 0
+                        self._circuit_open = False
+
+                        if was_open or was_unavailable:
+                            self._logger.info(
+                                "re_reprobe_recovered",
+                                model=self._model,
+                                was_circuit_open=was_open,
+                                was_unavailable=was_unavailable,
+                            )
+                            self._emit_status_changed(available=True)
+                    else:
+                        self._logger.debug(
+                            "re_reprobe_model_not_found",
+                            wanted=self._model,
+                            available=model_ids,
+                        )
+            except (httpx.ConnectError, httpx.TimeoutException, TimeoutError):
+                self._logger.debug("re_reprobe_unreachable")
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                self._logger.debug("re_reprobe_error", error=str(exc))

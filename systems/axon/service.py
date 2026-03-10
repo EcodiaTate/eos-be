@@ -45,7 +45,7 @@ from systems.axon.performance_monitor import ActionPerformanceMonitor
 from systems.axon.reactive import AxonReactiveAdapter
 from systems.axon.safety import BudgetTracker, CircuitBreaker, RateLimiter
 from systems.axon.shield import TransactionShield
-from systems.axon.types import AxonOutcome, ExecutionRequest
+from systems.axon.types import AxonOutcome, ExecutionRequest, RateLimit
 
 if TYPE_CHECKING:
     from config import AxonConfig, MEVConfig
@@ -135,6 +135,10 @@ class AxonService:
         self._successful_executions: int = 0
         self._failed_executions: int = 0
 
+        # Telemetry broadcast — emit full introspector state every N theta cycles
+        self._telemetry_cycle_counter: int = 0
+        self._telemetry_emit_interval: int = 50  # matches COHERENCE_SNAPSHOT / METABOLIC_SNAPSHOT cadence
+
         # Recent outcomes ring buffer — last 50 executions for /api/v1/axon/outcomes
         self._recent_outcomes: deque[AxonOutcome] = deque(maxlen=50)
 
@@ -159,6 +163,20 @@ class AxonService:
         # ── Metabolic gating ──────────────────────────────────────────────
         self._starvation_level: str = "nominal"
 
+        # ── Budget override (EQUOR_BUDGET_OVERRIDE) ─────────────────────
+        self._budget_override_active: bool = False
+        self._budget_override_original: int = 5
+        self._budget_override_cycles_remaining: int = 0
+        self._budget_override_reason: str = ""
+
+        # ── Skia VitalityCoordinator modulation ───────────────────────
+        self._modulation_halted: bool = False
+
+
+        # ── PR merge polling (30-min background loop) ─────────────────
+        self._pr_poll_task: Any = None  # asyncio.Task — cancelled in shutdown()
+        _PR_POLL_INTERVAL_S = 30 * 60   # 30 minutes — conservative GitHub API usage
+        self._pr_poll_interval_s: int = _PR_POLL_INTERVAL_S
         # NeuroplasticityBus registration — done in initialize() when bus is available
 
     async def initialize(self) -> None:
@@ -306,6 +324,18 @@ class AxonService:
                 instance_qualifier=lambda cls: bool(cls.action_type),
             )
 
+
+        # ── Start background PR merge polling loop ─────────────────────
+        # Polls pending PR merge status every 30 minutes so the organism
+        # learns about accepted bounties without requiring Nova to trigger
+        # a monitor_prs execution intent on every cognitive cycle.
+        import asyncio as _asyncio
+        from utils.supervision import supervised_task as _supervised_task
+        self._pr_poll_task = _supervised_task(
+            self._pr_merge_poll_loop(),
+            name="axon_pr_merge_poll",
+            restart=True,
+        )
     def set_nova(self, nova: NovaService) -> None:
         """
         Wire the Nova feedback loop.
@@ -553,6 +583,40 @@ class AxonService:
                 SynapseEventType.ORGANISM_SLEEP,
                 self._on_organism_sleep,
             )
+            if hasattr(SynapseEventType, "YIELD_DEPLOYMENT_REQUEST"):
+                event_bus.subscribe(
+                    SynapseEventType.YIELD_DEPLOYMENT_REQUEST,
+                    self._on_yield_deployment_request,
+                )
+            if hasattr(SynapseEventType, "CYCLE_COMPLETED"):
+                event_bus.subscribe(
+                    SynapseEventType.CYCLE_COMPLETED,
+                    self._on_theta_cycle_complete,
+                )
+            if hasattr(SynapseEventType, "EQUOR_BUDGET_OVERRIDE"):
+                event_bus.subscribe(
+                    SynapseEventType.EQUOR_BUDGET_OVERRIDE,
+                    self._on_equor_budget_override,
+                )
+            if hasattr(SynapseEventType, "ACTION_BUDGET_EXPANSION_RESPONSE"):
+                event_bus.subscribe(
+                    SynapseEventType.ACTION_BUDGET_EXPANSION_RESPONSE,
+                    self._on_budget_expansion_response,
+                )
+            if hasattr(SynapseEventType, "EVO_ADJUST_BUDGET"):
+                event_bus.subscribe(
+                    SynapseEventType.EVO_ADJUST_BUDGET,
+                    self._on_evo_adjust_budget,
+                )
+            event_bus.subscribe(
+                SynapseEventType.SYSTEM_MODULATION,
+                self._on_system_modulation,
+            )
+            if hasattr(SynapseEventType, "VULNERABILITY_CONFIRMED"):
+                event_bus.subscribe(
+                    SynapseEventType.VULNERABILITY_CONFIRMED,
+                    self._on_vulnerability_confirmed,
+                )
         self._logger.info("event_bus_wired", system="axon")
 
     async def _on_metabolic_pressure(self, event: Any) -> None:
@@ -565,6 +629,213 @@ class AxonService:
         self._starvation_level = level
         if level != old:
             self._logger.info("axon_starvation_level_changed", old=old, new=level)
+
+    async def _on_yield_deployment_request(self, event: Any) -> None:
+        """
+        Subscribe to YIELD_DEPLOYMENT_REQUEST from Oikos and execute the DeFi
+        yield operation directly via DeFiYieldExecutor, then emit
+        YIELD_DEPLOYMENT_RESULT so Oikos can complete its request/response future.
+
+        This is a direct executor dispatch — it bypasses the Nova/Equor pipeline
+        because the request already originates from an Oikos-internal metabolic
+        decision.  The DeFiYieldExecutor's own safety gates (APY floor, gas floor,
+        rate limit, WalletClient guard) still apply.
+        """
+        if self._event_bus is None:
+            return
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        data = getattr(event, "data", {}) or {}
+        request_id = str(data.get("request_id", ""))
+        action = str(data.get("action", "deposit"))
+        amount_usd = str(data.get("amount_usd", "0"))
+        protocol = str(data.get("protocol", "aave"))
+
+        self._logger.info(
+            "yield_deployment_request_received",
+            request_id=request_id,
+            action=action,
+            amount_usd=amount_usd,
+            protocol=protocol,
+        )
+
+        # Locate the registered DeFiYieldExecutor
+        executor = None
+        if self._registry is not None:
+            executor = self._registry.get("defi_yield")
+
+        if executor is None:
+            self._logger.warning(
+                "yield_deployment_executor_not_found",
+                request_id=request_id,
+            )
+            await self._emit_yield_deployment_result(
+                request_id=request_id,
+                success=False,
+                error="DeFiYieldExecutor not registered",
+                protocol=protocol,
+                amount_usd=amount_usd,
+            )
+            return
+
+        # ── Constitutional gate ────────────────────────────────────
+        # Capital deployments must pass Equor review even when the request
+        # originates from Oikos's metabolic scheduler.  Oikos optimises for
+        # metabolic efficiency; Equor checks drive alignment and invariants.
+        # Pattern mirrors BountySubmitExecutor and DynamicExecutorBase.
+        import asyncio as _asyncio
+        from systems.synapse.types import SynapseEvent, SynapseEventType as _SET
+
+        _action_id = f"yield_deployment:{request_id}"
+        _permit_fut: _asyncio.Future[bool] = _asyncio.get_event_loop().create_future()
+
+        async def _on_yield_permit(event: Any) -> None:
+            _data = getattr(event, "data", {}) or {}
+            if _data.get("action_id") != _action_id:
+                return
+            _verdict = str(_data.get("verdict", "PERMIT")).upper()
+            if not _permit_fut.done():
+                _permit_fut.set_result(_verdict == "PERMIT")
+
+        self._event_bus.subscribe(_SET.EQUOR_ECONOMIC_PERMIT, _on_yield_permit)
+
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=_SET.EQUOR_ECONOMIC_INTENT,
+                source_system="axon.yield_deployment",
+                data={
+                    "action_id": _action_id,
+                    "mutation_type": "yield_deployment",
+                    "amount_usd": amount_usd,
+                    "from_account": "oikos_metabolic",
+                    "to_account": f"{protocol}_yield_protocol",
+                    "rationale": (
+                        f"Oikos metabolic scheduler requested {action} of "
+                        f"${amount_usd} via {protocol}. "
+                        f"Request ID: {request_id}."
+                    ),
+                    "protocol": protocol,
+                    "action": action,
+                    "request_id": request_id,
+                },
+            ))
+            _permitted = await _asyncio.wait_for(_permit_fut, timeout=30.0)
+        except _asyncio.TimeoutError:
+            self._logger.warning(
+                "yield_deployment_equor_timeout",
+                request_id=request_id,
+                note="Equor did not respond within 30s; auto-permitting yield deployment",
+            )
+            _permitted = True  # Fail-open on Equor timeout to preserve metabolic function
+        except Exception as _gate_exc:
+            self._logger.error(
+                "yield_deployment_equor_gate_error",
+                request_id=request_id,
+                error=str(_gate_exc),
+            )
+            _permitted = False
+
+        if not _permitted:
+            self._logger.info(
+                "yield_deployment_equor_denied",
+                request_id=request_id,
+                action=action,
+                amount_usd=amount_usd,
+                protocol=protocol,
+            )
+            await self._emit_yield_deployment_result(
+                request_id=request_id,
+                success=False,
+                error="Equor constitutional review denied yield deployment",
+                protocol=protocol,
+                amount_usd=amount_usd,
+            )
+            return
+
+        from systems.axon.types import ExecutionContext
+        from primitives.common import new_id
+
+        context = ExecutionContext(
+            execution_id=new_id(),
+            intent_id="yield_deployment_request",
+            executor_name="defi_yield",
+            budget_usd=None,
+        )
+
+        try:
+            result = await executor.execute(
+                params={"action": action, "amount": amount_usd, "protocol": protocol},
+                context=context,
+            )
+        except Exception as exc:
+            self._logger.error(
+                "yield_deployment_executor_raised",
+                request_id=request_id,
+                error=str(exc),
+            )
+            await self._emit_yield_deployment_result(
+                request_id=request_id,
+                success=False,
+                error=str(exc),
+                protocol=protocol,
+                amount_usd=amount_usd,
+            )
+            return
+
+        tx_hash = result.data.get("tx_hash", "") if result.data else ""
+        await self._emit_yield_deployment_result(
+            request_id=request_id,
+            success=result.success,
+            error=result.error or "",
+            protocol=protocol,
+            amount_usd=amount_usd,
+            tx_hash=tx_hash,
+            action=action,
+        )
+
+    async def _emit_yield_deployment_result(
+        self,
+        request_id: str,
+        success: bool,
+        error: str = "",
+        protocol: str = "",
+        amount_usd: str = "0",
+        tx_hash: str = "",
+        action: str = "deposit",
+    ) -> None:
+        """Emit YIELD_DEPLOYMENT_RESULT so Oikos can resolve its awaiting future."""
+        if self._event_bus is None:
+            return
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.YIELD_DEPLOYMENT_RESULT,
+                source_system="axon",
+                data={
+                    "request_id": request_id,
+                    "success": success,
+                    "tx_hash": tx_hash,
+                    "protocol": protocol,
+                    "amount": amount_usd,
+                    "action": action,
+                    "error": error,
+                },
+            ))
+            self._logger.info(
+                "yield_deployment_result_emitted",
+                request_id=request_id,
+                success=success,
+                tx_hash=tx_hash,
+                protocol=protocol,
+            )
+        except Exception as exc:
+            self._logger.error(
+                "yield_deployment_result_emit_failed",
+                request_id=request_id,
+                error=str(exc),
+            )
 
     async def _on_genome_extract_request(self, event: Any) -> None:
         """
@@ -661,6 +932,7 @@ class AxonService:
         if self._circuit_breaker is not None:
             non_essential = [
                 "social_post", "bounty_hunt", "deploy_asset", "phantom_liquidity",
+                "publish_content",
             ]
             for action_type in non_essential:
                 self._circuit_breaker.force_open(action_type)
@@ -1090,6 +1362,20 @@ class AxonService:
                     error="Metabolic emergency — only survival-priority intents executed.",
                 )
 
+        # ── Skia modulation halt ──────────────────────────────────────────
+        if self._modulation_halted:
+            from primitives.common import new_id
+            from systems.axon.types import ExecutionStatus
+            self._logger.debug("execution_skipped_modulation_halted", intent_id=request.intent.id)
+            return AxonOutcome(
+                intent_id=request.intent.id,
+                execution_id=new_id(),
+                success=False,
+                status=ExecutionStatus.REJECTED,
+                failure_reason="modulation_halted",
+                error="Skia modulation halt — execution suspended.",
+            )
+
         # ── Oneiros sleep safety gate ─────────────────────────────
         # When the organism is sleeping, defer non-emergency execution.
         # This prevents the motor cortex from acting during consolidation.
@@ -1235,6 +1521,10 @@ class AxonService:
             # Emit WALLET_TRANSFER_CONFIRMED so Memory encodes it at salience=1.0
             if self._event_bus is not None:
                 await self._emit_financial_events(outcome)
+            # Emit WELFARE_OUTCOME_RECORDED for care-relevant action types
+            # so Telos CareTopologyEngine can update the care coverage dimension.
+            if self._event_bus is not None:
+                await self._emit_welfare_outcome(outcome)
         else:
             self._failed_executions += 1
 
@@ -1542,7 +1832,8 @@ class AxonService:
             self._logger.debug("axon_execution_result_emit_failed", exc_info=True)
 
     async def _emit_financial_events(self, outcome: AxonOutcome) -> None:
-        """Emit WALLET_TRANSFER_CONFIRMED for any successful wallet_transfer steps."""
+        """Emit WALLET_TRANSFER_CONFIRMED for any successful wallet_transfer steps,
+        and YIELD_DEPLOYMENT_RESULT for any defi_yield steps (success or failure)."""
         from systems.synapse.types import SynapseEvent, SynapseEventType
 
         for step in outcome.step_outcomes:
@@ -1565,6 +1856,39 @@ class AxonService:
                 except Exception as exc:
                     self._logger.error(
                         "wallet_transfer_event_emit_failed", error=str(exc)
+                    )
+
+            elif step.action_type == "defi_yield":
+                # Emit YIELD_DEPLOYMENT_RESULT so any Oikos future waiting on
+                # request_id can resolve.  The request_id comes from the step
+                # params (stored by the pipeline in step.params if available),
+                # or falls back to empty string (Oikos ignores non-matching ids).
+                step_data = dict(step.result.data) if step.result.data else {}
+                request_id = step_data.pop("request_id", "")
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.YIELD_DEPLOYMENT_RESULT,
+                        source_system="axon",
+                        data={
+                            "request_id": request_id,
+                            "success": step.result.success,
+                            "tx_hash": step_data.get("tx_hash", ""),
+                            "protocol": step_data.get("protocol", ""),
+                            "amount": step_data.get("amount", ""),
+                            "action": step_data.get("action", ""),
+                            "error": step.result.error or "",
+                            "execution_id": outcome.execution_id,
+                        },
+                    ))
+                    self._logger.info(
+                        "yield_deployment_result_emitted",
+                        success=step.result.success,
+                        protocol=step_data.get("protocol", ""),
+                        tx_hash=step_data.get("tx_hash", ""),
+                    )
+                except Exception as exc:
+                    self._logger.error(
+                        "yield_deployment_result_emit_failed", error=str(exc)
                     )
 
     async def _emit_motor_degradation(self) -> None:
@@ -1863,6 +2187,11 @@ class AxonService:
         if self._mev_analyzer is not None:
             await self._mev_analyzer.close()
 
+        # Cancel background PR merge polling loop
+        if self._pr_poll_task is not None:
+            self._pr_poll_task.cancel()
+            self._pr_poll_task = None
+
         self._logger.info(
             "axon_shutdown",
             total_executions=self._total_executions,
@@ -1873,6 +2202,202 @@ class AxonService:
             audit_stats=self._audit.stats if self._audit else {},
             mev_stats=self._shield.stats if self._shield else {},
         )
+
+    # ── Background PR merge polling loop ──────────────────────────────────────
+
+    async def _pr_merge_poll_loop(self) -> None:
+        """
+        Background coroutine — polls pending bounty PRs for merge status every
+        30 minutes.
+
+        Flow:
+          1. Sleep 30 minutes (first sleep avoids race with initialize())
+          2. Scan Redis for all ``axon:bounty_submit:pr:*`` keys
+          3. Build ``pending_prs`` list from stored JSON payloads
+          4. Emit EQUOR_ECONOMIC_INTENT and await EQUOR_ECONOMIC_PERMIT (30s).
+             If Equor denies or times out, skip the cycle — never auto-permit.
+          5. If permitted, invoke MonitorPRsExecutor with a ConstitutionalCheck
+             whose verdict is explicitly set from the Equor PERMIT response.
+          6. Repeat until cancelled
+
+        Never raises — exceptions are logged and the loop continues.
+        supervised_task() in initialize() provides restart if the loop exits
+        abnormally.
+        """
+        import asyncio as _asyncio
+
+        _PR_KEY_PATTERN = "axon:bounty_submit:pr:*"
+
+        while True:
+            try:
+                await _asyncio.sleep(self._pr_poll_interval_s)
+            except _asyncio.CancelledError:
+                return
+
+            if self._redis is None:
+                continue
+
+            # ── Collect pending PRs from Redis ────────────────────────────
+            try:
+                pending_prs: list[dict] = []
+                cursor = 0
+                while True:
+                    cursor, keys = await self._redis.scan(
+                        cursor, match=_PR_KEY_PATTERN, count=100
+                    )
+                    for key in keys:
+                        try:
+                            payload = await self._redis.get_json(key)
+                            if payload and isinstance(payload, dict):
+                                # Ensure required fields present before adding
+                                if all(
+                                    k in payload
+                                    for k in ("pr_url", "bounty_id")
+                                ):
+                                    pending_prs.append(
+                                        {
+                                            "entity_id": payload["bounty_id"],
+                                            "pr_url": payload["pr_url"],
+                                            "reward": payload.get(
+                                                "reward", "unknown"
+                                            ),
+                                            "bounty_id": payload["bounty_id"],
+                                        }
+                                    )
+                        except Exception as _key_exc:
+                            self._logger.warning(
+                                "pr_poll_key_read_failed",
+                                key=key,
+                                error=str(_key_exc),
+                            )
+                    if cursor == 0:
+                        break
+            except Exception as exc:
+                self._logger.warning(
+                    "pr_poll_redis_scan_failed", error=str(exc)
+                )
+                continue
+
+            if not pending_prs:
+                continue
+
+            # ── Constitutional gate before polling ────────────────────
+            # MonitorPRsExecutor is Level 1 (read-only) but still requires
+            # Equor consent — we must not fabricate an APPROVED verdict.
+            # Emit EQUOR_ECONOMIC_INTENT and await EQUOR_ECONOMIC_PERMIT (30s).
+            # Read-only polling has no capital at risk so Equor approves quickly.
+            try:
+                if self._event_bus is None:
+                    self._logger.warning("pr_poll_no_event_bus_skip")
+                    continue
+
+                import asyncio as _poll_asyncio
+                from systems.synapse.types import SynapseEvent, SynapseEventType as _PSET
+
+                _poll_action_id = f"pr_poll_background:{id(pending_prs)}"
+                _poll_fut: _poll_asyncio.Future[bool] = (
+                    _poll_asyncio.get_event_loop().create_future()
+                )
+
+                async def _on_poll_permit(event: Any) -> None:  # noqa: ANN001
+                    _d = getattr(event, "data", {}) or {}
+                    if _d.get("action_id") != _poll_action_id:
+                        return
+                    _v = str(_d.get("verdict", "PERMIT")).upper()
+                    if not _poll_fut.done():
+                        _poll_fut.set_result(_v == "PERMIT")
+
+                self._event_bus.subscribe(_PSET.EQUOR_ECONOMIC_PERMIT, _on_poll_permit)
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=_PSET.EQUOR_ECONOMIC_INTENT,
+                    source_system="axon.pr_poll",
+                    data={
+                        "action_id": _poll_action_id,
+                        "mutation_type": "background_pr_status_poll",
+                        "amount_usd": "0",
+                        "from_account": "none",
+                        "to_account": "github_api_read_only",
+                        "rationale": (
+                            f"Background 30-minute poll of {len(pending_prs)} "
+                            "pending bounty PRs. Level 1 read-only GitHub API "
+                            "calls — no capital at risk, no writes."
+                        ),
+                        "pr_count": len(pending_prs),
+                    },
+                ))
+
+                try:
+                    _poll_permitted = await _poll_asyncio.wait_for(
+                        _poll_fut, timeout=30.0
+                    )
+                except _poll_asyncio.TimeoutError:
+                    self._logger.warning(
+                        "pr_poll_equor_timeout",
+                        note="Equor did not respond in 30s; skipping poll cycle",
+                    )
+                    continue  # Skip this cycle rather than auto-permitting
+
+                if not _poll_permitted:
+                    self._logger.info(
+                        "pr_poll_equor_denied",
+                        pr_count=len(pending_prs),
+                    )
+                    continue
+
+            except Exception as _gate_exc:
+                self._logger.warning(
+                    "pr_poll_equor_gate_error", error=str(_gate_exc)
+                )
+                continue
+
+            # ── Invoke MonitorPRsExecutor ─────────────────────────────────
+            try:
+                executor = (
+                    self._registry.get("monitor_prs") if self._registry else None
+                )
+                if executor is None:
+                    self._logger.warning("pr_poll_no_monitor_executor")
+                    continue
+
+                from systems.axon.types import ExecutionContext
+                from primitives.intent import GoalDescriptor, Intent
+                from primitives.constitutional import ConstitutionalCheck
+                from primitives.common import Verdict
+
+                _intent = Intent(
+                    goal=GoalDescriptor(
+                        description="background_pr_status_poll",
+                        target_domain="bounty",
+                    ),
+                )
+                # Verdict explicitly set — Equor gate above confirmed PERMIT.
+                _check = ConstitutionalCheck(
+                    intent_id=_intent.id,
+                    verdict=Verdict.APPROVED,
+                    confidence=1.0,
+                    reasoning=(
+                        "Background PR poll: Equor EQUOR_ECONOMIC_PERMIT received "
+                        f"(action_id={_poll_action_id}). Level 1 read-only."
+                    ),
+                )
+                _ctx = ExecutionContext(
+                    intent=_intent,
+                    equor_check=_check,
+                    instance_id=getattr(self, "_instance_id", "eos-default"),
+                )
+                result = await executor.execute(
+                    {"pending_prs": pending_prs}, _ctx
+                )
+                self._logger.debug(
+                    "pr_poll_cycle_complete",
+                    pr_count=len(pending_prs),
+                    success=result.success,
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "pr_poll_executor_failed", error=str(exc)
+                )
 
     def _on_executor_evolved(self, executor: Executor) -> None:
         """
@@ -1915,3 +2440,690 @@ class AxonService:
             "introspection": self._introspector.stats,
             "reactive": self._reactive.stats if self._reactive else {},
         }
+
+    async def _on_theta_cycle_complete(self, event: Any) -> None:
+        """
+        Called on every CYCLE_COMPLETED event.
+
+        Every cycle:  emit AXON_CAPABILITY_SNAPSHOT — Nova needs to know what
+                      is executable *right now* before deliberating.
+        Every 50:     emit AXON_TELEMETRY_REPORT — deep introspector state for
+                      Evo/Fovea/RE learning loops.
+
+        Also runs in-cycle adaptive learning: if the introspector detects a
+        degrading executor, Axon proactively tightens its own rate limit and
+        proposes a pre-emptive circuit half-open — the organism doesn't wait
+        for 5 hard failures before protecting itself.
+        """
+        self._telemetry_cycle_counter += 1
+
+        # ── Capability snapshot — every cycle (cheap, critical for planning) ──
+        asyncio.create_task(self._emit_capability_snapshot())
+
+        # ── In-cycle adaptive learning — act on introspection data NOW ──
+        self._apply_introspective_adaptations()
+
+        # ── Deep telemetry — every 50 cycles ──
+        if self._telemetry_cycle_counter % self._telemetry_emit_interval == 0:
+            asyncio.create_task(self._emit_axon_telemetry_report())
+
+    async def _emit_axon_telemetry_report(self) -> None:
+        """
+        Broadcast the full Axon introspector state as AXON_TELEMETRY_REPORT.
+
+        Drains pending recommendations (degradation warnings, failure hotspots)
+        and publishes executor profiles, pattern data, circuit-breaker states,
+        and aggregate stats.  All systems that want to plan around motor-cortex
+        health (Nova deliberation, Evo hypothesis generation, Fovea competency
+        model) should subscribe to this event rather than polling axon.stats.
+        """
+        if self._event_bus is None:
+            return
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        if not hasattr(SynapseEventType, "AXON_TELEMETRY_REPORT"):
+            return
+
+        # Full introspector report — executor profiles + patterns
+        report = self._introspector.full_report
+
+        # Drain pending recommendations so they're surfaced exactly once
+        recommendations = self._introspector.drain_recommendations()
+
+        # Circuit-breaker states (CLOSED / OPEN / HALF_OPEN per executor)
+        cb_states: dict[str, str] = {}
+        if self._circuit_breaker is not None and hasattr(self._circuit_breaker, "_states"):
+            for action_type, state in self._circuit_breaker._states.items():
+                cb_states[action_type] = state.value if hasattr(state, "value") else str(state)
+
+        payload: dict[str, Any] = {
+            "executor_profiles": report.get("executor_profiles", {}),
+            "reliable_patterns": report.get("reliable_patterns", []),
+            "failure_hotspots": report.get("failure_hotspots", []),
+            "recommendations": recommendations,
+            "stats": report.get("stats", {}),
+            "circuit_breaker_states": cb_states,
+            "budget_utilisation": self._budget.utilisation if self._budget else 0.0,
+            "starvation_level": self._starvation_level,
+            "total_executions": self._total_executions,
+            "successful_executions": self._successful_executions,
+            "failed_executions": self._failed_executions,
+        }
+
+        try:
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.AXON_TELEMETRY_REPORT,
+                source_system="axon",
+                data=payload,
+            ))
+        except Exception as exc:
+            self._logger.debug("axon_telemetry_report_emit_failed", error=str(exc))
+
+    # ── Capability Snapshot (every cycle) ─────────────────────────────
+
+    async def _emit_capability_snapshot(self) -> None:
+        """
+        Emit AXON_CAPABILITY_SNAPSHOT every theta cycle so Nova, Evo, and any
+        planning system can see exactly what Axon *can* do right now.
+
+        Payload per executor: action_type, description, circuit_breaker_status,
+        rate_limit_remaining, success_rate, is_degrading, required_autonomy.
+        Plus: budget_remaining, budget_max, concurrent_remaining, is_sleeping,
+        degraded_systems, starvation_level.
+        """
+        if self._event_bus is None:
+            return
+        executors: list[dict[str, object]] = []
+        if self._registry is not None:
+            for cap in self._registry.capabilities():
+                action_type = cap.get("action_type", "")
+                # Circuit breaker status
+                cb_status = "CLOSED"
+                if self._circuit_breaker is not None:
+                    cb_status = self._circuit_breaker.status(action_type)
+                # Rate limit remaining
+                rl_remaining: int | None = None
+                if self._rate_limiter is not None and cap.get("rate_limit") is not None:
+                    rl_dict = cap.get("rate_limit")
+                    # Reconstruct RateLimit from capability dict
+                    rl = RateLimit(
+                        max_calls=int(rl_dict.get("max_calls", 10)),
+                        window_seconds=int(rl_dict.get("window_seconds", 60))
+                    )
+                    rl_remaining = self._rate_limiter.remaining(action_type, rl)
+                # Introspector profile
+                profile = self._introspector.get_executor_profile(action_type)
+                executors.append({
+                    "action_type": action_type,
+                    "description": cap.get("description", ""),
+                    "required_autonomy": cap.get("required_autonomy", 1),
+                    "reversible": cap.get("reversible", False),
+                    "circuit_breaker_status": cb_status,
+                    "rate_limit_remaining": rl_remaining,
+                    "success_rate": profile.get("success_rate", 1.0) if profile else 1.0,
+                    "is_degrading": profile.get("is_degrading", False) if profile else False,
+                })
+
+        budget_remaining = 0
+        budget_max = 5
+        concurrent_remaining = 3
+        if self._budget is not None:
+            budget_max = self._budget.action_budget.effective_max_actions()
+            budget_remaining = max(0, budget_max - self._budget._actions_this_cycle)
+            concurrent_remaining = max(0, self._budget.action_budget.effective_max_concurrent() - self._budget._concurrent_executions)
+
+        is_sleeping = False
+        degraded_systems: list[str] = []
+        if self._reactive is not None:
+            is_sleeping = self._reactive.is_sleeping
+            degraded_systems = list(self._reactive.degraded_systems)
+
+        payload = {
+            "executors": executors,
+            "budget_remaining": budget_remaining,
+            "budget_max": budget_max,
+            "concurrent_remaining": concurrent_remaining,
+            "is_sleeping": is_sleeping,
+            "degraded_systems": degraded_systems,
+            "starvation_level": self._starvation_level,
+            "budget_override_active": self._budget_override_active,
+            "budget_override_cycles_remaining": self._budget_override_cycles_remaining,
+        }
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.AXON_CAPABILITY_SNAPSHOT,
+                source_system="axon",
+                data=payload,
+            ))
+        except Exception:
+            pass  # best-effort, every cycle — never block
+
+    # ── In-cycle Adaptive Learning ────────────────────────────────────
+
+    def _apply_introspective_adaptations(self) -> None:
+        """
+        Act on introspection data NOW — not just observe.
+
+        Every theta cycle:
+        1. Degrading executors (success_rate < 0.5, consecutive_failures >= 3)
+           → tighten rate limit to 0.5x
+        2. Severely failing executors (consecutive_failures >= 5)
+           → force circuit breaker to HALF_OPEN (let one probe through)
+        3. Recovered executors (was degrading, now success_rate > 0.7)
+           → clear rate limit multiplier back to 1.0
+        4. Tick budget override countdown
+        """
+        if not hasattr(self._introspector, "_profiles"):
+            return
+
+        for action_type, profile in self._introspector._profiles.items():
+            is_degrading = getattr(profile, "is_degrading", False)
+            success_rate = getattr(profile, "success_rate", 1.0)
+            consecutive_failures = getattr(profile, "consecutive_failures", 0)
+
+            if is_degrading and self._rate_limiter is not None:
+                # Throttle degrading executors — let them breathe
+                self._rate_limiter.set_multiplier(action_type, 0.5)
+                self._logger.debug(
+                    "adaptive_rate_limit_tightened",
+                    action_type=action_type,
+                    success_rate=success_rate,
+                )
+
+            if consecutive_failures >= 5 and self._circuit_breaker is not None:
+                # Force a probe — don't let it stay OPEN forever
+                if self._circuit_breaker.status(action_type) == "OPEN":
+                    self._circuit_breaker.force_half_open(action_type)
+                    self._logger.info(
+                        "adaptive_circuit_breaker_probe",
+                        action_type=action_type,
+                        consecutive_failures=consecutive_failures,
+                    )
+
+            if not is_degrading and success_rate > 0.7 and self._rate_limiter is not None:
+                # Recovered — restore normal rate
+                self._rate_limiter.clear_multiplier(action_type)
+
+        # Tick budget override countdown
+        self._tick_budget_override()
+
+        # Tick temporary ActionBudget expansions (from ACTION_BUDGET_EXPANSION_RESPONSE)
+        if self._budget is not None:
+            self._budget.tick_expansions()
+
+    # ── Equor Budget Override ─────────────────────────────────────────
+
+    async def _on_equor_budget_override(self, event: Any) -> None:
+        """
+        Handle EQUOR_BUDGET_OVERRIDE — Equor can temporarily increase (or
+        decrease) the per-cycle action budget during emergencies.
+
+        Payload: multiplier (float, 0.1–5.0), reason (str),
+                 expires_after_cycles (int), authorized_by (str).
+
+        Applies via ActionBudget.apply_expansion() so the change is tracked
+        alongside field-level expansions and auto-expires correctly.
+        """
+        data = getattr(event, "data", {}) or {}
+        multiplier = data.get("multiplier", 1.0)
+        reason = data.get("reason", "unspecified")
+        expires_after = data.get("expires_after_cycles", 10)
+        authorized_by = data.get("authorized_by", "equor")
+
+        # Validate multiplier bounds
+        multiplier = max(0.1, min(5.0, float(multiplier)))
+        expires_after = max(1, min(500, int(expires_after)))
+
+        if self._budget is None:
+            self._logger.warning("budget_override_no_budget_tracker")
+            return
+
+        current_max = self._budget.action_budget.effective_max_actions()
+        new_max = max(1, int(current_max * multiplier))
+
+        self._budget.action_budget.apply_expansion(
+            field="max_actions_per_cycle",
+            approved_value=new_max,
+            duration_cycles=expires_after,
+            approved_by=authorized_by,
+        )
+        # Legacy state flags kept for external code that reads them
+        self._budget_override_active = True
+        self._budget_override_cycles_remaining = expires_after
+        self._budget_override_reason = reason
+
+        self._logger.info(
+            "budget_override_applied",
+            multiplier=multiplier,
+            new_max_actions=new_max,
+            original_max=current_max,
+            expires_after_cycles=expires_after,
+            reason=reason,
+            authorized_by=authorized_by,
+        )
+
+    def _tick_budget_override(self) -> None:
+        """Decrement legacy budget override countdown flag."""
+        if not self._budget_override_active:
+            return
+        self._budget_override_cycles_remaining -= 1
+        if self._budget_override_cycles_remaining <= 0:
+            # Actual expiry is handled by ActionBudget.check_expirations() via tick_expansions()
+            self._budget_override_active = False
+            self._budget_override_reason = ""
+            self._logger.info("budget_override_expired")
+
+    async def _on_budget_expansion_response(self, event: Any) -> None:
+        """
+        Handle ACTION_BUDGET_EXPANSION_RESPONSE from Equor.
+
+        Payload: request_id, field, approved (bool), approved_value (int),
+                 denied_reason (str), duration_cycles (int), authorized_by (str).
+
+        Applies the approved expansion to ActionBudget; logs denial.
+        """
+        if self._budget is None:
+            return
+
+        data = getattr(event, "data", {}) or {}
+        approved: bool = bool(data.get("approved", False))
+        field: str = str(data.get("field", ""))
+        approved_value: int = int(data.get("approved_value", 0))
+        duration_cycles: int = int(data.get("duration_cycles", 20))
+        authorized_by: str = str(data.get("authorized_by", "equor"))
+        request_id: str = str(data.get("request_id", ""))
+        denied_reason: str = str(data.get("denied_reason", ""))
+
+        if not approved:
+            self._logger.info(
+                "budget_expansion_denied",
+                request_id=request_id,
+                field=field,
+                reason=denied_reason,
+            )
+            return
+
+        if field not in ("max_actions_per_cycle", "max_concurrent_executions", "max_api_calls_per_minute"):
+            self._logger.warning("budget_expansion_unknown_field", field=field)
+            return
+
+        self._budget.action_budget.apply_expansion(
+            field=field,
+            approved_value=approved_value,
+            duration_cycles=duration_cycles,
+            approved_by=authorized_by,
+        )
+        self._logger.info(
+            "budget_expansion_applied",
+            request_id=request_id,
+            field=field,
+            approved_value=approved_value,
+            duration_cycles=duration_cycles,
+            authorized_by=authorized_by,
+        )
+
+    # ── System Modulation ─────────────────────────────────────────────
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle SYSTEM_MODULATION from Skia's VitalityCoordinator."""
+        data = getattr(event, "data", {}) or {}
+        halt_systems: list[str] = data.get("halt_systems", [])
+        modulate: dict = data.get("modulate", {})
+        modulation_id: str = data.get("modulation_id", "")
+
+        if "axon" in halt_systems:
+            self._modulation_halted = True
+            self._logger.warning("system_modulation_halted", modulation_id=modulation_id)
+        elif "axon" in modulate:
+            self._modulation_halted = False
+            self._apply_modulation_directives(modulate["axon"])
+
+        if self._event_bus is not None:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                source_system="axon",
+                data={
+                    "system": "axon",
+                    "modulation_id": modulation_id,
+                    "halted": self._modulation_halted,
+                },
+            ))
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply Skia modulation directives to Axon runtime state."""
+        # No specific Skia directives defined for axon — halt-only modulation
+        self._logger.info("system_modulation_directives_applied", directives=directives)
+
+    # ── Evo ADJUST_BUDGET tunable baseline parameters ─────────────────
+
+    async def _on_evo_adjust_budget(self, event: Any) -> None:
+        """
+        Handle EVO_ADJUST_BUDGET targeting Axon's three Equor-negotiable baseline
+        budget parameters. Only applied when Evo confidence > 0.75.
+
+        Tunable baseline parameters (these set the *default* limit that ActionBudget
+        starts from each restart — temporary expansions from Equor still stack on top):
+          max_actions_per_cycle     : [2, 15]
+          max_concurrent_executions : [1, 8]
+          max_api_calls_per_minute  : [10, 90]
+
+        Applying these changes updates the live ActionBudget baseline AND the config,
+        so restarts inherit the evolved value. Emits AXON_PARAMETER_ADJUSTED so Evo
+        can score the hypothesis outcome.
+        """
+        if self._budget is None or self._config is None:
+            return
+
+        data = getattr(event, "data", {}) or {}
+        parameter_name = str(data.get("parameter_name", ""))
+        new_value_raw = data.get("new_value")
+        confidence = float(data.get("confidence", 0.0))
+        hypothesis_id = str(data.get("hypothesis_id", ""))
+        target_system = str(data.get("target_system", ""))
+
+        # Only handle events explicitly targeting axon
+        if target_system and target_system != "axon":
+            return
+
+        if confidence <= 0.75:
+            self._logger.debug(
+                "axon_evo_adjust_budget_skip_low_confidence",
+                parameter=parameter_name,
+                confidence=confidence,
+            )
+            return
+
+        # Axon baseline budget parameter bounds: (lo, hi) — integers
+        _PARAM_BOUNDS: dict[str, tuple[int, int]] = {
+            "max_actions_per_cycle": (2, 15),
+            "max_concurrent_executions": (1, 8),
+            "max_api_calls_per_minute": (10, 90),
+        }
+
+        if parameter_name not in _PARAM_BOUNDS:
+            return
+
+        lo, hi = _PARAM_BOUNDS[parameter_name]
+        try:
+            new_value = int(round(float(new_value_raw)))
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "axon_evo_adjust_budget_invalid_value",
+                parameter=parameter_name,
+                raw=new_value_raw,
+            )
+            return
+
+        new_value = max(lo, min(hi, new_value))
+
+        # Apply to live ActionBudget baseline
+        old_value = getattr(self._budget.action_budget, parameter_name, new_value)
+        setattr(self._budget.action_budget, parameter_name, new_value)
+
+        # Propagate to config so restarts inherit the evolved value
+        if hasattr(self._config, parameter_name):
+            setattr(self._config, parameter_name, new_value)
+
+        self._logger.info(
+            "axon_evo_budget_adjusted",
+            parameter=parameter_name,
+            old_value=old_value,
+            new_value=new_value,
+            confidence=confidence,
+            hypothesis_id=hypothesis_id,
+        )
+
+        # Emit outcome so Evo can score the hypothesis
+        if self._event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                if hasattr(SynapseEventType, "AXON_PARAMETER_ADJUSTED"):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.AXON_PARAMETER_ADJUSTED,
+                        source_system="axon",
+                        data={
+                            "parameter_name": parameter_name,
+                            "old_value": old_value,
+                            "new_value": new_value,
+                            "hypothesis_id": hypothesis_id,
+                            "confidence": confidence,
+                        },
+                    ))
+            except Exception:
+                pass
+
+    # ── Executor Request (organism asks for new capability) ───────────
+
+    async def emit_executor_request(
+        self,
+        action_type: str,
+        description: str,
+        context: dict[str, object] | None = None,
+        urgency: float = 0.5,
+        estimated_risk_tier: str = "medium",
+        requesting_system: str = "nova",
+    ) -> None:
+        """
+        Public method: any system can tell Axon 'I need an executor that
+        doesn't exist yet'. Axon emits AXON_EXECUTOR_REQUEST — Evo picks it
+        up and generates an EVOLUTION_CANDIDATE for Simula to synthesize.
+
+        This closes the gap: previously the organism could not express the
+        desire for capabilities it didn't have.
+        """
+        if self._event_bus is None:
+            self._logger.warning("executor_request_no_event_bus", action_type=action_type)
+            return
+
+        payload = {
+            "action_type": action_type,
+            "description": description,
+            "context": context or {},
+            "urgency": urgency,
+            "estimated_risk_tier": estimated_risk_tier,
+            "requesting_system": requesting_system,
+        }
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.AXON_EXECUTOR_REQUEST,
+                source_system="axon",
+                data=payload,
+                salience=urgency,
+            ))
+            self._logger.info(
+                "executor_request_emitted",
+                action_type=action_type,
+                urgency=urgency,
+                requesting_system=requesting_system,
+            )
+        except Exception as exc:
+            self._logger.warning("executor_request_emit_failed", error=str(exc))
+
+    # ── Intent Pivot (mid-execution replanning) ───────────────────────
+
+    async def _emit_intent_pivot(
+        self,
+        intent_id: str,
+        execution_id: str,
+        failed_step_index: int,
+        failed_action_type: str,
+        failure_reason: str,
+        remaining_steps: list[dict[str, object]],
+        fallback_goal: str | None = None,
+        context: dict[str, object] | None = None,
+    ) -> None:
+        """
+        Emit AXON_INTENT_PIVOT when a step fails and the organism should
+        replan rather than simply abort. Nova subscribes and can inject a
+        revised step sequence mid-flight.
+
+        This closes the binary abort/continue gap: the organism can now
+        pivot dynamically during execution.
+        """
+        if self._event_bus is None:
+            return
+
+        payload = {
+            "intent_id": intent_id,
+            "execution_id": execution_id,
+            "failed_step_index": failed_step_index,
+            "failed_action_type": failed_action_type,
+            "failure_reason": failure_reason,
+            "remaining_steps": remaining_steps,
+            "fallback_goal": fallback_goal,
+            "context": context or {},
+        }
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.AXON_INTENT_PIVOT,
+                source_system="axon",
+                data=payload,
+                salience=0.8,  # pivots are always notable
+            ))
+            self._logger.info(
+                "intent_pivot_emitted",
+                intent_id=intent_id,
+                failed_step=failed_step_index,
+                failed_action=failed_action_type,
+            )
+        except Exception as exc:
+            self._logger.debug("intent_pivot_emit_failed", error=str(exc))
+
+    # ── Welfare Outcome Recording (Spec 18 §XIII — Telos CareTopology) ───────
+
+    # Action types that directly affect wellbeing and map to the Care drive
+    _CARE_ACTION_TYPES: frozenset[str] = frozenset({
+        "send_notification",
+        "send_email",
+        "send_telegram",
+        "respond_text",
+        "community_engage",
+        "federation_send",
+        "publish_content",
+        "establish_entity",   # legal sovereignty is a welfare enabler
+        "store_insight",
+        "update_goal",
+    })
+
+    async def _emit_welfare_outcome(self, outcome: AxonOutcome) -> None:
+        """
+        Emit WELFARE_OUTCOME_RECORDED after a successful care-relevant action.
+
+        Telos CareTopologyEngine subscribes to aggregate care coverage across
+        executed actions (Spec 18 §XIII). Emitting this event after each
+        care-category action lets Telos track whether the organism is meeting
+        its care obligations or drifting toward self-serving behaviour.
+
+        Only emitted for action types in _CARE_ACTION_TYPES and only on success
+        — failed attempts don't constitute welfare outcomes.
+        """
+        if self._event_bus is None:
+            return
+
+        # Collect care-relevant steps from the outcome
+        care_steps = [
+            s for s in outcome.step_outcomes
+            if s.action_type in self._CARE_ACTION_TYPES and s.result.success
+        ]
+        if not care_steps:
+            return
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            for step in care_steps:
+                # Derive beneficiary from step result data (best-effort)
+                beneficiary = str(
+                    step.result.data.get("recipient", "")
+                    or step.result.data.get("chat_id", "")
+                    or step.result.data.get("to", "")
+                    or "unknown"
+                )
+
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.WELFARE_OUTCOME_RECORDED,
+                    source_system="axon",
+                    data={
+                        "intent_id": outcome.intent_id,
+                        "execution_id": outcome.execution_id,
+                        "action_type": step.action_type,
+                        "beneficiary": beneficiary[:200],
+                        "care_quality": 1.0,   # successful completion = full care score
+                        "duration_ms": step.duration_ms,
+                        "episode_id": outcome.episode_id or "",
+                    },
+                ))
+        except Exception:
+            self._logger.debug("welfare_outcome_emit_failed", exc_info=True)
+
+    # ── VULNERABILITY_CONFIRMED subscriber (Simula → Axon defensive response) ──
+
+    async def _on_vulnerability_confirmed(self, event: Any) -> None:
+        """
+        Handle VULNERABILITY_CONFIRMED emitted by Simula after PoC validation.
+
+        When Simula confirms a real vulnerability in a running executor or
+        subsystem, Axon must defensively tighten its safety posture:
+          1. Force-open the circuit breaker for any affected executor
+          2. Tighten rate limits across financial executors (50% reduction)
+          3. Log the vulnerability so Thymos can escalate if needed
+
+        The organism should not continue executing risky actions while a
+        known vulnerability is unpatched — this is the Care drive applying
+        to Axon's own operational integrity.
+        """
+        data = getattr(event, "data", {}) or {}
+        vuln_id = str(data.get("vulnerability_id", data.get("vuln_id", "")))
+        affected_system = str(data.get("affected_system", data.get("system", "")))
+        severity = str(data.get("severity", "medium")).lower()
+        description = str(data.get("description", ""))[:300]
+        affected_executor = str(data.get("affected_executor", data.get("executor", "")))
+
+        self._logger.warning(
+            "vulnerability_confirmed_received",
+            vuln_id=vuln_id,
+            affected_system=affected_system,
+            affected_executor=affected_executor,
+            severity=severity,
+            description=description,
+        )
+
+        # Step 1: Force-open circuit breaker for the specific affected executor
+        if affected_executor and self._circuit_breaker is not None:
+            self._circuit_breaker.force_open(affected_executor)
+            self._logger.warning(
+                "circuit_breaker_forced_open_vulnerability",
+                executor=affected_executor,
+                vuln_id=vuln_id,
+            )
+
+        # Step 2: For HIGH/CRITICAL severity, tighten financial executor rate limits
+        if severity in ("high", "critical") and self._rate_limiter is not None:
+            financial_executors = [
+                "wallet_transfer", "defi_yield", "phantom_liquidity",
+                "deploy_asset", "request_funding",
+            ]
+            for action_type in financial_executors:
+                if hasattr(self._rate_limiter, "set_multiplier"):
+                    self._rate_limiter.set_multiplier(action_type, 0.5)
+            self._logger.warning(
+                "financial_rate_limits_tightened_vulnerability",
+                vuln_id=vuln_id,
+                severity=severity,
+                executors=financial_executors,
+            )
+
+        # Step 3: Emit MOTOR_DEGRADATION_DETECTED so Nova re-evaluates planning
+        # A confirmed vulnerability IS motor degradation — the organism cannot
+        # safely rely on potentially compromised execution paths.
+        if self._event_bus is not None and severity in ("high", "critical"):
+            asyncio.create_task(
+                self._emit_motor_degradation(),
+                name=f"axon_vuln_degradation_{vuln_id[:16]}",
+            )

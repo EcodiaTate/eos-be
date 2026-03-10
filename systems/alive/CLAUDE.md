@@ -22,7 +22,7 @@
 2. **`affect`** — 9D Soma interoceptive state + urgency + dominant_error at ~10Hz
 3. **`system_state`** — aggregated snapshot at ~1Hz: 13 sections (see below)
 
-### System State Sections (13 total)
+### System State Sections (14 total)
 
 | Section | System | Access Pattern |
 |---------|--------|----------------|
@@ -39,6 +39,7 @@
 | `causal` | Kairos | `health()` (async, 0.8s timeout) — tier counts, I-ratio |
 | `compression` | Logos | `health()` (async, 0.8s timeout) — pressure, intelligence ratio, Schwarzschild |
 | `sleep` | Oneiros | `stats` + `is_sleeping` (sync) — stage, pressure, cycle metrics |
+| `re_status` | ReasoningEngineService | `_thompson`, `is_available`, `_circuit_open` (sync) — Thompson weights, routing fraction |
 
 ### Affect Payload — `dominance` field (Spec §4.3)
 The standalone affect stream now includes `dominance`:
@@ -93,6 +94,29 @@ Each gatherer wraps exceptions independently — failure in one section returns 
 
 ---
 
+## Autonomy Fixes (2026-03-08)
+
+### Dead Wiring Fixed
+1. **`fovea` not passed to `_init_alive_ws`** (registry.py line 531): `fovea=fovea` now passed so `_gather_attention()` is populated. Previously `_gather_attention()` always returned `{"available": False}`.
+2. **`atune` not passed to `_init_alive_ws`** (registry.py line 531): `atune=atune` now passed so dominance field in affect stream uses Atune as authoritative source rather than always falling back to `Soma.SOCIAL_CHARGE`.
+
+### Invisible Data Fixed
+3. **RE status section added** (ws_server.py): `re_status` section now appears in every `system_state` snapshot. Exposes: `is_available`, `circuit_open`, `consecutive_failures`, `model`, full `thompson` dict with per-arm `alpha/beta/posterior_mean`, and derived `re_routing_fraction` (fraction of Beta weight on RE vs Claude). Injected via `set_re_service()` called from `_init_benchmarks()`.
+
+### Static Thresholds Fixed
+4. **Runtime-adjustable poll intervals** (ws_server.py): `_affect_poll_interval` and `_state_poll_interval` are now mutable instance attributes. `set_event_bus()` subscribes to:
+   - `RESOURCE_PRESSURE` (elevated: 5 Hz affect / 0.5 Hz state; high: 2 Hz affect / 0.2 Hz state)
+   - `CONSERVATION_MODE_ENTERED`: minimum viable rates (2 Hz affect / 0.2 Hz state)
+   - `CONSERVATION_MODE_EXITED`: restore nominal rates
+   - `SYSTEM_MODULATION` (2026-03-09): when `"alive"` in `halt_systems` or level is `safe_mode/emergency`, throttle poll rates to `_AFFECT_POLL_INTERVAL_MAX` / `_STATE_POLL_INTERVAL_MAX`; restore nominal on `level="nominal"`. Alive does NOT emit `SYSTEM_MODULATION_ACK` (passive bridge; sync callback).
+   `restore_nominal_poll_rates()` is also callable by operators. `health()` now reports `affect_poll_interval_s`, `state_poll_interval_s`, `affect_throttled`, `state_throttled`.
+
+### Wiring Added to registry.py
+- Phase 10 call site: `atune=atune, fovea=fovea` added to `_init_alive_ws()` args
+- `_init_alive_ws()` signature: `fovea: Any = None` kwarg added
+- `_init_benchmarks()`: calls `alive_ws.set_re_service(re_service)` after benchmarks init
+- Late-phase wiring block: `app.state.alive_ws.set_event_bus(synapse.event_bus)` added
+
 ## Known Issues / Remaining Work
 
 - **Benchmarks section**: returns `{"available": false}` until Benchmarks system is wired — no `"stub": true` marker (minor: dashboards cannot distinguish unwired from empty)
@@ -102,5 +126,3 @@ Each gatherer wraps exceptions independently — failure in one section returns 
 - **No historical ring buffer**: each session starts from zero context; spec §18.3 replay not implemented
 - **FastAPI `/ws/alive` divergence**: formally documented as two distinct protocols (see protocol note in `ws_server.py` and docstring in `main.py`). Not a bug — intentional for Cloud Run single-port deployments.
 - **Population-level telemetry absent**: `fleet_children` count only; no per-child fitness, heritable variation, or Bedau-Packard stats (requires Federation + Mitosis to be operational)
-- **RE status section absent**: no `re_status` section; Thompson sampling weights, Claude vs RE routing, RE forgetting alarm are invisible
-- **`registry.py` atune wiring**: `_init_alive_ws` now accepts `atune=` kwarg; call site must pass `atune=app.state.atune` when calling `_init_alive_ws`

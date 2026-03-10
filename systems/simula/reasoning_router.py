@@ -53,28 +53,30 @@ class ReasoningRouter:
 
     def select_strategy(self, available: list[str] | None = None) -> str:
         """Select the best proof strategy via Thompson sampling."""
+        ranked = self.rank_strategies(available)
+        return ranked[0] if ranked else self._strategies[0]
+
+    def rank_strategies(self, available: list[str] | None = None) -> list[str]:
+        """Rank all available strategies by Thompson sampling (highest first)."""
         candidates = available or list(self._strategies)
         if not candidates:
-            return self._strategies[0]
+            return list(self._strategies)
 
-        best_strategy = candidates[0]
-        best_sample = -1.0
+        samples: list[tuple[str, float]] = []
         for strategy in candidates:
             arm = self._arms.get(strategy)
             if arm is None:
                 arm = ArmStats()
                 self._arms[strategy] = arm
-            s = arm.sample
-            if s > best_sample:
-                best_sample = s
-                best_strategy = strategy
+            samples.append((strategy, arm.sample))
+
+        samples.sort(key=lambda x: x[1], reverse=True)
 
         self._log.debug(
-            "strategy_selected",
-            strategy=best_strategy,
-            sample=f"{best_sample:.3f}",
+            "strategies_ranked",
+            ranking=[(s, f"{v:.3f}") for s, v in samples],
         )
-        return best_strategy
+        return [s for s, _ in samples]
 
     def update(self, strategy: str, success: bool) -> None:
         """Update the arm's posterior after observing a proof outcome."""

@@ -153,6 +153,10 @@ class InputChannelRegistry:
     def __init__(self) -> None:
         self._channels: dict[str, InputChannel] = {}
         self._log = logger.bind(component="InputChannelRegistry")
+        self._event_bus: Any = None
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        self._event_bus = event_bus
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -285,6 +289,25 @@ class InputChannelRegistry:
 
         self._channels[channel.id] = channel
         self._log.info("input_channel_registered", channel_id=channel.id, domain=channel.domain)
+
+        # Emit INPUT_CHANNEL_REGISTERED on Synapse so Benchmarks + Evo can observe new sensors
+        if self._event_bus is not None:
+            import contextlib
+            async def _emit_registered() -> None:
+                from systems.synapse.types import SynapseEventType
+                with contextlib.suppress(Exception):
+                    await self._event_bus.emit(
+                        SynapseEventType.INPUT_CHANNEL_REGISTERED,
+                        {
+                            "channel_id": channel.id,
+                            "channel_name": channel.name,
+                            "domain": channel.domain,
+                            "active_channel_count": len(self.active_channels()),
+                        },
+                        source_system="nova",
+                    )
+            asyncio.ensure_future(_emit_registered())
+
         return True
 
     # ── Observability ─────────────────────────────────────────────────────────

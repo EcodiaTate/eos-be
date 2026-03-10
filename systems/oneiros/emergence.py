@@ -420,7 +420,11 @@ class EmergenceStage:
         wake_prep: WakeStatePreparation,
         sleep_duration_s: float,
     ) -> None:
-        """Broadcast WAKE_INITIATED with full WakeStatePreparation payload."""
+        """Broadcast WAKE_INITIATED with full WakeStatePreparation payload.
+
+        Also emits FOVEA_PREATTENTION_CACHE_READY (Gap 2 fix) when the cache is
+        non-empty so Fovea can load pre-generated predictions as precision priors.
+        """
         if self._event_bus is None:
             return
 
@@ -442,3 +446,46 @@ class EmergenceStage:
             },
         )
         await self._event_bus.emit(event)
+
+        # Wire ORGANISM_WAKE — Axon, Identity, SACM, Simula subscribe to this.
+        # WAKE_INITIATED is Oneiros-internal; ORGANISM_WAKE is the organism-wide signal.
+        organism_wake_event = SynapseEvent(
+            event_type=SynapseEventType.ORGANISM_WAKE,
+            source_system=_SOURCE,
+            data={
+                "sleep_duration_s": sleep_duration_s,
+                "intelligence_improvement": wake_prep.intelligence_improvement,
+            },
+        )
+        await self._event_bus.emit(organism_wake_event)
+
+        # Gap 2 fix: deliver full pre-attention cache to Fovea via a dedicated event.
+        # WAKE_INITIATED carries only the count (for lightweight consumers).
+        # Fovea subscribes to FOVEA_PREATTENTION_CACHE_READY for the full payload.
+        cache = wake_prep.pre_attention_cache
+        if cache.total_predictions > 0:
+            try:
+                entries_payload = [
+                    {
+                        "domain": getattr(e, "domain", ""),
+                        "context_key": getattr(e, "context_key", ""),
+                        "predicted_content": getattr(e, "predicted_content", {}),
+                        "confidence": getattr(e, "confidence", 0.0),
+                        "generating_schema_ids": getattr(e, "generating_schema_ids", []),
+                    }
+                    for e in (cache.entries or [])
+                ]
+            except Exception:
+                entries_payload = []
+
+            cache_event = SynapseEvent(
+                event_type=SynapseEventType.FOVEA_PREATTENTION_CACHE_READY,
+                source_system=_SOURCE,
+                data={
+                    "entries": entries_payload,
+                    "domains_covered": cache.domains_covered,
+                    "total_predictions": cache.total_predictions,
+                    "sleep_cycle_id": wake_prep.sleep_narrative.sleep_cycle_id,
+                },
+            )
+            await self._event_bus.emit(cache_event)

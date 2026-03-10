@@ -34,7 +34,7 @@ import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
@@ -139,6 +139,92 @@ class ExecutorGenerator:
         """Inject the live ExecutorRegistry so generated executors can be hot-loaded."""
         self._axon_registry = registry
 
+    # ── Build-error RE training signal ────────────────────────────────────────
+
+    def _emit_build_error(
+        self,
+        *,
+        generated_code: str,
+        prompt_used: str,
+        error_type: Literal["syntax", "import", "runtime", "verification_timeout",
+                            "proof_failed", "sandbox_escape"],
+        error_message: str,
+        error_traceback: str | None,
+        template: ExecutorTemplate,
+        lesson: str,
+    ) -> None:
+        """Fire-and-forget RE_TRAINING_EXAMPLE(outcome_quality=0.0) on any build error.
+
+        Never raises. Uses asyncio.create_task so it cannot block the caller.
+        """
+        import asyncio
+
+        bus = self._event_bus
+        if bus is None:
+            return
+
+        async def _emit() -> None:
+            try:
+                from decimal import Decimal
+
+                from primitives.common import DriveAlignmentVector, SystemID
+                from primitives.re_training import RETrainingExample
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+
+                safe_code = generated_code[:4000] if generated_code else ""
+                safe_prompt = prompt_used[:2000] if prompt_used else ""
+                safe_error = error_message[:1000] if error_message else ""
+                safe_tb = (error_traceback[:1500] if error_traceback else "")
+                safe_lesson = lesson[:500] if lesson else ""
+
+                reasoning_trace = (
+                    f"error_type={error_type}\n"
+                    f"executor={template.name} action_type={template.action_type}\n"
+                    f"protocol={template.protocol_or_platform}\n"
+                    f"error={safe_error}\n"
+                    + (f"traceback={safe_tb}\n" if safe_tb else "")
+                    + f"lesson={safe_lesson}"
+                )
+
+                example = RETrainingExample(
+                    source_system=SystemID.SIMULA,
+                    episode_id=getattr(template, "source_hypothesis_id", "") or "",
+                    instruction=safe_prompt or (
+                        f"Generate Axon executor {template.name} "
+                        f"for {template.protocol_or_platform}: {template.description[:120]}"
+                    ),
+                    input_context=(
+                        f"executor={template.name} "
+                        f"action_type={template.action_type} "
+                        f"error_type={error_type} "
+                        f"strategy=executor_generation"
+                    ),
+                    output=safe_code,
+                    outcome_quality=0.0,
+                    category="build_error",
+                    reasoning_trace=reasoning_trace,
+                    alternatives_considered=[error_type],
+                    cost_usd=Decimal("0"),
+                    latency_ms=0,
+                    constitutional_alignment=DriveAlignmentVector(),
+                    domain="software",
+                    skill_area="executor_generation",
+                    domain_difficulty="expert",
+                )
+                await bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                    source_system="simula.executor_generator",
+                    data=example.model_dump(mode="json"),
+                ))
+            except Exception:
+                pass  # Never let emission errors propagate
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_emit())
+        except RuntimeError:
+            pass  # No running event loop — skip silently
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def generate_executor(
@@ -179,11 +265,25 @@ class ExecutorGenerator:
             )
 
         # 3–4. Generate code via LLM
+        prompt = ""
         try:
             prompt = self._build_generation_prompt(template)
             generated_code = await self._generate_code_via_llm(prompt, template)
         except Exception as exc:
+            import traceback as _tb
             log.error("executor_code_generation_failed", error=str(exc))
+            self._emit_build_error(
+                generated_code="",
+                prompt_used=prompt,
+                error_type="runtime",
+                error_message=f"Code generation failed: {exc}",
+                error_traceback=_tb.format_exc(),
+                template=template,
+                lesson=(
+                    "Executor code generation raised an exception before producing any output. "
+                    "The LLM call or prompt construction failed."
+                ),
+            )
             return ExecutorGenerationResult(
                 success=False,
                 action_type=template.action_type,
@@ -199,6 +299,37 @@ class ExecutorGenerator:
                 "executor_code_validation_failed",
                 errors=validation_errors,
                 preview=generated_code[:300],
+            )
+            # Classify the dominant error type
+            _has_syntax = any(
+                "AST syntax" in e or "syntax error" in e.lower()
+                for e in validation_errors
+            )
+            _has_import = any("import" in e.lower() for e in validation_errors)
+            _has_dangerous = any(
+                "dangerous" in e.lower() or "forbidden" in e.lower()
+                for e in validation_errors
+            )
+            _exec_err_type: Literal[
+                "syntax", "import", "runtime", "verification_timeout",
+                "proof_failed", "sandbox_escape"
+            ] = (
+                "syntax" if _has_syntax
+                else "sandbox_escape" if _has_dangerous
+                else "import" if _has_import
+                else "runtime"
+            )
+            self._emit_build_error(
+                generated_code=generated_code,
+                prompt_used=prompt,
+                error_type=_exec_err_type,
+                error_message="; ".join(validation_errors),
+                error_traceback=None,
+                template=template,
+                lesson=(
+                    f"Generated executor code failed {_exec_err_type} validation: "
+                    + "; ".join(validation_errors[:3])
+                ),
             )
             return ExecutorGenerationResult(
                 success=False,

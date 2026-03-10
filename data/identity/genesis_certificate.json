@@ -1,0 +1,15 @@
+{
+  "certificate_id": "01KK6EVK4GEE90TT7T5W88SJBR",
+  "instance_id": "genesis",
+  "lineage_hash": "aeebad4a796fcc2e15dc4c6061b45ed9b373f26adfc798ca7d2d8cc58182718e",
+  "certificate_type": "genesis",
+  "issuer_instance_id": "genesis",
+  "issuer_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAci4d8AMeqm7ALstruekpJgL2h/xCverLBuq8L22jVLY=\n-----END PUBLIC KEY-----\n",
+  "issued_at": "2026-03-08T10:11:02.416174Z",
+  "expires_at": "2036-03-05T10:11:02.416174Z",
+  "validity_days": 3650,
+  "signature": "XRpmWSlvlI/1DUsXWJZOci/wiLLMDrOtdextBDhzr3LK2K6sYr1xipIoaDdQ91kV3DeqJ9yXdZOV8o26O1n8DQ==",
+  "constitutional_hash": "e41e29e496dd10eacfe6fca4ea2d78d0246b6850fa480b3f20001efad37b0fc5",
+  "protocol_version": "1.0",
+  "renewal_count": 0
+}

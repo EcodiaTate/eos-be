@@ -179,6 +179,16 @@ class TournamentEngine:
         for h in hypotheses:
             self._hypothesis_to_tournament[h.id] = tournament.id
 
+        # Apply any pending inherited priors for this tournament's hypotheses
+        pending_priors = getattr(self, "_pending_priors", {})
+        for h in hypotheses:
+            if tournament.id in pending_priors:
+                prior = pending_priors[tournament.id].get(h.id)
+                if prior is not None:
+                    alpha, beta_val = prior
+                    tournament.beta_parameters[h.id].alpha = alpha
+                    tournament.beta_parameters[h.id].beta = beta_val
+
         self._total_created += 1
         self._logger.info(
             "tournament_created",
@@ -454,6 +464,44 @@ class TournamentEngine:
     def get_all_tournaments(self) -> list[HypothesisTournament]:
         """Return all tournaments (running + converged, not archived)."""
         return list(self._tournaments.values())
+
+    def seed_inherited_prior(
+        self,
+        tournament_id: str,
+        hypothesis_id: str,
+        alpha: float,
+        beta: float,
+    ) -> None:
+        """
+        Seed a Beta prior from a parent genome into an existing tournament.
+
+        If the tournament doesn't exist yet (child hasn't seen the hypotheses), the
+        prior is stored in a pending registry and applied when the tournament is
+        created via _create_tournament().
+
+        Alpha and beta are applied directly — they represent parent's accumulated
+        evidence (already filtered to ≥5 samples at export time).
+        """
+        existing = self._tournaments.get(tournament_id)
+        if existing is not None:
+            # Tournament already running — update the Beta distribution directly
+            existing_beta = existing.beta_parameters.get(hypothesis_id)
+            if existing_beta is not None:
+                # Merge: parent's posterior becomes child's prior
+                existing_beta.alpha = alpha
+                existing_beta.beta = beta
+                self._logger.debug(
+                    "tournament_prior_seeded",
+                    tournament_id=tournament_id,
+                    hypothesis_id=hypothesis_id[:12],
+                    alpha=round(alpha, 3),
+                    beta=round(beta, 3),
+                )
+        else:
+            # Tournament not yet created — stash for later application
+            if not hasattr(self, "_pending_priors"):
+                self._pending_priors: dict[str, dict[str, tuple[float, float]]] = {}
+            self._pending_priors.setdefault(tournament_id, {})[hypothesis_id] = (alpha, beta)
 
     @property
     def stats(self) -> dict[str, int]:

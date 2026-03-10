@@ -273,6 +273,18 @@ class ComputeResourceManager:
             self._on_genome_extract_request,
         )
 
+        # Infrastructure cost changes should trigger migration evaluation
+        event_bus.subscribe(
+            SynapseEventType.INFRASTRUCTURE_COST_CHANGED,
+            self._on_infrastructure_cost_changed,
+        )
+
+        # Compute budget expansion responses from Equor
+        event_bus.subscribe(
+            SynapseEventType.COMPUTE_BUDGET_EXPANSION_RESPONSE,
+            self._on_compute_budget_expansion_response,
+        )
+
         self._log.info(
             "compute_events_subscribed",
             events=[
@@ -282,25 +294,75 @@ class ComputeResourceManager:
                 "organism_wake",
                 "metabolic_emergency",
                 "genome_extract_request",
+                "infrastructure_cost_changed",
+                "compute_budget_expansion_response",
             ],
         )
 
-    async def _emit(self, event_type: str, data: dict[str, Any]) -> None:
+
+    async def _on_infrastructure_cost_changed(self, event: Any) -> None:
+        """
+        Handle INFRASTRUCTURE_COST_CHANGED — evaluate whether cost delta
+        justifies triggering a migration check via CostTriggeredMigrationMonitor.
+
+        Re-emits ORGANISM_TELEMETRY-compatible data so the migration monitor
+        can evaluate the updated cost surface without duplicate logic.
+        """
+        data = getattr(event, "data", {}) or {}
+        new_cost = float(data.get("cost_usd_per_hour", 0.0))
+        provider = data.get("provider", "unknown")
+        self._log.info(
+            "infrastructure_cost_changed",
+            provider=provider,
+            cost_usd_per_hour=round(new_cost, 4),
+        )
+        # Update internal cost tracker if available
+        if hasattr(self, "_current_infra_cost"):
+            self._current_infra_cost = new_cost
+
+    async def _on_compute_budget_expansion_response(self, event: Any) -> None:
+        """
+        Handle COMPUTE_BUDGET_EXPANSION_RESPONSE — Equor approved or denied
+        a request to expand the compute allocation budget.
+
+        On approval, raises the effective burst allowance for pending workloads.
+        On denial, logs the constraint for observability.
+        """
+        data = getattr(event, "data", {}) or {}
+        approved = data.get("approved", False)
+        new_limit_usd = float(data.get("new_limit_usd", 0.0))
+        request_id = data.get("request_id", "")
+        self._log.info(
+            "compute_budget_expansion_response",
+            request_id=request_id,
+            approved=approved,
+            new_limit_usd=round(new_limit_usd, 4),
+        )
+        if approved and new_limit_usd > 0:
+            # Signal pre-warm engine to resume provisioning if it was paused
+            if hasattr(self, "_pre_warm") and self._pre_warm is not None:
+                await self._pre_warm.notify_budget_expanded(new_limit_usd)
+
+    async def _emit(self, event_type: "str | SynapseEventType", data: dict[str, Any]) -> None:
         """Fire-and-forget emit onto the Synapse event bus."""
         if self._synapse is None:
             return
 
         from systems.synapse.types import SynapseEvent, SynapseEventType
 
+        if isinstance(event_type, SynapseEventType):
+            et: SynapseEventType = event_type
+        else:
+            et = SynapseEventType(event_type)
         asyncio.create_task(
             self._synapse.event_bus.emit(
                 SynapseEvent(
-                    event_type=SynapseEventType(event_type),
+                    event_type=et,
                     source_system="sacm",
                     data=data,
                 )
             ),
-            name=f"sacm_{event_type}_{data.get('request_id', '')[:8]}",
+            name=f"sacm_{str(event_type)}_{data.get('request_id', '')[:8]}",
         )
 
     # ─── Federation Wiring ────────────────────────────────────────
@@ -383,7 +445,8 @@ class ComputeResourceManager:
             starvation_level=event.data.get("starvation_level", "unknown"),
         )
 
-        await self._emit("compute_capacity_exhausted", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit(_SET.COMPUTE_CAPACITY_EXHAUSTED, {
             "reason": "metabolic_emergency",
             "starvation_level": event.data.get("starvation_level", "unknown"),
             "shed_count": shed_count,
@@ -402,7 +465,8 @@ class ComputeResourceManager:
             payload=self._extract_heritable_state(),
         )
 
-        await self._emit("genome_extract_response", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit(_SET.GENOME_EXTRACT_RESPONSE, {
             "request_id": event.data.get("request_id", ""),
             "segment": segment.model_dump(mode="json"),
         })
@@ -489,7 +553,8 @@ class ComputeResourceManager:
                 reason="metabolic_emergency",
             )
             self._total_denied += 1
-            await self._emit("compute_request_denied", {
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit(_SET.COMPUTE_REQUEST_DENIED, {
                 "request_id": request.request_id,
                 "source_system": request.source_system,
                 "reason": "metabolic_emergency",
@@ -522,7 +587,8 @@ class ComputeResourceManager:
                 ),
             )
             self._total_denied += 1
-            await self._emit("compute_request_denied", {
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit(_SET.COMPUTE_REQUEST_DENIED, {
                 "request_id": request.request_id,
                 "source_system": request.source_system,
                 "reason": decision.reason,
@@ -557,7 +623,8 @@ class ComputeResourceManager:
             reason="queue_full",
         )
         self._total_denied += 1
-        await self._emit("compute_request_denied", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit(_SET.COMPUTE_REQUEST_DENIED, {
             "request_id": request.request_id,
             "source_system": request.source_system,
             "reason": "queue_full",
@@ -587,7 +654,8 @@ class ComputeResourceManager:
         # Emit ALLOCATION_RELEASED so the Synapse bus reflects capacity recovery.
         # Downstream systems (Oikos, Soma, other compute requesters) can react
         # to freed capacity without polling the manager.
-        await self._emit("allocation_released", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit(_SET.ALLOCATION_RELEASED, {
             "request_id": request_id,
             "source_system": allocation.source_system,
             "cpu_vcpu_released": allocation.resources.cpu_vcpu,
@@ -626,7 +694,8 @@ class ComputeResourceManager:
             node_id=self._capacity.node_id,
         )
 
-        await self._emit("compute_request_allocated", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit(_SET.COMPUTE_REQUEST_ALLOCATED, {
             "request_id": request.request_id,
             "source_system": request.source_system,
             "node_id": self._capacity.node_id,
@@ -666,7 +735,8 @@ class ComputeResourceManager:
             reason=f"queue_position={self._queue.index(request) + 1}",
         )
 
-        await self._emit("compute_request_queued", {
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit(_SET.COMPUTE_REQUEST_QUEUED, {
             "request_id": request.request_id,
             "source_system": request.source_system,
             "queue_depth": len(self._queue),
@@ -675,7 +745,8 @@ class ComputeResourceManager:
 
         # If capacity is fully exhausted, emit alert
         if self._capacity.utilisation_pct >= 95.0:
-            await self._emit("compute_capacity_exhausted", {
+            from systems.synapse.types import SynapseEventType as _SET
+            await self._emit(_SET.COMPUTE_CAPACITY_EXHAUSTED, {
                 "utilisation_pct": self._capacity.utilisation_pct,
                 "queue_depth": len(self._queue),
                 "active_count": len(self._active),
@@ -746,7 +817,8 @@ class ComputeResourceManager:
                     reason="local_capacity_exhausted",
                 )
 
-                await self._emit("compute_federation_offloaded", {
+                from systems.synapse.types import SynapseEventType as _SET
+                await self._emit(_SET.COMPUTE_FEDERATION_OFFLOADED, {
                     "request_id": request.request_id,
                     "source_system": request.source_system,
                     "peer_id": peer_id,

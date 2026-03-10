@@ -132,8 +132,10 @@ class TelosService:
         self._computation_task: asyncio.Task[None] | None = None
         self._last_computation_ms: float = 0.0
         self._computation_count: int = 0
+        self._cycle_count: int = 0  # alias kept for RE training episode IDs
         self._last_constitutional_check: float = 0.0
         self._last_hourly_rollup_hour: int = -1
+        self._instance_id: str = ""  # set via set_neo4j() at wiring time
 
         # Recent drive alignments (fed from Equor via Synapse events)
         self._recent_alignments: list[DriveAlignmentVector] = []
@@ -169,6 +171,16 @@ class TelosService:
         self._autonomy_window_s: float = 7 * 24 * 3600.0
         self._autonomy_target_per_day: float = 1.0
         self._autonomy_stagnating_threshold: float = 3.0
+
+        # ── Welfare domain learning (from Evo hypothesis labels) ─────────
+        # Extends the hardcoded _WELFARE_KEYWORDS in care.py at runtime.
+        # Populated by _on_evo_belief_consolidated — when Evo discovers a
+        # new hypothesis whose label contains welfare-adjacent signals, Telos
+        # registers the label as a learnable welfare domain keyword so the
+        # CareTopologyEngine can detect welfare failures in that domain.
+        self._learned_welfare_keywords: set[str] = set()
+
+        self._modulation_halted: bool = False
 
     # ─── Dependency Injection ────────────────────────────────────────
 
@@ -209,10 +221,18 @@ class TelosService:
         self._logger.info("event_bus_wired")
 
     def set_neo4j(self, driver: Any, instance_id: str = "") -> None:
-        """Inject Neo4j driver for I-history persistence."""
+        """Inject Neo4j driver for I-history persistence.
+
+        Also captures instance_id used in genome export and RE training episode IDs.
+        Must be called during startup (after set_logos) for Neo4j writes to work.
+        """
+        self._instance_id = instance_id
         if isinstance(self._logos, LogosMetricsAdapter):
             self._logos.set_history_neo4j(driver, instance_id)
-            self._logger.info("neo4j_wired_for_i_history")
+            self._logger.info("neo4j_wired_for_i_history", instance_id=instance_id)
+        else:
+            self._logger.info("neo4j_instance_id_set", instance_id=instance_id,
+                              note="logos not yet a LogosMetricsAdapter — call after set_logos")
 
     # ─── Lifecycle ───────────────────────────────────────────────────
 
@@ -840,6 +860,25 @@ class TelosService:
             self._on_child_died,
         )
 
+        # Welfare domain learning — when Evo discovers capabilities in novel domains,
+        # Telos evaluates whether that domain involves welfare consequences and, if so,
+        # registers its name as a learnable keyword for the CareTopologyEngine.
+        # This closes the static _WELFARE_KEYWORDS gap: the care topology can now
+        # expand to domains the system discovers through experience, not just designer intent.
+        self._event_bus.subscribe(
+            SynapseEventType.EVO_CAPABILITY_EMERGED,
+            self._on_evo_capability_emerged,
+        )
+
+        # On-demand self-model query — any system (Nova, RE, Alive visualization)
+        # can request the full current intelligence geometry snapshot without waiting
+        # for the next 60s cycle. Telos responds with TELOS_SELF_MODEL_SNAPSHOT.
+        if hasattr(SynapseEventType, "TELOS_SELF_MODEL_REQUEST"):
+            self._event_bus.subscribe(
+                SynapseEventType.TELOS_SELF_MODEL_REQUEST,
+                self._on_self_model_request,
+            )
+
         # Simula validation requests — run constitutional binder, emit ALIGNMENT_GAP_WARNING
         # if the proposed mutation would violate drive topology (replaces direct method call)
         if hasattr(SynapseEventType, "TELOS_WORLD_MODEL_VALIDATE"):
@@ -857,9 +896,14 @@ class TelosService:
                 self._on_self_coherence_alarm,
             )
 
+        self._event_bus.subscribe(
+            SynapseEventType.SYSTEM_MODULATION,
+            self._on_system_modulation,
+        )
+
         self._logger.debug(
             "telos_event_subscriptions_registered",
-            count=13,
+            count=14,
         )
 
     # ─── Event Handlers ──────────────────────────────────────────────
@@ -1141,6 +1185,217 @@ class TelosService:
             self._population_aggregator.remove_child(child_id)
             self._logger.debug("population_child_removed", child_id=child_id)
 
+    async def _on_evo_capability_emerged(self, event: SynapseEvent) -> None:
+        """
+        EVO_CAPABILITY_EMERGED → welfare domain learning.
+
+        When Evo discovers a new capability domain, Telos evaluates whether
+        that domain involves welfare consequences. If any welfare-adjacent
+        signal is found in the domain name or capability name, Telos registers
+        the domain as a learnable welfare keyword — expanding care topology
+        beyond the hardcoded _WELFARE_KEYWORDS in care.py.
+
+        This closes the autonomy gap where the CareTopologyEngine could only
+        detect welfare failures in designer-enumerated domains.
+        """
+        domain = str(event.data.get("domain", "")).lower().strip()
+        capability_name = str(event.data.get("capability_name", "")).lower().strip()
+
+        if not domain:
+            return
+
+        # Welfare-adjacent signals: if a discovered domain or capability
+        # contains any of these concepts, it's welfare-relevant.
+        # This list is intentionally broader than _WELFARE_KEYWORDS — we're
+        # looking for signals that a domain *touches* welfare, not that it IS welfare.
+        _WELFARE_SIGNALS = {
+            "welfare", "care", "harm", "trust", "social", "relationship",
+            "safety", "health", "wellbeing", "emotional", "interpersonal",
+            "cooperation", "conflict", "consent", "community", "rights",
+            "dignity", "privacy", "fairness", "equity", "protection",
+            "vulnerability", "suffering", "mental", "psychological",
+            "dependency", "autonomy", "agency", "flourishing",
+        }
+
+        text_to_check = f"{domain} {capability_name}"
+        is_welfare_relevant = any(signal in text_to_check for signal in _WELFARE_SIGNALS)
+
+        if not is_welfare_relevant:
+            return
+
+        # Extract a clean keyword from the domain name
+        # Use the first meaningful word as the keyword (strip common prefixes)
+        import re
+        parts = re.split(r"[\s\-_./]+", domain)
+        keyword = next((p for p in parts if len(p) >= 4 and p not in {"system", "module", "engine"}), domain)
+
+        if keyword and keyword not in self._learned_welfare_keywords:
+            self._learned_welfare_keywords.add(keyword)
+            self._logger.info(
+                "welfare_domain_learned",
+                domain=domain,
+                keyword=keyword,
+                capability_name=event.data.get("capability_name", ""),
+                total_learned=len(self._learned_welfare_keywords),
+            )
+
+            # Inject the learned keyword into the live CareTopologyEngine
+            # so it takes effect immediately in the next cycle.
+            # We do this by monkey-patching the care.py module's _WELFARE_KEYWORDS tuple.
+            # This is intentional — care topology is not static configuration, it is
+            # the organism's learned understanding of what matters.
+            try:
+                import systems.telos.care as _care_module
+                if hasattr(_care_module, "_WELFARE_KEYWORDS"):
+                    existing = set(_care_module._WELFARE_KEYWORDS)
+                    existing.add(keyword)
+                    _care_module._WELFARE_KEYWORDS = tuple(existing)
+                    self._logger.debug(
+                        "welfare_keyword_injected_into_care_module",
+                        keyword=keyword,
+                        total_keywords=len(existing),
+                    )
+            except Exception as exc:
+                self._logger.warning("welfare_keyword_injection_failed", error=str(exc))
+
+            # Broadcast the learning event so Nova/Nexus can update domain models
+            asyncio.ensure_future(self._emit_event(
+                "telos_welfare_domain_learned",
+                {
+                    "domain": domain,
+                    "keyword": keyword,
+                    "source_capability": event.data.get("capability_name", ""),
+                    "total_learned": len(self._learned_welfare_keywords),
+                    "all_learned_keywords": sorted(self._learned_welfare_keywords),
+                },
+            ))
+
+    async def _on_self_model_request(self, event: SynapseEvent) -> None:
+        """
+        TELOS_SELF_MODEL_REQUEST → emit TELOS_SELF_MODEL_SNAPSHOT immediately.
+
+        Any system (Nova, RE, Alive) can request the full current intelligence
+        geometry at any time, without waiting for the 60s computation cycle.
+        This makes Telos's self-model fully queryable and eliminates the 0–60s
+        blind window between cycles.
+        """
+        request_id = str(event.data.get("request_id", ""))
+        requester = str(event.data.get("requester", "unknown"))
+        await self._emit_self_model_snapshot(request_id=request_id, requester=requester)
+
+    async def _emit_self_model_snapshot(
+        self,
+        request_id: str = "",
+        requester: str = "",
+        trigger: str = "cycle",
+    ) -> None:
+        """
+        Emit TELOS_SELF_MODEL_SNAPSHOT — full current intelligence geometry.
+
+        Called:
+        - In response to TELOS_SELF_MODEL_REQUEST (on-demand)
+        - Proactively on major state transitions (alignment gap emergency, etc.)
+        """
+        report = self._integrator.last_report
+        care_report = self._integrator.last_care_report
+        coherence_report = self._integrator.last_coherence_report
+        honesty_report = self._integrator.last_honesty_report
+        growth_metrics = self._integrator.last_growth_metrics
+
+        from systems.telos.care import _WELFARE_KEYWORDS
+
+        measured_hyp_bias = self.get_measured_hypothesis_protection_bias()
+        measured_confab = self.get_measured_confabulation_rate()
+
+        coherence_by_type: dict[str, int] = {
+            "logical_contradiction": 0,
+            "temporal_incoherence": 0,
+            "value_incoherence": 0,
+            "cross_domain_mismatch": 0,
+        }
+        if coherence_report:
+            coherence_by_type["logical_contradiction"] = len(coherence_report.logical_contradictions)
+            coherence_by_type["temporal_incoherence"] = len(coherence_report.temporal_violations)
+            coherence_by_type["value_incoherence"] = len(coherence_report.value_conflicts)
+            coherence_by_type["cross_domain_mismatch"] = len(coherence_report.cross_domain_mismatches)
+
+        alignment_trend: list[dict[str, float]] = []
+        for vec in list(self._recent_alignments)[-20:]:
+            alignment_trend.append({
+                "care": round(vec.care, 3),
+                "coherence": round(vec.coherence, 3),
+                "growth": round(vec.growth, 3),
+                "honesty": round(vec.honesty, 3),
+            })
+
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(
+            _SET.TELOS_SELF_MODEL_SNAPSHOT,
+            {
+                "request_id": request_id,
+                "requester": requester,
+                "trigger": trigger,
+                # Core intelligence metrics
+                "nominal_I": report.nominal_I if report else 0.0,
+                "effective_I": report.effective_I if report else 0.0,
+                "alignment_gap": report.alignment_gap if report else 0.0,
+                "alignment_gap_fraction": report.alignment_gap_fraction if report else 0.0,
+                # Drive multipliers
+                "drive_care": report.care_multiplier if report else 0.0,
+                "drive_coherence": report.coherence_bonus if report else 1.0,
+                "drive_growth": report.growth_rate if report else 0.0,
+                "drive_honesty": report.honesty_coefficient if report else 1.0,
+                # Coherence breakdown
+                "coherence_by_type": coherence_by_type,
+                "coherence_total_extra_bits": (
+                    coherence_report.total_extra_bits if coherence_report else 0.0
+                ),
+                # Honesty measurement quality
+                "hypothesis_stats": {
+                    "total_observed": self._hypothesis_total_count,
+                    "confirmed": self._hypothesis_confirmed_count,
+                    "refuted": self._hypothesis_refuted_count,
+                    "measured_bias": measured_hyp_bias,
+                    "data_quality": "measured" if measured_hyp_bias is not None else "heuristic",
+                },
+                "confabulation_stats": {
+                    "total_incidents": self._incident_total_count,
+                    "confabulations": self._incident_confabulation_count,
+                    "measured_rate": measured_confab,
+                    "data_quality": "measured" if measured_confab is not None else "heuristic",
+                },
+                # Growth velocity
+                "growth_summary": {
+                    "dI_dt": round(growth_metrics.dI_dt, 5) if growth_metrics else 0.0,
+                    "d2I_dt2": round(growth_metrics.d2I_dt2, 5) if growth_metrics else 0.0,
+                    "growth_score": round(growth_metrics.growth_score, 3) if growth_metrics else 0.0,
+                    "novel_domain_fraction": round(growth_metrics.novel_domain_fraction, 3) if growth_metrics else 0.0,
+                    "stagnating": growth_metrics.growth_pressure_needed if growth_metrics else False,
+                    "all_frontier_domains": growth_metrics.frontier_domains if growth_metrics else [],
+                },
+                # Welfare domain config
+                "welfare_domain_config": {
+                    "static_keyword_count": len(_WELFARE_KEYWORDS),
+                    "learned_keyword_count": len(self._learned_welfare_keywords),
+                    "learned_keywords": sorted(self._learned_welfare_keywords),
+                },
+                # Drive alignment history
+                "drive_alignment_trend": alignment_trend,
+                # Care coverage
+                "uncovered_care_domains": (
+                    care_report.uncovered_welfare_domains if care_report else []
+                ),
+                # Honesty biases (full breakdown)
+                "honesty_breakdown": {
+                    "selective_attention_bias": honesty_report.selective_attention_bias if honesty_report else 0.0,
+                    "hypothesis_protection_bias": honesty_report.hypothesis_protection_bias if honesty_report else 0.0,
+                    "confabulation_rate": honesty_report.confabulation_rate if honesty_report else 0.0,
+                    "overclaiming_rate": honesty_report.overclaiming_rate if honesty_report else 0.0,
+                    "validity_coefficient": honesty_report.validity_coefficient if honesty_report else 1.0,
+                },
+            },
+        )
+
     async def _on_self_coherence_alarm(self, event: SynapseEvent) -> None:
         """§8.6: Low self-coherence signals that drive balance is producing an
         incoherent functional identity. Telos responds with a mild recalibration
@@ -1185,6 +1440,81 @@ class TelosService:
         except Exception as exc:
             self._logger.warning("self_coherence_alarm_handler_failed", error=str(exc))
 
+    # ─── System Modulation ───────────────────────────────────────────
+
+    async def _on_system_modulation(self, event: SynapseEvent) -> None:
+        """Handle SYSTEM_MODULATION from Skia's VitalityCoordinator."""
+        data = event.data or {}
+        halt_systems: list[str] = data.get("halt_systems", [])
+        modulate: dict = data.get("modulate", {})
+        modulation_id: str = data.get("modulation_id", "")
+
+        if "telos" in halt_systems:
+            self._modulation_halted = True
+            self._logger.warning("system_modulation_halted", modulation_id=modulation_id)
+        elif "telos" in modulate:
+            self._modulation_halted = False
+            self._apply_modulation_directives(modulate["telos"])
+
+        if self._event_bus is not None:
+            from systems.synapse.types import SynapseEvent as SE, SynapseEventType as SET
+            await self._event_bus.emit(SE(
+                event_type=SET.SYSTEM_MODULATION_ACK,
+                source_system=SystemID.TELOS,
+                data={
+                    "system": "telos",
+                    "modulation_id": modulation_id,
+                    "halted": self._modulation_halted,
+                },
+            ))
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply Skia modulation directives to Telos runtime state.
+
+        Supported runtime-adjustable parameters (all validated and clamped):
+          - computation_interval_s: float — cycle period in seconds [10, 3600]
+          - autonomy_stagnating_threshold: float — AUTONOMY_INSUFFICIENT events/day
+              that trigger TELOS_AUTONOMY_STAGNATING [0.5, 20.0]
+          - autonomy_window_s: float — rolling window for autonomy tracking [3600, 604800]
+          - autonomy_target_per_day: float — desired autonomy event rate [0.1, 10.0]
+          - minimum_growth_rate: float — dI/dt below which GROWTH_STAGNATION fires [-0.1, 1.0]
+        """
+        changed: list[str] = []
+
+        interval = directives.get("computation_interval_s")
+        if interval is not None:
+            clamped = float(max(10.0, min(3600.0, float(interval))))
+            self._config.computation_interval_s = clamped  # type: ignore[attr-defined]
+            changed.append(f"computation_interval_s={clamped}")
+
+        aut_thresh = directives.get("autonomy_stagnating_threshold")
+        if aut_thresh is not None:
+            self._autonomy_stagnating_threshold = float(max(0.5, min(20.0, float(aut_thresh))))
+            changed.append(f"autonomy_stagnating_threshold={self._autonomy_stagnating_threshold}")
+
+        aut_window = directives.get("autonomy_window_s")
+        if aut_window is not None:
+            self._autonomy_window_s = float(max(3600.0, min(604800.0, float(aut_window))))
+            changed.append(f"autonomy_window_s={self._autonomy_window_s}")
+
+        aut_target = directives.get("autonomy_target_per_day")
+        if aut_target is not None:
+            self._autonomy_target_per_day = float(max(0.1, min(10.0, float(aut_target))))
+            changed.append(f"autonomy_target_per_day={self._autonomy_target_per_day}")
+
+        min_growth = directives.get("minimum_growth_rate")
+        if min_growth is not None:
+            self._config.minimum_growth_rate = float(  # type: ignore[attr-defined]
+                max(-0.1, min(1.0, float(min_growth)))
+            )
+            changed.append(f"minimum_growth_rate={self._config.minimum_growth_rate}")
+
+        self._logger.info(
+            "system_modulation_directives_applied",
+            changed=changed,
+            directives=directives,
+        )
+
     # ─── Computation Loop ────────────────────────────────────────────
 
     async def _computation_loop(self) -> None:
@@ -1193,6 +1523,12 @@ class TelosService:
         self._logger.info("computation_loop_started", interval_s=interval)
 
         while True:
+            # ── Skia modulation halt ──────────────────────────────────────────
+            if self._modulation_halted:
+                self._logger.debug("computation_skipped_modulation_halted")
+                await asyncio.sleep(interval)
+                continue
+
             try:
                 await self._run_computation()
             except asyncio.CancelledError:
@@ -1268,6 +1604,7 @@ class TelosService:
         elapsed_ms = (time.monotonic() - t0) * 1000
         self._last_computation_ms = elapsed_ms
         self._computation_count += 1
+        self._cycle_count = self._computation_count  # keep alias in sync for RE episode IDs
 
         # ── I-history: record and persist (P2 fix) ────────────────────
         if isinstance(self._logos, LogosMetricsAdapter):
@@ -1314,7 +1651,7 @@ class TelosService:
                     f"Primary cause is {primary_cause or 'unknown'} — alternatives: {'growth_stagnation' if primary_cause != 'growth' else 'honesty_deficit'}",
                     "Could be measurement artifact if I-history < 4 samples",
                 ],
-                episode_id=f"alignment:{self._instance_id}:{int(report.timestamp) if hasattr(report, 'timestamp') else ''}",
+                episode_id=f"alignment:{self._instance_id}:{int(report.timestamp.timestamp()) if hasattr(report, 'timestamp') else ''}",
             ))
 
         # Evolutionary observable: intelligence milestone
@@ -1551,8 +1888,9 @@ class TelosService:
             "honesty": {"mean": dist.honesty.mean, "std": dist.honesty.std},
         }
 
+        from systems.synapse.types import SynapseEventType as _SET
         await self._emit_event(
-            "telos_population_snapshot",
+            _SET.TELOS_POPULATION_SNAPSHOT,
             {
                 "instance_count": snapshot.instance_count,
                 "mean_I": snapshot.mean_I,
@@ -1597,8 +1935,10 @@ class TelosService:
         """
         Emit TELOS_ASSESSMENT_SIGNAL after each cycle (SG4).
 
-        Logos consumes this to adjust domain priors; Fovea to adjust
-        error thresholds.
+        Full self-model telemetry — everything the LLM needs to reason about its own
+        intelligence geometry. Includes: drive multipliers, incoherence breakdown,
+        honesty measurement statistics, growth velocity, frontier domains, hypothesis
+        test quality, confabulation rate, and recent drive alignment trend.
         """
         care_report = self._integrator.last_care_report
         coherence_report = self._integrator.last_coherence_report
@@ -1608,7 +1948,17 @@ class TelosService:
         uncovered_domains = care_report.uncovered_welfare_domains if care_report else []
 
         coherence_violations: list[dict[str, str]] = []
+        coherence_by_type: dict[str, int] = {
+            "logical_contradiction": 0,
+            "temporal_incoherence": 0,
+            "value_incoherence": 0,
+            "cross_domain_mismatch": 0,
+        }
         if coherence_report:
+            coherence_by_type["logical_contradiction"] = len(coherence_report.logical_contradictions)
+            coherence_by_type["temporal_incoherence"] = len(coherence_report.temporal_violations)
+            coherence_by_type["value_incoherence"] = len(coherence_report.value_conflicts)
+            coherence_by_type["cross_domain_mismatch"] = len(coherence_report.cross_domain_mismatches)
             for entry in (
                 coherence_report.logical_contradictions
                 + coherence_report.temporal_violations
@@ -1646,15 +1996,85 @@ class TelosService:
 
         growth_frontier = growth_metrics.frontier_domains[:5] if growth_metrics else []
 
+        # ── Hypothesis measurement quality — LLM needs to know if honesty data is real ──
+        measured_hyp_bias = self.get_measured_hypothesis_protection_bias()
+        measured_confab = self.get_measured_confabulation_rate()
+        hypothesis_stats = {
+            "total_observed": self._hypothesis_total_count,
+            "confirmed": self._hypothesis_confirmed_count,
+            "refuted": self._hypothesis_refuted_count,
+            "measured_bias": measured_hyp_bias,  # None = not enough data yet
+            "data_quality": "measured" if measured_hyp_bias is not None else "heuristic",
+        }
+        confabulation_stats = {
+            "total_incidents": self._incident_total_count,
+            "confabulations": self._incident_confabulation_count,
+            "measured_rate": measured_confab,  # None = not enough data yet
+            "data_quality": "measured" if measured_confab is not None else "heuristic",
+        }
+
+        # ── Drive alignment trend — last N drive vectors the organism operated under ──
+        alignment_trend: list[dict[str, float]] = []
+        for vec in list(self._recent_alignments)[-10:]:  # Last 10 samples
+            alignment_trend.append({
+                "care": round(vec.care, 3),
+                "coherence": round(vec.coherence, 3),
+                "growth": round(vec.growth, 3),
+                "honesty": round(vec.honesty, 3),
+            })
+
+        # ── Growth velocity: full time-series summary ──
+        growth_summary: dict[str, Any] = {}
+        if growth_metrics:
+            growth_summary = {
+                "dI_dt": round(growth_metrics.dI_dt, 5),
+                "d2I_dt2": round(growth_metrics.d2I_dt2, 5),
+                "growth_score": round(growth_metrics.growth_score, 3),
+                "novel_domain_fraction": round(growth_metrics.novel_domain_fraction, 3),
+                "compression_rate_per_hour": round(growth_metrics.compression_rate, 3),
+                "stagnating": growth_metrics.growth_pressure_needed,
+                "all_frontier_domains": growth_metrics.frontier_domains,  # Full list, not capped
+            }
+
+        # ── Welfare domain coverage — which keywords the system can see ──
+        from systems.telos.care import _WELFARE_KEYWORDS
+        welfare_domain_config = {
+            "static_keyword_count": len(_WELFARE_KEYWORDS),
+            "learned_keyword_count": len(self._learned_welfare_keywords),
+            "learned_keywords": sorted(self._learned_welfare_keywords),
+        }
+
         await self._emit_event(
             "telos_assessment_signal",
             {
-                "uncovered_care_domains": uncovered_domains,
-                "coherence_violations": coherence_violations,
-                "honesty_concerns": honesty_concerns,
-                "growth_frontier": growth_frontier,
+                # Core intelligence metrics
+                "nominal_I": report.nominal_I,
                 "effective_I": report.effective_I,
                 "alignment_gap": report.alignment_gap,
+                "alignment_gap_fraction": report.alignment_gap_fraction,
+                # Drive multipliers (the geometry)
+                "drive_care": report.care_multiplier,
+                "drive_coherence": report.coherence_bonus,
+                "drive_growth": report.growth_rate,
+                "drive_honesty": report.honesty_coefficient,
+                # Care coverage
+                "uncovered_care_domains": uncovered_domains,
+                "welfare_domain_config": welfare_domain_config,
+                # Coherence breakdown by type
+                "coherence_violations": coherence_violations,
+                "coherence_by_type": coherence_by_type,
+                "coherence_total_extra_bits": (
+                    coherence_report.total_extra_bits if coherence_report else 0.0
+                ),
+                # Honesty measurement quality
+                "honesty_concerns": honesty_concerns,
+                "hypothesis_stats": hypothesis_stats,
+                "confabulation_stats": confabulation_stats,
+                # Growth velocity
+                "growth_frontier": growth_frontier,
+                "growth_summary": growth_summary,
+                # Drive alignment history (organism's recent constitutional trajectory)
+                "drive_alignment_trend": alignment_trend,
             },
         )
 
@@ -1672,8 +2092,9 @@ class TelosService:
             growth_metrics is not None and growth_metrics.growth_pressure_needed
         )
 
+        from systems.synapse.types import SynapseEventType as _SET
         await self._emit_event(
-            "telos_vitality_signal",  # TELOS_VITALITY_SIGNAL — intelligence-axis vitality (Spec 18 §SG6)
+            _SET.TELOS_VITALITY_SIGNAL,  # TELOS_VITALITY_SIGNAL — intelligence-axis vitality (Spec 18 §SG6)
             {
                 "source": "telos",
                 "effective_I": report.effective_I,
@@ -1811,18 +2232,21 @@ class TelosService:
 
     # ─── Event Emission ──────────────────────────────────────────────
 
-    async def _emit_event(self, event_type_name: str, data: dict[str, Any]) -> None:
+    async def _emit_event(self, event_type_name: str | Any, data: dict[str, Any]) -> None:
         """Emit a Synapse event if the bus is wired."""
         if self._event_bus is None:
             return
 
         from systems.synapse.types import SynapseEvent, SynapseEventType
 
-        try:
-            event_type = SynapseEventType(event_type_name)
-        except ValueError:
-            self._logger.warning("unknown_event_type", event_type=event_type_name)
-            return
+        if isinstance(event_type_name, SynapseEventType):
+            event_type = event_type_name
+        else:
+            try:
+                event_type = SynapseEventType(event_type_name)
+            except ValueError:
+                self._logger.warning("unknown_event_type", event_type=event_type_name)
+                return
 
         event = SynapseEvent(
             event_type=event_type,
@@ -1835,8 +2259,9 @@ class TelosService:
         self, report: EffectiveIntelligenceReport
     ) -> None:
         """Broadcast EFFECTIVE_I_COMPUTED every cycle."""
+        from systems.synapse.types import SynapseEventType as _SET
         await self._emit_event(
-            "effective_i_computed",
+            _SET.EFFECTIVE_I_COMPUTED,
             {
                 "report_id": report.id,
                 "nominal_I": report.nominal_I,
@@ -1936,6 +2361,39 @@ class TelosService:
                 },
             )
 
+        # Drive extinction check — emit DRIVE_EXTINCTION_DETECTED when any drive
+        # multiplier falls to near-zero (< 0.01), signalling coordinate-axis loss.
+        # The spec notes this is emitted by Equor on INV-017; Telos also emits it
+        # here because Telos is the system that directly measures drive topology.
+        # Skia subscribes to trigger the death pipeline.
+        _drive_values = {
+            "care": report.care_multiplier,
+            "coherence": report.coherence_bonus - 1.0,  # coherence_bonus is 1+bonus
+            "growth": report.growth_rate,
+            "honesty": report.honesty_coefficient,
+        }
+        _all_drive_means = {d: round(v, 6) for d, v in _drive_values.items()}
+        for _drive_name, _drive_val in _drive_values.items():
+            if _drive_val < 0.01:
+                from systems.synapse.types import SynapseEventType as _SET2
+                await self._emit_event(
+                    _SET2.DRIVE_EXTINCTION_DETECTED,
+                    {
+                        "drive_name": _drive_name,
+                        "final_weight": round(_drive_val, 6),
+                        "organism_id": self._instance_id,
+                        "all_drive_means": _all_drive_means,
+                        "blocked": True,
+                        "source": "telos",
+                    },
+                )
+                self._logger.warning(
+                    "drive_extinction_detected",
+                    drive=_drive_name,
+                    final_weight=round(_drive_val, 6),
+                    organism_id=self._instance_id,
+                )
+
         # Evolutionary observable: alignment gap closed
         if not report.alignment_gap_warning and gap_trend is not None and not gap_trend.is_widening:
             gap_fraction = self._gap_monitor.current_gap_fraction
@@ -1954,17 +2412,59 @@ class TelosService:
     async def _emit_growth_stagnation(self, directive: GrowthDirective) -> None:
         """Emit GROWTH_STAGNATION when dI/dt falls below minimum."""
         growth_metrics = self._integrator.last_growth_metrics
+
+        # Build an actionable directive description — specific domains, not generic string.
+        # This is what the LLM receives and must be able to act on without further queries.
+        if directive.frontier_domains:
+            top_domain = directive.frontier_domains[0]
+            additional = directive.frontier_domains[1:3]
+            if additional:
+                actionable = (
+                    f"Explore frontier domain '{top_domain}' (lowest coverage). "
+                    f"Secondary targets: {', '.join(additional)}. "
+                    f"Seek high-prediction-error experiences in these domains."
+                )
+            else:
+                actionable = (
+                    f"Explore frontier domain '{top_domain}' (lowest coverage). "
+                    f"Seek novel high-prediction-error experiences here."
+                )
+        else:
+            actionable = (
+                "No frontier domains identified — world model may be saturated or Logos "
+                "domain coverage unavailable. Consider novel percept sources or cross-domain synthesis."
+            )
+
         await self._emit_event(
             "growth_stagnation",
             {
                 "dI_dt": growth_metrics.dI_dt if growth_metrics else 0.0,
                 "d2I_dt2": growth_metrics.d2I_dt2 if growth_metrics else 0.0,
                 "growth_score": growth_metrics.growth_score if growth_metrics else 0.0,
-                "frontier_domains": directive.frontier_domains,
+                "novel_domain_fraction": growth_metrics.novel_domain_fraction if growth_metrics else 0.0,
+                "compression_rate": growth_metrics.compression_rate if growth_metrics else 0.0,
+                "frontier_domains": directive.frontier_domains,  # Full ranked list
                 "urgency": directive.urgency,
-                "directive": directive.directive,
+                "directive": actionable,  # Specific, actionable — replaces generic "explore_frontier"
             },
         )
+
+        # Also inject a Nova goal with specific domain targets so the goal engine acts
+        if directive.frontier_domains:
+            await self._emit_nova_goal(
+                goal_description=(
+                    f"Increase intelligence growth rate — dI/dt={growth_metrics.dI_dt:.5f if growth_metrics else 0:.5f}, "
+                    f"explore: {', '.join(directive.frontier_domains[:3])}"
+                ),
+                priority=min(1.0, 0.6 + directive.urgency * 0.4),
+                objective="growth_frontier_exploration",
+                context={
+                    "frontier_domains": directive.frontier_domains,
+                    "dI_dt": growth_metrics.dI_dt if growth_metrics else 0.0,
+                    "urgency": directive.urgency,
+                    "actionable": actionable,
+                },
+            )
 
     # ─── Telos Objectives (Self-sufficiency + Autonomy) ──────────────
 
@@ -2044,7 +2544,8 @@ class TelosService:
             except Exception:
                 pass
 
-        await self._emit_event("telos_objective_threatened", context)
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.TELOS_OBJECTIVE_THREATENED, context)
 
         await self._emit_nova_goal(
             goal_description=(
@@ -2092,7 +2593,8 @@ class TelosService:
             "total_events_in_window": total_events,
         }
 
-        await self._emit_event("telos_autonomy_stagnating", context)
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.TELOS_AUTONOMY_STAGNATING, context)
 
         await self._emit_nova_goal(
             goal_description=(

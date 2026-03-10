@@ -102,6 +102,23 @@ class ChildHealthReporter:
         # but does not prevent the health reporter from starting.
         await self._run_cert_handshake()
 
+        # Problem 4: Subscribe to CHILD_HEALTH_REQUEST so parent probes trigger an
+        # immediate CHILD_HEALTH_REPORT instead of waiting for the next 10-min cycle.
+        if self._synapse is not None:
+            event_bus = getattr(self._synapse, "event_bus", None)
+            if event_bus is not None and hasattr(event_bus, "subscribe"):
+                try:
+                    from systems.synapse.types import SynapseEventType
+                    event_bus.subscribe(
+                        SynapseEventType.CHILD_HEALTH_REQUEST,
+                        self._on_child_health_request,
+                    )
+                    self._log.info("child_health_request_subscription_registered")
+                except Exception as exc:
+                    self._log.warning(
+                        "child_health_request_subscription_failed", error=str(exc)
+                    )
+
         self._task = asyncio.create_task(
             self._report_loop(),
             name="child_health_reporter",
@@ -161,6 +178,32 @@ class ChildHealthReporter:
                 await asyncio.sleep(self._interval)
             except asyncio.CancelledError:
                 break
+
+    async def _on_child_health_request(self, event: Any) -> None:
+        """Handle CHILD_HEALTH_REQUEST — emit an immediate CHILD_HEALTH_REPORT.
+
+        Oikos emits CHILD_HEALTH_REQUEST every 10 minutes to probe each live child.
+        This handler responds immediately rather than waiting for the next scheduled
+        _report_loop cycle, closing the 10-minute visibility gap.
+
+        Only responds if the request targets this child instance (child_instance_id
+        matches self._instance_id) or if no specific target is given.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        target_id = str(data.get("child_instance_id", ""))
+        if target_id and target_id != self._instance_id:
+            # Request is for a different child — ignore
+            return
+
+        self._log.debug(
+            "child_health_request_received",
+            request_id=data.get("request_id", ""),
+            parent_id=data.get("parent_instance_id", ""),
+        )
+        try:
+            await self._emit_report()
+        except Exception as exc:
+            self._log.error("child_health_request_report_failed", error=str(exc))
 
     async def _emit_report(self) -> None:
         """Collect metrics and emit CHILD_HEALTH_REPORT."""

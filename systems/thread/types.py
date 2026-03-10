@@ -125,6 +125,7 @@ class TurningPointType(enum.StrEnum):
     CONNECTION = "connection"
     ACHIEVEMENT = "achievement"
     RUPTURE = "rupture"  # Commitment violated / relationship broken
+    RESILIENCE = "resilience"  # Survived a crash and self-repaired
 
 
 class DriftClassification(enum.StrEnum):

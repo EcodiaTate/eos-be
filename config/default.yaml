@@ -483,6 +483,12 @@ oikos:
   morphogenesis_growth_efficiency_threshold: 1.5
   morphogenesis_max_organs: 20
 
+  # Runtime-adjustable autonomy thresholds (Evo can tune via genome inheritance)
+  rollback_penalty_threshold_usd: 0.10    # 24h Simula rollback cost before METABOLIC_PRESSURE
+  cognitive_pressure_suspend_threshold: 0.90  # Logos pressure level that suspends GROWTH
+  cognitive_pressure_resume_threshold: 0.80   # Logos pressure level that resumes GROWTH
+  autonomy_signal_interval_s: 3600.0      # Interval between ECONOMIC_AUTONOMY_SIGNAL broadcasts
+
   # Phase 16g — Civilization layer (Certificate of Alignment)
   certificate_validity_days: 30
   certificate_expiry_warning_days: 7

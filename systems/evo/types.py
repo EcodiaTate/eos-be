@@ -740,6 +740,14 @@ TUNABLE_PARAMETERS: dict[str, ParameterSpec] = {
     "belief.halflife.context":     ParameterSpec(min_val=0.5, max_val=14.0, step=0.25),
     "belief.halflife.social":      ParameterSpec(min_val=7.0, max_val=90.0, step=2.0),
     "belief.halflife.policy":      ParameterSpec(min_val=30.0, max_val=365.0, step=10.0),
+
+    # Atune workspace — evolvable curiosity / spontaneous recall rhythm.
+    # Higher base_prob → more frequent spontaneous recall (wider curiosity).
+    # Lower cooldown_cycles → recalls can fire more frequently.
+    # Higher curiosity_boost → affect.curiosity has stronger influence on recall.
+    "atune.workspace.base_prob":       ParameterSpec(min_val=0.005, max_val=0.10, step=0.003),
+    "atune.workspace.cooldown_cycles": ParameterSpec(min_val=5.0, max_val=50.0, step=1.0),
+    "atune.workspace.curiosity_boost": ParameterSpec(min_val=0.01, max_val=0.10, step=0.005),
 }
 
 # Default initial values (mid-range or from spec defaults)
@@ -776,6 +784,10 @@ PARAMETER_DEFAULTS: dict[str, float] = {
     "belief.halflife.context":     2.0,
     "belief.halflife.social":      14.0,
     "belief.halflife.policy":      90.0,
+    # Atune workspace curiosity defaults
+    "atune.workspace.base_prob":       0.02,
+    "atune.workspace.cooldown_cycles": 20.0,
+    "atune.workspace.curiosity_boost": 0.03,
 }
 
 # Change velocity limits (spec Section IX)

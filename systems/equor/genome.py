@@ -637,6 +637,7 @@ class EquorGenomeExtractor:
             fragment_dict = dict(equor_genome_fragment)
 
         top_amendments: list[dict[str, Any]] = fragment_dict.get("top_amendments", [])
+        amendment_rationale: list[str] = fragment_dict.get("amendment_rationale", [])
         drive_deltas: dict[str, float] = fragment_dict.get("drive_calibration_deltas", {})
         constitution_hash: str = str(fragment_dict.get("constitution_hash", ""))
         total_adopted: int = int(fragment_dict.get("total_amendments_adopted", 0))
@@ -658,9 +659,11 @@ class EquorGenomeExtractor:
                 self._log.warning("equor_apply_drive_deltas_failed", error=str(exc))
 
         # ── Step 2: Write GovernanceRecord nodes for inherited amendments ──
-        for amendment in top_amendments:
+        for idx, amendment in enumerate(top_amendments):
+            # Attach inherited rationale from parallel list if available
+            rationale = amendment_rationale[idx] if idx < len(amendment_rationale) else ""
             try:
-                await self._write_inherited_amendment_record(amendment, genome_id)
+                await self._write_inherited_amendment_record(amendment, genome_id, inherited_rationale=rationale)
             except Exception as exc:
                 self._log.warning(
                     "equor_write_inherited_amendment_failed",
@@ -737,14 +740,29 @@ class EquorGenomeExtractor:
         self,
         amendment: dict[str, Any],
         genome_id: str,
+        *,
+        inherited_rationale: str = "",
     ) -> None:
-        """Persist an inherited amendment as a GovernanceRecord in the child's graph."""
+        """Persist an inherited amendment as a GovernanceRecord in the child's graph.
+
+        Args:
+            amendment: Amendment snapshot dict from the parent's genome fragment.
+            genome_id: Parent genome ID for lineage tracking.
+            inherited_rationale: Plain-text rationale from the parent's
+                amendment_rationale list (parallel to top_amendments). Used to
+                enrich the GovernanceRecord with the reasoning behind adoption.
+        """
         import json as _json
+
+        # Prefer the per-amendment rationale from the snapshot; fall back to
+        # the parallel inherited_rationale list from the fragment
+        rationale = amendment.get("rationale", "") or inherited_rationale
 
         details = {
             "title": amendment.get("title", ""),
             "description": amendment.get("description", ""),
-            "rationale": amendment.get("rationale", ""),
+            "rationale": rationale,
+            "inherited_rationale": inherited_rationale,
             "proposed_drives": amendment.get("proposed_drives", {}),
             "current_drives": amendment.get("previous_drives", {}),
             "inherited": True,

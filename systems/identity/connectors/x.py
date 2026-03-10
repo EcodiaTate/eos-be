@@ -241,5 +241,6 @@ class XConnector(PlatformConnector):
 
         if success and self._credentials is not None:
             self._credentials.status = ConnectorStatus.REVOKED
-        await self._emit_event("connector_revoked", {"platform_id": self.platform_id})
+        from systems.synapse.types import SynapseEventType as _SET
+        await self._emit_event(_SET.CONNECTOR_REVOKED, {"platform_id": self.platform_id})
         return success

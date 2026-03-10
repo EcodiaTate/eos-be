@@ -114,3 +114,58 @@ async def benchmarks_all_trends(
         raise HTTPException(status_code=503, detail="Benchmarks service not initialized")
     trends = await benchmarks.all_trends(since=since)
     return AllTrendsResponse(trends={k: v.model_dump() for k, v in trends.items()})
+
+
+# ─── RE Training admin endpoints ──────────────────────────────────────────
+
+
+class RETrainingStatusResponse(EOSBaseModel):
+    training_halted: bool
+    halt_reason: str | None
+    last_train_at: str | None
+    training_runs_total: int
+
+
+class RETrainingHaltClearResponse(EOSBaseModel):
+    cleared: bool
+    message: str
+
+
+@router.get("/re-training/status", response_model=RETrainingStatusResponse)
+async def re_training_status(request: Request) -> RETrainingStatusResponse:
+    """Return current RE training gate status — halted flag, halt reason, last run."""
+    clo = getattr(request.app.state, "continual_learning", None)
+    if clo is None:
+        raise HTTPException(status_code=503, detail="ContinualLearningOrchestrator not initialized")
+    halted, reason = await clo._is_training_halted()
+    last_train = getattr(clo, "_last_train_at", None)
+    runs = getattr(clo, "_training_runs", [])
+    return RETrainingStatusResponse(
+        training_halted=halted,
+        halt_reason=reason or None,
+        last_train_at=last_train.isoformat() if last_train else None,
+        training_runs_total=len(runs),
+    )
+
+
+@router.post("/re-training/clear-halt", response_model=RETrainingHaltClearResponse)
+async def re_training_clear_halt(request: Request) -> RETrainingHaltClearResponse:
+    """Clear a persisted training halt.
+
+    Use after investigating a RE quality regression and confirming the root
+    cause is addressed.  The next scheduled training check (≤6 hours) will
+    re-evaluate should_train() without the halt gate.
+
+    This endpoint is intentionally unauthenticated at the router level — the
+    organism itself calls it via Thymos self-healing when the RE monitor
+    confirms quality has recovered above the floor.
+    """
+    clo = getattr(request.app.state, "continual_learning", None)
+    if clo is None:
+        raise HTTPException(status_code=503, detail="ContinualLearningOrchestrator not initialized")
+    await clo.clear_training_halt()
+    logger.info("re_training_halt_cleared_via_api")
+    return RETrainingHaltClearResponse(
+        cleared=True,
+        message="Training halt cleared. Next check_and_train() cycle will re-evaluate should_train().",
+    )

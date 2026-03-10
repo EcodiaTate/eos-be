@@ -44,10 +44,12 @@ if TYPE_CHECKING:
     from systems.memory.service import MemoryService
     from systems.mitosis.fleet_service import MitosisFleetService
     from systems.mitosis.spawner import LocalDockerSpawner
+    from systems.nova.service import NovaService
     from systems.oikos.service import OikosService
     from systems.simula.service import SimulaService
     from systems.synapse.service import SynapseService
     from systems.telos.service import TelosService
+    from systems.voxis.service import VoxisService
 
 logger = structlog.get_logger()
 
@@ -104,6 +106,10 @@ class SpawnChildExecutor(Executor):
         equor: EquorService | None = None,
         axon: AxonService | None = None,
         telos: TelosService | None = None,
+        soma: Any | None = None,
+        nova: NovaService | None = None,
+        voxis: VoxisService | None = None,
+        eis: Any | None = None,
     ) -> None:
         self._wallet = wallet
         self._oikos = oikos
@@ -116,7 +122,15 @@ class SpawnChildExecutor(Executor):
         self._equor = equor
         self._axon = axon
         self._telos = telos
+        self._soma = soma
+        self._nova = nova
+        self._voxis = voxis
+        self._eis = eis
         self._logger = logger.bind(system="axon.executor.spawn_child")
+
+    def set_fleet_service(self, fleet_service: Any) -> None:
+        """Inject MitosisFleetService after construction (used by wire_mitosis_phase)."""
+        self._fleet_service = fleet_service  # type: ignore[attr-defined]
 
     # ── Validation ─────────────────────────────────────────────
 
@@ -209,6 +223,10 @@ class SpawnChildExecutor(Executor):
         equor_genome_id = str(params.get("equor_genome_id", "")).strip()
         axon_genome_id = str(params.get("axon_genome_id", "")).strip()
         telos_genome_id = str(params.get("telos_genome_id", "")).strip()
+        soma_genome_id = str(params.get("soma_genome_id", "")).strip()
+        nova_genome_id = str(params.get("nova_genome_id", "")).strip()
+        voxis_genome_id = str(params.get("voxis_genome_id", "")).strip()
+        eis_genome_id = str(params.get("eis_genome_id", "")).strip()
         generation = int(params.get("generation", 1))
 
         self._logger.info(
@@ -250,6 +268,8 @@ class SpawnChildExecutor(Executor):
         # belief_genome_id: snapshot of parent's hypothesis set, drive weights, drift history
         # simula_genome_id: snapshot of Simula's current evolution params + last 10 mutations
         # Both are resolved NOW so the child inherits the live parent state, not a stale param.
+        belief_genome: object | None = None
+        simula_genome: object | None = None
         if not belief_genome_id and self._evo is not None:
             try:
                 belief_genome = await self._evo.export_belief_genome()
@@ -359,6 +379,103 @@ class SpawnChildExecutor(Executor):
                     note="Proceeding with empty telos_genome_id — child uses default drive calibrations",
                 )
 
+        # soma_genome_id: snapshot of parent's interoceptive setpoints, dynamics matrix,
+        # and allostatic baselines. Child Soma applies these with ±5% noise so the child
+        # inherits calibrated homeostatic geometry from birth.
+        soma_genome: object | None = None
+        if not soma_genome_id and self._soma is not None:
+            try:
+                soma_genome = await self._soma.export_somatic_genome()
+                if soma_genome is not None:
+                    soma_genome_id = str(getattr(soma_genome, "id", getattr(soma_genome, "system_id", "soma")))
+                    self._logger.info(
+                        "spawn_child_soma_genome_resolved",
+                        child_id=child_id,
+                        soma_genome_id=soma_genome_id,
+                        version=getattr(soma_genome, "version", 0),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_soma_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding without soma genome — child uses default homeostatic setpoints",
+                )
+
+        # nova_genome_id: snapshot of parent's goal-domain priors, policy success rates,
+        # belief urgency thresholds, and active inference EFE weights. Children apply
+        # these with ±15% jitter so deliberation quality is high from birth.
+        nova_genome: object | None = None
+        if not nova_genome_id and self._nova is not None:
+            try:
+                nova_genome = await self._nova.export_nova_genome()
+                if nova_genome is not None:
+                    nova_genome_id = str(getattr(nova_genome, "genome_id", ""))
+                    self._logger.info(
+                        "spawn_child_nova_genome_resolved",
+                        child_id=child_id,
+                        nova_genome_id=nova_genome_id,
+                        domain_count=len(getattr(nova_genome, "goal_domain_priors", {})),
+                        policy_count=len(getattr(nova_genome, "policy_success_rates", {})),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_nova_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding with empty nova_genome_id — child inherits no deliberation priors",
+                )
+
+        # voxis_genome_id: snapshot of parent's personality vector, vocabulary affinities,
+        # and strategy preferences. Children apply these with ±10% jitter so they speak
+        # with their parent's voice from the first expression cycle.
+        voxis_genome: object | None = None
+        if not voxis_genome_id and self._voxis is not None:
+            try:
+                voxis_genome = await self._voxis.export_voxis_genome()
+                if voxis_genome is not None:
+                    voxis_genome_id = str(getattr(voxis_genome, "genome_id", ""))
+                    self._logger.info(
+                        "spawn_child_voxis_genome_resolved",
+                        child_id=child_id,
+                        voxis_genome_id=voxis_genome_id,
+                        personality_dims=len(getattr(voxis_genome, "personality_vector", {})),
+                        vocab_count=len(getattr(voxis_genome, "vocabulary_affinities", {})),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_voxis_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding with empty voxis_genome_id — child starts with neutral personality",
+                )
+
+        # eis_genome_id: snapshot of parent's immune memory (threat patterns, anomaly
+        # baselines, quarantine thresholds). Children apply these via EISGenomeExtractor
+        # so they recognise known attack signatures from the first percept cycle.
+        eis_genome: object | None = None
+        if not eis_genome_id and self._eis is not None:
+            try:
+                genome_extractor = getattr(self._eis, "_genome_extractor", None)
+                if genome_extractor is not None:
+                    eis_genome = await genome_extractor.extract_genome_segment()
+                if eis_genome is not None:
+                    eis_genome_id = str(getattr(eis_genome, "id", getattr(eis_genome, "system_id", "eis")))
+                    self._logger.info(
+                        "spawn_child_eis_genome_resolved",
+                        child_id=child_id,
+                        eis_genome_id=eis_genome_id,
+                        patterns=len(getattr(eis_genome, "payload", {}).get("threat_patterns", [])),
+                        baselines=len(getattr(eis_genome, "payload", {}).get("anomaly_baselines", {})),
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "spawn_child_eis_genome_failed",
+                    child_id=child_id,
+                    error=str(exc),
+                    note="Proceeding without EIS genome — child starts with empty immune memory",
+                )
+
         # ── Step 1: Boot child container via LocalDockerSpawner ──
         spawn_container_id = container_id
         spawn_federation_addr = ""
@@ -378,6 +495,10 @@ class SpawnChildExecutor(Executor):
                 equor_genome_id=equor_genome_id,
                 axon_genome_id=axon_genome_id,
                 telos_genome_id=telos_genome_id,
+                soma_genome_id=soma_genome_id,
+                nova_genome_id=nova_genome_id,
+                voxis_genome_id=voxis_genome_id,
+                eis_genome_id=eis_genome_id,
                 generation=generation,
             )
 
@@ -410,6 +531,74 @@ class SpawnChildExecutor(Executor):
                         telos_payload = telos_genome.model_dump_for_transport()  # type: ignore[union-attr]
                         seed_config.child_config_overrides["telos_genome_payload"] = str(
                             __import__("json").dumps(telos_payload)
+                        )
+                    except Exception:
+                        pass
+
+                # Attach BeliefGenome payload to seed config for env injection
+                # Child EvoService reads ECODIAOS_BELIEF_GENOME_PAYLOAD on initialize()
+                if belief_genome is not None:
+                    try:
+                        belief_payload = belief_genome.model_dump_for_transport()  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["belief_genome_payload"] = str(
+                            __import__("json").dumps(belief_payload)
+                        )
+                    except Exception:
+                        pass
+
+                # Attach SimulaGenome payload to seed config for env injection
+                # Child SimulaService reads ECODIAOS_SIMULA_GENOME_PAYLOAD on initialize()
+                if simula_genome is not None:
+                    try:
+                        simula_payload = simula_genome.model_dump_for_transport()  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["simula_genome_payload"] = str(
+                            __import__("json").dumps(simula_payload)
+                        )
+                    except Exception:
+                        pass
+
+                # Attach Soma OrganGenomeSegment payload to seed config for env injection
+                # Child SomaService reads ECODIAOS_SOMA_GENOME_PAYLOAD on initialize()
+                if soma_genome is not None:
+                    try:
+                        soma_payload = soma_genome.model_dump()  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["soma_genome_payload"] = str(
+                            __import__("json").dumps(soma_payload, default=str)
+                        )
+                    except Exception:
+                        pass
+
+                # Attach NovaGenomeFragment payload to seed config for env injection
+                # Child NovaService reads ECODIAOS_NOVA_GENOME_PAYLOAD on initialize()
+                if nova_genome is not None:
+                    try:
+                        nova_payload = nova_genome.model_dump_for_transport()  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["nova_genome_payload"] = str(
+                            __import__("json").dumps(nova_payload)
+                        )
+                    except Exception:
+                        pass
+
+                # Attach VoxisGenomeFragment payload to seed config for env injection
+                # Child VoxisService reads ECODIAOS_VOXIS_GENOME_PAYLOAD on initialize()
+                if voxis_genome is not None:
+                    try:
+                        voxis_payload = voxis_genome.model_dump_for_transport()  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["voxis_genome_payload"] = str(
+                            __import__("json").dumps(voxis_payload)
+                        )
+                    except Exception:
+                        pass
+
+                # Attach EIS OrganGenomeSegment payload to seed config for env injection
+                # Child EISService reads ECODIAOS_EIS_GENOME_PAYLOAD on initialize() and
+                # passes it to EISGenomeExtractor.seed_from_genome_segment() so the child
+                # starts with the parent's immune memory (threat patterns + anomaly baselines).
+                if eis_genome is not None:
+                    try:
+                        eis_payload = eis_genome.model_dump(mode="json")  # type: ignore[union-attr]
+                        seed_config.child_config_overrides["eis_genome_payload"] = str(
+                            __import__("json").dumps(eis_payload, default=str)
                         )
                     except Exception:
                         pass
@@ -597,6 +786,8 @@ class SpawnChildExecutor(Executor):
             # No Synapse bus — fallback direct call (dev/test only, bus unavailable)
             from systems.oikos.models import ChildPosition, ChildStatus  # noqa: PLC0415
 
+            _oikos_config = getattr(self._oikos, "_config", None)
+            _max_rescues: int = getattr(_oikos_config, "mitosis_max_rescues_per_child", 2)
             child_position = ChildPosition(
                 instance_id=child_id,
                 niche=niche_name,
@@ -606,6 +797,7 @@ class SpawnChildExecutor(Executor):
                 status=ChildStatus.ALIVE if seed_transferred else ChildStatus.SPAWNING,
                 wallet_address=wallet_addr,
                 container_id=spawn_container_id,
+                max_rescues=_max_rescues,
             )
             await self._oikos.register_child(child_position)
             _child_registered = True
@@ -631,36 +823,53 @@ class SpawnChildExecutor(Executor):
                     note="Proceeding without genome payload — child will use defaults",
                 )
 
-        # ── Step 4: Emit CHILD_SPAWNED event ──
+        # ── Step 4: Emit CHILD_SPAWNED + INSTANCE_SPAWNED events ──
         if self._synapse is not None:
             try:
                 from systems.synapse.types import SynapseEvent, SynapseEventType
 
+                _spawn_data = {
+                    "child_instance_id": child_id,
+                    "niche": niche_name,
+                    "seed_capital_usd": seed_amount if seed_transferred else "0",
+                    "seed_transfer_deferred": not seed_transferred,
+                    "dividend_rate": dividend_rate,
+                    "wallet_address": wallet_addr,
+                    "tx_hash": tx_hash,
+                    "network": network,
+                    "container_id": spawn_container_id,
+                    "federation_address": spawn_federation_addr,
+                    "execution_id": context.execution_id,
+                    "organism_genome_id": organism_genome_id,
+                    "belief_genome_id": belief_genome_id,
+                    "simula_genome_id": simula_genome_id,
+                    "equor_genome_id": equor_genome_id,
+                    "axon_genome_id": axon_genome_id,
+                    "telos_genome_id": telos_genome_id,
+                    "nova_genome_id": nova_genome_id,
+                    "voxis_genome_id": voxis_genome_id,
+                    "eis_genome_id": eis_genome_id,
+                    "generation": generation,
+                    # Full genome payload — Mitosis seeds the child from this.
+                    # Empty dict when Memory unavailable; child falls back to defaults.
+                    "parent_genome_payload": parent_genome_payload,
+                }
                 await self._synapse.event_bus.emit(SynapseEvent(
                     event_type=SynapseEventType.CHILD_SPAWNED,
                     source_system="axon.spawn_child",
+                    data=_spawn_data,
+                ))
+                # INSTANCE_SPAWNED — Nexus/Logos need this to register divergence
+                # profiles and snapshot the world model for the new instance.
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.INSTANCE_SPAWNED,
+                    source_system="axon.spawn_child",
                     data={
-                        "child_instance_id": child_id,
+                        "instance_id": child_id,
                         "niche": niche_name,
-                        "seed_capital_usd": seed_amount if seed_transferred else "0",
-                        "seed_transfer_deferred": not seed_transferred,
-                        "dividend_rate": dividend_rate,
-                        "wallet_address": wallet_addr,
-                        "tx_hash": tx_hash,
-                        "network": network,
+                        "generation": generation,
                         "container_id": spawn_container_id,
                         "federation_address": spawn_federation_addr,
-                        "execution_id": context.execution_id,
-                        "organism_genome_id": organism_genome_id,
-                        "belief_genome_id": belief_genome_id,
-                        "simula_genome_id": simula_genome_id,
-                        "equor_genome_id": equor_genome_id,
-                        "axon_genome_id": axon_genome_id,
-                        "telos_genome_id": telos_genome_id,
-                        "generation": generation,
-                        # Full genome payload — Mitosis seeds the child from this.
-                        # Empty dict when Memory unavailable; child falls back to defaults.
-                        "parent_genome_payload": parent_genome_payload,
                     },
                 ))
             except Exception as exc:
@@ -709,6 +918,9 @@ class SpawnChildExecutor(Executor):
                 "equor_genome_id": equor_genome_id,
                 "axon_genome_id": axon_genome_id,
                 "telos_genome_id": telos_genome_id,
+                "nova_genome_id": nova_genome_id,
+                "voxis_genome_id": voxis_genome_id,
+                "eis_genome_id": eis_genome_id,
                 "generation": generation,
             },
             side_effects=[side_effect],
@@ -730,6 +942,10 @@ class SpawnChildExecutor(Executor):
         equor_genome_id: str = "",
         axon_genome_id: str = "",
         telos_genome_id: str = "",
+        soma_genome_id: str = "",
+        nova_genome_id: str = "",
+        voxis_genome_id: str = "",
+        eis_genome_id: str = "",
         generation: int = 1,
     ) -> Any:
         """Build a SeedConfiguration from executor params for the spawner."""
@@ -759,6 +975,10 @@ class SpawnChildExecutor(Executor):
                 equor_genome_id=equor_genome_id,
                 axon_genome_id=axon_genome_id,
                 telos_genome_id=telos_genome_id,
+                soma_genome_id=soma_genome_id,
+                nova_genome_id=nova_genome_id,
+                voxis_genome_id=voxis_genome_id,
+                eis_genome_id=eis_genome_id,
                 generation=generation,
             )
         except Exception as exc:

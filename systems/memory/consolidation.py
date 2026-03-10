@@ -159,7 +159,7 @@ async def _run_community_detection(neo4j: Neo4jClient) -> dict[str, Any]:
             WITH e1.leiden_community AS c1, e2.leiden_community AS c2,
                  r.strength AS strength
             WITH c1, c2, sum(strength) AS internal_weight,
-                 count(r) AS edge_count
+                 count(*) AS edge_count
             WITH sum(CASE WHEN c1 = c2 THEN internal_weight ELSE 0 END) AS modularity_internal,
                  sum(internal_weight) AS total_weight
             RETURN modularity_internal / (total_weight + 0.001) AS modularity

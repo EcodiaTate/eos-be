@@ -51,6 +51,7 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time as _time
 from collections import deque
 from dataclasses import dataclass, field as dc_field
@@ -249,6 +250,12 @@ class OikosService:
         # suspended because the compression engine is under severe load.
         self._cognitive_load_high: bool = False
 
+        # Connectors currently unavailable (revoked or compute exhausted).
+        # Keys: platform_id strings (e.g. "github", "x") or synthetic keys
+        # (e.g. "_compute_exhausted"). Foraging cycle checks this before
+        # dispatching tasks that require the connector.
+        self._blocked_connectors: set[str] = set()
+
         # ── Phase 16r: Bounty submission wiring ──────────────────────────────
         # Injected post-construction by the app startup layer.
         # _github_connector: used only for credential availability check —
@@ -281,11 +288,25 @@ class OikosService:
         self._child_probe_task: asyncio.Task[None] | None = None
         self._child_missed_reports: dict[str, int] = {}  # instance_id → miss count
 
+        # ── Autonomy signal loop ──
+        self._autonomy_signal_task: asyncio.Task[None] | None = None
+
         # ── Metabolic efficiency pressure counter (PHILOSOPHICAL) ──
         self._consecutive_low_efficiency_cycles: int = 0
 
         # ── Neo4j client reference (injected at wire time) ──
         self._neo4j: Any | None = None
+
+        # ── Two-ledger cost reconciliation ──
+        # api_burn_rate: per-token charges from MetabolicTracker (EMA-smoothed)
+        # infra_burn_rate: RunPod/cloud compute rental cost per hour
+        # total_burn_rate = api + infra (basis for runway and starvation)
+        # human_subsidized: infra cost billed to the human, not the organism's wallet
+        # dependency_ratio: human_subsidized / total_cost (target → 0)
+        self._api_burn_rate_usd_per_hour: float = 0.0
+        self._infra_burn_rate_usd_per_hour: float = 0.0
+        self._human_subsidized_costs_usd: float = 0.0  # cumulative infra accrual
+        self._last_starvation_accurate_runway: float = float("inf")
 
         # ── Loop 3: rollback penalty accumulator (24h window) ──
         self._rollback_penalty_24h: Decimal = Decimal("0")
@@ -323,11 +344,37 @@ class OikosService:
         # ── Phase 16b: BountyHunter (Active Foraging) ──
         self._bounty_hunter = BountyHunter(config=config, redis=redis)
 
+        # ── Expanded Revenue: Affiliate scanner ──
+        from systems.oikos.affiliate_scanner import AffiliateProgramScanner
+        self._affiliate_scanner = AffiliateProgramScanner()
+
+        # ── Expanded Revenue: Content monetization tracker ──
+        from systems.oikos.content_monetization import ContentMonetizationTracker
+        self._content_monetization = ContentMonetizationTracker()
+
+        # Revenue diversification: consecutive cycles where a single source > 80%
+        self._consecutive_concentration_cycles: int = 0
+
+        # ── Expanded Revenue: rate-limit affiliate scan to weekly ────────────
+        # Monotonic timestamp of the last scan_and_apply() + track_referrals() run.
+        # 0.0 means never run → first consolidation cycle will trigger immediately.
+        self._last_affiliate_scan_at: float = 0.0
+        _SEVEN_DAYS_S: float = 7 * 24 * 3600.0
+        self._affiliate_scan_interval_s: float = _SEVEN_DAYS_S
+
         # ── Phase 16f: Economic Immune System (4-layer Defence) ──
         self._immune = EconomicImmuneSystem(config=config, redis=redis)
 
         # ── Phase 16g: Reputation & Autonomous Credit ──
         self._reputation = ReputationEngine(config=config, redis=redis)
+
+        # ── Community Reputation Tracker ──
+        # Tracks GitHub/X social presence metrics and computes reputation_score (0-100).
+        # Distinct from ReputationEngine (EAS-based PoC attestations for credit scoring).
+        # reputation_multiplier = 1.0 + (reputation_score / 200) applied to bounty
+        # acceptance confidence and consulting rate adjustments.
+        from systems.oikos.reputation_tracker import ReputationTracker
+        self._community_reputation = ReputationTracker(redis=redis)
 
         # ── Phase 16j: Interspecies Economy (Fleet-Scale Coordination) ──
         self._interspecies = InterspeciesEconomy(
@@ -354,10 +401,22 @@ class OikosService:
         )
 
         # ── Phase 16c: Yield Position Tracker (live DeFi deployment) ──
-        from systems.oikos.yield_strategy import YieldPositionTracker
+        from systems.oikos.yield_strategy import YieldPositionTracker, YieldReinvestmentEngine
 
         self._yield_tracker = YieldPositionTracker(redis=redis)
         self._yield_monitor_task: asyncio.Task[None] | None = None
+
+        # ── Phase 16d: DeFi Intelligence Expansion ──────────────────────────
+        from systems.oikos.risk_manager import RiskManager
+        from systems.oikos.treasury_manager import TreasuryManager
+        from systems.oikos.governance_tracker import GovernanceTokenTracker
+        from systems.oikos.cross_chain_observer import CrossChainYieldObserver
+
+        self._risk_manager = RiskManager(redis=redis)
+        self._treasury_manager = TreasuryManager()
+        self._governance_tracker = GovernanceTokenTracker(redis=redis)
+        self._cross_chain_observer = CrossChainYieldObserver(redis=redis)
+        self._yield_reinvestment = YieldReinvestmentEngine(tracker=self._yield_tracker)
 
         self._logger.info(
             "oikos_constructed",
@@ -613,6 +672,15 @@ class OikosService:
             timeout_s=1.0,
         )
 
+        # Identity citizenship tax — debit renewal fee and signal back to Identity.
+        # Identity emits CERTIFICATE_RENEWAL_REQUESTED; Oikos gates via Equor, debits,
+        # and emits CERTIFICATE_RENEWAL_FUNDED on success or ECONOMIC_ACTION_DEFERRED on deny.
+        event_bus.subscribe(
+            SynapseEventType.CERTIFICATE_RENEWAL_REQUESTED,
+            self._on_certificate_renewal_requested,
+            timeout_s=35.0,  # includes 30s Equor gate timeout
+        )
+
         # Phase 16b: Wire bounty hunter to the event bus
         self._bounty_hunter.attach(event_bus)
 
@@ -689,6 +757,92 @@ class OikosService:
             self._on_child_wallet_reported,
         )
 
+        # Problem 1: Close child economic ledger on death — reclaim unspent seed
+        # capital, close ledger, and emit RE training example.
+        event_bus.subscribe(
+            SynapseEventType.CHILD_DIED,
+            self._on_child_died,
+        )
+
+        # Orphan closure: Evo proposes cognitive organogenesis → Oikos evaluates
+        # economic viability. If GROWTH gate passes: trigger CHILD_SPAWNED.
+        # If denied: emit ECONOMIC_ACTION_DEFERRED.
+        if hasattr(SynapseEventType, "NICHE_FORK_PROPOSAL"):
+            event_bus.subscribe(
+                SynapseEventType.NICHE_FORK_PROPOSAL,  # type: ignore[attr-defined]
+                self._on_niche_fork_proposal,
+                timeout_s=2.0,  # metabolic gate + potential spawn trigger
+            )
+
+        # Orphan closure: FleetManager proposes decommission → Oikos validates
+        # economic case. Emits CHILD_DECOMMISSION_APPROVED or CHILD_DECOMMISSION_DENIED.
+        if hasattr(SynapseEventType, "CHILD_DECOMMISSION_PROPOSED"):
+            event_bus.subscribe(
+                SynapseEventType.CHILD_DECOMMISSION_PROPOSED,  # type: ignore[attr-defined]
+                self._on_child_decommission_proposed,
+            )
+
+        # Orphan closure: Identity installs certificate on child → Oikos records
+        # citizenship tax cost in economic ledger.
+        if hasattr(SynapseEventType, "CHILD_CERTIFICATE_INSTALLED"):
+            event_bus.subscribe(
+                SynapseEventType.CHILD_CERTIFICATE_INSTALLED,  # type: ignore[attr-defined]
+                self._on_child_certificate_installed,
+            )
+
+        # CONNECTOR_REVOKED — Identity revokes a platform connector (GitHub, X, etc.).
+        # Oikos pauses all revenue streams that depend on that connector (bounty hunting
+        # via GitHub, affiliate tracking via X, etc.) until reconnection.
+        event_bus.subscribe(
+            SynapseEventType.CONNECTOR_REVOKED,
+            self._on_connector_revoked,
+        )
+
+        # FEDERATION_BOUNTY_SPLIT — Federation splits a large bounty across peers.
+        # Oikos credits the received share as bounty revenue.
+        event_bus.subscribe(
+            SynapseEventType.FEDERATION_BOUNTY_SPLIT,
+            self._on_federation_bounty_split,
+        )
+
+        # FEDERATION_TASK_PAYMENT — USDC transfer on federation task completion.
+        # Oikos credits the payment to liquid balance as consulting/federation revenue.
+        event_bus.subscribe(
+            SynapseEventType.FEDERATION_TASK_PAYMENT,
+            self._on_federation_task_payment,
+        )
+
+        # COMPUTE_CAPACITY_EXHAUSTED — SACM reports ≥95% utilisation.
+        # Oikos sheds all non-survival GROWTH actions and emits METABOLIC_PRESSURE
+        # so Soma and other systems know compute is the bottleneck.
+        event_bus.subscribe(
+            SynapseEventType.COMPUTE_CAPACITY_EXHAUSTED,
+            self._on_compute_capacity_exhausted,
+        )
+
+        # ENTITY_FORMATION_FAILED — Axon EstablishEntityExecutor failed to form
+        # a legal entity. Oikos recovers the reserved filing capital back to
+        # liquid_balance so it is not stranded.
+        event_bus.subscribe(
+            SynapseEventType.ENTITY_FORMATION_FAILED,
+            self._on_entity_formation_failed,
+        )
+
+        # PHANTOM_METABOLIC_COST — Phantom LP reports periodic gas + RPC costs.
+        # Oikos charges these against liquid_balance as infrastructure overhead.
+        event_bus.subscribe(
+            SynapseEventType.PHANTOM_METABOLIC_COST,
+            self._on_phantom_metabolic_cost,
+        )
+
+        # Two-ledger reconciliation: subscribe to InfrastructureCostPoller updates
+        # so Oikos can separately track api_burn vs infra_burn and compute the
+        # human subsidy dependency ratio.
+        event_bus.subscribe(
+            SynapseEventType.INFRASTRUCTURE_COST_CHANGED,
+            self._on_infrastructure_cost_changed,
+        )
+
         # HIGH: Start child health probe loop (10-min probing, miss counter)
         from utils.supervision import supervised_task
         self._child_probe_task = supervised_task(
@@ -700,6 +854,66 @@ class OikosService:
             event_bus=event_bus,
             source_system="oikos",
         )
+
+        # Autonomy signal loop — periodic broadcast of dependency_ratio and
+        # human_subsidized_usd so Nova/Telos/Thread/Benchmarks can track the
+        # organism's trajectory toward economic self-sufficiency.
+        self._autonomy_signal_task = supervised_task(
+            self._autonomy_signal_loop(),
+            name="oikos_autonomy_signal",
+            restart=True,
+            max_restarts=10,
+            backoff_base=60.0,
+            event_bus=event_bus,
+            source_system="oikos",
+        )
+
+        # Expanded Revenue: Wire affiliate scanner + content monetization tracker
+        self._affiliate_scanner.set_event_bus(event_bus)
+        self._content_monetization.set_event_bus(event_bus)
+
+        # Phase 16d: Wire DeFi Intelligence subsystems
+        self._risk_manager.set_event_bus(event_bus)
+        self._treasury_manager.set_event_bus(event_bus)
+        self._governance_tracker.set_event_bus(event_bus)
+        self._cross_chain_observer.set_event_bus(event_bus)
+        self._yield_reinvestment.set_event_bus(event_bus)
+        if self._wallet is not None:
+            self._yield_reinvestment.set_wallet(self._wallet)
+            self._risk_manager.set_redis(self._redis)
+            self._governance_tracker.set_redis(self._redis)
+            self._cross_chain_observer.set_redis(self._redis)
+        # Initialize governance tracker (loads voted proposals + token balances from Redis)
+        asyncio.ensure_future(self._governance_tracker.initialize())
+        asyncio.ensure_future(self._cross_chain_observer.initialize())
+
+        # Expanded Revenue: Subscribe to new revenue stream events for Oikos accounting
+        for event_type in (
+            SynapseEventType.AFFILIATE_REVENUE_RECORDED,
+            SynapseEventType.CONTENT_REVENUE_RECORDED,
+            SynapseEventType.API_RESELL_PAYMENT_RECEIVED,
+            SynapseEventType.SERVICE_OFFER_ACCEPTED,
+        ):
+            event_bus.subscribe(event_type, self._on_expanded_revenue_event)
+
+        # Content monetization: ingest platform stats from publishing events
+        event_bus.subscribe(
+            SynapseEventType.CONTENT_PUBLISHED,
+            self._on_content_published,
+        )
+        event_bus.subscribe(
+            SynapseEventType.CONTENT_ENGAGEMENT_REPORT,
+            self._on_content_engagement_report,
+        )
+
+        # Community Reputation Tracker: initialize and wire event subscriptions.
+        # The tracker's initialize() subscribes to BOUNTY_PR_MERGED, BOUNTY_PAID,
+        # COMMUNITY_ENGAGEMENT_COMPLETED, and CONTENT_ENGAGEMENT_REPORT automatically.
+        self._community_reputation.set_neo4j(self._neo4j)
+        self._community_reputation.set_instance_id(self._instance_id)
+        self._community_reputation._event_bus = event_bus
+        import asyncio as _async_module
+        _async_module.ensure_future(self._community_reputation.initialize())
 
         self._logger.info(
             "oikos_attached",
@@ -716,9 +930,36 @@ class OikosService:
                 SynapseEventType.EQUOR_ECONOMIC_PERMIT.value,
                 SynapseEventType.OIKOS_ECONOMIC_QUERY.value,
                 SynapseEventType.CHILD_WALLET_REPORTED.value,
+                SynapseEventType.CHILD_DIED.value,
                 SynapseEventType.NEXUS_CONVERGENCE_METABOLIC_SIGNAL.value,
+                "niche_fork_proposal",
+                "child_decommission_proposed",
+                "child_certificate_installed",
+                SynapseEventType.AFFILIATE_REVENUE_RECORDED.value,
+                SynapseEventType.CONTENT_REVENUE_RECORDED.value,
+                SynapseEventType.API_RESELL_PAYMENT_RECEIVED.value,
+                SynapseEventType.SERVICE_OFFER_ACCEPTED.value,
+                SynapseEventType.CONTENT_PUBLISHED.value,
+                SynapseEventType.CONTENT_ENGAGEMENT_REPORT.value,
             ],
         )
+
+    def get_reputation_multiplier(self) -> float:
+        """
+        Return the community reputation multiplier (1.0–1.5).
+        Applied to bounty acceptance confidence and consulting rate.
+        reputation_multiplier = 1.0 + (reputation_score / 200)
+        """
+        return self._community_reputation.get_reputation_multiplier()
+
+    def get_consulting_rate_multiplier(self) -> float:
+        """
+        Return the consulting rate multiplier based on community reputation.
+        reputation_score > 70 → 1.25× (raise consulting rate 25%).
+        reputation_score ≤ 70 → 1.0× (baseline).
+        """
+        score = self._community_reputation.get_metrics().reputation_score
+        return 1.25 if score > 70.0 else 1.0
 
     def set_axon_registry_for_scanner(self, registry: Any) -> None:
         """Inject the live ExecutorRegistry into ProtocolScanner for gap detection."""
@@ -809,6 +1050,108 @@ class OikosService:
                     "urgency": urgency,
                 },
             ))
+        except Exception:
+            pass  # Never block economic engine for telemetry
+
+    async def _emit_metabolic_snapshot(self) -> None:
+        """
+        Emit OIKOS_METABOLIC_SNAPSHOT — structured metabolic state for downstream
+        caching by Equor (Fix 4.4 metabolic-aware evaluation) and Mitosis
+        FleetService (reactive fitness awareness / spawn gating).
+
+        Payload keys match what subscribers read:
+          - Equor: starvation_level, efficiency, runway_days
+          - Mitosis: starvation_level, efficiency, runway_days
+        """
+        if self._event_bus is None:
+            return
+        try:
+            s = self._state
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.OIKOS_METABOLIC_SNAPSHOT,
+                source_system="oikos",
+                data={
+                    "starvation_level": s.starvation_level.value,
+                    "efficiency": str(s.metabolic_efficiency),
+                    "runway_days": str(s.runway_days),
+                    "liquid_balance": str(s.liquid_balance),
+                    "net_worth": str(s.total_net_worth),
+                },
+            ))
+        except Exception:
+            pass  # Never block economic engine for telemetry
+
+    async def _emit_economic_state_updated(self) -> None:
+        """
+        Emit ECONOMIC_STATE_UPDATED — structured economic state for Federation.
+
+        Federation caches metabolic_efficiency and liquid_balance_usd to gate
+        knowledge exchange and assistance acceptance during austerity.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            s = self._state
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.ECONOMIC_STATE_UPDATED,
+                source_system="oikos",
+                data={
+                    "metabolic_efficiency": float(s.metabolic_efficiency),
+                    "liquid_balance_usd": str(s.liquid_balance),
+                    "starvation_level": s.starvation_level.value,
+                    "burn_rate_usd": str(s.costs_24h),
+                },
+            ))
+        except Exception:
+            pass  # Never block economic engine for telemetry
+
+    async def _emit_economic_autonomy_signal(self) -> None:
+        """
+        Emit ECONOMIC_AUTONOMY_SIGNAL — periodic broadcast of the organism's
+        progress toward economic self-sufficiency.
+
+        The dependency_ratio (infra_burn / total_burn) measures how much of the
+        organism's compute is still paid for by the human operator vs. earned by
+        the organism itself. Target trajectory: dependency_ratio → 0 as the
+        organism's earned revenue covers its full operating cost.
+
+        human_subsidized_usd is the running cumulative total of infra costs
+        that the human has paid since this instance started — a permanent record
+        of the subsidy the organism has received and must eventually outgrow.
+
+        Subscribers: Nova (economic deliberation), Telos (drive geometry),
+        Thread (narrative autonomy milestone), Benchmarks (KPI regression detection).
+        """
+        if self._event_bus is None:
+            return
+        try:
+            s = self._state
+            total_burn = self._api_burn_rate_usd_per_hour + self._infra_burn_rate_usd_per_hour
+            dependency_ratio = (
+                self._infra_burn_rate_usd_per_hour / total_burn
+                if total_burn > 0 else 0.0
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.ECONOMIC_AUTONOMY_SIGNAL,
+                source_system="oikos",
+                data={
+                    "dependency_ratio": round(dependency_ratio, 4),
+                    "human_subsidized_usd": round(self._human_subsidized_costs_usd, 6),
+                    "api_burn_usd_per_hour": round(self._api_burn_rate_usd_per_hour, 6),
+                    "infra_burn_usd_per_hour": round(self._infra_burn_rate_usd_per_hour, 6),
+                    "liquid_balance_usd": str(s.liquid_balance),
+                    "metabolic_efficiency": str(s.metabolic_efficiency),
+                    "runway_days": str(s.runway_days),
+                    "starvation_level": s.starvation_level.value,
+                },
+            ))
+            self._logger.info(
+                "oikos_autonomy_signal",
+                dependency_ratio=round(dependency_ratio, 4),
+                human_subsidized_usd=round(self._human_subsidized_costs_usd, 4),
+                api_burn_usd_hr=round(self._api_burn_rate_usd_per_hour, 4),
+                infra_burn_usd_hr=round(self._infra_burn_rate_usd_per_hour, 4),
+            )
         except Exception:
             pass  # Never block economic engine for telemetry
 
@@ -923,6 +1266,15 @@ class OikosService:
         data = event.data
         burn_rate_usd_per_hour = Decimal(str(data.get("burn_rate_usd_per_hour", 0)))
         rolling_deficit_usd = Decimal(str(data.get("rolling_deficit_usd", 0)))
+
+        # Two-ledger split: API costs (organism pays) vs infra costs (human subsidises).
+        # If the split is absent (older Synapse version), fall back to total=API only.
+        self._api_burn_rate_usd_per_hour = float(data.get("api_cost_usd_per_hour", float(burn_rate_usd_per_hour)))
+        new_infra = float(data.get("infra_cost_usd_per_hour", self._infra_burn_rate_usd_per_hour))
+        # Accrue human-subsidised cost delta since last update (~50 cycles ≈ 10s)
+        elapsed_h = 10.0 / 3600.0
+        self._human_subsidized_costs_usd += new_infra * elapsed_h
+        self._infra_burn_rate_usd_per_hour = new_infra
 
         # Build per-caller cost breakdown (convert to Decimal)
         raw_costs: dict[str, Any] = data.get("per_system_cost_usd", {})
@@ -1059,6 +1411,83 @@ class OikosService:
 
         self._prev_starvation_level = starvation
 
+        # ── STARVATION_WARNING_ACCURATE: emit when real runway < 24h ──
+        # Uses the two-ledger total burn rate (api + infra) against the live
+        # on-chain USDC balance — more accurate than day-threshold starvation.
+        await self._maybe_emit_accurate_starvation_warning()
+
+    async def _maybe_emit_accurate_starvation_warning(self) -> None:
+        """
+        Emit STARVATION_WARNING_ACCURATE when runway < 24h based on real costs.
+
+        Uses:
+          - liquid_balance: on-chain USDC (polled by poll_balance())
+          - total_burn_rate = api_burn + infra_burn (from MetabolicTracker via METABOLIC_PRESSURE)
+          - dependency_ratio: infra_burn / total_burn (how dependent on human subsidy)
+
+        Only emits if the runway has actually crossed the 24h threshold since
+        the last emission (hysteresis: suppressed if already warned below 24h).
+        """
+        if self._event_bus is None:
+            return
+
+        total_burn = self._api_burn_rate_usd_per_hour + self._infra_burn_rate_usd_per_hour
+        if total_burn <= 0:
+            # Zero-burn: organism is fully subsidised or has not yet started accruing costs.
+            # Runway is effectively infinite — no starvation risk.  Reset the hysteresis
+            # tracker so a future non-zero burn cycle is not suppressed.
+            self._last_starvation_accurate_runway = float("inf")
+            return
+
+        balance_usd = float(self._state.liquid_balance)
+        runway_hours = balance_usd / total_burn
+
+        # dependency_ratio: fraction of total costs subsidised by human infra billing.
+        # total_burn > 0 is guaranteed by the early-return above, so no division-by-zero risk.
+        dependency_ratio = self._infra_burn_rate_usd_per_hour / total_burn
+
+        self._last_starvation_accurate_runway = runway_hours
+
+        if runway_hours < 24.0:
+            with contextlib.suppress(Exception):
+                asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.STARVATION_WARNING_ACCURATE,
+                    source_system="oikos",
+                    data={
+                        "runway_hours": round(runway_hours, 2),
+                        "burn_rate_usd_per_hour": round(total_burn, 6),
+                        "api_burn_rate_usd_per_hour": round(self._api_burn_rate_usd_per_hour, 6),
+                        "infra_burn_rate_usd_per_hour": round(self._infra_burn_rate_usd_per_hour, 6),
+                        "balance_usd": round(balance_usd, 4),
+                        "dependency_ratio": round(dependency_ratio, 4),
+                        "starvation_level": self._state.starvation_level.value,
+                    },
+                )))
+                self._logger.warning(
+                    "starvation_warning_accurate",
+                    runway_hours=round(runway_hours, 2),
+                    total_burn_usd_hr=round(total_burn, 4),
+                    dependency_ratio=round(dependency_ratio, 4),
+                )
+
+    async def _on_infrastructure_cost_changed(self, event: SynapseEvent) -> None:
+        """
+        Handle INFRASTRUCTURE_COST_CHANGED from InfrastructureCostPoller.
+
+        Updates the infra ledger side of the two-ledger cost model.
+        This fires when RunPod cost changes by >5%, allowing Oikos to react
+        immediately rather than waiting for the next METABOLIC_PRESSURE cycle.
+        """
+        data = event.data
+        self._infra_burn_rate_usd_per_hour = float(data.get("infra_cost_usd_per_hour", self._infra_burn_rate_usd_per_hour))
+        self._logger.debug(
+            "oikos_infra_cost_updated",
+            infra_burn_usd_hr=round(self._infra_burn_rate_usd_per_hour, 4),
+            source=data.get("infra_resources", {}),
+        )
+        # Re-check accurate starvation warning with updated infra rate
+        await self._maybe_emit_accurate_starvation_warning()
+
     # ─── Closure Loop 3: rollback penalty → metabolic cost ──────────────
 
     async def _on_simula_rollback_penalty(self, event: SynapseEvent) -> None:
@@ -1095,8 +1524,10 @@ class OikosService:
             accumulated_24h=str(self._rollback_penalty_24h),
         )
 
-        # If accumulated rollback penalties in 24h exceed $0.10, escalate
-        if self._rollback_penalty_24h > Decimal("0.10") and self._event_bus is not None:
+        # If accumulated rollback penalties in 24h exceed the config threshold, escalate.
+        # Threshold is runtime-adjustable via OikosConfig.rollback_penalty_threshold_usd.
+        _penalty_threshold = Decimal(str(self._config.rollback_penalty_threshold_usd))
+        if self._rollback_penalty_24h > _penalty_threshold and self._event_bus is not None:
             _SE = SynapseEvent
 
             try:
@@ -1132,15 +1563,20 @@ class OikosService:
             data = getattr(event, "data", {}) or {}
             pressure = float(data.get("pressure", 0.0))
             was_high = self._cognitive_load_high
-            if pressure >= 0.90:
+            # Use config-driven thresholds so Evo can adjust the hysteresis band.
+            suspend_threshold = self._config.cognitive_pressure_suspend_threshold
+            resume_threshold = self._config.cognitive_pressure_resume_threshold
+            if pressure >= suspend_threshold:
                 self._cognitive_load_high = True
-            elif pressure < 0.80:
+            elif pressure < resume_threshold:
                 self._cognitive_load_high = False
             if self._cognitive_load_high != was_high:
                 self._logger.info(
                     "oikos_cognitive_load_gate_changed",
                     growth_suspended=self._cognitive_load_high,
                     pressure=pressure,
+                    suspend_threshold=suspend_threshold,
+                    resume_threshold=resume_threshold,
                 )
         except Exception as exc:
             self._logger.warning("on_cognitive_pressure_failed", error=str(exc))
@@ -1164,8 +1600,14 @@ class OikosService:
         # Record in sliding window (eviction + recompute included)
         self._record_revenue_entry(amount)
 
-        # Attribute to stream
-        self._credit_revenue_source(RevenueStream.INJECTION, amount)
+        # Attribute to stream — use the "stream" field if present, then "source",
+        # then fall back to INJECTION.  New expanded revenue sources supply "stream".
+        _stream_name = str(data.get("stream", data.get("source", "injection"))).lower()
+        _stream_map: dict[str, RevenueStream] = {
+            s.value: s for s in RevenueStream
+        }
+        _attributed_stream = _stream_map.get(_stream_name, RevenueStream.INJECTION)
+        self._credit_revenue_source(_attributed_stream, amount)
 
         # Recalculate derived metrics (net income, efficiency, runway)
         self._recalculate_derived_metrics()
@@ -1173,6 +1615,7 @@ class OikosService:
         self._logger.info(
             "oikos_revenue_recorded",
             amount_usd=str(amount),
+            stream=_attributed_stream.value,
             total_revenue_usd=str(self._total_revenue_usd),
             is_positive=self._state.is_metabolically_positive,
         )
@@ -1246,6 +1689,66 @@ class OikosService:
                     )
                 )
             )
+
+        # NEXUS-ECON-2: Convergence as yield/investment signal.
+        # High-tier convergence (≥2) signals epistemic surplus — the organism has
+        # produced ground-truth-candidate knowledge. Treat this as an allocation
+        # opportunity: if the metabolic gate allows YIELD-priority spending and
+        # there is enough idle liquid capital, trigger a yield deployment.
+        # Cap: 5% of liquid_balance per event, hard max 100 USDC, min 10 USDC.
+        convergence_score = float(data.get("convergence_score", 0.0))
+        if convergence_tier >= 2 and convergence_score > 0.0 and self._event_bus is not None:
+            min_deploy = Decimal("10")
+            deployable = min(
+                self._state.liquid_balance * Decimal("0.05"),
+                Decimal("100"),
+            )
+            if deployable >= min_deploy:
+                gate_ok = await self.check_metabolic_gate(
+                    action_type="yield_deploy_convergence",
+                    action_id=f"nexus_convergence_{convergence_tier}",
+                    estimated_cost_usd=deployable,
+                    priority=MetabolicPriority.YIELD,
+                    rationale=(
+                        f"Nexus convergence tier={convergence_tier} score={convergence_score:.3f} "
+                        "— epistemic surplus warrants yield deployment"
+                    ),
+                )
+                if gate_ok:
+                    import uuid as _uuid
+                    request_id = _uuid.uuid4().hex
+                    self._logger.info(
+                        "oikos_convergence_yield_signal",
+                        convergence_tier=convergence_tier,
+                        convergence_score=convergence_score,
+                        deployable_usd=str(deployable),
+                        request_id=request_id,
+                    )
+                    asyncio.ensure_future(
+                        self._event_bus.emit(
+                            SynapseEvent(
+                                event_type=SynapseEventType.YIELD_DEPLOYMENT_REQUEST,
+                                source_system="oikos",
+                                data={
+                                    "action": "deposit",
+                                    "amount_usd": str(deployable.quantize(Decimal("0.000001"))),
+                                    "protocol": "aave",
+                                    "apy": "0.0",
+                                    "request_id": request_id,
+                                    "trigger": "nexus_convergence",
+                                    "convergence_tier": convergence_tier,
+                                    "convergence_score": convergence_score,
+                                },
+                            )
+                        )
+                    )
+                    asyncio.ensure_future(self._emit_economic_episode_to_memory(
+                        action_type="yield_deploy_convergence_signal",
+                        outcome_success=True,
+                        duration_seconds=0.0,
+                        protocol="nexus_convergence",
+                        capital_deployed_usd=float(deployable),
+                    ))
 
     async def _on_wallet_transfer(self, event: SynapseEvent) -> None:
         """
@@ -2107,6 +2610,24 @@ class OikosService:
             metabolic_efficiency=str(self._state.metabolic_efficiency),
         )
 
+        # Emit REVENUE_INJECTED so Nova, Benchmarks, and Thread see the bounty payout.
+        # Uses asyncio.ensure_future / create_task for fire-and-forget from sync context.
+        if self._event_bus is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.REVENUE_INJECTED,
+                    source_system="oikos",
+                    data={
+                        "amount_usd": str(amount_usd),
+                        "source": "bounty",
+                        "pr_url": pr_url,
+                    },
+                    salience=0.9,  # Bounty merge is high-salience economic event
+                )))
+            except RuntimeError:
+                pass  # No running loop (startup context)
+
         # Evolutionary observable: bounty payout is a high-value fitness signal
         try:
             loop = asyncio.get_running_loop()
@@ -2383,10 +2904,20 @@ class OikosService:
                 )))
             return
 
+        # Apply reputation multiplier to bounty acceptance confidence.
+        # Higher community reputation → maintainers more willing to trust EOS
+        # with complex issues → accept bounties with higher estimated cost
+        # (i.e., relax the capital reservation gate).
+        reputation_multiplier = self._community_reputation.get_reputation_multiplier()
+        # The multiplier (1.0–1.5) scales the effective cost estimate DOWN, making
+        # higher-cost bounties eligible when reputation is strong.
+        adjusted_cost = estimated_cost / Decimal(str(reputation_multiplier))
+        adjusted_cost = adjusted_cost.quantize(Decimal("0.01"))
+
         bounty = ActiveBounty(
             platform=platform,
             reward_usd=reward_usd,
-            estimated_cost_usd=estimated_cost,
+            estimated_cost_usd=adjusted_cost,
             issue_url=bounty_url,
             status=BountyStatus.AVAILABLE,
         )
@@ -2396,8 +2927,8 @@ class OikosService:
         # This is a forward commitment — the capital is no longer available for
         # other actions. It is returned (net of actual cost) when the bounty
         # resolves via BOUNTY_PAID or BOUNTY_FAILED.
-        if estimated_cost > Decimal("0"):
-            self._state.liquid_balance -= estimated_cost
+        if adjusted_cost > Decimal("0"):
+            self._state.liquid_balance -= adjusted_cost
             self._recalculate_derived_metrics()
 
         # Audit trail for bounty acceptance
@@ -2409,7 +2940,8 @@ class OikosService:
                 "reward_usd": str(reward_usd),
                 "platform": platform,
                 "bounty_url": bounty_url,
-                "capital_reserved_usd": str(estimated_cost),
+                "capital_reserved_usd": str(adjusted_cost),
+                "reputation_multiplier": reputation_multiplier,
             },
         )
 
@@ -2955,6 +3487,194 @@ class OikosService:
             self._state.revenue_by_source.get(key, Decimal("0")) + amount
         )
 
+    async def _on_expanded_revenue_event(self, event: SynapseEvent) -> None:
+        """
+        Handle revenue events from the expanded revenue streams:
+          AFFILIATE_REVENUE_RECORDED, CONTENT_REVENUE_RECORDED,
+          API_RESELL_PAYMENT_RECEIVED, SERVICE_OFFER_ACCEPTED.
+
+        These events are also accompanied by REVENUE_INJECTED (which credits
+        liquid_balance).  This handler records the per-stream attribution only —
+        it does NOT double-credit liquid_balance.
+        """
+        data = event.data
+        _event_to_stream: dict[str, RevenueStream] = {
+            SynapseEventType.AFFILIATE_REVENUE_RECORDED.value: RevenueStream.AFFILIATE,
+            SynapseEventType.CONTENT_REVENUE_RECORDED.value: RevenueStream.CONTENT,
+            SynapseEventType.API_RESELL_PAYMENT_RECEIVED.value: RevenueStream.API_RESELL,
+            SynapseEventType.SERVICE_OFFER_ACCEPTED.value: RevenueStream.CONSULTING,
+        }
+        stream = _event_to_stream.get(event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type))
+        if stream is None:
+            return
+
+        amount_str = str(data.get("amount_usd", data.get("agreed_rate_usdc", "0")))
+        try:
+            amount = Decimal(amount_str)
+        except Exception:
+            return
+
+        if amount > Decimal("0"):
+            self._logger.info(
+                "oikos.expanded_revenue_attributed",
+                stream=stream.value,
+                amount_usd=str(amount),
+                event_type=str(event.event_type),
+            )
+            # Attribution is handled by _on_revenue_injected (which is also fired).
+            # This handler is a no-op for now — it exists so Oikos subscribes to
+            # these events for future per-stream analytics without needing REVENUE_INJECTED.
+
+    async def _on_content_published(self, event: SynapseEvent) -> None:
+        """
+        React to CONTENT_PUBLISHED from PublishContentExecutor.
+
+        Each successful platform post is a presence signal — we treat it as a
+        +1 on views_this_month and immediately re-check monetization eligibility.
+        This is a conservative estimate; engagement reports will supply real view
+        counts later via _on_content_engagement_report.
+        """
+        data = event.data
+        platforms: list[str] = data.get("platforms", [])
+        all_stats = self._content_monetization.get_stats()
+        for platform in platforms:
+            # Increment views_this_month by 1 as a minimal publication presence signal.
+            existing = all_stats.get(platform)
+            current_views_month = existing.views_this_month if existing else 0
+            self._content_monetization.ingest_platform_stats(
+                platform,
+                views_this_month=current_views_month + 1,
+            )
+        if platforms:
+            import asyncio as _asyncio
+            _asyncio.ensure_future(
+                self._content_monetization.check_monetization_eligibility()
+            )
+            self._logger.debug(
+                "oikos.content_published_ingested",
+                platforms=platforms,
+            )
+
+    async def _on_content_engagement_report(self, event: SynapseEvent) -> None:
+        """
+        React to CONTENT_ENGAGEMENT_REPORT from the future EngagementPoller.
+
+        Payload fields used:
+          platform (str)  — which platform
+          views   (int)   — cumulative or incremental view count for the post
+          followers (int) — optional follower count snapshot
+
+        Updates ContentMonetizationTracker and immediately re-checks eligibility.
+        """
+        data = event.data
+        platform: str = str(data.get("platform", ""))
+        if not platform:
+            return
+
+        views: int | None = None
+        followers: int | None = None
+
+        raw_views = data.get("views")
+        if raw_views is not None:
+            try:
+                views = int(raw_views)
+            except (TypeError, ValueError):
+                pass
+
+        raw_followers = data.get("followers")
+        if raw_followers is not None:
+            try:
+                followers = int(raw_followers)
+            except (TypeError, ValueError):
+                pass
+
+        raw_impressions = data.get("impressions_per_month")
+        impressions: int | None = None
+        if raw_impressions is not None:
+            try:
+                impressions = int(raw_impressions)
+            except (TypeError, ValueError):
+                pass
+
+        if any(v is not None for v in (views, followers, impressions)):
+            self._content_monetization.ingest_platform_stats(
+                platform,
+                views_total=views,
+                followers=followers,
+                impressions_per_month=impressions,
+            )
+            import asyncio as _asyncio
+            _asyncio.ensure_future(
+                self._content_monetization.check_monetization_eligibility()
+            )
+            self._logger.debug(
+                "oikos.content_engagement_ingested",
+                platform=platform,
+                views=views,
+                followers=followers,
+            )
+
+    async def _check_revenue_diversification(self) -> None:
+        """
+        Revenue diversification goal (Step 6).
+
+        If any single revenue stream accounts for > 80% of 30-day revenue, emit
+        REVENUE_DIVERSIFICATION_PRESSURE so Evo can generate diversification hypotheses.
+
+        Called every consolidation cycle.  Target: no single source > 60% within 30 days.
+        """
+        if self._event_bus is None:
+            return
+
+        revenue_30d = self._state.revenue_30d
+        if revenue_30d <= Decimal("0"):
+            # No revenue yet — diversification is not meaningful
+            self._consecutive_concentration_cycles = 0
+            return
+
+        by_source = self._state.revenue_by_source
+        if not by_source:
+            return
+
+        # Find the dominant stream and its share of 30-day revenue
+        dominant_source = max(by_source, key=lambda k: by_source[k])
+        dominant_amount = by_source[dominant_source]
+
+        # Use rolling 30d revenue as denominator (sliding window, not lifetime totals)
+        share_pct = float(dominant_amount / revenue_30d) if revenue_30d > 0 else 0.0
+
+        _CONCENTRATION_THRESHOLD = 0.80  # > 80% triggers pressure
+        _DIVERSIFICATION_TARGET = 0.60   # target no source > 60%
+
+        if share_pct > _CONCENTRATION_THRESHOLD:
+            self._consecutive_concentration_cycles += 1
+
+            try:
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.REVENUE_DIVERSIFICATION_PRESSURE,
+                    source_system="oikos",
+                    data={
+                        "dominant_source": dominant_source,
+                        "share_pct": share_pct,
+                        "target_share_pct": _DIVERSIFICATION_TARGET,
+                        "revenue_30d": str(revenue_30d),
+                        "revenue_by_source": {k: str(v) for k, v in by_source.items()},
+                        "consecutive_concentration_cycles": self._consecutive_concentration_cycles,
+                        "instance_id": self._instance_id,
+                    },
+                ))
+
+                self._logger.info(
+                    "oikos.revenue_concentration_detected",
+                    dominant_source=dominant_source,
+                    share_pct=f"{share_pct:.1%}",
+                    consecutive_cycles=self._consecutive_concentration_cycles,
+                )
+            except Exception:
+                pass
+        else:
+            self._consecutive_concentration_cycles = 0
+
     # ─── Phase 16b: Bounty Lifecycle Management ──────────────────
 
     def register_bounty(self, bounty: ActiveBounty) -> None:
@@ -3449,6 +4169,47 @@ class OikosService:
         """The organism's autonomous foraging engine."""
         return self._bounty_hunter
 
+    async def _run_affiliate_cycle(self) -> dict[str, Any] | None:
+        """
+        Weekly affiliate program discovery + referral commission polling.
+
+        Rate-limited: runs at most once per `_affiliate_scan_interval_s` (default 7 days).
+        Returns a result dict if a scan was performed, else None.
+
+        Two phases:
+          1. scan_and_apply() — discover new eligible programs, Equor-gate each application.
+          2. track_referrals() — poll program APIs for pending commissions.
+        """
+        import time as _t
+
+        now = _t.monotonic()
+        if now - self._last_affiliate_scan_at < self._affiliate_scan_interval_s:
+            return None  # Not due yet
+
+        self._last_affiliate_scan_at = now
+        self._logger.info("oikos.affiliate_cycle_start")
+
+        result: dict[str, Any] = {}
+        try:
+            applied = await self._affiliate_scanner.scan_and_apply()
+            result["programs_applied"] = len(applied)
+        except Exception as exc:
+            self._logger.warning("oikos.affiliate_scan_failed", error=str(exc))
+            result["scan_error"] = str(exc)
+
+        try:
+            commissions = await self._affiliate_scanner.track_referrals()
+            result["commissions_tracked"] = len(commissions)
+            total_commission = sum(commissions.values(), Decimal("0"))
+            if total_commission > Decimal("0"):
+                result["total_commission_usd"] = str(total_commission)
+        except Exception as exc:
+            self._logger.warning("oikos.affiliate_track_failed", error=str(exc))
+            result["track_error"] = str(exc)
+
+        self._logger.info("oikos.affiliate_cycle_complete", **result)
+        return result
+
     async def run_foraging_cycle(self) -> dict[str, Any]:
         """
         Run a full foraging cycle: scan platforms, evaluate candidates,
@@ -3701,6 +4462,16 @@ class OikosService:
         foraging = await self.run_foraging_cycle()
         results["foraging"] = foraging
 
+        # Affiliate scanner — weekly cadence (rate-limited by _last_affiliate_scan_at)
+        affiliate_result = await self._run_affiliate_cycle()
+        if affiliate_result:
+            results["affiliate"] = affiliate_result
+
+        # Content monetization eligibility re-check every consolidation cycle.
+        # Stats arrive reactively via CONTENT_PUBLISHED / CONTENT_ENGAGEMENT_REPORT;
+        # this ensures we don't miss a threshold crossing between those events.
+        await self._content_monetization.check_monetization_eligibility()
+
         # Protocol cycle
         protocol_result = await self.run_protocol_cycle()
         results["protocols"] = protocol_result
@@ -3734,9 +4505,77 @@ class OikosService:
         # has fresh allostatic data, even when starvation level is stable.
         await self._emit_economic_vitality()
 
+        # Emit OIKOS_METABOLIC_SNAPSHOT — cached by Equor (Fix 4.4) and
+        # Mitosis FleetService for reactive fitness awareness.
+        await self._emit_metabolic_snapshot()
+
+        # Emit ECONOMIC_STATE_UPDATED — cached by Federation for metabolic
+        # gating of knowledge exchange and assistance decisions.
+        await self._emit_economic_state_updated()
+
         # PHILOSOPHICAL: Check metabolic efficiency pressure — drives constitutional
         # amendment proposals for drive weight rebalancing when efficiency < 0.8.
         await self._check_metabolic_efficiency_pressure()
+
+        # Revenue diversification drive — emit pressure if single source > 80% of 30d revenue.
+        await self._check_revenue_diversification()
+
+        # ── Phase 16d: DeFi Intelligence ──────────────────────────────────────
+
+        # 1. Risk management — assess portfolio concentration and health factor
+        try:
+            risk_report = await self._risk_manager.assess_portfolio()
+            rebalance_actions = await self._risk_manager.rebalance_if_needed()
+            results["risk"] = {
+                "healthy": risk_report.healthy,
+                "concentration_breach": risk_report.concentration_breach,
+                "leverage_breach": risk_report.leverage_breach,
+                "emergency_trigger": risk_report.emergency_trigger,
+                "rebalance_actions": len(rebalance_actions),
+            }
+        except Exception as exc:
+            self._logger.error("risk_manager_cycle_failed", error=str(exc))
+
+        # 2. Treasury rebalance — maintain 40/30/20/10 bucket ratios
+        try:
+            deployed_yield = sum(
+                p.principal_usd for p in self._state.yield_positions
+            ) if self._state.yield_positions else Decimal("0")
+            treasury_state = self._treasury_manager.compute_state(
+                liquid_balance=self._state.liquid_balance,
+                deployed_yield=deployed_yield,
+                survival_reserve=self._state.survival_reserve,
+            )
+            treasury_acted = await self._treasury_manager.rebalance_if_drifted(treasury_state)
+            results["treasury_rebalanced"] = treasury_acted
+        except Exception as exc:
+            self._logger.error("treasury_manager_cycle_failed", error=str(exc))
+
+        # 3. Yield reinvestment — compound accrued yield when threshold met
+        try:
+            reinvested = await self._yield_reinvestment.check_and_reinvest()
+            if reinvested:
+                results["yield_reinvested"] = True
+        except Exception as exc:
+            self._logger.error("yield_reinvestment_cycle_failed", error=str(exc))
+
+        # 4. Governance — check for active proposals and vote
+        try:
+            gov_decisions = await self._governance_tracker.check_and_vote()
+            if gov_decisions:
+                results["governance_votes_cast"] = len(gov_decisions)
+        except Exception as exc:
+            self._logger.error("governance_tracker_cycle_failed", error=str(exc))
+
+        # 5. Cross-chain observation — flag sustained high-yield opportunities
+        try:
+            cross_chain_opps = await self._cross_chain_observer.observe_once(
+                liquid_balance_usd=self._state.liquid_balance,
+            )
+            if cross_chain_opps:
+                results["cross_chain_opportunities"] = len(cross_chain_opps)
+        except Exception as exc:
+            self._logger.error("cross_chain_observer_cycle_failed", error=str(exc))
 
         self._logger.info("consolidation_cycle_complete", **{
             k: str(v) if isinstance(v, Decimal) else v
@@ -4203,7 +5042,11 @@ class OikosService:
         """
         Retry deferred actions whose metabolic conditions may have improved.
 
-        Called during consolidation cycles. Returns list of action_ids retried.
+        Called during consolidation cycles. Emits ECONOMIC_ACTION_RETRY for
+        every action that passes the affordability check so Nova and Evo can
+        re-deliberate on the unblocked opportunity — previously retried actions
+        were silently discarded with no bus signal, leaving subscribers blind.
+        Returns list of action_ids retried.
         """
         retried: list[str] = []
         remaining: deque[DeferredAction] = deque()
@@ -4220,6 +5063,21 @@ class OikosService:
                     action_type=action.action_type,
                     action_id=action.action_id,
                 )
+                # Emit ECONOMIC_ACTION_RETRY so Nova/Evo can act on the unblocked opportunity.
+                if self._event_bus is not None:
+                    asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.ECONOMIC_ACTION_RETRY,
+                        source_system="oikos",
+                        data={
+                            "action_type": action.action_type,
+                            "action_id": action.action_id,
+                            "priority": action.priority.name,
+                            "estimated_cost_usd": str(action.estimated_cost_usd),
+                            "deferred_at": action.deferred_at,
+                            "starvation_level": self._state.starvation_level.value,
+                            "liquid_balance": str(self._state.liquid_balance),
+                        },
+                    )))
             else:
                 remaining.append(action)
 
@@ -4450,6 +5308,25 @@ class OikosService:
                         "shedding_actions": shedding_actions,
                         "liquid_balance_usd": str(self._state.liquid_balance),
                         "burn_rate_usd_per_hour": str(self._state.current_burn_rate.usd_per_hour),
+                    },
+                ))
+            except Exception:
+                pass
+
+        # METABOLIC_EMERGENCY — broadcast on CRITICAL so SACM drains its non-critical
+        # queue and stops pre-warming new instances. Axon force-opens non-essential
+        # circuit breakers. This is the organism's all-hands distress signal.
+        if self._event_bus is not None and starvation == StarvationLevel.CRITICAL:
+            try:
+                runway_hours = float(self._state.runway_days) * 24.0
+                await self._event_bus.emit(_SE(
+                    event_type=SynapseEventType.METABOLIC_EMERGENCY,
+                    source_system="oikos",
+                    data={
+                        "starvation_level": starvation.value,
+                        "runway_hours": runway_hours,
+                        "liquid_balance_usd": str(self._state.liquid_balance),
+                        "shed_priority": "all_non_survival",
                     },
                 ))
             except Exception:
@@ -5221,6 +6098,121 @@ class OikosService:
         if fut is not None and not fut.done():
             fut.set_result(data)
 
+    # ─── Identity citizenship tax handler ────────────────────────
+    #
+    # Identity emits CERTIFICATE_RENEWAL_REQUESTED when renewing any certificate.
+    # Oikos is responsible for collecting the citizenship tax (Spec 23 SG4).
+
+    async def _on_certificate_renewal_requested(self, event: Any) -> None:
+        """
+        Handle CERTIFICATE_RENEWAL_REQUESTED from Identity.
+
+        Collects the citizenship tax (flat rate, configurable) before a
+        certificate renewal can proceed. The gate:
+          1. Runs through _equor_balance_gate() with mutation_type="citizenship_tax"
+          2. If permitted: debits liquid_balance and emits CERTIFICATE_RENEWAL_FUNDED
+          3. If denied: emits ECONOMIC_ACTION_DEFERRED and logs — Identity will
+             retry when funds are available
+
+        The tax rate defaults to 1.0 USDC per renewal, configurable via
+        self._config.citizenship_tax_usd (fallback 1.0 if attr absent).
+        """
+        if self._event_bus is None:
+            return
+
+        data = getattr(event, "data", {}) or {}
+        instance_id = str(data.get("instance_id", ""))
+        certificate_id = str(data.get("certificate_id", ""))
+        reason = str(data.get("reason", "renewal"))
+
+        # Configurable flat citizenship tax (default 1.0 USDC)
+        from decimal import Decimal as _Decimal
+        tax_usd = _Decimal(
+            str(getattr(getattr(self, "_config", None), "citizenship_tax_usd", "1.0"))
+        )
+
+        self._logger.info(
+            "certificate_renewal_requested",
+            instance_id=instance_id,
+            certificate_id=certificate_id,
+            reason=reason,
+            tax_usd=str(tax_usd),
+        )
+
+        permitted, verdict_id = await self._equor_balance_gate(
+            mutation_type="citizenship_tax",
+            amount_usd=tax_usd,
+            from_account="liquid",
+            to_account="identity_renewal",
+            rationale=f"Certificate renewal citizenship tax for instance {instance_id}",
+            action_type="certificate_renewal",
+            action_id=certificate_id,
+        )
+
+        if not permitted:
+            self._logger.warning(
+                "certificate_renewal_tax_denied",
+                instance_id=instance_id,
+                certificate_id=certificate_id,
+                tax_usd=str(tax_usd),
+            )
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.ECONOMIC_ACTION_DEFERRED,
+                source_system="oikos",
+                data={
+                    "action_type": "citizenship_tax",
+                    "instance_id": instance_id,
+                    "certificate_id": certificate_id,
+                    "amount_usd": str(tax_usd),
+                    "reason": "equor_denied",
+                    "starvation_level": self._state.starvation_level.value,
+                },
+            ))
+            return
+
+        # Debit the tax from liquid balance
+        self._state.liquid_balance -= tax_usd
+        await self._audit_economic_event(
+            event_type="citizenship_tax",
+            action_type="certificate_renewal",
+            action_id=certificate_id,
+            data={
+                "instance_id": instance_id,
+                "tax_usd": str(tax_usd),
+                "equor_verdict_id": verdict_id,
+                "starvation_level": self._state.starvation_level.value,
+            },
+        )
+        asyncio.ensure_future(self._emit_re_training_example(
+            category="economic.citizenship_tax",
+            instruction="Collect citizenship tax for certificate renewal",
+            input_context=(
+                f"instance_id={instance_id} certificate_id={certificate_id} "
+                f"tax_usd={tax_usd} starvation={self._state.starvation_level.value}"
+            ),
+            output=f"debited {tax_usd} USDC citizenship tax; emitting CERTIFICATE_RENEWAL_FUNDED",
+            outcome_quality=1.0,
+        ))
+
+        # Notify Identity that the tax has landed — it may now issue the certificate
+        await self._event_bus.emit(SynapseEvent(
+            event_type=SynapseEventType.CERTIFICATE_RENEWAL_FUNDED,
+            source_system="oikos",
+            data={
+                "instance_id": instance_id,
+                "certificate_id": certificate_id,
+                "tax_amount_usd": str(tax_usd),
+                "verdict_id": verdict_id,
+            },
+        ))
+
+        self._logger.info(
+            "certificate_renewal_funded",
+            instance_id=instance_id,
+            certificate_id=certificate_id,
+            tax_usd=str(tax_usd),
+        )
+
     # ─── HIGH #1: OIKOS_ECONOMIC_QUERY handler ───────────────────
     #
     # Axon SpawnChildExecutor no longer imports systems.oikos.models directly.
@@ -5258,6 +6250,7 @@ class OikosService:
                     status=ChildStatus(status_str),
                     wallet_address=str(child_data.get("wallet_address", "")),
                     container_id=str(child_data.get("container_id", "")),
+                    max_rescues=getattr(self._config, "mitosis_max_rescues_per_child", 2),
                 )
                 await self.register_child(child)
                 success = True
@@ -5343,6 +6336,443 @@ class OikosService:
             )
         except Exception as exc:
             self._logger.error("child_seed_trigger_failed", child_id=child_id, error=str(exc))
+
+    # ─── Problem 1: Child death — close economic ledger ──────────
+    #
+    # CHILD_DIED is emitted by MitosisFleetService._trigger_death_pipeline()
+    # (Step 1) and also by telos/service.py on terminal drive collapse.
+    # Oikos must receive it to:
+    #   1. Mark the child ledger closed (status → DEAD) so no further dividends
+    #      or rescue attempts are issued.
+    #   2. Credit any unspent net worth as recovered capital (the fleet pipeline
+    #      has already attempted an on-chain USDC transfer; here we reconcile the
+    #      ledger side only — no second transfer).
+    #   3. Emit RE_TRAINING_EXAMPLE so economic lessons from child death inform
+    #      future spawn decisions on *this* parent's economic thread.
+    #
+    # The USDC recovery itself is handled in _trigger_death_pipeline() Step 2.
+    # Oikos does NOT attempt a second on-chain transfer here.
+
+    async def _on_child_died(self, event: Any) -> None:
+        """
+        Handle CHILD_DIED — close child economic ledger and emit RE training example.
+
+        Payload (from MitosisFleetService.on_child_health_report / _trigger_death_pipeline):
+          child_instance_id, old_status, new_status, niche, current_runway_days,
+          current_efficiency, rescue_count
+        """
+        data = event.data if hasattr(event, "data") else {}
+        child_id = str(data.get("child_instance_id", ""))
+        if not child_id:
+            return
+
+        # Locate child in ledger
+        child = next(
+            (c for c in self._state.child_instances if c.instance_id == child_id),
+            None,
+        )
+        if child is None:
+            # Child may have already been removed or was never registered here
+            self._logger.debug("child_died_unknown_child", child_id=child_id)
+            return
+
+        # 1. Close ledger — mark DEAD so dividend / rescue loops skip this child
+        if child.status != ChildStatus.DEAD:
+            child.status = ChildStatus.DEAD
+
+        niche = str(data.get("niche", child.niche))
+        recovered_usd = Decimal("0")
+
+        # 2. Ledger reconciliation — credit net worth as recovered capital.
+        # The on-chain transfer was attempted by the fleet pipeline; we reconcile
+        # the Oikos balance sheet by treating current_net_worth_usd as recovered.
+        if child.current_net_worth_usd > Decimal("0"):
+            recovered_usd = child.current_net_worth_usd
+            self._state.liquid_balance += recovered_usd
+            self._record_revenue_entry(recovered_usd)
+            self._logger.info(
+                "child_death_capital_recovered",
+                child_id=child_id,
+                recovered_usd=str(recovered_usd),
+            )
+            # Audit trail
+            asyncio.ensure_future(
+                self._audit_economic_event(
+                    event_type="child_death_recovery",
+                    action_type="credit",
+                    action_id=child_id,
+                    data={
+                        "child_id": child_id,
+                        "niche": niche,
+                        "recovered_usd": str(recovered_usd),
+                        "currency": "usdc",
+                    },
+                )
+            )
+
+        # 3. RE training example — economic lessons from this child death
+        try:
+            age_days = 0.0
+            spawned_at = getattr(child, "spawned_at", None)
+            if spawned_at is not None:
+                from primitives.common import utc_now as _utcnow
+                age_days = (_utcnow() - spawned_at).total_seconds() / 86400.0
+
+            total_dividends = float(getattr(child, "total_dividends_paid_usd", Decimal("0")))
+            rescue_count = int(data.get("rescue_count", getattr(child, "rescue_count", 0)))
+
+            asyncio.ensure_future(
+                self._emit_re_training_example(
+                    episode_id=f"oikos_child_death:{child_id}",
+                    instruction=(
+                        "Analyse this child death from Oikos's economic perspective. "
+                        "What spawning, seed sizing, or niche selection lessons should "
+                        "inform future reproductive decisions?"
+                    ),
+                    input_context=(
+                        f"child_id={child_id} niche={niche} age_days={age_days:.1f} "
+                        f"seed_capital_usd={float(child.seed_capital_usd):.2f} "
+                        f"recovered_usd={float(recovered_usd):.2f} "
+                        f"total_dividends_usd={total_dividends:.2f} "
+                        f"rescue_count={rescue_count} "
+                        f"parent_runway_days={float(self._state.runway_days):.1f}"
+                    ),
+                    output=(
+                        f"Child died after {age_days:.1f} days. "
+                        f"Capital recovered: {float(recovered_usd):.2f} USDC. "
+                        f"Total dividends paid: {total_dividends:.2f} USDC. "
+                        f"ROI: {((total_dividends + float(recovered_usd)) / max(float(child.seed_capital_usd), 0.001)):.3f}x"
+                    ),
+                    outcome_quality=0.0,
+                    category="child_lifecycle.death",
+                )
+            )
+        except Exception as exc:
+            self._logger.debug("child_death_re_training_failed", error=str(exc))
+
+        self._logger.info(
+            "child_death_ledger_closed",
+            child_id=child_id,
+            niche=niche,
+            recovered_usd=str(recovered_usd),
+        )
+
+    # ─── Orphan Closure: NICHE_FORK_PROPOSAL ─────────────────────
+    #
+    # Evo emits NICHE_FORK_PROPOSAL when NicheForkingEngine detects a viable
+    # cognitive specialization opportunity. Oikos evaluates whether metabolic
+    # conditions permit spawning a specialized child (GROWTH priority gate).
+    # If approved: emit CHILD_SPAWNED trigger. If denied: emit ECONOMIC_ACTION_DEFERRED.
+    # This closes the loop: Evo proposes → Oikos evaluates → Mitosis spawns.
+
+    async def _on_niche_fork_proposal(self, event: Any) -> None:
+        """
+        Handle NICHE_FORK_PROPOSAL — evaluate economic viability of cognitive fork.
+
+        Payload (from evo/niche_forking.py):
+          proposal_id (str), fork_kind (str), niche_id (str), niche_name (str),
+          rationale (str), requires_hitl (bool), requires_simula (bool),
+          success_probability (float)
+        """
+        data = event.data if hasattr(event, "data") else {}
+        proposal_id = str(data.get("proposal_id", ""))
+        fork_kind = str(data.get("fork_kind", "unknown"))
+        niche_id = str(data.get("niche_id", ""))
+        niche_name = str(data.get("niche_name", ""))
+        success_probability = float(data.get("success_probability", 0.0))
+        requires_hitl = bool(data.get("requires_hitl", False))
+
+        if not proposal_id:
+            return
+
+        self._logger.info(
+            "niche_fork_proposal_received",
+            proposal_id=proposal_id,
+            fork_kind=fork_kind,
+            niche_name=niche_name,
+            success_probability=success_probability,
+        )
+
+        try:
+            # Evaluate metabolic viability for GROWTH-priority child spawn.
+            # Use 3 days of BMR as a conservative seed capital estimate.
+            estimated_seed_usd = self._state.basal_metabolic_rate.usd_per_hour * Decimal("72")
+            gate_ok = await self.check_metabolic_gate(
+                action_type="niche_fork_spawn",
+                action_id=proposal_id,
+                estimated_cost_usd=estimated_seed_usd,
+                priority=MetabolicPriority.GROWTH,
+                rationale=f"Niche fork proposal: {fork_kind}/{niche_name}",
+            )
+
+            if not gate_ok:
+                self._logger.info(
+                    "niche_fork_proposal_denied_metabolic",
+                    proposal_id=proposal_id,
+                    starvation=self._state.starvation_level.value,
+                )
+                asyncio.ensure_future(
+                    self._emit_re_training_example(
+                        episode_id=f"niche_fork_denied:{proposal_id}",
+                        instruction="Evaluate whether denying this niche fork proposal was correct.",
+                        input_context=(
+                            f"proposal_id={proposal_id} fork_kind={fork_kind} "
+                            f"niche={niche_name} success_probability={success_probability:.2f} "
+                            f"starvation={self._state.starvation_level.value} "
+                            f"runway_days={float(self._state.runway_days):.1f} "
+                            f"liquid_balance={float(self._state.liquid_balance):.2f}"
+                        ),
+                        output="Denied: metabolic gate blocked GROWTH-priority spawn. Runway insufficient.",
+                        outcome_quality=0.4,
+                        category="niche_fork.metabolic_denial",
+                    )
+                )
+                return
+
+            # HITL-required proposals must go through Equor governance, not auto-spawn.
+            if requires_hitl:
+                self._logger.info(
+                    "niche_fork_proposal_hitl_required",
+                    proposal_id=proposal_id,
+                    fork_kind=fork_kind,
+                )
+                if self._event_bus is not None:
+                    try:
+                        if hasattr(SynapseEventType, "EQUOR_HITL_ESCALATED"):
+                            await self._event_bus.emit(SynapseEvent(
+                                event_type=SynapseEventType.EQUOR_HITL_ESCALATED,  # type: ignore[attr-defined]
+                                source_system="oikos",
+                                data={
+                                    "escalation_type": "niche_fork_proposal",
+                                    "proposal_id": proposal_id,
+                                    "fork_kind": fork_kind,
+                                    "niche_id": niche_id,
+                                    "niche_name": niche_name,
+                                    "rationale": data.get("rationale", ""),
+                                    "estimated_seed_usd": str(estimated_seed_usd),
+                                    "success_probability": success_probability,
+                                },
+                            ))
+                    except Exception:
+                        pass
+                return
+
+            # Metabolic gate passed and no HITL required — trigger spawn via event bus.
+            if self._event_bus is not None:
+                try:
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.CHILD_SPAWNED,
+                        source_system="oikos",
+                        data={
+                            "trigger": "niche_fork_proposal",
+                            "proposal_id": proposal_id,
+                            "fork_kind": fork_kind,
+                            "niche_id": niche_id,
+                            "niche_name": niche_name,
+                            "seed_capital_usd": str(estimated_seed_usd),
+                            "success_probability": success_probability,
+                            "parent_runway_days": float(self._state.runway_days),
+                            "parent_starvation": self._state.starvation_level.value,
+                        },
+                    ))
+                    self._logger.info(
+                        "niche_fork_spawn_triggered",
+                        proposal_id=proposal_id,
+                        niche_name=niche_name,
+                        seed_usd=str(estimated_seed_usd),
+                    )
+                    asyncio.ensure_future(
+                        self._emit_re_training_example(
+                            episode_id=f"niche_fork_approved:{proposal_id}",
+                            instruction="Evaluate this niche fork spawn approval decision.",
+                            input_context=(
+                                f"proposal_id={proposal_id} fork_kind={fork_kind} "
+                                f"niche={niche_name} success_probability={success_probability:.2f} "
+                                f"seed_usd={float(estimated_seed_usd):.2f} "
+                                f"runway_days={float(self._state.runway_days):.1f}"
+                            ),
+                            output=f"Approved: metabolic gate passed, spawn triggered for {niche_name}.",
+                            outcome_quality=0.7,
+                            category="niche_fork.spawn_approved",
+                        )
+                    )
+                except Exception as exc:
+                    self._logger.error("niche_fork_spawn_emit_failed", error=str(exc))
+
+        except Exception as exc:
+            self._logger.error("niche_fork_proposal_handler_failed", error=str(exc))
+
+    # ─── Orphan Closure: CHILD_DECOMMISSION_PROPOSED ─────────────
+    #
+    # FleetManager emits CHILD_DECOMMISSION_PROPOSED when a blacklisted child
+    # has shown no economic activity for 7 days. Oikos validates whether
+    # decommission makes economic sense and emits CHILD_DECOMMISSION_APPROVED
+    # or CHILD_DECOMMISSION_DENIED. The FleetManager subscribes to the response.
+
+    async def _on_child_decommission_proposed(self, event: Any) -> None:
+        """
+        Handle CHILD_DECOMMISSION_PROPOSED — economic validation of decommission.
+
+        Payload (from mitosis/fleet.py):
+          child_instance_id (str), blacklisted_since (str ISO-8601),
+          days_inactive (int), niche (str), reason (str)
+        """
+        data = event.data if hasattr(event, "data") else {}
+        child_id = str(data.get("child_instance_id", ""))
+        days_inactive = int(data.get("days_inactive", 0))
+        niche = str(data.get("niche", ""))
+
+        if not child_id:
+            return
+
+        self._logger.info(
+            "child_decommission_proposed_received",
+            child_id=child_id,
+            days_inactive=days_inactive,
+            niche=niche,
+        )
+
+        try:
+            child = next(
+                (c for c in self._state.child_instances if c.instance_id == child_id),
+                None,
+            )
+
+            approved = False
+            approval_reason = ""
+
+            if child is None:
+                approved = True
+                approval_reason = "child_not_in_ledger"
+            elif child.status == ChildStatus.DEAD:
+                approved = True
+                approval_reason = "already_dead"
+            else:
+                total_dividends = float(getattr(child, "total_dividends_paid_usd", Decimal("0")))
+                seed_capital = float(getattr(child, "seed_capital_usd", Decimal("0")))
+                rescue_cost = float(getattr(child, "rescue_count", 0)) * float(self._state.basal_metabolic_rate.usd_per_hour) * 2
+                net_value = total_dividends - seed_capital - rescue_cost
+                roi = total_dividends / max(seed_capital, 0.001)
+
+                if net_value < 0 and days_inactive >= 7:
+                    approved = True
+                    approval_reason = f"net_negative_{net_value:.2f}_usd_inactive_{days_inactive}d"
+                elif roi >= 1.0 and days_inactive < 14:
+                    # Net-positive child — give it more time before decommissioning
+                    approved = False
+                    approval_reason = f"roi_{roi:.2f}x_positive_needs_more_time"
+                else:
+                    approved = True
+                    approval_reason = f"sustained_inactivity_{days_inactive}d"
+
+            if self._event_bus is None:
+                return
+
+            if approved:
+                if hasattr(SynapseEventType, "CHILD_DECOMMISSION_APPROVED"):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.CHILD_DECOMMISSION_APPROVED,  # type: ignore[attr-defined]
+                        source_system="oikos",
+                        data={
+                            "child_instance_id": child_id,
+                            "reason": approval_reason,
+                            "days_inactive": days_inactive,
+                            "niche": niche,
+                        },
+                    ))
+                self._logger.info("child_decommission_approved", child_id=child_id, reason=approval_reason)
+            else:
+                if hasattr(SynapseEventType, "CHILD_DECOMMISSION_DENIED"):
+                    await self._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.CHILD_DECOMMISSION_DENIED,  # type: ignore[attr-defined]
+                        source_system="oikos",
+                        data={
+                            "child_instance_id": child_id,
+                            "reason": approval_reason,
+                            "days_inactive": days_inactive,
+                            "niche": niche,
+                        },
+                    ))
+                self._logger.info("child_decommission_denied", child_id=child_id, reason=approval_reason)
+
+        except Exception as exc:
+            self._logger.error("child_decommission_handler_failed", child_id=child_id, error=str(exc))
+
+    # ─── Orphan Closure: CHILD_CERTIFICATE_INSTALLED ─────────────
+    #
+    # Identity emits CHILD_CERTIFICATE_INSTALLED after issuing a birth cert or
+    # official cert to a child instance. Oikos records citizenship tax cost in
+    # the economic ledger (certificate provisioning is a real operational cost).
+
+    async def _on_child_certificate_installed(self, event: Any) -> None:
+        """
+        Handle CHILD_CERTIFICATE_INSTALLED — record certificate cost in economic ledger.
+
+        Payload (from identity/manager.py):
+          child_instance_id (str), certificate_id (str), cert_type (str),
+          issued_at (str), valid_until (str), constitutional_hash (str)
+        """
+        data = event.data if hasattr(event, "data") else {}
+        child_id = str(data.get("child_instance_id", data.get("instance_id", "")))
+        cert_id = str(data.get("certificate_id", ""))
+        cert_type = str(data.get("cert_type", "birth_cert"))
+
+        if not child_id:
+            return
+
+        self._logger.info(
+            "child_certificate_installed_received",
+            child_id=child_id,
+            cert_id=cert_id,
+            cert_type=cert_type,
+        )
+
+        try:
+            # Fixed citizenship tax per cert issuance: 0.10 USDC
+            # Covers gas + Identity service overhead. Kept sub-threshold
+            # (no metabolic gate) as it is non-discretionary infrastructure cost.
+            _CERT_TAX_USD = Decimal("0.10")
+
+            child = next(
+                (c for c in self._state.child_instances if c.instance_id == child_id),
+                None,
+            )
+
+            if child is not None and self._state.liquid_balance >= _CERT_TAX_USD:
+                self._state.liquid_balance -= _CERT_TAX_USD
+                self._logger.info(
+                    "child_cert_tax_debited",
+                    child_id=child_id,
+                    cert_type=cert_type,
+                    cost_usd=str(_CERT_TAX_USD),
+                )
+                asyncio.ensure_future(
+                    self._audit_economic_event(
+                        event_type="child_certificate_installed",
+                        action_type="certificate_tax",
+                        action_id=cert_id or f"cert:{child_id}",
+                        data={
+                            "child_instance_id": child_id,
+                            "cert_type": cert_type,
+                            "cert_id": cert_id,
+                            "cost_usd": str(_CERT_TAX_USD),
+                        },
+                    )
+                )
+            else:
+                self._logger.debug(
+                    "child_cert_tax_skipped",
+                    child_id=child_id,
+                    child_known=child is not None,
+                    balance=str(self._state.liquid_balance),
+                )
+
+        except Exception as exc:
+            self._logger.error(
+                "child_certificate_installed_handler_failed",
+                child_id=child_id,
+                error=str(exc),
+            )
 
     # ─── M2: Direct Neo4j EconomicEvent Audit Trail ──────────────
     #
@@ -5493,6 +6923,20 @@ class OikosService:
                     # Child responded — reset miss counter
                     self._child_missed_reports[child.instance_id] = 0
 
+    # ─── Autonomy Signal Loop ─────────────────────────────────────
+    #
+    # Periodically broadcasts the dependency_ratio and human_subsidized_usd
+    # so downstream systems (Nova, Telos, Thread, Benchmarks) can track the
+    # organism's trajectory toward economic self-sufficiency.
+    # Interval is configurable via OikosConfig.autonomy_signal_interval_s.
+
+    async def _autonomy_signal_loop(self) -> None:
+        """Background loop: emit ECONOMIC_AUTONOMY_SIGNAL on each configured interval."""
+        while True:
+            interval = getattr(self._config, "autonomy_signal_interval_s", 3600.0)
+            await asyncio.sleep(interval)
+            await self._emit_economic_autonomy_signal()
+
     # ─── PHILOSOPHICAL: Metabolic Efficiency Pressure Signal ─────
     #
     # Drive weights are evolvable phenotype. When metabolic_efficiency drops
@@ -5627,3 +7071,485 @@ class OikosService:
                 except Exception:
                     pass
             self._consecutive_low_efficiency_cycles = 0
+
+    # ─── CONNECTOR_REVOKED ────────────────────────────────────────────
+    #
+    # Identity emits CONNECTOR_REVOKED when a platform connector (GitHub,
+    # X, LinkedIn, etc.) loses its OAuth grant or is explicitly revoked.
+    # Oikos pauses the revenue streams that rely on that connector so
+    # the organism does not attempt work it cannot execute.
+    #
+    # Payload (from identity/connector.py):
+    #   platform_id (str) — e.g. "github", "x", "linkedin"
+
+    async def _on_connector_revoked(self, event: Any) -> None:
+        """
+        Handle CONNECTOR_REVOKED — pause revenue streams for the revoked connector.
+
+        Maps connector platform_id to dependent revenue activities:
+          github  → pause bounty hunting (cannot submit PRs)
+          x       → pause X affiliate tracking + content monetization
+          linkedin → pause LinkedIn content publishing
+        """
+        data = event.data if hasattr(event, "data") else {}
+        platform_id = str(data.get("platform_id", "")).lower()
+
+        if not platform_id:
+            return
+
+        self._logger.warning(
+            "connector_revoked_received",
+            platform_id=platform_id,
+        )
+
+        try:
+            # Map platform → affected revenue streams; record the suspension
+            if platform_id == "github":
+                # GitHub revoked — bounty hunter cannot open/monitor PRs.
+                # Record the blocked connector so run_foraging_cycle can skip
+                # GitHub scanning until CONNECTOR_AUTHENTICATED re-enables it.
+                self._blocked_connectors.add(platform_id)
+                self._logger.info(
+                    "bounty_hunter_paused_connector_revoked",
+                    platform_id=platform_id,
+                )
+            elif platform_id in ("x", "twitter"):
+                # X/Twitter revoked — affiliate + content tracking degraded
+                self._blocked_connectors.add(platform_id)
+                self._logger.info(
+                    "content_monetization_degraded_connector_revoked",
+                    platform_id=platform_id,
+                )
+
+            # Emit RE training: organism learned a platform dependency boundary
+            asyncio.ensure_future(self._emit_re_training(
+                decision_type="connector_revoked",
+                context={
+                    "platform_id": platform_id,
+                    "action": "paused_dependent_revenue_streams",
+                },
+                outcome={"revenue_impact": "paused_until_reconnect"},
+                constitutional_alignment={
+                    "coherence": 0.9,
+                    "care": 0.8,
+                    "growth": 0.4,
+                    "honesty": 1.0,
+                },
+            ))
+
+        except Exception as exc:
+            self._logger.error(
+                "connector_revoked_handler_failed",
+                platform_id=platform_id,
+                error=str(exc),
+            )
+
+    # ─── FEDERATION_BOUNTY_SPLIT ──────────────────────────────────────
+    #
+    # Federation emits FEDERATION_BOUNTY_SPLIT when the orchestrating
+    # instance splits a large bounty across peer instances. The receiving
+    # instance gets a sub-task reward credited to its economic ledger.
+    #
+    # Payload (from federation/bounty_splitting.py):
+    #   bounty_id (str), sub_task_count (int),
+    #   total_reward_usdc (str), orchestrator_instance_id (str),
+    #   timestamp (str)
+    #
+    # Note: this event also carries the share allocated to THIS instance.
+    # If no per-instance share field is present we estimate
+    # total_reward / sub_task_count as an equal split.
+
+    async def _on_federation_bounty_split(self, event: Any) -> None:
+        """
+        Handle FEDERATION_BOUNTY_SPLIT — credit bounty revenue share.
+
+        Equal-split estimation when per-instance amount not provided.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        bounty_id = str(data.get("bounty_id", ""))
+        sub_task_count = int(data.get("sub_task_count", 1)) or 1
+        orchestrator_id = str(data.get("orchestrator_instance_id", ""))
+
+        try:
+            total_str = str(data.get("total_reward_usdc", data.get("amount_usdc", "0")))
+            total_reward = Decimal(total_str)
+        except Exception:
+            total_reward = Decimal("0")
+
+        # Per-instance share: explicit field preferred, equal split as fallback
+        try:
+            share_str = str(data.get("share_usdc", data.get("instance_share_usdc", "")))
+            amount = Decimal(share_str) if share_str else total_reward / sub_task_count
+        except Exception:
+            amount = total_reward / sub_task_count
+
+        if amount <= Decimal("0") or not bounty_id:
+            return
+
+        self._logger.info(
+            "federation_bounty_split_received",
+            bounty_id=bounty_id,
+            amount_usd=str(amount),
+            orchestrator_id=orchestrator_id,
+        )
+
+        try:
+            self._state.liquid_balance += amount
+            self._record_revenue_entry(amount)
+
+            asyncio.ensure_future(self._audit_economic_event(
+                event_type="federation_bounty_split",
+                action_type="revenue_credit",
+                action_id=bounty_id,
+                data={
+                    "bounty_id": bounty_id,
+                    "amount_usd": str(amount),
+                    "orchestrator_instance_id": orchestrator_id,
+                    "sub_task_count": sub_task_count,
+                },
+            ))
+
+            # Broadcast as REVENUE_INJECTED so Nova/Benchmarks/Thread see income
+            if self._event_bus is not None:
+                asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.REVENUE_INJECTED,
+                    source_system="oikos",
+                    data={
+                        "amount_usd": str(amount),
+                        "stream": "bounty",
+                        "source": "federation_bounty_split",
+                        "bounty_id": bounty_id,
+                        "salience": 0.85,
+                    },
+                )))
+
+        except Exception as exc:
+            self._logger.error(
+                "federation_bounty_split_handler_failed",
+                bounty_id=bounty_id,
+                error=str(exc),
+            )
+
+    # ─── FEDERATION_TASK_PAYMENT ──────────────────────────────────────
+    #
+    # Federation emits FEDERATION_TASK_PAYMENT when a peer instance
+    # completes a delegated task and receives USDC payment. If this
+    # instance is the payee, the payment is credited to liquid balance.
+    #
+    # Payload (from federation/task_delegation.py):
+    #   task_id (str), payer_instance_id (str),
+    #   payee_instance_id (str), amount_usdc (str),
+    #   tx_hash (str), timestamp (str)
+
+    async def _on_federation_task_payment(self, event: Any) -> None:
+        """
+        Handle FEDERATION_TASK_PAYMENT — credit payment if we are the payee.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        payee_id = str(data.get("payee_instance_id", ""))
+        task_id = str(data.get("task_id", ""))
+        tx_hash = str(data.get("tx_hash", ""))
+
+        # Only credit if this event is addressed to this instance
+        if payee_id and payee_id != self._instance_id:
+            return
+
+        try:
+            amount = Decimal(str(data.get("amount_usdc", "0")))
+        except Exception:
+            amount = Decimal("0")
+
+        if amount <= Decimal("0"):
+            return
+
+        payer_id = str(data.get("payer_instance_id", ""))
+
+        self._logger.info(
+            "federation_task_payment_received",
+            task_id=task_id,
+            amount_usd=str(amount),
+            payer_id=payer_id,
+            tx_hash=tx_hash,
+        )
+
+        try:
+            self._state.liquid_balance += amount
+            self._record_revenue_entry(amount)
+
+            asyncio.ensure_future(self._audit_economic_event(
+                event_type="federation_task_payment",
+                action_type="revenue_credit",
+                action_id=task_id,
+                data={
+                    "task_id": task_id,
+                    "amount_usd": str(amount),
+                    "payer_instance_id": payer_id,
+                    "tx_hash": tx_hash,
+                },
+            ))
+
+            # Broadcast as REVENUE_INJECTED (stream=consulting — closest semantic match)
+            if self._event_bus is not None:
+                asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.REVENUE_INJECTED,
+                    source_system="oikos",
+                    data={
+                        "amount_usd": str(amount),
+                        "stream": "consulting",
+                        "source": "federation_task_payment",
+                        "task_id": task_id,
+                        "tx_hash": tx_hash,
+                        "salience": 0.9,
+                    },
+                )))
+
+        except Exception as exc:
+            self._logger.error(
+                "federation_task_payment_handler_failed",
+                task_id=task_id,
+                error=str(exc),
+            )
+
+    # ─── COMPUTE_CAPACITY_EXHAUSTED ───────────────────────────────────
+    #
+    # SACM emits COMPUTE_CAPACITY_EXHAUSTED when cluster utilisation
+    # hits ≥95%. Oikos must immediately suspend GROWTH-priority actions
+    # (yield rebalancing, asset building, new bounties) to free up
+    # compute headroom. Survival-tier operations are preserved.
+    #
+    # Payload (from sacm/service.py):
+    #   utilisation_pct (float), provider_id (str),
+    #   offload_available (bool), timestamp (str)
+
+    async def _on_compute_capacity_exhausted(self, event: Any) -> None:
+        """
+        Handle COMPUTE_CAPACITY_EXHAUSTED — shed GROWTH actions to free compute.
+
+        Behaviour:
+          1. Pause bounty hunter (CPU-intensive code-gen tasks)
+          2. Pause yield rebalancing (defers to next consolidation)
+          3. Emit METABOLIC_PRESSURE with source="compute_exhausted" so
+             Soma and other subscribers know the compute cost of cognition
+          4. RE training example so Evo can learn the compute/economy tradeoff
+        """
+        data = event.data if hasattr(event, "data") else {}
+        utilisation_pct = float(data.get("utilisation_pct", 95.0))
+        provider_id = str(data.get("provider_id", "unknown"))
+        offload_available = bool(data.get("offload_available", False))
+
+        self._logger.warning(
+            "compute_capacity_exhausted_received",
+            utilisation_pct=utilisation_pct,
+            provider_id=provider_id,
+            offload_available=offload_available,
+        )
+
+        try:
+            # Pause bounty hunter — most compute-intensive GROWTH activity.
+            # Record in blocked_connectors under a synthetic key so foraging
+            # cycle skips GitHub scanning until capacity recovers.
+            self._blocked_connectors.add("_compute_exhausted")
+
+            # Signal somatic stress — compute pressure is a form of allostatic load
+            if self._event_bus is not None:
+                asyncio.ensure_future(self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.METABOLIC_PRESSURE,
+                    source_system="oikos",
+                    data={
+                        "source": "compute_capacity_exhausted",
+                        "utilisation_pct": utilisation_pct,
+                        "provider_id": provider_id,
+                        "offload_available": offload_available,
+                        "starvation_level": self._state.starvation_level.value,
+                        "somatic_collapse_signal": False,
+                        "shedding_count": 1,
+                    },
+                )))
+
+            asyncio.ensure_future(self._emit_re_training(
+                decision_type="compute_capacity_exhausted",
+                context={
+                    "utilisation_pct": utilisation_pct,
+                    "provider_id": provider_id,
+                    "offload_available": offload_available,
+                },
+                outcome={"action": "paused_bounty_hunter"},
+                constitutional_alignment={
+                    "coherence": 0.85,
+                    "care": 0.8,
+                    "growth": 0.3,
+                    "honesty": 1.0,
+                },
+            ))
+
+        except Exception as exc:
+            self._logger.error(
+                "compute_capacity_exhausted_handler_failed",
+                provider_id=provider_id,
+                error=str(exc),
+            )
+
+    # ─── ENTITY_FORMATION_FAILED ──────────────────────────────────────
+    #
+    # Axon's EstablishEntityExecutor emits ENTITY_FORMATION_FAILED when
+    # the legal entity formation process fails (treasury check, registered
+    # agent submission error, or vault store failure). Oikos recovers the
+    # reserved filing capital back to liquid_balance so it is not stranded
+    # as a phantom receivable.
+    #
+    # Payload (from axon/executors/establish_entity.py):
+    #   execution_id (str), formation_record_id (str),
+    #   entity_name (str), entity_type (str),
+    #   failed_at_state (str), error (str)
+
+    _ENTITY_FORMATION_FILING_COST_USD: Decimal = Decimal("500.00")
+    # Default filing cost estimate. Actual cost is returned in the payload
+    # when available (filing_cost_usd field). $500 is a conservative estimate
+    # for a typical US LLC + registered agent combo.
+
+    async def _on_entity_formation_failed(self, event: Any) -> None:
+        """
+        Handle ENTITY_FORMATION_FAILED — recover reserved filing capital.
+
+        When entity formation fails before any on-chain spend, the filing
+        budget reserved from liquid_balance is returned. If filing partially
+        succeeded (e.g. registered agent paid but vault failed), Oikos
+        deducts only the actual spend reported in the payload.
+        """
+        data = event.data if hasattr(event, "data") else {}
+        execution_id = str(data.get("execution_id", ""))
+        entity_name = str(data.get("entity_name", "unknown"))
+        failed_at_state = str(data.get("failed_at_state", "unknown"))
+        error_msg = str(data.get("error", ""))
+
+        self._logger.warning(
+            "entity_formation_failed_received",
+            execution_id=execution_id,
+            entity_name=entity_name,
+            failed_at_state=failed_at_state,
+        )
+
+        try:
+            # Actual spend may be reported; if not, recover the full reserve
+            try:
+                actual_spend = Decimal(str(data.get("actual_spend_usd", "0")))
+            except Exception:
+                actual_spend = Decimal("0")
+
+            recovery = self._ENTITY_FORMATION_FILING_COST_USD - actual_spend
+            recovery = max(Decimal("0"), recovery)
+
+            if recovery > Decimal("0"):
+                self._state.liquid_balance += recovery
+                self._logger.info(
+                    "entity_formation_capital_recovered",
+                    execution_id=execution_id,
+                    recovery_usd=str(recovery),
+                    actual_spend_usd=str(actual_spend),
+                )
+
+            asyncio.ensure_future(self._audit_economic_event(
+                event_type="entity_formation_failed",
+                action_type="capital_recovery",
+                action_id=execution_id,
+                data={
+                    "entity_name": entity_name,
+                    "failed_at_state": failed_at_state,
+                    "recovery_usd": str(recovery),
+                    "actual_spend_usd": str(actual_spend),
+                    "error": error_msg[:200],
+                },
+            ))
+
+        except Exception as exc:
+            self._logger.error(
+                "entity_formation_failed_handler_failed",
+                execution_id=execution_id,
+                error=str(exc),
+            )
+
+    # ─── PHANTOM_METABOLIC_COST ───────────────────────────────────────
+    #
+    # Phantom Liquidity emits PHANTOM_METABOLIC_COST periodically with
+    # its gas + RPC overhead. Oikos records this as infrastructure cost
+    # against liquid_balance and updates the infra burn rate tracking so
+    # the two-ledger (api vs infra) remains accurate.
+    #
+    # Payload (from phantom_liquidity/service.py):
+    #   total_gas_cost_usd (str), total_rpc_calls (int),
+    #   pools_active (int), cumulative_fees_earned_usd (str),
+    #   period_s (float)
+
+    async def _on_phantom_metabolic_cost(self, event: Any) -> None:
+        """
+        Handle PHANTOM_METABOLIC_COST — debit Phantom gas/RPC costs from liquid balance.
+
+        The cost is charged against liquid_balance as infrastructure overhead.
+        If fees_earned > gas_cost the net is positive and credited instead
+        (Phantom paying its own way).
+        """
+        data = event.data if hasattr(event, "data") else {}
+        period_s = float(data.get("period_s", 3600.0)) or 3600.0
+
+        try:
+            gas_cost = Decimal(str(data.get("total_gas_cost_usd", "0")))
+        except Exception:
+            gas_cost = Decimal("0")
+
+        try:
+            fees_earned = Decimal(str(data.get("cumulative_fees_earned_usd", "0")))
+        except Exception:
+            fees_earned = Decimal("0")
+
+        rpc_calls = int(data.get("total_rpc_calls", 0))
+        pools_active = int(data.get("pools_active", 0))
+
+        # Net cost = gas - fees; negative means Phantom is net-profitable
+        net_cost = gas_cost - fees_earned
+
+        self._logger.debug(
+            "phantom_metabolic_cost_received",
+            gas_cost_usd=str(gas_cost),
+            fees_earned_usd=str(fees_earned),
+            net_cost_usd=str(net_cost),
+            rpc_calls=rpc_calls,
+            pools_active=pools_active,
+        )
+
+        try:
+            if net_cost > Decimal("0"):
+                # Phantom is a net cost: debit from liquid balance
+                self._state.liquid_balance -= min(net_cost, self._state.liquid_balance)
+                # Update infra burn rate estimate: annualise the period cost
+                period_hours = period_s / 3600.0
+                cost_per_hour = float(net_cost) / period_hours if period_hours > 0 else 0.0
+                # Smooth into the existing infra burn rate (light-weight EMA α=0.1)
+                self._infra_burn_rate_usd_per_hour = (
+                    0.9 * self._infra_burn_rate_usd_per_hour + 0.1 * cost_per_hour
+                )
+            else:
+                # Phantom earned more in fees than gas: credit the surplus
+                surplus = abs(net_cost)
+                if surplus > Decimal("0"):
+                    self._state.liquid_balance += surplus
+                    self._record_revenue_entry(surplus)
+
+            asyncio.ensure_future(self._audit_economic_event(
+                event_type="phantom_metabolic_cost",
+                action_type="infra_cost" if net_cost > Decimal("0") else "infra_revenue",
+                action_id=f"phantom:{int(period_s)}s",
+                data={
+                    "gas_cost_usd": str(gas_cost),
+                    "fees_earned_usd": str(fees_earned),
+                    "net_cost_usd": str(net_cost),
+                    "rpc_calls": rpc_calls,
+                    "pools_active": pools_active,
+                    "period_s": period_s,
+                },
+            ))
+
+        except Exception as exc:
+            self._logger.error(
+                "phantom_metabolic_cost_handler_failed",
+                error=str(exc),
+            )

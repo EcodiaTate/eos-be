@@ -46,7 +46,7 @@
 - Persisted to Redis (`eos:benchmarks:evolutionary_observables:{instance_id}`) — restart-safe
 - Restores history on startup via `restore_from_redis()`
 
-### Synapse Subscriptions (8 inbound)
+### Synapse Subscriptions (16+ inbound, some conditional)
 | Event | Handler | Purpose |
 |---|---|---|
 | `EVOLUTIONARY_OBSERVABLE` | EvolutionaryTracker | Bedau-Packard population stats |
@@ -58,6 +58,16 @@
 | `BENCHMARKS_METABOLIC_VALUE` | `_on_metabolic_value` | Push-based metabolic efficiency time-series (168-sample 7-day deque); emits `BENCHMARK_REGRESSION` when latest reading < 90% of rolling mean and trend slope is negative — detects economic collapse within one consolidation cycle instead of the 24h poll window |
 | `RE_DECISION_OUTCOME` | `_on_re_decision_outcome` | Tracks RE model performance in a 7-day rolling window (`_re_outcomes`). Computes `success_rate` + `usage_pct`. Stores in `_re_performance` dict, included in monthly eval Neo4j node. |
 | `CHILD_SPAWNED` | `_on_child_spawned_genome` | Cache child genome snapshot (`_fleet_genomes`) for monthly Bedau-Packard fleet-level computation |
+| `DOMAIN_EPISODE_RECORDED` | `_on_domain_episode_recorded` | Ingest domain task outcome into `DomainKPICalculator` |
+| `NEXUS_EPISTEMIC_VALUE` | `_on_nexus_epistemic_value` | Accumulate per-observable-type epistemic scores (rolling sum+count per type); on `local_epistemic_state` sentinel emits `DOMAIN_KPI_SNAPSHOT` (domain=nexus_epistemic) with `epistemic_value_per_cycle` and `schema_quality_trend` (8 Mar 2026) |
+| `RE_TRAINING_EXPORT_COMPLETE` | `_on_re_training_export_complete` | Track RE training data export volume KPIs; emits `DOMAIN_KPI_SNAPSHOT` (domain=re_training) |
+| `EVO_BELIEF_CONSOLIDATED` | `_on_evo_belief_consolidated` | Track belief consolidation frequency + compression as evolutionary fitness KPI. Increments `_evo_consolidations_total`. Now emits `DOMAIN_KPI_SNAPSHOT` (domain=evolutionary_fitness, kpi_type=belief_consolidation) to Synapse. **(Orphan closure — 2026-03-08)** |
+| `EVO_GENOME_EXTRACTED` | `_on_evo_genome_extracted` | Track genome extraction events as population genetics KPI. Increments `_evo_genome_extractions_total`. Now emits `DOMAIN_KPI_SNAPSHOT` (domain=evolutionary_fitness, kpi_type=genome_extraction) to Synapse. **(Orphan closure — 2026-03-08)** |
+| `ECONOMIC_ACTION_DEFERRED` | `_on_economic_action_deferred` | Track metabolic gate denial rate as economic health KPI. Increments `_economic_deferrals_total`; emits `DOMAIN_KPI_SNAPSHOT` (domain=economic_health). **(Orphan closure — 2026-03-08)** |
+| `BENCHMARK_THRESHOLD_UPDATE` | `_on_threshold_update` | Adjust `_re_progress_min_improvement_pct` and/or `_metabolic_degradation_fraction` at runtime without a restart. Payload fields optional: `re_progress_min_improvement_pct` (float [0.5, 20.0]), `metabolic_degradation_fraction` (float [0.02, 0.50]), `source` (str), `reason` (str). **(Autonomy gap closure — 2026-03-08)** **Emitter wired 2026-03-09**: Evo `ConsolidationOrchestrator._emit_benchmark_threshold_calibration()` fires this at Phase 5.5 of every consolidation — learning_rate≥0.8→3.0%, <0.3→7.0%; economic_ratio<1.1→0.07, ≥1.5→0.15. Deduplicated: only fires when value shifts ≥0.5% or ≥0.01 fraction. |
+| `CRASH_PATTERN_CONFIRMED` | `_on_crash_pattern_confirmed` | **(Learning trajectory — 2026-03-09)** Increments `_crash_patterns_discovered`; updates running confidence sum for rolling average. Emits `BENCHMARKS_KPI` with `kpi_name="crash_pattern.confidence_avg"` and `kpi_name="crash_pattern.discovered_total"`. |
+| `CRASH_PATTERN_RESOLVED` | `_on_crash_pattern_resolved` | **(Learning trajectory — 2026-03-09)** Increments `_crash_patterns_resolved`; computes resolution rate. Emits `BENCHMARKS_KPI` with `kpi_name="crash_pattern.resolution_rate"`. |
+| `BENCHMARK_RE_PROGRESS` (re_model.health_score) | `_on_benchmark_re_progress_for_trajectory` | **(Learning trajectory — 2026-03-09)** Filters for `kpi_name == "re_model.health_score"`. Appends `(iso_timestamp, value)` to `_re_model_health_history` (deque[30]). Calls `_compute_learning_velocity()` (linear regression slope over 7-day window). Emits `BENCHMARK_RE_PROGRESS` with `kpi_name="organism.learning_velocity"` and the slope in health-score-per-day units. |
 
 ---
 
@@ -642,6 +652,78 @@ Idempotent daily MERGE. Silently no-ops if `Instance` node not yet created.
 
 ---
 
+## Autonomy Audit Gap Closure (2026-03-08)
+
+All four autonomy audit categories resolved:
+
+| Category | Gap | Fix |
+|---|---|---|
+| **Dead wiring** | `set_reasoning_engine()` implemented but never called from `registry.py` → pillars 1–4 + memorization detection ran with `_reasoning_engine=None` every month | `registry.py:_init_benchmarks()` now calls `benchmarks.set_reasoning_engine(re_service)` immediately after `set_re_service()` |
+| **Invisible telemetry** | `_evo_consolidations_total`, `_evo_genome_extractions_total`, `_economic_deferrals_total`, `_re_training_batches_exported`, `_re_training_episodes_total`, `_re_performance`, `_last_phenotype_divergence` all computed but absent from `stats` and `health()` | All 9 fields added to both `stats` property and `health()` return dict |
+| **Invisible telemetry** | Evo consolidation + genome extraction events were logged but never emitted to Synapse bus → Nexus/Alive had no visibility into evolutionary fitness frequency | `_on_evo_belief_consolidated` and `_on_evo_genome_extracted` now emit `DOMAIN_KPI_SNAPSHOT` (domain=evolutionary_fitness) fire-and-forget |
+| **Static thresholds** | `5.0` (RE progress min improvement %) and `0.9` (metabolic degradation fraction) were hardcoded magic numbers with no runtime adjustment path | `_re_progress_min_improvement_pct` + `_metabolic_degradation_fraction` instance vars; `set_thresholds()` setter; `BENCHMARK_THRESHOLD_UPDATE` Synapse event subscription; both thresholds exposed in `stats` |
+
+| **Learning trajectory KPIs absent** | No crash pattern awareness, no organism-level learning velocity derived from RE health time-series | `_crash_patterns_discovered`, `_crash_patterns_resolved`, `_crash_pattern_confidence_sum`, `_re_model_health_history` (deque[30]), `_compute_learning_velocity()` added; 3 new subscriptions (2026-03-09) |
+
+---
+
+## Learning Trajectory KPIs — COMPLETE (2026-03-09)
+
+EcodiaOS now has unified self-awareness of its learning trajectory via Benchmarks.
+
+### New State (`__init__`)
+```python
+self._crash_patterns_discovered: int = 0
+self._crash_patterns_resolved: int = 0
+self._crash_pattern_confidence_sum: float = 0.0   # running sum for rolling avg
+self._re_model_health_history: deque[tuple[str, float]] = deque(maxlen=30)  # (iso_timestamp, value)
+```
+
+### New Methods
+- **`_on_crash_pattern_confirmed(event)`** — increments `_crash_patterns_discovered`; updates `_crash_pattern_confidence_sum` for rolling average. `stats` exposes `crash_patterns_discovered`, `crash_patterns_resolved`, `crash_pattern_confidence_avg`, `crash_pattern_resolution_rate`.
+- **`_on_crash_pattern_resolved(event)`** — increments `_crash_patterns_resolved`.
+- **`_on_benchmark_re_progress_for_trajectory(event)`** — filters `kpi_name == "re_model.health_score"`; appends to `_re_model_health_history`; calls `_compute_learning_velocity()`.
+- **`_compute_learning_velocity() → float`** — linear regression (pure Python, no scipy) of health_score over the most recent 7-day window from `_re_model_health_history`. Returns slope in health-score-per-day. Returns 0.0 if <3 data points. Normalises timestamps to fractional days before fitting.
+
+### New Emitted Events (via these handlers)
+| Event | When |
+|---|---|
+| `BENCHMARK_RE_PROGRESS` kpi_name=`organism.learning_velocity` | On every `re_model.health_score` update; value = slope in health-score/day |
+
+### `stats` Property Additions
+```python
+"crash_patterns_discovered": self._crash_patterns_discovered,
+"crash_patterns_resolved": self._crash_patterns_resolved,
+"crash_pattern_confidence_avg": round(self._crash_pattern_confidence_sum / max(1, self._crash_patterns_discovered), 3),
+"crash_pattern_resolution_rate": round(self._crash_patterns_resolved / max(1, self._crash_patterns_discovered), 3),
+"re_model_health_history_len": len(self._re_model_health_history),
+"organism_learning_velocity": self._compute_learning_velocity(),
+```
+
+---
+
+## Autonomy Calibration Loop — COMPLETE (2026-03-09)
+
+The Evo ↔ Benchmarks calibration loop is now fully closed end-to-end:
+
+1. **Evo adjusts thresholds** (`consolidation.py Phase 5.5`):
+   - `ConsolidationOrchestrator._emit_benchmark_threshold_calibration()` fires after every Phase 5 parameter optimisation
+   - Maps `learning_rate` → `re_progress_min_improvement_pct` (3.0/5.0/7.0%)
+   - Maps `economic_ratio` → `metabolic_degradation_fraction` (0.07/0.10/0.15)
+   - Deduplicated: only emits when either value shifts ≥0.5% or ≥0.01 fraction
+   - Payload includes `learning_rate`, `economic_ratio`, `adj_count`, `consolidation_number`
+
+2. **Benchmarks adapts evaluation** (`service.py:_on_threshold_update`):
+   - Updates `_re_progress_min_improvement_pct` (consumed at RE progress check line ~2553)
+   - Updates `_metabolic_degradation_fraction` (consumed at metabolic degradation check line ~674)
+   - Both thresholds exposed in `stats` so Evo can observe current values
+
+3. **Regressions feed back to Evo** (`service.py:_fire_regression_event` → Evo's `_on_benchmark_regression`):
+   - Path 4 (added 2026-03-09): when regression coincides with pending unevaluated ParameterTuner adjustments, Evo queues a rollback PatternCandidate identifying the suspect parameter change as a possible causal contributor
+   - Complements the existing `ParameterTuner.tick_evaluation()` auto-revert mechanism
+
+---
+
 ## Known Issues / Remaining Gaps
 
 | Gap | Location | Risk |
@@ -672,7 +754,7 @@ Idempotent daily MERGE. Silently no-ops if `Instance` node not yet created.
 ### Downstream (emits to)
 | Event | Consumers |
 |---|---|
-| `BENCHMARK_REGRESSION` | Thymos (→ MEDIUM incident), Soma (→ warning severity) |
+| `BENCHMARK_REGRESSION` | Thymos (→ MEDIUM incident), Soma (→ warning severity), **Evo** (`_on_benchmark_regression` — emergency hypothesis candidate if critical; `LEARNING_PRESSURE` + early consolidation if 3+ consecutive; `RE_TRAINING_REQUESTED` for RE KPIs) |
 | `BENCHMARK_RECOVERY` | Thymos, Evo — close feedback loops |
 | `BENCHMARK_RE_PROGRESS` | Nova (Thompson sampling weight update) |
 | `BEDAU_PACKARD_SNAPSHOT` | Alive visualization |
@@ -691,6 +773,13 @@ benchmarks.set_event_bus(synapse.event_bus)
 benchmarks.set_redis(redis_client)
 benchmarks.set_memory(memory)
 await benchmarks.initialize()
+# Both set_re_service() and set_reasoning_engine() are called with the same re_service:
+# set_re_service() → wires into EvaluationProtocol (5-pillar framework)
+# set_reasoning_engine() → wires into pillars.py (direct pillar 1–4 + memorization)
+benchmarks.set_re_service(re_service)
+benchmarks.set_reasoning_engine(re_service)
+# Optional runtime threshold adjustment (called by Evo via Synapse or directly):
+# benchmarks.set_thresholds(re_progress_min_improvement_pct=3.0, metabolic_degradation_fraction=0.15)
 ```
 
 ### Push callers

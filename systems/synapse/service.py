@@ -148,6 +148,10 @@ class SynapseService:
         # so the organism can self-measure heartbeat health and coherence quality.
         self._benchmarks: Any = None
 
+        # Soma reference for organism telemetry (emotions, interoception state).
+        # Stored here in addition to _clock so the 50-cycle block can query it.
+        self._soma: Any = None
+
         # Nova + Evo references for CognitiveStallSentinel activity deltas.
         # Counters from the *previous* cycle are tracked here so we can derive
         # "did nova produce an intent this cycle?" without modifying nova/evo.
@@ -167,6 +171,18 @@ class SynapseService:
         # Economic state from Oikos — used to derive events_per_dollar metrics
         self._cached_burn_rate_usd: float = 0.0
         self._cached_liquid_balance_usd: float = 0.0
+
+        # Interoception signal cache — updated by INTEROCEPTIVE_ALERT subscription.
+        # Used to populate OrganismTelemetry without blocking the 50-cycle emit.
+        self._interoception_cache: dict[str, Any] = {
+            "error_rate_per_min": None,
+            "cascade_pressure": False,
+            "latency_spike_active": False,
+        }
+
+        # Persona handle cache — updated reactively on PERSONA_CREATED / PERSONA_EVOLVED.
+        # Included in ORGANISM_TELEMETRY so Nova knows the organism's public identity.
+        self._cached_persona_handle: str | None = None
 
     # ─── Lifecycle ───────────────────────────────────────────────────
 
@@ -213,6 +229,22 @@ class SynapseService:
             self._on_oikos_starvation_warning,
         )
 
+        # Subscribe to INTEROCEPTIVE_ALERT to cache pressure signals for OrganismTelemetry
+        self._event_bus.subscribe(
+            SynapseEventType.INTEROCEPTIVE_ALERT,
+            self._on_interoceptive_alert_for_cache,
+        )
+
+        # Subscribe to persona events to cache the organism's public handle for telemetry
+        self._event_bus.subscribe(
+            SynapseEventType.PERSONA_CREATED,
+            self._on_persona_update,
+        )
+        self._event_bus.subscribe(
+            SynapseEventType.PERSONA_EVOLVED,
+            self._on_persona_update,
+        )
+
         # Register with NeuroplasticityBus for hot-reload of allocators & rhythm strategies
         if self._neuroplasticity_bus is not None:
             self._neuroplasticity_bus.register(
@@ -230,8 +262,9 @@ class SynapseService:
         self._logger.info("synapse_initialized")
 
     def set_soma(self, soma: Any) -> None:
-        """Wire Soma service into the clock (step 0 of theta cycle)."""
+        """Wire Soma service into the clock (step 0 of theta cycle) and cache for telemetry."""
         self._clock.set_soma(soma)
+        self._soma = soma
 
     def set_thymos(self, thymos: Any) -> None:
         """
@@ -676,6 +709,25 @@ class SynapseService:
             liquid_balance_usd=event.data.get("liquid_balance_usd", "unknown"),
         )
 
+    async def _on_interoceptive_alert_for_cache(self, event: SynapseEvent) -> None:
+        """
+        Cache interoception signal state so ORGANISM_TELEMETRY can include it
+        without reading it from a separate source in the hot-path 50-cycle block.
+        """
+        alert_type = str(event.data.get("alert_type", ""))
+        if alert_type == "error_rate":
+            self._interoception_cache["error_rate_per_min"] = event.data.get("value")
+        elif alert_type == "cascade":
+            self._interoception_cache["cascade_pressure"] = True
+        elif alert_type == "latency":
+            self._interoception_cache["latency_spike_active"] = True
+
+    async def _on_persona_update(self, event: SynapseEvent) -> None:
+        """Cache the organism's public handle for inclusion in ORGANISM_TELEMETRY."""
+        handle = event.data.get("handle") if event.data else None
+        if handle:
+            self._cached_persona_handle = handle
+
     # ─── NeuroplasticityBus callbacks ────────────────────────────────
 
     def _on_allocator_evolved(self, new_allocator: BaseResourceAllocator) -> None:
@@ -952,6 +1004,8 @@ class SynapseService:
                     data={
                         "rolling_deficit_usd": meta_snap.rolling_deficit_usd,
                         "burn_rate_usd_per_hour": meta_snap.burn_rate_usd_per_hour,
+                        "api_cost_usd_per_hour": meta_snap.api_cost_usd_per_hour,
+                        "infra_cost_usd_per_hour": meta_snap.infra_cost_usd_per_hour,
                         "total_calls": meta_snap.total_calls,
                         "per_system_cost_usd": meta_snap.per_system_cost_usd,
                         "cycle": self._cycle_count,
@@ -964,12 +1018,110 @@ class SynapseService:
                     data={
                         "rolling_deficit_usd": meta_snap.rolling_deficit_usd,
                         "burn_rate_usd_per_hour": meta_snap.burn_rate_usd_per_hour,
+                        "api_cost_usd_per_hour": meta_snap.api_cost_usd_per_hour,
+                        "infra_cost_usd_per_hour": meta_snap.infra_cost_usd_per_hour,
                         "total_calls": meta_snap.total_calls,
                         "per_system_cost_usd": meta_snap.per_system_cost_usd,
                     },
                 ))
             # Reset window accumulator so next interval is a clean delta
             self._metabolism.reset_window()
+
+            # ── 5c. ORGANISM_TELEMETRY — unified state broadcast ──────────────
+            # Build once per 50-cycle interval using already-computed snapshots.
+            # Gracefully degrades: missing sub-systems leave fields at defaults.
+            with contextlib.suppress(Exception):
+                from primitives.telemetry import OrganismTelemetry, SystemHealthSummary
+
+                coherence_snap = self._coherence.latest
+                resources_snap = self._resources.stats
+                health_records = self._health.stats.get("systems", {})
+
+                # Per-system health summaries
+                _health_summaries: dict[str, SystemHealthSummary] = {
+                    sid: SystemHealthSummary(
+                        latency_ema_ms=info.get("latency_ema_ms", 0.0),
+                        consecutive_misses=info.get("consecutive_misses", 0),
+                        restart_count=info.get("restart_count", 0),
+                        status=info.get("status", "healthy"),
+                    )
+                    for sid, info in health_records.items()
+                }
+
+                # Per-system CPU from resource allocator
+                _cpu_per_system: dict[str, float] = dict(
+                    resources_snap.get("system_loads", {})
+                )
+                _total_cpu = (
+                    resources_snap.get("snapshot", {}).get("total_cpu_percent", 0.0)
+                    if isinstance(resources_snap, dict)
+                    else 0.0
+                )
+
+                # Active emotions from Soma (non-blocking, best-effort)
+                _emotions: list[str] = []
+                if self._soma is not None:
+                    try:
+                        _active = self._soma.get_active_emotions()
+                        _emotions = [e.name for e in _active] if _active else []
+                    except Exception:
+                        pass
+
+                # Compute two-ledger dependency ratio for organism self-awareness.
+                # api_burn = per-token charges from organism's wallet
+                # infra_burn = RunPod compute billed to human (subsidised cost)
+                _api_burn = meta_snap.api_cost_usd_per_hour
+                _infra_burn = meta_snap.infra_cost_usd_per_hour
+                _total_burn = meta_snap.burn_rate_usd_per_hour
+                _dependency_ratio = (
+                    _infra_burn / _total_burn if _total_burn > 0 else 0.0
+                )
+
+                _telemetry = OrganismTelemetry(
+                    # Metabolic
+                    burn_rate_usd_per_hour=_total_burn,
+                    runway_hours=meta_snap.hours_until_depleted,
+                    per_provider_cost=dict(meta_snap.per_provider_cost_usd),
+                    infra_cost_usd_per_hour=_infra_burn,
+                    infra_resources=dict(
+                        getattr(meta_snap, "infra_resources", {}) or {}
+                    ),
+                    # Two-ledger
+                    api_burn_rate_usd_per_hour=_api_burn,
+                    dependency_ratio=_dependency_ratio,
+                    # Coherence
+                    phi=coherence_snap.phi_approximation,
+                    resonance=coherence_snap.system_resonance,
+                    diversity=coherence_snap.broadcast_diversity,
+                    synchrony=coherence_snap.response_synchrony,
+                    coherence_composite=coherence_snap.composite,
+                    # Rhythm
+                    rhythm_state=self._rhythm.current_state.value,
+                    cycles_in_rhythm_state=self._rhythm.stats.get("cycles_in_state", 0),
+                    # Health + resources
+                    health=_health_summaries,
+                    cpu_per_system=_cpu_per_system,
+                    total_cpu_pct=_total_cpu,
+                    # Emotions
+                    emotions=_emotions,
+                    # Interoception (from cache updated by INTEROCEPTIVE_ALERT)
+                    error_rate_per_min=self._interoception_cache["error_rate_per_min"],
+                    cascade_pressure=self._interoception_cache["cascade_pressure"],
+                    latency_spike_active=self._interoception_cache["latency_spike_active"],
+                    # Persona — public identity handle (None until PersonaEngine seals)
+                    persona_handle=self._cached_persona_handle,
+                    # Provenance
+                    cycle_number=self._cycle_count,
+                )
+                await self._event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.ORGANISM_TELEMETRY,
+                    source_system="synapse",
+                    data=_telemetry.model_dump(mode="json"),
+                ))
+                # Reset cascade/latency flags after each broadcast so they don't
+                # persist across cycles when the pressure is gone.
+                self._interoception_cache["cascade_pressure"] = False
+                self._interoception_cache["latency_spike_active"] = False
 
         # ── 6. Record telemetry ──
         if self._metrics is not None:
@@ -1086,7 +1238,7 @@ class SynapseService:
             soma_tick_data = SomaTickEvent(
                 cycle_number=result.cycle_number,
                 somatic_state=result.somatic,
-            ).model_dump()
+            ).model_dump(mode="json")
             # EIS anomaly_detector expects a "drives" key with dict[str, float]
             # of interoceptive dimension values for drive-state baseline tracking.
             soma_tick_data["drives"] = dict(result.somatic.precision_weights)

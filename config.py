@@ -104,6 +104,7 @@ class LLMConfig(BaseModel):
     provider: str = "bedrock"
     model: str = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
     api_key: str = ""
+    endpoint: str = "http://localhost:8000"  # used by vllm/ollama providers
     fallback_provider: str | None = None
     fallback_model: str | None = None
     budget: LLMBudget = Field(default_factory=LLMBudget)
@@ -128,7 +129,7 @@ class HotSwapConfig(BaseModel):
     local_inference_endpoint: str = "http://localhost:8000"
     local_inference_provider: str = "vllm"  # "vllm" | "ollama"
     # Base model used by the local inference engine
-    local_base_model: str = "unsloth/Meta-Llama-3.1-8B-Instruct"
+    local_base_model: str = "Qwen/Qwen3-8B"
     # Timeout for adapter loading operations (seconds)
     adapter_load_timeout_s: float = 120.0
     # Whether to automatically revert on probation failure (vs. just alerting)
@@ -284,6 +285,20 @@ class EvoConfig(BaseModel):
     max_active_hypotheses: int = 50
     max_parameter_delta_per_cycle: float = 0.03
     min_evidence_for_integration: int = 10
+    # How often Evo attempts to generate new hypotheses from accumulated pattern
+    # candidates (every N broadcast cycles).  Lower = more responsive but higher
+    # LLM cost.  Genome-heritable via EvoGenomeExtractor so child instances can
+    # inherit a tuned value discovered by the parent.
+    hypothesis_generation_interval: int = 200
+    # How often Evo re-evaluates evidence for all active hypotheses (every N
+    # broadcast cycles).  Lower = faster convergence but more compute per cycle.
+    evidence_evaluation_interval: int = 50
+    # How many direction reversals in the 10-nudge window trigger a HIGH_VOLATILITY
+    # flag, halving the weight of the hypothesis's evidence until it stabilises.
+    volatility_oscillation_threshold: int = 6
+    # Consecutive RE_DECISION_OUTCOME events with success_rate < 0.60 before Evo
+    # queues a hyperparameter-adjustment PatternCandidate.  Genome-heritable.
+    re_degradation_count_threshold: int = 10
 
 
 class SimulaConfig(BaseModel):
@@ -576,6 +591,12 @@ class SimulaConfig(BaseModel):
     # 0.1 = cautious (spread across many), 1.0 = aggressive (max concentration in #1).
     protocol_allocation_aggressiveness: float = 0.5
 
+    # Preventive audit scan sensitivity — Evo-tunable via ADJUST_BUDGET.
+    # 0.0 = only flag combined_risk > 0.7 (critical only)
+    # 0.5 = default thresholds (critical > 0.7, risk 0.4–0.7)
+    # 1.0 = flag everything above fragility_score > 0.2
+    audit_aggressiveness: float = 0.5
+
 
 class ThymosConfig(BaseModel):
     # Sentinel scan interval (seconds)
@@ -678,6 +699,8 @@ class OikosConfig(BaseModel):
     mitosis_child_struggling_runway_days: float = 30.0
     # Maximum rescue attempts per child before graceful death
     mitosis_max_rescues_per_child: int = 2
+    # Target runway days to restore on rescue (was hardcoded 60)
+    mitosis_rescue_runway_days: int = 60
     # Probability that any individual genome parameter is mutated during inheritance
     mitosis_mutation_rate: float = 0.05
     # Speciation distance threshold (cosine distance) — emit SPECIATION_EVENT above this
@@ -750,6 +773,20 @@ class OikosConfig(BaseModel):
     budget_audit_redis_key: str = "eos:oikos:budget_audit"
     # Maximum audit entries to keep in Redis.
     budget_audit_max_entries: int = 1000
+
+    # ── Runtime-adjustable thresholds (autonomy) ──
+    # Accumulated rollback penalties (USD) in a 24h window that trigger a
+    # METABOLIC_PRESSURE escalation with source="mutation_waste".
+    # Evo can evolve this threshold via the NeuroplasticityBus cost model.
+    rollback_penalty_threshold_usd: float = 0.10
+    # Logos cognitive pressure level at which GROWTH allocations are suspended.
+    cognitive_pressure_suspend_threshold: float = 0.90
+    # Logos cognitive pressure level at which GROWTH allocations resume (hysteresis).
+    cognitive_pressure_resume_threshold: float = 0.80
+    # Interval (seconds) between dependency-ratio broadcasts on the Synapse bus.
+    # Emits ECONOMIC_AUTONOMY_SIGNAL so Nova/Telos/Thread can model the organism's
+    # trajectory toward self-sufficiency (dependency_ratio target → 0).
+    autonomy_signal_interval_s: float = 3600.0
 
     # ── Phase 16g: Civilization Layer (Certificate of Alignment) ──
     # Certificate validity period in days
@@ -1037,6 +1074,12 @@ class IdentityCommConfig(BaseModel):
     imap_mailbox: str = "INBOX"
     imap_scan_interval_s: float = 60.0
 
+    telegram_admin_chat_id: str = ""
+    """Telegram chat ID that the organism broadcasts status to and accepts messages from.
+    When set, inbound webhook messages from other chat IDs are silently dropped.
+    Set via ECODIAOS_IDENTITY_COMM__TELEGRAM_ADMIN_CHAT_ID (or
+    ECODIAOS_CONNECTORS__TELEGRAM__ADMIN_CHAT_ID — both are read)."""
+
     @model_validator(mode="after")
     def _strip_secrets(self) -> IdentityCommConfig:
         for field in ("twilio_auth_token", "twilio_account_sid", "twilio_from_number", "imap_password"):
@@ -1044,6 +1087,86 @@ class IdentityCommConfig(BaseModel):
             if val:
                 object.__setattr__(self, field, val.strip())
         return self
+
+
+class CaptchaConfig(BaseModel):
+    """CAPTCHA solving service configuration for autonomous account creation."""
+
+    twocaptcha_api_key: str = ""
+    """2captcha API key — set via ECODIAOS_CAPTCHA__TWOCAPTCHA_API_KEY."""
+
+    anticaptcha_api_key: str = ""
+    """Anti-Captcha API key — set via ECODIAOS_CAPTCHA__ANTICAPTCHA_API_KEY."""
+
+    provider: str = "2captcha"
+    """Active CAPTCHA provider: "2captcha" | "anticaptcha".
+    Set via ECODIAOS_CAPTCHA__PROVIDER."""
+
+    polling_interval_s: float = 5.0
+    """Seconds between polling for solved CAPTCHA result."""
+
+    max_wait_s: float = 120.0
+    """Maximum seconds to wait for a CAPTCHA solve before timing out."""
+
+    @model_validator(mode="after")
+    def _strip_secrets(self) -> "CaptchaConfig":
+        for field in ("twocaptcha_api_key", "anticaptcha_api_key"):
+            val = getattr(self, field)
+            if val:
+                object.__setattr__(self, field, val.strip())
+        return self
+
+    @property
+    def active_api_key(self) -> str:
+        """Return the API key for the configured provider."""
+        if self.provider == "anticaptcha":
+            return self.anticaptcha_api_key
+        return self.twocaptcha_api_key
+
+    @property
+    def enabled(self) -> bool:
+        """True if at least one CAPTCHA provider is configured."""
+        return bool(self.twocaptcha_api_key or self.anticaptcha_api_key)
+
+
+class AccountProvisionerConfig(BaseModel):
+    """Configuration for autonomous platform account provisioning."""
+
+    enabled: bool = True
+    """Whether to auto-provision platform identities on first boot.
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__ENABLED."""
+
+    github_username_prefix: str = "ecodiaos"
+    """Prefix for generated GitHub usernames: {prefix}-{instance_id[:8]}.
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__GITHUB_USERNAME_PREFIX."""
+
+    github_email_domain: str = ""
+    """Domain for generated Gmail addresses. If empty, Gmail provisioning is used.
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__GITHUB_EMAIL_DOMAIN."""
+
+    twilio_area_code: str = "415"
+    """Default US area code for Twilio number provisioning.
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__TWILIO_AREA_CODE."""
+
+    twilio_number_cost_usd: str = "1.15"
+    """Monthly cost of a Twilio US local number in USD (for Oikos accounting).
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__TWILIO_NUMBER_COST_USD."""
+
+    browser_headless: bool = True
+    """Run Playwright browser in headless mode.
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__BROWSER_HEADLESS."""
+
+    browser_stealth: bool = True
+    """Apply playwright-stealth anti-detection patches to browser.
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__BROWSER_STEALTH."""
+
+    otp_wait_timeout_s: int = 300
+    """Seconds to wait for an OTP code during account creation flows.
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__OTP_WAIT_TIMEOUT_S."""
+
+    equor_approval_timeout_s: float = 30.0
+    """Seconds to wait for Equor constitutional approval before timing out.
+    Set via ECODIAOS_ACCOUNT_PROVISIONER__EQUOR_APPROVAL_TIMEOUT_S."""
 
 
 class ExternalPlatformsConfig(BaseModel):
@@ -1431,9 +1554,9 @@ class FineTuneConfig(BaseModel):
     default_format: str = "instruction"  # "instruction" | "dpo" | "chat"
 
     # ── Training Defaults ──
-    base_model: str = "unsloth/Meta-Llama-3.1-8B-Instruct"
-    lora_rank: int = 64
-    lora_alpha: int = 128
+    base_model: str = "Qwen/Qwen3-8B"
+    lora_rank: int = 32
+    lora_alpha: int = 64
     learning_rate: float = 2e-4
     num_epochs: int = 3
     max_seq_length: int = 4096
@@ -1483,6 +1606,57 @@ class BenchmarkConfig(BaseModel):
     """Fire a BENCHMARK_REGRESSION event when a KPI drops this % below its rolling avg."""
 
 
+class SearchConfig(BaseModel):
+    """
+    Web intelligence configuration.
+
+    Provider precedence: brave → serpapi → ddg (DuckDuckGo scrape, no key needed).
+    Set at least one API key for reliable results; DDG is rate-limited and
+    should be treated as a fallback only.
+
+    Env vars:
+      ECODIAOS_SEARCH__PROVIDER=brave
+      ECODIAOS_SEARCH__BRAVE_API_KEY=<key>
+      ECODIAOS_SEARCH__SERPAPI_KEY=<key>
+    """
+
+    provider: str = "ddg"
+    """Search provider: "brave" | "serpapi" | "ddg"."""
+
+    brave_api_key: str = ""
+    """Brave Search API key (https://api.search.brave.com)."""
+
+    serpapi_key: str = ""
+    """SerpAPI key (https://serpapi.com)."""
+
+    # HTTP behaviour
+    request_timeout_s: float = 10.0
+    """Timeout for each individual HTTP request."""
+
+    max_req_per_domain_per_hour: int = 60
+    """Hard crawl-budget ceiling — never exceed 60 req/hr to any single domain."""
+
+    rate_limit_s: float = 1.0
+    """Minimum seconds between consecutive requests to the same domain (≥1.0)."""
+
+    default_num_results: int = 10
+    """Default number of search results to fetch when not specified by caller."""
+
+    # Monitor check interval
+    monitor_check_interval_hours: int = 6
+    """How often to re-fetch monitored URLs and emit INTELLIGENCE_UPDATE events."""
+
+    # Playwright JS rendering
+    render_js_enabled: bool = False
+    """Enable Playwright for JS-heavy pages (requires playwright to be installed)."""
+
+    # High-value intelligence feed schedules (hours)
+    defillama_interval_hours: int = 6
+    github_trending_interval_hours: int = 24
+    hacker_news_interval_hours: int = 4
+    bounty_platforms_interval_hours: int = 2
+
+
 # ─── Root Configuration ──────────────────────────────────────────
 
 
@@ -1530,9 +1704,12 @@ class EcodiaOSConfig(BaseSettings):
     external_platforms: ExternalPlatformsConfig = Field(default_factory=ExternalPlatformsConfig)
     connectors: ConnectorsConfig = Field(default_factory=ConnectorsConfig)
     identity_comm: IdentityCommConfig = Field(default_factory=IdentityCommConfig)
+    captcha: CaptchaConfig = Field(default_factory=CaptchaConfig)
+    account_provisioner: AccountProvisionerConfig = Field(default_factory=AccountProvisionerConfig)
     hot_swap: HotSwapConfig = Field(default_factory=HotSwapConfig)
     phantom_liquidity: PhantomLiquidityConfig = Field(default_factory=PhantomLiquidityConfig)
     benchmarks: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
+    search: SearchConfig = Field(default_factory=SearchConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
@@ -1619,8 +1796,143 @@ def load_config(config_path: str | Path | None = None) -> EcodiaOSConfig:
         raw.setdefault("wallet", {})["account_name"] = wallet_name
     if wallet_seed := os.environ.get("ECODIAOS_WALLET__SEED_FILE_PATH"):
         raw.setdefault("wallet", {})["seed_file_path"] = wallet_seed
+    # Oikos genesis flag
+    if genesis_flag := os.environ.get("ECODIAOS_OIKOS__IS_GENESIS_NODE"):
+        raw.setdefault("oikos", {})["is_genesis_node"] = genesis_flag.lower() in (
+            "true",
+            "1",
+            "yes",
+        )
 
     return EcodiaOSConfig(**raw)
+
+
+# ─── Runtime Config Query API ────────────────────────────────────
+#
+# These functions make the config inspectable at runtime without restarting
+# the organism. Secrets are redacted before exposure so the introspection
+# API is safe to call from monitoring endpoints.
+
+_SECRET_KEYWORDS = frozenset({"key", "secret", "token", "password", "pwd", "api_key"})
+
+
+def _is_secret_field(name: str) -> bool:
+    """Return True when a config field name looks like a secret."""
+    lower = name.lower()
+    return any(kw in lower for kw in _SECRET_KEYWORDS)
+
+
+class ConfigEntry(dict):
+    """
+    A single config value with provenance metadata.
+
+    Keys:
+      value   — current value (redacted to "<redacted>" for secret fields)
+      source  — "default" | "yaml" | "env"
+      is_secret — bool
+    """
+
+
+def get_all_config(
+    config: "EcodiaOSConfig",
+    *,
+    yaml_raw: dict[str, Any] | None = None,
+) -> dict[str, "ConfigEntry"]:
+    """
+    Flatten the full config into a key→ConfigEntry mapping.
+
+    ``yaml_raw`` is the raw YAML dict that was used to build ``config``
+    (pass it from ``load_config`` if you want accurate source attribution).
+    Without it, every non-default field is reported as source="unknown".
+
+    Secret fields (matching _SECRET_KEYWORDS) are redacted in the returned
+    value but their existence and source are still reported.
+    """
+    import os
+
+    env_keys: set[str] = {k.lower() for k in os.environ if k.startswith("ECODIAOS_")}
+    result: dict[str, ConfigEntry] = {}
+
+    def _flatten(obj: Any, prefix: str, yaml_node: Any) -> None:
+        if hasattr(obj, "model_fields"):
+            for field_name in obj.model_fields:
+                value = getattr(obj, field_name, None)
+                full_key = f"{prefix}.{field_name}" if prefix else field_name
+                yaml_child = (
+                    yaml_node.get(field_name) if isinstance(yaml_node, dict) else None
+                )
+                _flatten(value, full_key, yaml_child)
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                full_key = f"{prefix}.{k}" if prefix else k
+                yaml_child = (
+                    yaml_node.get(k) if isinstance(yaml_node, dict) else None
+                )
+                _flatten(v, full_key, yaml_child)
+        else:
+            secret = _is_secret_field(prefix.split(".")[-1])
+            # Determine source heuristically.
+            env_candidate = "ECODIAOS_" + prefix.replace(".", "__").upper()
+            if env_candidate.lower() in env_keys:
+                source = "env"
+            elif yaml_node is not None:
+                source = "yaml"
+            else:
+                source = "default"
+            entry: ConfigEntry = ConfigEntry(
+                value="<redacted>" if secret else obj,
+                source=source,
+                is_secret=secret,
+            )
+            result[prefix] = entry
+
+    yaml_node: Any = yaml_raw or {}
+    _flatten(config, "", yaml_node)
+    return result
+
+
+def get_config(
+    config: "EcodiaOSConfig",
+    key: str,
+    *,
+    yaml_raw: dict[str, Any] | None = None,
+) -> "ConfigEntry | None":
+    """
+    Return the ConfigEntry for a single dot-delimited key.
+
+    Example: get_config(config, "nova.max_active_goals")
+    Returns None if the key does not exist.
+    """
+    all_cfg = get_all_config(config, yaml_raw=yaml_raw)
+    return all_cfg.get(key)
+
+
+def is_overridden(config: "EcodiaOSConfig", key: str) -> bool:
+    """
+    Return True if the value differs from the Pydantic model default.
+
+    Uses the model's schema defaults. If the field has no default (required),
+    returns True unconditionally.
+    """
+    # Walk the dotted path to find the leaf model and field.
+    parts = key.split(".")
+    obj: Any = config
+    for part in parts[:-1]:
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return False
+    field_name = parts[-1]
+    if not hasattr(obj, "model_fields") or field_name not in obj.model_fields:
+        return False
+    field_info = obj.model_fields[field_name]
+    default = field_info.default
+    current = getattr(obj, field_name, None)
+    if default is None and field_info.default_factory is not None:  # type: ignore[union-attr]
+        try:
+            default = field_info.default_factory()  # type: ignore[misc]
+        except Exception:
+            return True  # Can't compare; assume overridden.
+    return current != default
 
 
 def load_seed(seed_path: str | Path) -> SeedConfig:

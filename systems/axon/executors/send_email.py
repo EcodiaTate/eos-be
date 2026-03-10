@@ -34,6 +34,10 @@ class SendEmailExecutor(Executor):
         self._email_client = email_client
         self._event_bus = event_bus
 
+    def set_email_client(self, client: Any) -> None:
+        """Inject the EmailClient after construction (registry wiring pattern)."""
+        self._email_client = client
+
     async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         to = params.get("to")
         if not to or not isinstance(to, str):
@@ -69,16 +73,9 @@ class SendEmailExecutor(Executor):
                 body=body,
             )
 
-            await self._emit_event(
-                SynapseEventType.ACTION_EXECUTED,
-                {
-                    "action_type": self.action_type,
-                    "to": to,
-                    "subject": subject,
-                    "execution_id": context.execution_id,
-                },
-            )
-
+            # RE trace only — AXON_EXECUTION_RESULT (emitted by service.py) is
+            # the canonical aggregate event; per-executor ACTION_EXECUTED would
+            # create duplicate signals with no dedup strategy.
             await self._emit_re_trace(context, params, success=True)
 
             return ExecutionResult(
@@ -87,14 +84,6 @@ class SendEmailExecutor(Executor):
                 side_effects=[f"Email sent to {to}: {subject}"],
             )
         except Exception as exc:
-            await self._emit_event(
-                SynapseEventType.ACTION_FAILED,
-                {
-                    "action_type": self.action_type,
-                    "error": str(exc),
-                    "execution_id": context.execution_id,
-                },
-            )
             await self._emit_re_trace(context, params, success=False, error=str(exc))
             return ExecutionResult(success=False, error=str(exc))
 

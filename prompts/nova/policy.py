@@ -24,6 +24,7 @@ def build_policy_generation_prompt(
     affect: AffectState,
     available_action_types: list[str],
     max_policies: int = 5,
+    causal_laws_summary: str = "",
 ) -> str:
     """
     Build the policy generation prompt.
@@ -48,7 +49,10 @@ Urgency: {"High" if goal.urgency > 0.6 else "Moderate" if goal.urgency > 0.3 els
 
 ## CURRENT WORLD BELIEFS
 {beliefs_summary}
-
+{f"""
+## DISCOVERED CAUSAL LAWS (Kairos-validated)
+{causal_laws_summary}
+""" if causal_laws_summary else ""}
 ## RELEVANT MEMORIES AND PAST EXPERIENCES
 {memory_summary or "No relevant past experiences retrieved."}
 
@@ -63,6 +67,16 @@ Generate {max_policies} distinct strategies for achieving this goal.
 Strategies should differ meaningfully in approach, not just in phrasing.
 At least one strategy should be conservative (low-risk, high-certainty).
 At least one strategy should be epistemic (aimed at learning more).
+
+**NOVEL ACTION GUIDANCE:** If the goal genuinely cannot be achieved with any of the
+listed action types, you may include a policy that uses "propose_novel_action" as the
+action_type.  That step's parameters MUST include:
+  - action_name: snake_case name for the proposed action type
+  - description: what the executor would do (1–2 sentences)
+  - required_capabilities: list of string capability tags
+  - expected_outcome: what the action accomplishes for this goal
+  - justification: why none of the existing action types is adequate
+Use propose_novel_action sparingly — prefer existing types wherever possible.
 
 For each strategy, respond with valid JSON in this exact format:
 {{
@@ -280,4 +294,17 @@ AVAILABLE_ACTION_TYPES: list[str] = [
     # ── Internal (no delivery) ────────────────────────────────────
     "observe: Continue monitoring without acting (gather more information)",
     "wait: Pause and let the situation develop",
+    # ── Novel action proposal (meta-action) ───────────────────────
+    # Use ONLY when no existing action type is sufficient for the current goal
+    # and you can clearly articulate what a new action type would do.  The
+    # proposal is routed to Simula for feasibility evaluation, Equor review,
+    # and dynamic executor generation.  Required parameters in the step:
+    #   action_name (str)             — proposed canonical action type (snake_case)
+    #   description (str)             — what the action does in 1–2 sentences
+    #   required_capabilities (list)  — e.g. ["http_client", "defi_write"]
+    #   expected_outcome (str)        — what the action accomplishes for the goal
+    #   justification (str)           — why none of the existing types is adequate
+    "propose_novel_action: Propose a new action capability when no existing type fits "
+    "the current goal. Use sparingly — only when the goal genuinely cannot be achieved "
+    "with any of the action types listed above.",
 ]

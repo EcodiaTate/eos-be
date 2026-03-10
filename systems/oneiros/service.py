@@ -261,6 +261,9 @@ class OneirosService:
         # Metabolic starvation level — AUSTERITY: 50% dreams, EMERGENCY+: halt all
         self._starvation_level: str = "nominal"
 
+        # ── Skia VitalityCoordinator modulation ───────────────────────
+        self._modulation_halted: bool = False
+
         # Pending insights for wake broadcast
         self._pending_wake_insights: list[Any] = []
 
@@ -270,6 +273,11 @@ class OneirosService:
             with contextlib.suppress(AttributeError):
                 event_bus = synapse.event_bus
         self._v2_engine = SleepCycleEngine(event_bus=event_bus)
+
+        # Forward neo4j to engine now if it was passed at construction time.
+        # This seeds MetaCognition and DirectedExploration before any set_ calls.
+        if neo4j is not None:
+            self._v2_engine.set_neo4j(neo4j)
 
         self._logger = logger
 
@@ -314,6 +322,16 @@ class OneirosService:
         self._economic_dream_worker = oikos.get_dream_worker()
         self._threat_model_worker = oikos.get_threat_model_worker()
         self._logger.info("oikos_wired_for_economic_dreaming")
+
+    def set_neo4j(self, neo4j: Any) -> None:
+        """Wire Neo4j for MetaCognition concept promotion and DirectedExploration storage."""
+        self._neo4j = neo4j
+        self._journal._neo4j = neo4j  # DreamJournal constructed before neo4j is wired
+        self._v2_engine.set_neo4j(neo4j)
+
+    def set_benchmarks(self, benchmarks: Any) -> None:
+        """Wire BenchmarkService for pre/post-sleep KPI measurement."""
+        self._v2_engine.set_benchmarks(benchmarks)
 
     def set_fovea(self, fovea: Any) -> None:
         """Wire Fovea for v2 REM error-domain targeting and checkpoint backlog count."""
@@ -425,6 +443,10 @@ class OneirosService:
                         SynapseEventType.FEDERATION_SLEEP_SYNC,
                         self._on_federation_sleep_sync,
                     )
+                event_bus.subscribe(
+                    SynapseEventType.SYSTEM_MODULATION,
+                    self._on_system_modulation,
+                )
             except Exception as exc:
                 self._logger.warning("synapse_subscribe_failed", error=str(exc))
 
@@ -569,6 +591,11 @@ class OneirosService:
 
         Stages: DESCENT → SLOW_WAVE → REM → (Lucid Dreaming) → EMERGENCE
         """
+        # ── Skia modulation halt ──────────────────────────────────────────
+        if self._modulation_halted:
+            self._logger.warning("sleep_cycle_skipped_modulation_halted", cycle_id=cycle_id)
+            return
+
         try:
             # Determine trigger from pressure
             trigger = SleepTrigger.SCHEDULED
@@ -1148,6 +1175,11 @@ class OneirosService:
             self._current_cycle.interrupted = True
             self._current_cycle.interrupt_reason = f"Critical: {event_type}"
 
+        # Capture the current checkpoint before cancelling the task so that
+        # the next sleep cycle can resume from SLOW_WAVE rather than restarting
+        # from scratch.  interrupt() stores the checkpoint in _pending_restore_checkpoint.
+        await self._v2_engine.interrupt(reason=f"emergency_wake:{event_type}")
+
         if self._sleep_task is not None and not self._sleep_task.done():
             self._sleep_task.cancel()
 
@@ -1155,6 +1187,61 @@ class OneirosService:
             "reason": str(event_type),
             "stage_interrupted": self._stage_controller.current_stage.value,
         })
+
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle VitalityCoordinator austerity orders.
+
+        Skia emits SYSTEM_MODULATION when the organism needs to conserve resources.
+        This system applies the directive and ACKs so Skia knows the order was received.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("level", "nominal")
+        halt_systems = data.get("halt_systems", [])
+        modulate = data.get("modulate", {})
+
+        system_id = "oneiros"
+        compliant = True
+        reason: str | None = None
+
+        if system_id in halt_systems:
+            self._modulation_halted = True
+            self._logger.warning("system_modulation_halt", level=level)
+        elif system_id in modulate:
+            directives = modulate[system_id]
+            self._apply_modulation_directives(directives)
+            self._logger.info("system_modulation_applied", level=level, directives=directives)
+        elif level == "nominal":
+            self._modulation_halted = False
+            self._logger.info("system_modulation_resumed", level=level)
+
+        # Emit ACK so Skia knows the order was received
+        if self._synapse is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await self._synapse.event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                    data={
+                        "system_id": system_id,
+                        "level": level,
+                        "compliant": compliant,
+                        "reason": reason,
+                    },
+                    source_system=system_id,
+                ))
+            except Exception as exc:
+                self._logger.warning("modulation_ack_failed", error=str(exc))
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply modulation directives from VitalityCoordinator.
+
+        Oneiros directive: {"dream_frequency_factor": 0.5} — reduce dream
+        frequency to conserve cognitive resources during austerity.
+        """
+        factor = directives.get("dream_frequency_factor")
+        if factor is not None:
+            self._logger.info("modulation_dream_frequency_reduced", factor=factor)
+        else:
+            self._logger.info("modulation_directives_received", directives=directives)
 
     # ── Public API ────────────────────────────────────────────────
 

@@ -98,16 +98,7 @@ class QueryMemoryGraphExecutor(Executor):
                 raw = await self._memory.recent_episodes(limit=limit)
                 results = raw if isinstance(raw, list) else []
 
-            await self._emit_event(
-                SynapseEventType.ACTION_EXECUTED,
-                {
-                    "action_type": self.action_type,
-                    "query_type": query_type,
-                    "result_count": len(results),
-                    "execution_id": context.execution_id,
-                },
-            )
-
+            # RE trace only — AXON_EXECUTION_RESULT is the canonical aggregate.
             await self._emit_re_trace(context, params, success=True, result_count=len(results))
 
             return ExecutionResult(
@@ -122,14 +113,6 @@ class QueryMemoryGraphExecutor(Executor):
                 ],
             )
         except Exception as exc:
-            await self._emit_event(
-                SynapseEventType.ACTION_FAILED,
-                {
-                    "action_type": self.action_type,
-                    "error": str(exc),
-                    "execution_id": context.execution_id,
-                },
-            )
             await self._emit_re_trace(context, params, success=False, result_count=0, error=str(exc))
             return ExecutionResult(success=False, error=str(exc))
 

@@ -56,14 +56,27 @@
 ### Gap Closures (2026-03-07, session 4)
 - **Daily self-probe** — `_daily_self_probe_loop()` started in `initialize()` via `asyncio.ensure_future`. Fires every 24h. Constructs a synthetic `Percept.from_internal(SystemID.EIS, "self_test", {"threat_score": 0.7, ...})` and pushes it through `eis_gate()`. Emits `EIS_LAYER_TRIGGERED` with `layer="self_test"` and `result="ok"` (non-PASS gate verdict) or `result="degraded"` (PASS verdict or exception). Ensures EIS is never permanently silent on Genesis instances with no external sensor input.
 
+### Gap Closures (2026-03-08, autonomy audit)
+
+- **Dead wiring: `federation.set_eis(eis)` never called** — `wire_federation_phase()` in `wiring.py` now accepts `eis: Any = None` and calls `federation.set_eis(eis)` when both are non-None. `registry.py` `wire_federation_phase()` call updated with `eis=eis`. `FederationIngestionPipeline._run_eis_check()` now has a live EIS reference instead of silently skipping cross-instance percept taint analysis.
+
+- **Dead wiring: EIS genome not exported to children** — `SpawnChildExecutor` now accepts `_eis` and exports `EISGenomeExtractor.extract_genome_segment()` in Step 0b. `eis_genome_id` added to `SeedConfiguration`, `CHILD_SPAWNED` event payload, and `ExecutionResult.data`. Payload injected as `eis_genome_payload` in `seed_config.child_config_overrides` for `ECODIAOS_EIS_GENOME_PAYLOAD` env var on child boot. `wire_mitosis_phase()` accepts `eis=` and injects `spawn_executor._eis = eis`. `registry.py` `wire_mitosis_phase()` call updated with `eis=eis`. Children start with parent's threat patterns and anomaly baselines — immune co-evolution is now operational.
+
+- **Invisible action: `handle_quarantine_cleared()` had no Synapse trigger** — `set_synapse()` now subscribes to `EQUOR_HITL_APPROVED`. New handler `_on_equor_hitl_approved()` reads `approval_type=="quarantine_cleared"` + `threat_pattern_ids=[...]` and calls `handle_quarantine_cleared()`. Equor can now autonomously close the false-positive feedback loop by emitting `EQUOR_HITL_APPROVED` without any direct API call.
+
+- **Invisible data: `compute_risk_salience_factor()` not used by Fovea** — `fovea/gateway.py` now calls `from systems.eis.integration import compute_risk_salience_factor` after setting `percept.metadata["eis_result"]`. The gain-amplified EIS risk score replaces the raw `annotated.composite_score` as `eis_risk_level`, feeding Fovea's causal-dimension routing with the configured RISK_SALIENCE_GAIN multiplier.
+
+- **Invisible data: `belief_update_weight()` not used by Nova** — `nova/belief_updater.py` `update_from_broadcast()` now calls `from systems.eis.integration import belief_update_weight` and multiplies `broadcast.precision` by the returned weight before any belief update. High-threat percepts have their influence on the belief state attenuated toward BELIEF_FLOOR even when they pass quarantine — adversarial inputs can no longer poison Nova's beliefs.
+
 ## What's Missing
 
-- **integration.py not consumed** — `belief_update_weight()` and `compute_risk_salience_factor()` are coded but no system imports them
-- **Federation percept screening** — cross-instance percepts bypass EIS
+- ~~**integration.py not consumed**~~ — **RESOLVED 2026-03-08**: `belief_update_weight()` consumed by `nova/belief_updater.py`; `compute_risk_salience_factor()` consumed by `fovea/gateway.py`
+- ~~**Federation percept screening**~~ — **RESOLVED 2026-03-08**: `federation.set_eis(eis)` now called in `wire_federation_phase()` so `FederationIngestionPipeline._run_eis_check()` has a live EIS
 - **RE routing in L5** — no Thompson sampling between Claude and RE
 - **Safe-mode threshold** — undefined; no transition logic
 - **Pathogen retirement** — no background task to prune stale/high-FP entries
 - **ConstitutionalGraph static** — doesn't update when organism evolves
+- ~~**Child-side EIS genome apply**~~ — **RESOLVED 2026-03-08**: `EISService.initialize()` reads `ECODIAOS_EIS_GENOME_PAYLOAD` and calls `self._genome_extractor.seed_from_genome_segment()`. `self._genome_extractor` is now instantiated in `__init__` (eager, not lazy) so it's available immediately. Genesis nodes skip apply via `ECODIAOS_IS_GENESIS_NODE=true` guard.
 - ~~**Neo4j not wired in registry**~~ — **RESOLVED 2026-03-07**: `eis.set_neo4j(infra.neo4j)` added to `SystemRegistry.startup()` Phase 2 after `set_metrics()`
 
 ---
@@ -78,6 +91,8 @@
 | `INTENT_REJECTED` | Equor | `_handle_intent_rejected` |
 | `INTEROCEPTIVE_PERCEPT` | Soma | `_handle_interoceptive_percept` |
 | `METABOLIC_PRESSURE` | Oikos | `_handle_metabolic_pressure` |
+| `EQUOR_HITL_APPROVED` | Equor/Human operator | `_on_equor_hitl_approved` (approval_type=="quarantine_cleared") |
+| `SYSTEM_MODULATION` | Skia/VitalityCoordinator | `_on_system_modulation` — sets `_system_modulation_halted`; skips L5 LLM quarantine when halted; emits `SYSTEM_MODULATION_ACK` with `reason="l5_quarantine_suspended"` |
 | `subscribe_all()` | All | `_handle_any_event` (anomaly detection) |
 
 ### Emitted

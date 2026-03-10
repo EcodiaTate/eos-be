@@ -266,6 +266,22 @@ class KairosPipeline:
         self._economic_events_received: int = 0
         self._price_observations: list[dict[str, Any]] = []
 
+        # SG-SOMA: Buffered drive vector snapshots (organism introspection)
+        self._drive_vector_observations: list[dict[str, Any]] = []
+        self._drive_vector_count: int = 0
+
+        # ── Self-causality tracker (Part B) ──────────────────────────────────
+        # Tracks organism-internal observable variables sampled each pipeline run.
+        # We apply the same correlation+direction logic to discover causal laws
+        # WITHIN the organism (e.g. "prediction_error_rate → coherence_decrease").
+        # Rolling window: last 100 samples per variable.
+        self._internal_var_history: dict[str, list[float]] = {}
+        self._INTERNAL_VAR_WINDOW: int = 100
+        # Accepted internal invariants: {(cause, effect) → hold_rate}
+        self._internal_invariants: dict[tuple[str, str], dict[str, Any]] = {}
+        # Internal invariant discovery count
+        self._internal_invariants_discovered: int = 0
+
     # --- Wiring ---
 
     def set_event_bus(self, event_bus: EventBus) -> None:
@@ -381,7 +397,44 @@ class KairosPipeline:
             self._on_price_observation,
         )
 
-        logger.info("kairos_subscriptions_registered", events=10)
+        # SG-NEXUS: Ground truth convergence feedback from Nexus
+        # When a fragment reaches Level 3/4 epistemic certainty, re-evaluate
+        # corresponding invariants against the now-validated ground truth.
+        if hasattr(SynapseEventType, "GROUND_TRUTH_CANDIDATE"):
+            self._event_bus.subscribe(
+                SynapseEventType.GROUND_TRUTH_CANDIDATE,
+                self._on_ground_truth_candidate,
+            )
+        if hasattr(SynapseEventType, "EMPIRICAL_INVARIANT_CONFIRMED"):
+            self._event_bus.subscribe(
+                SynapseEventType.EMPIRICAL_INVARIANT_CONFIRMED,
+                self._on_empirical_invariant_confirmed,
+            )
+
+        # SG-PERCEPT: Raw observation stream — convert percepts to causal variable obs
+        if hasattr(SynapseEventType, "PERCEPT_ARRIVED"):
+            self._event_bus.subscribe(
+                SynapseEventType.PERCEPT_ARRIVED,
+                self._on_percept_arrived,
+            )
+
+        # SG-DRIVE: Drive weight / somatic modulation events for drive coupling
+        if hasattr(SynapseEventType, "EQUOR_DRIVE_WEIGHTS_UPDATED"):
+            self._event_bus.subscribe(
+                SynapseEventType.EQUOR_DRIVE_WEIGHTS_UPDATED,
+                self._on_drive_weights_updated,
+            )
+
+        # SG-SOMA: Somatic drive vector — observe organism drives as causal variables
+        # This closes the organism-awareness loop: Kairos can discover causal
+        # relationships BETWEEN drives (e.g. low Coherence → high Care response).
+        if hasattr(SynapseEventType, "SOMATIC_DRIVE_VECTOR"):
+            self._event_bus.subscribe(
+                SynapseEventType.SOMATIC_DRIVE_VECTOR,
+                self._on_somatic_drive_vector,
+            )
+
+        logger.info("kairos_subscriptions_registered", events=16)
 
     # --- Event handlers ---
 
@@ -394,7 +447,9 @@ class KairosPipeline:
         error payload into a pre-seeded CorrelationCandidate so the next
         pipeline run starts with these causal surprises already in Stage 1.
         """
-        data = event.data
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
+        if not data:
+            return
         routes = data.get("routes", [])
         causal_error = data.get("causal_error", 0.0)
 
@@ -429,8 +484,11 @@ class KairosPipeline:
 
     async def _on_evolution_candidate(self, event: SynapseEvent) -> None:
         """Handle Evo evolution candidates that might be causal claims."""
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
+        if not data:
+            return
         self._evo_events_received += 1
-        self._evo_pipeline.process_evolution_candidate(event.data)
+        self._evo_pipeline.process_evolution_candidate(data)
 
     async def _on_episode_stored(self, event: SynapseEvent) -> None:
         """
@@ -440,7 +498,7 @@ class KairosPipeline:
         Extract variable pairs from the episode's context and content, then
         pre-seed the correlation miner so the next pipeline run includes them.
         """
-        data = event.data if hasattr(event, "data") else {}
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
         context_id = data.get("context_id", data.get("episode_id", ""))
         observations = data.get("observations", [])
 
@@ -485,7 +543,7 @@ class KairosPipeline:
         Convert the match to a pre-seeded CorrelationCandidate so the next
         run_pipeline() call tests it through the full causal pipeline.
         """
-        data = event.data if hasattr(event, "data") else {}
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
         self._cross_domain_events_received += 1
 
         domain_a = data.get("domain_a", "")
@@ -516,7 +574,7 @@ class KairosPipeline:
         existing invariants against the new model structure. Non-Kairos
         updates (from other systems) may reveal new contexts for testing.
         """
-        data = event.data if hasattr(event, "data") else {}
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
         source = data.get("source", "")
 
         # Skip our own updates to avoid feedback loops
@@ -550,7 +608,7 @@ class KairosPipeline:
         cross-domain patterns that Kairos should mine. Pre-seed the
         correlation miner with any causal structures from consolidation.
         """
-        data = event.data if hasattr(event, "data") else {}
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
         self._oneiros_consolidations_received += 1
 
         # Extract cross-domain patterns from consolidation output
@@ -582,7 +640,7 @@ class KairosPipeline:
         If validated: merge into CausalHierarchy at appropriate tier.
         If contradicted: emit KAIROS_INVARIANT_CONTRADICTED.
         """
-        data = event.data if hasattr(event, "data") else {}
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
         source_instance = data.get("source_instance_id", "unknown")
         abstract_form = data.get("abstract_form", "")
         tier_val = int(data.get("tier", 1))
@@ -672,7 +730,7 @@ class KairosPipeline:
         gas_price_gwei, protocol, roi_pct, success, etc.) that EconomicCausalMiner
         uses for pattern discovery.  Buffer episodes for the next mining cycle.
         """
-        data = event.data if hasattr(event, "data") else {}
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
         self._economic_events_received += 1
 
         # Validate minimum required fields
@@ -699,7 +757,7 @@ class KairosPipeline:
         relationship exists that Kairos has not yet discovered.
         Convert to a pre-seeded CorrelationCandidate with high weight.
         """
-        data = event.data if hasattr(event, "data") else {}
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
 
         # Only handle economic-domain errors (cost, yield, etc.)
         source_system = data.get("source_system", "")
@@ -739,7 +797,7 @@ class KairosPipeline:
         typically precede yield APY changes by minutes to hours.
         Buffer for EconomicCausalMiner time-series correlation mining.
         """
-        data = event.data if hasattr(event, "data") else {}
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
         price_str = data.get("price", "0")
         pair = data.get("pair", [])
 
@@ -754,6 +812,206 @@ class KairosPipeline:
                 "timestamp": data.get("timestamp", ""),
                 "pool_address": data.get("pool_address", ""),
             })
+
+    # --- SG-NEXUS: Ground truth convergence handlers ---
+
+    async def _on_ground_truth_candidate(self, event: SynapseEvent) -> None:
+        """
+        SG-NEXUS: Handle GROUND_TRUTH_CANDIDATE from Nexus.
+
+        When a world model fragment reaches Level 3 epistemic certainty (triangulated),
+        it is a strong prior that the corresponding causal relationship is real.
+        Pre-seed the correlation miner with the abstract structure so the next
+        pipeline run investigates it with full causal machinery.
+        """
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
+        abstract_structure = data.get("abstract_structure", {})
+        epistemic_value = float(data.get("epistemic_value", 0.0))
+
+        cause = abstract_structure.get("cause", "") or data.get("cause", "")
+        effect = abstract_structure.get("effect", "") or data.get("effect", "")
+
+        if not cause or not effect:
+            return
+
+        candidate = CorrelationCandidate(
+            variable_a=f"nexus_ground_truth:{cause}",
+            variable_b=f"nexus_ground_truth:{effect}",
+            mean_correlation=min(epistemic_value, 1.0),
+            cross_context_variance=0.0,
+            context_count=2,
+        )
+        self._correlation_miner.add_preseed(candidate)
+
+        logger.debug(
+            "ground_truth_candidate_seeded",
+            cause=cause,
+            effect=effect,
+            epistemic_value=round(epistemic_value, 3),
+        )
+
+    async def _on_empirical_invariant_confirmed(self, event: SynapseEvent) -> None:
+        """
+        SG-NEXUS: Handle EMPIRICAL_INVARIANT_CONFIRMED from Nexus.
+
+        Level 4 epistemic certainty — this fragment has been confirmed by multiple
+        independent sources. Boost the corresponding Kairos invariant's recency_weight
+        to prevent decay, and re-validate it for potential tier promotion.
+        """
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
+        abstract_form = data.get("abstract_form", "") or data.get("statement", "")
+        fragment_id = data.get("fragment_id", "")
+
+        if not abstract_form:
+            return
+
+        # Find corresponding invariant in hierarchy and reinforce it
+        for invariant in self._hierarchy.get_all():
+            if (
+                invariant.abstract_form == abstract_form
+                or (fragment_id and fragment_id in invariant.id)
+            ):
+                invariant.recency_weight = 1.0  # Reset decay — empirically confirmed
+                invariant.validated = True
+                self._hierarchy.promote_if_eligible(invariant.id)
+                logger.info(
+                    "invariant_reinforced_by_nexus_confirmation",
+                    invariant_id=invariant.id,
+                    abstract_form=abstract_form[:80],
+                )
+                break
+
+    # --- SG-PERCEPT: Raw observation stream ---
+
+    async def _on_percept_arrived(self, event: SynapseEvent) -> None:
+        """
+        SG-PERCEPT: Handle PERCEPT_ARRIVED — convert raw percepts into observation variables.
+
+        Every percept is a potential observation for Stage 1 correlation mining.
+        Extract numeric salience components and buffer them as observations keyed
+        by the percept's domain context so the pipeline can correlate across contexts.
+        """
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
+        percept_id = data.get("percept_id", "")
+        domain = data.get("domain", data.get("source_system", "general"))
+        salience = data.get("salience", {})
+
+        if not percept_id or not isinstance(salience, dict):
+            return
+
+        # Only buffer numeric salience components as observable variables
+        obs: dict[str, float] = {}
+        for key, val in salience.items():
+            if isinstance(val, (int, float)):
+                obs[f"percept:{key}"] = float(val)
+
+        if not obs:
+            return
+
+        # Pre-seed from high-salience percepts as causal surprise signals
+        total_salience = sum(obs.values()) / max(len(obs), 1)
+        if total_salience > 0.5:
+            cause_key = max(obs, key=obs.get)  # type: ignore[arg-type]
+            candidate = CorrelationCandidate(
+                variable_a=f"percept:{domain}:{cause_key}",
+                variable_b=f"percept:response:{percept_id}",
+                mean_correlation=min(total_salience, 1.0),
+                cross_context_variance=0.0,
+                context_count=1,
+            )
+            self._correlation_miner.add_preseed(candidate)
+
+        logger.debug(
+            "percept_observation_buffered",
+            domain=domain,
+            variables=len(obs),
+            total_salience=round(total_salience, 3),
+        )
+
+    # --- SG-DRIVE: Drive weight coupling ---
+
+    async def _on_drive_weights_updated(self, event: SynapseEvent) -> None:
+        """
+        SG-DRIVE: Handle EQUOR_DRIVE_WEIGHTS_UPDATED — drive coupling for Kairos.
+
+        When Equor updates drive weights, Kairos should check whether the change
+        is causally explained by known invariants (closing an autonomy feedback loop).
+        Significant unexplained drive shifts → new causal candidate: what caused
+        the constitutional drift?
+
+        This ensures Kairos mines the organism's own motivational structure,
+        not just the external environment.
+        """
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
+        drive_deltas = data.get("drive_deltas", {}) or data.get("weight_changes", {})
+        amendment_id = data.get("amendment_id", "")
+
+        if not drive_deltas:
+            return
+
+        for drive_name, delta in drive_deltas.items():
+            if not isinstance(delta, (int, float)):
+                continue
+            abs_delta = abs(float(delta))
+            if abs_delta < 0.05:
+                continue  # Below materiality threshold — ignore small drift
+
+            candidate = CorrelationCandidate(
+                variable_a=f"drive_pressure:{drive_name}",
+                variable_b=f"constitutional_drift:{amendment_id or 'unknown'}",
+                mean_correlation=min(abs_delta * 5, 1.0),  # Scale 0.2→1.0
+                cross_context_variance=0.0,
+                context_count=1,
+            )
+            self._correlation_miner.add_preseed(candidate)
+
+            logger.debug(
+                "drive_shift_seeded_as_causal_candidate",
+                drive=drive_name,
+                delta=round(float(delta), 4),
+                amendment_id=amendment_id,
+            )
+
+    async def _on_somatic_drive_vector(self, event: SynapseEvent) -> None:
+        """
+        SG-SOMA: Handle SOMATIC_DRIVE_VECTOR — buffer organism drive state as causal observations.
+
+        Each drive vector is a snapshot of the organism's motivational state.
+        Kairos buffers these and uses them as a cross-context observation set,
+        enabling discovery of causal relationships BETWEEN drives:
+        e.g. "low Coherence causes elevated Care drive response".
+
+        This is a deep autonomy contribution: the organism discovers the causal
+        structure of its own motivational system, enabling deliberate drive management.
+        """
+        data = getattr(event, "data", {}) if not isinstance(event, dict) else event
+        drives = data.get("drives", data.get("drive_weights", {}))
+
+        if not isinstance(drives, dict) or not drives:
+            return
+
+        self._drive_vector_count += 1
+
+        # Build flat numeric observation from drive values
+        obs: dict[str, Any] = {f"drive:{k}": float(v) for k, v in drives.items() if isinstance(v, (int, float))}
+        if not obs:
+            return
+
+        # Buffer with context keyed by timestamp bucket (hourly granularity)
+        timestamp = data.get("timestamp", "")
+        context_key = f"drive_context:{timestamp[:13]}" if timestamp else f"drive_context:{self._drive_vector_count // 100}"
+        obs["_context"] = context_key
+
+        # Cap buffer at 300 drive vector snapshots
+        if len(self._drive_vector_observations) < 300:
+            self._drive_vector_observations.append(obs)
+
+        logger.debug(
+            "somatic_drive_vector_buffered",
+            drives=list(drives.keys()),
+            context=context_key,
+            buffer_size=len(self._drive_vector_observations),
+        )
 
     # --- Pipeline execution ---
 
@@ -783,6 +1041,17 @@ class KairosPipeline:
         temporal_events = temporal_events or []
         axon_logs = axon_logs or []
         known_domains = known_domains or []
+
+        # SG-SOMA: Merge buffered drive vector observations into the observation set.
+        # Drive vectors are organism-introspective observations — mining their causal
+        # structure reveals how the organism's own motivational system works.
+        if self._drive_vector_observations:
+            drive_obs = list(self._drive_vector_observations)
+            self._drive_vector_observations.clear()
+            # Group by context key stored in each observation
+            for obs in drive_obs:
+                ctx = str(obs.pop("_context", f"drive_context:{self._pipeline_runs}"))
+                observations_by_context.setdefault(ctx, []).append(obs)
 
         # Drain any Tier 3 promotions deferred from sync callbacks
         await self._drain_deferred_tier3()
@@ -1001,6 +1270,11 @@ class KairosPipeline:
         # ── Evolutionary Metrics (SG5) ─────────────────────────────
         await self._emit_evolutionary_metrics()
 
+        # ── Self-Causality Tracking (Part B) ───────────────────────
+        # Sample internal organism variables and discover causal laws
+        # within the organism's own dynamics.
+        await self._run_self_causal_tracking()
+
         summary = {
             "pipeline_run": self._pipeline_runs,
             "stage1_candidates": len(candidates),
@@ -1026,6 +1300,215 @@ class KairosPipeline:
 
         logger.info("pipeline_run_complete", **summary)
         return summary
+
+    # --- Self-Causality Tracking ---
+
+    async def _run_self_causal_tracking(self) -> None:
+        """
+        Part B: Sample organism-internal variables and mine causal laws within
+        the organism itself.
+
+        Tracked variables (sampled every pipeline run):
+          prediction_error_rate  — mean causal surprise rate from health status
+          coherence              — intelligence ledger mean I-ratio as a proxy
+          hypothesis_count       — total active invariants in the hierarchy
+          re_success_rate        — Tier 3 / (total discoveries) ratio
+          sleep_frequency        — consolidation events received (raw count proxy)
+          consolidation_depth    — Oneiros consolidation event counter (raw)
+
+        Algorithm:
+          1. Append current values to rolling history (window=100).
+          2. For each ordered pair (A, B) with ≥20 samples, compute Pearson r.
+          3. For pairs with |r| > 0.35 and A temporally precedes B (index offset),
+             accept as an internal causal rule.
+          4. Track hold_rate across pipeline runs (proportion of recent windows
+             where the relationship held).
+          5. Emit KAIROS_INTERNAL_INVARIANT when a new law is discovered or an
+             existing one's hold_rate changes significantly (Δ > 0.1).
+
+        Produces (:InternalCausalInvariant) — conceptually; actual Neo4j nodes
+        are not written here to avoid double-persistence. The Synapse event is
+        the primary output (Thread + Nova subscribe).
+        """
+        import math
+
+        # ── 1. Sample current variable values ──────────────────────
+        def _pearson(xs: list[float], ys: list[float]) -> float:
+            """Fast Pearson r for two same-length lists."""
+            n = len(xs)
+            if n < 5:
+                return 0.0
+            mx = sum(xs) / n
+            my = sum(ys) / n
+            num = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False))
+            dx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+            dy = math.sqrt(sum((y - my) ** 2 for y in ys))
+            if dx < 1e-9 or dy < 1e-9:
+                return 0.0
+            return num / (dx * dy)
+
+        health = self._health_status
+        total_active = self._hierarchy.total_count or 0
+        tier3_count = self._tier3_discoveries or 0
+        total_discoveries = max(1, self._invariants_created)
+
+        current_sample: dict[str, float] = {
+            "prediction_error_rate": health.causal_surprise_rate,
+            "coherence": self._intelligence_ledger.mean_i_ratio()
+            if hasattr(self._intelligence_ledger, "mean_i_ratio") else 0.0,
+            "hypothesis_count": float(total_active),
+            "re_success_rate": tier3_count / total_discoveries,
+            "sleep_frequency": float(self._oneiros_consolidations_received),
+            "consolidation_depth": float(
+                self._oneiros_consolidations_received + self._fovea_events_received
+            ) / max(1, self._pipeline_runs),
+        }
+
+        # Append to rolling history
+        for var, val in current_sample.items():
+            history = self._internal_var_history.setdefault(var, [])
+            history.append(val)
+            if len(history) > self._INTERNAL_VAR_WINDOW:
+                history.pop(0)
+
+        # Need at least 20 samples before mining
+        min_samples = min(len(h) for h in self._internal_var_history.values())
+        if min_samples < 20:
+            return
+
+        # ── 2. Mine pairwise correlations with temporal lag (A→B: A[:-1], B[1:]) ──
+        var_names = list(self._internal_var_history.keys())
+        newly_discovered: list[dict[str, Any]] = []
+
+        for i, cause_var in enumerate(var_names):
+            for j, effect_var in enumerate(var_names):
+                if i == j:
+                    continue
+
+                cause_hist = self._internal_var_history[cause_var]
+                effect_hist = self._internal_var_history[effect_var]
+
+                # Compute at lag=1 (A[:-1] predicts B[1:])
+                n = min(len(cause_hist), len(effect_hist))
+                if n < 20:
+                    continue
+
+                xs = cause_hist[-n:-1]   # cause values (earlier)
+                ys = effect_hist[-(n - 1):]  # effect values (later)
+
+                if len(xs) != len(ys) or len(xs) < 5:
+                    continue
+
+                r = _pearson(xs, ys)
+                if abs(r) < 0.35:
+                    continue
+
+                # Direction: A→B (temporal precedence confirmed by lag structure)
+                # Hold rate: proportion of the history window where correlation holds
+                # We approximate by splitting into 4 sub-windows and checking each
+                sub_size = max(5, len(xs) // 4)
+                holding_windows = 0
+                total_windows = 0
+                for start in range(0, len(xs) - sub_size, sub_size):
+                    sub_x = xs[start:start + sub_size]
+                    sub_y = ys[start:start + sub_size]
+                    sub_r = _pearson(sub_x, sub_y)
+                    if abs(sub_r) >= 0.25:  # Softer threshold per sub-window
+                        holding_windows += 1
+                    total_windows += 1
+
+                hold_rate = holding_windows / max(1, total_windows)
+                if hold_rate < 0.5:
+                    continue  # Doesn't hold consistently enough
+
+                direction = "positive" if r > 0 else "negative"
+                abstract_form = (
+                    f"{cause_var} {'increases' if direction == 'positive' else 'decreases'} "
+                    f"{effect_var} [lag: 1 pipeline run]"
+                )
+
+                key = (cause_var, effect_var)
+                existing = self._internal_invariants.get(key)
+
+                if existing is None:
+                    # New internal invariant discovered
+                    from primitives.common import new_id
+                    inv_id = new_id()
+                    entry: dict[str, Any] = {
+                        "invariant_id": inv_id,
+                        "cause_variable": cause_var,
+                        "effect_variable": effect_var,
+                        "direction": direction,
+                        "hold_rate": hold_rate,
+                        "correlation": round(r, 4),
+                        "lag_cycles": 1,
+                        "abstract_form": abstract_form,
+                        "discovery_run": self._pipeline_runs,
+                        "last_updated_run": self._pipeline_runs,
+                        "sample_count": len(xs),
+                    }
+                    self._internal_invariants[key] = entry
+                    newly_discovered.append(entry)
+                    self._internal_invariants_discovered += 1
+
+                    logger.info(
+                        "internal_causal_invariant_discovered",
+                        cause=cause_var,
+                        effect=effect_var,
+                        direction=direction,
+                        hold_rate=round(hold_rate, 3),
+                        correlation=round(r, 4),
+                    )
+
+                else:
+                    # Update existing — emit if hold_rate changed significantly
+                    old_hold = existing["hold_rate"]
+                    existing["hold_rate"] = hold_rate
+                    existing["correlation"] = round(r, 4)
+                    existing["last_updated_run"] = self._pipeline_runs
+                    existing["sample_count"] = len(xs)
+
+                    if abs(hold_rate - old_hold) >= 0.1:
+                        newly_discovered.append(existing)
+
+        # ── 3. Emit KAIROS_INTERNAL_INVARIANT for each new/updated law ──
+        for entry in newly_discovered:
+            await self._emit_internal_invariant(entry)
+
+    async def _emit_internal_invariant(self, entry: dict[str, Any]) -> None:
+        """Emit KAIROS_INTERNAL_INVARIANT for a discovered self-causal law."""
+        if self._event_bus is None:
+            return
+
+        from systems.synapse.types import SynapseEvent, SynapseEventType
+
+        if not hasattr(SynapseEventType, "KAIROS_INTERNAL_INVARIANT"):
+            return
+
+        await self._event_bus.emit(
+            SynapseEvent(
+                event_type=SynapseEventType.KAIROS_INTERNAL_INVARIANT,  # type: ignore[attr-defined]
+                source_system="kairos",
+                data={
+                    "invariant_id": entry["invariant_id"],
+                    "cause_variable": entry["cause_variable"],
+                    "effect_variable": entry["effect_variable"],
+                    "direction": entry["direction"],
+                    "lag_cycles": entry.get("lag_cycles", 1),
+                    "hold_rate": round(entry["hold_rate"], 4),
+                    "correlation": entry.get("correlation", 0.0),
+                    "abstract_form": entry["abstract_form"],
+                    "discovery_run": entry.get("discovery_run", self._pipeline_runs),
+                    "sample_count": entry.get("sample_count", 0),
+                },
+            )
+        )
+
+        logger.debug(
+            "kairos_internal_invariant_emitted",
+            abstract_form=entry["abstract_form"][:60],
+            hold_rate=round(entry["hold_rate"], 3),
+        )
 
     async def _run_economic_causal_mining(self) -> None:
         """
@@ -2117,7 +2600,7 @@ class KairosPipeline:
             logger.warning("memory_not_wired", method="query_observations_for_testing")
             return {}
 
-        invariant = self._hierarchy._find(invariant_id)
+        invariant = self._hierarchy.find_invariant(invariant_id)
         if invariant is None:
             return {}
 
@@ -2222,6 +2705,8 @@ class KairosPipeline:
             "discovered_patterns": len(self._discovered_patterns),
             "hierarchy": self._hierarchy.summary(),
             "intelligence_ledger": self._intelligence_ledger.summary(),
+            "economic_events_received": self._economic_events_received,
+            "drive_vector_snapshots": self._drive_vector_count,
             "correlation_miner": {
                 "pairs_evaluated": self._correlation_miner.total_pairs_evaluated,
                 "candidates_found": self._correlation_miner.total_candidates_found,
@@ -2243,6 +2728,12 @@ class KairosPipeline:
                 "scans_run": self._counter_detector.total_scans_run,
                 "violations_found": self._counter_detector.total_violations_found,
                 "refinements_made": self._counter_detector.total_refinements_made,
+            },
+            "self_causality": {
+                "variables_tracked": len(self._internal_var_history),
+                "invariants_discovered": self._internal_invariants_discovered,
+                "active_invariants": len(self._internal_invariants),
+                "sample_window": self._INTERNAL_VAR_WINDOW,
             },
         }
 

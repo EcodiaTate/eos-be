@@ -490,3 +490,207 @@ EXCHANGE_TRUST_GATES: dict[ExchangePayloadKind, TrustLevel] = {
     ExchangePayloadKind.MUTATION_PATTERN: TrustLevel.ALLY,
     ExchangePayloadKind.ECONOMIC_INTEL: TrustLevel.PARTNER,
 }
+
+
+# ─── Active Work Pooling (Spec 11b — Phase 2: Task Delegation) ───────
+
+
+class TaskType(enum.StrEnum):
+    """Types of work that can be delegated to federation peers."""
+
+    SOLVE_BOUNTY = "solve_bounty"    # Execute a GitHub/protocol bounty sub-task
+    ANALYSE = "analyse"              # Deep analysis (code review, audit, research summary)
+    SCRAPE = "scrape"                # Web/on-chain data collection
+    RESEARCH = "research"            # Literature / protocol research
+    VERIFY = "verify"                # Formal verification or test execution
+    GENERATE = "generate"            # Code / text / data generation
+
+
+class TaskStatus(enum.StrEnum):
+    """Lifecycle status of a delegated task."""
+
+    OFFERED = "offered"              # Sent to peer, awaiting acceptance
+    ACCEPTED = "accepted"            # Peer accepted, work in progress
+    COMPLETED = "completed"          # Result returned successfully
+    FAILED = "failed"                # Peer reported failure
+    EXPIRED = "expired"              # Deadline passed without completion
+    DECLINED = "declined"            # Peer declined the task
+
+
+class TaskDelegation(Identified):
+    """
+    A unit of work offered from one federated instance to another.
+
+    The delegating instance pays the accepting instance ``offered_reward_usdc``
+    on successful completion via WalletClient.  Trust gate is enforced by
+    TaskDelegationManager — minimum COLLEAGUE (score ≥ 20) required;
+    default is 0.7 normalised score threshold.
+    """
+
+    task_type: TaskType
+    payload: dict[str, Any] = Field(default_factory=dict)
+    offered_reward_usdc: Decimal = Decimal("0")
+    deadline_hours: int = 24
+    required_trust_level: float = 0.7   # Normalised 0-1 (0.7 ≈ PARTNER boundary)
+    delegating_instance_id: str
+    accepting_instance_id: str = ""     # Filled when accepted
+    status: TaskStatus = TaskStatus.OFFERED
+    created_at: datetime = Field(default_factory=utc_now)
+    accepted_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class DelegationResult(EOSBaseModel):
+    """Result returned by a peer that executed a delegated task."""
+
+    task_id: str
+    accepted: bool
+    result: dict[str, Any] | None = None
+    reward_claimed: bool = False
+    error: str = ""
+    completing_instance_id: str = ""
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
+# ─── Resource Sharing ────────────────────────────────────────────────
+
+
+class CapacityOffer(Identified):
+    """
+    Advertisement of spare compute capacity available to federation peers.
+
+    Instances under low cognitive load publish a CapacityOffer so peers
+    experiencing high load (CPU > 85%) can offload heavy analysis tasks.
+    The cost is a small flat fee in USDC per task.
+    """
+
+    instance_id: str
+    available_cycles_per_hour: int = 0
+    cost_usdc_per_task: Decimal = Decimal("0.1")
+    specialisations: list[str] = Field(default_factory=list)  # e.g. ["Solidity", "Rust", "DeFi"]
+    expires_at: datetime = Field(default_factory=utc_now)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class OffloadRequest(Identified):
+    """
+    Request to offload a heavy computation task to a peer with spare capacity.
+    """
+
+    requesting_instance_id: str
+    task_type: TaskType
+    payload: dict[str, Any] = Field(default_factory=dict)
+    offered_fee_usdc: Decimal = Decimal("0.1")
+    deadline_hours: int = 2
+    target_instance_id: str = ""  # Specific peer, or empty for marketplace routing
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
+# ─── Capital Yield Pooling ────────────────────────────────────────────
+
+
+class PoolParticipant(EOSBaseModel):
+    """One instance's contribution to a federated yield pool."""
+
+    instance_id: str
+    contribution_usdc: Decimal
+    share_fraction: float = 0.0    # Computed after all contributions locked
+    locked_at: datetime = Field(default_factory=utc_now)
+    wallet_address: str = ""
+
+
+class YieldPoolStatus(enum.StrEnum):
+    """Lifecycle of a federated yield pool."""
+
+    PROPOSED = "proposed"       # Open for participants to join
+    FUNDED = "funded"           # Capital locked, ready to deploy
+    ACTIVE = "active"           # Position deployed on-chain
+    SETTLED = "settled"         # Yield distributed, pool dissolved
+    CANCELLED = "cancelled"     # Did not reach minimum capital
+
+
+class YieldPoolProposal(Identified):
+    """
+    Proposal to pool capital across federated instances for a high-APY position.
+
+    Trust requirement is 0.9 (normalised) — capital pooling requires
+    deep trust.  Each participant's contribution is locked via smart
+    contract escrow.  Yield is distributed proportionally to contribution
+    share when the position is unwound.
+    """
+
+    proposer_instance_id: str
+    target_protocol: str           # e.g. "aave", "morpho", "uniswap_v3"
+    target_pool_address: str = ""
+    target_apy: float = 0.0
+    min_capital_usdc: Decimal = Decimal("1000")
+    max_participants: int = 5
+    lock_duration_hours: int = 168  # 1 week default
+    required_trust_level: float = 0.9
+    participants: list[PoolParticipant] = Field(default_factory=list)
+    status: YieldPoolStatus = YieldPoolStatus.PROPOSED
+    escrow_contract_address: str = ""
+    deploy_tx_hash: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    funded_at: datetime | None = None
+    settled_at: datetime | None = None
+
+
+# ─── Marketplace ─────────────────────────────────────────────────────
+
+
+class MarketplaceListingStatus(enum.StrEnum):
+    """Status of a marketplace task listing."""
+
+    OPEN = "open"
+    BIDDING = "bidding"
+    AWARDED = "awarded"
+    COMPLETED = "completed"
+    EXPIRED = "expired"
+
+
+class MarketplaceListing(Identified):
+    """
+    A task posted to the federation marketplace for competitive bidding.
+
+    Any instance with sufficient trust can bid.  The posting instance
+    awards the task after evaluating bids (trust score × specialisation
+    match × offered price).
+    """
+
+    poster_instance_id: str
+    task_type: TaskType
+    description: str
+    reward_usdc: Decimal
+    required_specialisations: list[str] = Field(default_factory=list)
+    min_trust_score: float = 20.0  # COLLEAGUE floor
+    deadline_hours: int = 24
+    status: MarketplaceListingStatus = MarketplaceListingStatus.OPEN
+    awarded_to_instance_id: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    expires_at: datetime = Field(default_factory=utc_now)
+
+
+class MarketplaceBid(Identified):
+    """A bid from one instance on an open marketplace listing."""
+
+    listing_id: str
+    bidding_instance_id: str
+    offered_price_usdc: Decimal  # May be lower than reward to win on price
+    specialisations: list[str] = Field(default_factory=list)
+    trust_score: float = 0.0
+    estimated_hours: float = 1.0
+    message: str = ""
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
+class MarketplaceRating(EOSBaseModel):
+    """Post-completion quality rating for a marketplace task."""
+
+    listing_id: str
+    task_id: str
+    rater_instance_id: str
+    rated_instance_id: str
+    score: float  # 0-1
+    comment: str = ""
+    timestamp: datetime = Field(default_factory=utc_now)

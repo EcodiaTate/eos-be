@@ -69,13 +69,73 @@ _APY_DROP_REBALANCE_THRESHOLD = Decimal("0.50")
 _HEALTH_CHECK_INTERVAL_S = 3600
 
 # DeFiLlama pool filter config.
-_SAFE_PROTOCOLS = frozenset({"aave-v3", "compound-v3", "morpho", "spark"})
+# Phase 16d additions: Aerodrome (AMM), Moonwell (lending), Extra Finance (leveraged),
+# Beefy (auto-compounding vault aggregator)
+_SAFE_PROTOCOLS = frozenset({
+    "aave-v3", "compound-v3", "morpho", "spark",
+    "aerodrome",        # Base: concentrated liquidity AMM, earns AERO rewards
+    "moonwell",         # Base: lending/borrowing, earns WELL rewards
+    "extra-finance",    # Base: leveraged yield farming (conservative mode)
+    "beefy",            # Multi-chain: auto-compounding vaults
+})
 _SAFE_CHAINS = frozenset({"Base"})          # Base only — where EOS funds live
 _SAFE_SYMBOLS = frozenset({"USDC", "USDT"})
 _MIN_TVL_USD = 10_000_000
 _MAX_APY_SANITY = Decimal("0.50")           # 50% APY cap — anything above is sus
 
+# Reinvestment threshold — accrued yield must exceed this before redeployment.
+# Below this the gas cost eats the compound benefit.
+_REINVESTMENT_THRESHOLD_USD = Decimal("5.00")
+
+# Map DeFiLlama project names to DeFiYieldExecutor protocol keys
+_PROTOCOL_EXECUTOR_MAP: dict[str, str] = {
+    "aave-v3": "aave",
+    "morpho": "morpho",
+    "aerodrome": "aerodrome",
+    "moonwell": "moonwell",
+    "extra-finance": "extra_finance",
+    "beefy": "beefy",
+    "compound-v3": "aave",   # Compound maps to aave-compatible path (ERC-4626)
+    "spark": "morpho",       # Spark maps to morpho-compatible path
+}
+
 _EVENT_SOURCE = "oikos.yield_strategy"
+
+# ─── YIELD_DEPLOYMENT_RESULT router ──────────────────────────────────────────
+#
+# Previously, each deploy_idle_capital() call subscribed a new one-shot closure
+# to YIELD_DEPLOYMENT_RESULT via EventBus.subscribe(). Because EventBus has no
+# unsubscribe() method, every call left a dead reference in the subscriber list.
+# Over many deployment cycles this accumulated unboundedly.
+#
+# Fix: use a module-level dict of pending Futures keyed by request_id plus a
+# single persistent router subscriber that is registered only once (on the first
+# call) and routes incoming results to the correct Future. Dead Futures are
+# cleaned up automatically once they resolve.
+
+_pending_yield_futures: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
+_yield_result_subscriber_registered: bool = False
+
+
+async def _yield_result_router(event: Any) -> None:
+    """Single persistent router for YIELD_DEPLOYMENT_RESULT events."""
+    request_id = event.data.get("request_id", "")
+    fut = _pending_yield_futures.get(request_id)
+    if fut is not None and not fut.done():
+        fut.set_result(event.data)
+        # Clean up the resolved future immediately
+        _pending_yield_futures.pop(request_id, None)
+
+
+def _ensure_yield_result_subscriber(event_bus: Any) -> None:
+    """Register the persistent router subscriber exactly once per bus."""
+    global _yield_result_subscriber_registered  # noqa: PLW0603
+    if _yield_result_subscriber_registered:
+        return
+    from systems.synapse.types import SynapseEventType
+
+    event_bus.subscribe(SynapseEventType.YIELD_DEPLOYMENT_RESULT, _yield_result_router)
+    _yield_result_subscriber_registered = True
 
 
 # ─── Outcome types ────────────────────────────────────────────────────────────
@@ -154,7 +214,7 @@ async def _fetch_best_base_pool() -> tuple[str, Decimal] | None:
         return None
 
     # Map DeFiLlama project name to DeFiYieldExecutor protocol key
-    executor_protocol = "morpho" if "morpho" in best_protocol else "aave"
+    executor_protocol = _PROTOCOL_EXECUTOR_MAP.get(best_protocol, "aave")
     return executor_protocol, best_apy
 
 
@@ -271,14 +331,14 @@ async def deploy_idle_capital(
     from systems.synapse.types import SynapseEvent, SynapseEventType
 
     request_id = str(uuid.uuid4())
-    result_future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+    result_future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
 
-    async def _on_yield_result(evt: SynapseEvent) -> None:
-        if evt.data.get("request_id") == request_id and not result_future.done():
-            result_future.set_result(evt.data)
-
-    # Subscribe once; the done-check in _on_yield_result makes it inert after use.
-    event_bus.subscribe(SynapseEventType.YIELD_DEPLOYMENT_RESULT, _on_yield_result)
+    # Register the shared router subscriber exactly once and route this
+    # request via the module-level _pending_yield_futures dict.
+    # Fixes the per-call subscriber leak: previously every deploy call added a
+    # new closure to the EventBus subscriber list with no cleanup path.
+    _ensure_yield_result_subscriber(event_bus)
+    _pending_yield_futures[request_id] = result_future
 
     await event_bus.emit(SynapseEvent(
         event_type=SynapseEventType.YIELD_DEPLOYMENT_REQUEST,
@@ -296,6 +356,8 @@ async def deploy_idle_capital(
     try:
         result_data = await asyncio.wait_for(result_future, timeout=30.0)
     except asyncio.TimeoutError:
+        # Clean up the timed-out future so the router doesn't see a stale entry.
+        _pending_yield_futures.pop(request_id, None)
         log.error("yield_deployment_timeout", request_id=request_id)
         return DeploymentOutcome(
             success=False, error="Axon deployment timeout", degraded=True
@@ -555,6 +617,114 @@ class YieldPositionTracker:
                 self._log.warning("accrue_update_failed", error=str(exc))
 
         return accrued
+
+
+# ─── Yield Reinvestment Engine ────────────────────────────────────────────────
+
+
+class YieldReinvestmentEngine:
+    """
+    Compound growth loop: when accrued yield exceeds the reinvestment threshold,
+    redeploy it back into the best available pool.
+
+    Threshold: $5.00 — below this gas cost erodes the compounding benefit.
+
+    Called from:
+      - YieldPositionTracker.record_accrued_yield() after each daily accrual
+      - OikosService.run_consolidation_cycle() as a safety net
+
+    Never raises — all failures return False with a log entry.
+    """
+
+    def __init__(
+        self,
+        tracker: "YieldPositionTracker",
+        wallet: "WalletClient | None" = None,
+        event_bus: "EventBus | None" = None,
+    ) -> None:
+        self._tracker = tracker
+        self._wallet = wallet
+        self._event_bus = event_bus
+        self._log = logger.bind(component="yield_reinvestment_engine")
+
+    def set_wallet(self, wallet: "WalletClient") -> None:
+        self._wallet = wallet
+
+    def set_event_bus(self, event_bus: "EventBus") -> None:
+        self._event_bus = event_bus
+
+    async def check_and_reinvest(self) -> bool:
+        """
+        Check whether enough yield has accrued to reinvest.
+
+        Returns True if reinvestment was triggered, False otherwise.
+        """
+        position = await self._tracker.load_position()
+        if position is None:
+            return False
+
+        # Read how much yield has accrued since last reinvestment
+        try:
+            last_accrual = Decimal(str(position.get("last_accrual_usd", "0")))
+        except InvalidOperation:
+            return False
+
+        if last_accrual < _REINVESTMENT_THRESHOLD_USD:
+            self._log.debug(
+                "reinvestment_below_threshold",
+                accrued_usd=str(last_accrual),
+                threshold=str(_REINVESTMENT_THRESHOLD_USD),
+            )
+            return False
+
+        self._log.info(
+            "reinvestment_threshold_met",
+            accrued_usd=str(last_accrual),
+            threshold=str(_REINVESTMENT_THRESHOLD_USD),
+        )
+
+        # Deploy accrued yield back into the best available pool
+        outcome = await deploy_idle_capital(
+            wallet=self._wallet,
+            event_bus=self._event_bus,
+        )
+
+        if not outcome.success:
+            self._log.warning("reinvestment_deploy_failed", error=outcome.error)
+            return False
+
+        # Emit YIELD_REINVESTED
+        from datetime import UTC, datetime as _dt  # noqa: PLC0415
+
+        await _emit(
+            self._event_bus,
+            event_type="yield_reinvested",
+            data={
+                "amount_usd": str(last_accrual),
+                "protocol": outcome.protocol,
+                "apy": str(outcome.apy),
+                "pool_id": outcome.protocol,
+                "accrued_since": position.get("last_accrual_at", ""),
+                "timestamp": _dt.now(UTC).isoformat(),
+            },
+        )
+
+        # Reset accrual counter in the position record
+        if self._tracker._redis is not None:  # noqa: SLF001
+            try:
+                position["last_accrual_usd"] = "0"
+                position["last_reinvested_at"] = _dt.now(UTC).isoformat()
+                await self._tracker._redis.set_json(_YIELD_POSITIONS_KEY, position)  # noqa: SLF001
+            except Exception as exc:
+                self._log.warning("reinvestment_position_update_failed", error=str(exc))
+
+        self._log.info(
+            "yield_reinvested",
+            amount_usd=str(last_accrual),
+            protocol=outcome.protocol,
+            apy=str(outcome.apy),
+        )
+        return True
 
 
 # ─── Event emission helper ────────────────────────────────────────────────────

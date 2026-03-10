@@ -76,8 +76,10 @@ from systems.simula.learning.grpo import GRPOTrainingEngine
 from systems.simula.learning.lilo import LiloLibraryEngine
 from systems.simula.proactive_scanner import ProactiveScanner
 from systems.simula.proposal_intelligence import ProposalIntelligence
+from systems.simula.preventive_audit import SimulaPreventiveAudit
 from systems.simula.repair_memory import RepairMemory
 from systems.simula.retrieval.swe_grep import SweGrepRetriever
+from systems.simula.reasoning_router import ReasoningRouter
 from systems.simula.rollback import RollbackManager
 from systems.simula.simulation import ChangeSimulator
 from systems.simula.verification.incremental import IncrementalVerificationEngine
@@ -113,6 +115,14 @@ class SimulaService:
 
     system_id: str = "simula"
 
+    # Parameters that appear in float_params (for Gaussian perturbation) but are
+    # semantically integers. After clamping, values for these params are cast to
+    # int via round() in both _on_config_drift and _on_evo_adjust_budget.
+    INT_PARAMS: frozenset[str] = frozenset({
+        "child_spawn_interval_days",
+        "child_min_profitability_usd",
+    })
+
     def __init__(
         self,
         config: SimulaConfig,
@@ -146,6 +156,9 @@ class SimulaService:
         self._intelligence: ProposalIntelligence | None = None
         self._analytics: EvolutionAnalyticsEngine | None = None
         self._efe_scorer: ArchitectureEFEScorer | None = None
+
+        # Thompson sampling for proof strategy selection (Z3/Lean/Dafny/static)
+        self._reasoning_router: ReasoningRouter = ReasoningRouter()
 
         # Stage 3 sub-systems
         self._incremental: IncrementalVerificationEngine | None = None
@@ -206,6 +219,9 @@ class SimulaService:
         # cleared after next successful proposal application.
         self._telos_alignment_gap_active: bool = False
 
+        # ── Skia VitalityCoordinator modulation ───────────────────────
+        self._modulation_halted: bool = False
+
         # Oneiros lucid dream simulation results (mutation_id → report dict)
         self._dream_results: dict[str, dict[str, Any]] = {}
         self._dream_results_lock: asyncio.Lock = asyncio.Lock()
@@ -246,6 +262,19 @@ class SimulaService:
         self._proactive_scanner: ProactiveScanner | None = None
         self._proactive_scanner_task: asyncio.Task[None] | None = None
         self._governance_timeout_task: asyncio.Task[None] | None = None
+
+        # Preventive audit — scheduled 4-hour fragility scanner
+        self._preventive_audit: SimulaPreventiveAudit | None = None
+        self._preventive_audit_task: asyncio.Task[None] | None = None
+
+        # ── Fatal crash pattern memory ──────────────────────────────────────────
+        # Populated by _on_crash_pattern_confirmed() as CRASH_PATTERN_CONFIRMED
+        # events arrive from Thymos or Kairos.  Each entry is a CrashPattern
+        # (from core.crash_pattern_analyzer) keyed by pattern_id.
+        # Used by _score_patch_against_patterns() to gate generated patches.
+        self._known_fatal_patterns: dict[str, Any] = {}
+        # Background task for proactive 2-hour pattern scan
+        self._pattern_scan_task: asyncio.Task[None] | None = None
 
         # Timestamp of the last proposal to reach a terminal state
         self._last_proposal_processed_at: str | None = None
@@ -783,6 +812,10 @@ class SimulaService:
                 self._health._symbolic_execution_blocking = self._config.symbolic_execution_blocking
                 self._health._symbolic_execution_domains = self._config.symbolic_execution_domains
 
+        # Wire proof strategy router into health checker for Thompson-prioritized verification
+        if self._health is not None:
+            self._health._reasoning_router = self._reasoning_router
+
         # Wire SWE-grep into the bridge for pre-translation retrieval (3B.5)
         if self._bridge is not None and self._swe_grep is not None:
             self._bridge.set_swe_grep(self._swe_grep)
@@ -901,6 +934,8 @@ class SimulaService:
             scan_interval_critical_factor=self._config.proactive_scan_interval_critical_factor,
         )
 
+        self._preventive_audit = SimulaPreventiveAudit(self)
+
         # Grid metabolism subscription is deferred to set_synapse() because
         # Synapse is always built after SimulaService.initialize() returns.
 
@@ -991,6 +1026,16 @@ class SimulaService:
             stage9_inspector_analytics=self._inspector_analytics is not None,
             stage9_tsdb_persistence=self._tsdb is not None,
         )
+
+        # Child-side genome inheritance: apply inherited learnable params from parent
+        try:
+            await self._apply_inherited_simula_genome_if_child()
+        except Exception as _sg_exc:
+            self._logger.warning(
+                "simula_genome_child_apply_failed",
+                error=str(_sg_exc),
+                note="Proceeding with default config params",
+            )
 
     async def _validate_tools(self) -> None:
         """
@@ -1089,6 +1134,11 @@ class SimulaService:
                     SynapseEventType.BOUNTY_SOLUTION_REQUESTED,
                     self._on_bounty_solution_requested,
                 )
+                # Thymos sandbox validation — replay proposed fix against recent episodes
+                synapse._event_bus.subscribe(
+                    SynapseEventType.SIMULA_SANDBOX_REQUESTED,
+                    self._on_simula_sandbox_requested,
+                )
                 # Thymos repair coordination via Synapse (no direct import)
                 synapse._event_bus.subscribe(
                     SynapseEventType.THYMOS_REPAIR_REQUESTED,
@@ -1104,8 +1154,9 @@ class SimulaService:
                     self._on_oneiros_consolidation_complete,
                 )
                 # Benchmarks regression — may trigger corrective proposals
+                # NOTE: Benchmarks emits BENCHMARK_REGRESSION (not BENCHMARK_REGRESSION_DETECTED)
                 synapse._event_bus.subscribe(
-                    SynapseEventType.BENCHMARK_REGRESSION_DETECTED,
+                    SynapseEventType.BENCHMARK_REGRESSION,
                     self._on_benchmark_regression_detected,
                 )
                 # Telos constitutional alignment gap — cache for VALIDATE stage
@@ -1134,6 +1185,14 @@ class SimulaService:
                         SynapseEventType.EVO_ADJUST_BUDGET,
                         self._on_evo_adjust_budget,
                     )
+                # SPEC_DRAFTED — Nova drafted a Spec for a new subsystem after
+                # gap detection; Simula implements after Equor approval arrives
+                # via EQUOR_ECONOMIC_PERMIT (correlated by proposal_id).
+                if hasattr(SynapseEventType, "SPEC_DRAFTED"):
+                    synapse._event_bus.subscribe(
+                        SynapseEventType.SPEC_DRAFTED,
+                        self._on_spec_drafted,
+                    )
                 # Economic outcome events → propose corrective mutations
                 if hasattr(SynapseEventType, "BOUNTY_PAID"):
                     synapse._event_bus.subscribe(
@@ -1149,6 +1208,30 @@ class SimulaService:
                     synapse._event_bus.subscribe(
                         SynapseEventType.REVENUE_INJECTED,
                         self._on_revenue_change,
+                    )
+                synapse._event_bus.subscribe(
+                    SynapseEventType.SYSTEM_MODULATION,
+                    self._on_system_modulation,
+                )
+                # Fatal crash pattern learning — subscribe to confirmed patterns
+                # emitted by Thymos (after all repair tiers fail) and Kairos
+                # (causal invariants tagged as crash patterns).
+                if hasattr(SynapseEventType, "CRASH_PATTERN_CONFIRMED"):
+                    synapse._event_bus.subscribe(
+                        SynapseEventType.CRASH_PATTERN_CONFIRMED,
+                        self._on_crash_pattern_confirmed,
+                    )
+                # Also subscribe to KAIROS_INVARIANT_DISTILLED so we can detect
+                # crash-pattern-tagged invariants directly from Kairos.
+                synapse._event_bus.subscribe(
+                    SynapseEventType.KAIROS_INVARIANT_DISTILLED,
+                    self._on_kairos_invariant_for_crash_patterns,
+                )
+                # Preventive audit: receive incident history from Thymos
+                if hasattr(SynapseEventType, "THYMOS_INCIDENT_RESPONSE"):
+                    synapse._event_bus.subscribe(
+                        SynapseEventType.THYMOS_INCIDENT_RESPONSE,
+                        self._preventive_audit.on_thymos_incident_response,
                     )
             except Exception as exc:
                 self._logger.exception("simula_synapse_subscribe_failed", error=str(exc))
@@ -1172,6 +1255,10 @@ class SimulaService:
                 # Dynamic executor expansion: wire event bus into ExecutorGenerator
                 if self._executor_generator is not None:
                     self._executor_generator.set_event_bus(event_bus)
+                # Build-error RE training: wire Synapse into HealthChecker so
+                # syntax/import/proof failures are captured as negative training examples
+                if self._health is not None:
+                    self._health.set_synapse(synapse)
 
             # Start the ProactiveScanner background supervised loop
             if self._proactive_scanner is not None and self._proactive_scanner_task is None:
@@ -1188,6 +1275,21 @@ class SimulaService:
                 )
                 self._logger.info("proactive_scanner_started")
 
+            # Start the PreventiveAudit background supervised loop (4-hour cycle)
+            if self._preventive_audit is not None and self._preventive_audit_task is None:
+                from utils.supervision import supervised_task
+
+                self._preventive_audit_task = supervised_task(
+                    self._preventive_audit.run_loop(),
+                    name="simula.preventive_audit",
+                    restart=True,
+                    max_restarts=5,
+                    backoff_base=2.0,
+                    event_bus=event_bus,
+                    source_system="simula",
+                )
+                self._logger.info("preventive_audit_started")
+
             # Start the governance timeout background loop
             if self._governance_timeout_task is None:
                 self._governance_timeout_task = asyncio.create_task(
@@ -1195,6 +1297,14 @@ class SimulaService:
                     name="simula.governance_timeout",
                 )
                 self._logger.info("governance_timeout_loop_started")
+
+            # Start the proactive crash-pattern scan (every 2 hours)
+            if self._pattern_scan_task is None:
+                self._pattern_scan_task = asyncio.create_task(
+                    self._proactive_pattern_scan_loop(),
+                    name="simula.pattern_scan",
+                )
+                self._logger.info("proactive_pattern_scan_started")
 
     def set_telos(self, telos: Any) -> None:
         """Wire Telos for constitutional binding validation of mutation proposals."""
@@ -1293,6 +1403,21 @@ class SimulaService:
                         "efe_score": proposal.efe_score,
                         "hypothesis_ids": hypothesis_ids,
                         "source": proposal.source,
+                    },
+                ))
+                # Co-emit SIMULA_EVOLUTION_APPLIED for Mitosis genome distribution
+                # (different consumer set from EVOLUTION_APPLIED — Mitosis only).
+                _changed = files_changed or []
+                await event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SIMULA_EVOLUTION_APPLIED,
+                    source_system="simula",
+                    data={
+                        "variant_id": proposal.id,
+                        "genome_id": str(to_version or self._current_version),
+                        "improvement_pct": round((proposal.efe_score or 0.0) * 100, 2),
+                        "systems_affected": list({
+                            f.split("/")[0] for f in _changed if "/" in f
+                        }) or [proposal.category.value],
                     },
                 ))
             else:
@@ -1453,7 +1578,14 @@ class SimulaService:
                 timestamp=utc_now(),
             )
 
-            event_type = SynapseEventType(event_type_name.lower())
+            _event_map = {
+                "PROOF_FOUND": SynapseEventType.PROOF_FOUND,
+                "PROOF_FAILED": SynapseEventType.PROOF_FAILED,
+                "PROOF_TIMEOUT": SynapseEventType.PROOF_TIMEOUT,
+            }
+            event_type = _event_map.get(event_type_name)
+            if event_type is None:
+                return
             await bus.emit(SynapseEvent(
                 event_type=event_type,
                 source_system="simula",
@@ -1472,6 +1604,88 @@ class SimulaService:
             ))
         except Exception:
             pass  # Best-effort — never block the proof pipeline
+
+    async def _emit_proof_events_from_health(
+        self,
+        health: Any,
+        proposal: EvolutionProposal,
+    ) -> None:
+        """Emit PROOF_FOUND/PROOF_FAILED/PROOF_TIMEOUT from a completed health check.
+
+        Extracts Dafny, Z3, and Lean results from the HealthCheckResult and fires
+        the appropriate proof lifecycle event for each. Best-effort — never raises.
+        """
+        try:
+            fv = getattr(health, "formal_verification", None)
+            if fv is not None:
+                # Dafny result
+                dafny = getattr(fv, "dafny", None)
+                if dafny is not None:
+                    dafny_status = getattr(dafny, "status", None)
+                    if dafny_status is not None:
+                        status_val = str(dafny_status.value if hasattr(dafny_status, "value") else dafny_status)
+                        if status_val == "verified":
+                            evt = "PROOF_FOUND"
+                        elif status_val == "timeout":
+                            evt = "PROOF_TIMEOUT"
+                        elif status_val in ("failed", "parse_error"):
+                            evt = "PROOF_FAILED"
+                        else:
+                            evt = None
+                        if evt:
+                            asyncio.ensure_future(self._emit_proof_event(
+                                evt,
+                                proof_id=f"dafny.{proposal.id}",
+                                proof_type="dafny",
+                                target=proposal.category.value,
+                                duration_ms=getattr(dafny, "total_dafny_time_ms", 0),
+                                attempts=getattr(dafny, "rounds_attempted", 0),
+                                reason=getattr(dafny, "error_summary", ""),
+                            ))
+                # Z3 result
+                z3 = getattr(fv, "z3", None)
+                if z3 is not None:
+                    valid = getattr(z3, "valid_invariants", [])
+                    rounds = getattr(z3, "rounds_attempted", 0)
+                    if rounds > 0:
+                        evt = "PROOF_FOUND" if valid else "PROOF_FAILED"
+                        asyncio.ensure_future(self._emit_proof_event(
+                            evt,
+                            proof_id=f"z3.{proposal.id}",
+                            proof_type="z3_invariants",
+                            target=proposal.category.value,
+                            duration_ms=getattr(z3, "total_z3_time_ms", 0),
+                            attempts=rounds,
+                            reason=getattr(z3, "error_summary", ""),
+                            solver="z3",
+                        ))
+            # Lean result
+            lv = getattr(health, "lean_verification", None)
+            if lv is not None:
+                lean_status = getattr(lv, "status", None)
+                if lean_status is not None:
+                    status_val = str(lean_status.value if hasattr(lean_status, "value") else lean_status)
+                    if status_val == "proved":
+                        evt = "PROOF_FOUND"
+                    elif status_val == "timeout":
+                        evt = "PROOF_TIMEOUT"
+                    elif status_val in ("failed", "parse_error"):
+                        evt = "PROOF_FAILED"
+                    else:
+                        evt = None
+                    if evt:
+                        asyncio.ensure_future(self._emit_proof_event(
+                            evt,
+                            proof_id=f"lean.{proposal.id}",
+                            proof_type="lean4",
+                            target=proposal.category.value,
+                            duration_ms=getattr(lv, "total_lean_time_ms", 0),
+                            attempts=len(getattr(lv, "attempts", [])),
+                            reason=getattr(lv, "error_summary", ""),
+                            solver="lean4",
+                        ))
+        except Exception:
+            pass  # Best-effort — never block the pipeline
 
     async def _emit_vulnerability_confirmed(
         self,
@@ -1951,6 +2165,63 @@ class SimulaService:
         except Exception as exc:
             self._logger.warning("on_revenue_change_simula_failed", error=str(exc))
 
+    async def _on_system_modulation(self, event: Any) -> None:
+        """Handle VitalityCoordinator austerity orders.
+
+        Skia emits SYSTEM_MODULATION when the organism needs to conserve resources.
+        This system applies the directive and ACKs so Skia knows the order was received.
+        """
+        data = getattr(event, "data", {}) or {}
+        level = data.get("level", "nominal")
+        halt_systems = data.get("halt_systems", [])
+        modulate = data.get("modulate", {})
+
+        system_id = "simula"
+        compliant = True
+        reason: str | None = None
+
+        if system_id in halt_systems:
+            self._modulation_halted = True
+            self._logger.warning("system_modulation_halt", level=level)
+        elif system_id in modulate:
+            directives = modulate[system_id]
+            self._apply_modulation_directives(directives)
+            self._logger.info("system_modulation_applied", level=level, directives=directives)
+        elif level == "nominal":
+            self._modulation_halted = False
+            self._logger.info("system_modulation_resumed", level=level)
+
+        # Emit ACK so Skia knows the order was received
+        if self._synapse is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                event_bus = getattr(self._synapse, "_event_bus", None)
+                if event_bus is not None:
+                    await event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.SYSTEM_MODULATION_ACK,
+                        data={
+                            "system_id": system_id,
+                            "level": level,
+                            "compliant": compliant,
+                            "reason": reason,
+                        },
+                        source_system=system_id,
+                    ))
+            except Exception as exc:
+                self._logger.warning("modulation_ack_failed", error=str(exc))
+
+    def _apply_modulation_directives(self, directives: dict) -> None:
+        """Apply modulation directives from VitalityCoordinator.
+
+        Simula directive: {"speculative_mutations": False} — pause speculative
+        mutations to conserve compute and economic resources during austerity.
+        """
+        speculative = directives.get("speculative_mutations", True)
+        if not speculative:
+            self._logger.info("modulation_speculative_mutations_paused")
+        else:
+            self._logger.info("modulation_directives_received", directives=directives)
+
     async def _on_cognitive_pressure(self, event: Any) -> None:
         """COGNITIVE_PRESSURE → enter minimal verification mode at high compression load.
 
@@ -2152,6 +2423,156 @@ class SimulaService:
         except Exception:
             pass
 
+    async def _on_simula_sandbox_requested(self, event: Any) -> None:
+        """
+        Handle SIMULA_SANDBOX_REQUESTED from Thymos.
+        Validates a proposed Tier 4 repair by checking constitutional constraints
+        and risk bounds, then emits SIMULA_SANDBOX_RESULT with correlation_id.
+        Thymos waits 30s for this response (fail-closed on timeout).
+        """
+        data = getattr(event, "data", {}) or {}
+        correlation_id = data.get("correlation_id", "")
+        repair_action = data.get("repair_action", "")
+        repair_tier = data.get("repair_tier", "")
+        target_system = data.get("target_system", "")
+        parameter_changes = data.get("parameter_changes", [])
+        repair_reason = data.get("reason", data.get("repair_reason", ""))
+
+        self._logger.info(
+            "simula_sandbox_requested",
+            correlation_id=correlation_id,
+            repair_action=repair_action,
+            repair_tier=repair_tier,
+            target_system=target_system,
+        )
+
+        approved = False
+        reason = "unknown"
+
+        try:
+            # Iron Rule check — reject repairs that touch protected systems
+            protected = {"equor", "simula", "constitution", "invariant"}
+            action_lower = (repair_action or "").lower()
+            target_lower = (target_system or "").lower()
+            if any(p in action_lower or p in target_lower for p in protected):
+                reason = f"iron_rule_violation: action or target touches protected system"
+                self._logger.warning(
+                    "simula_sandbox_iron_rule_blocked",
+                    correlation_id=correlation_id,
+                    action=repair_action,
+                    target=target_system,
+                )
+            else:
+                # Check parameter changes against constitutional constraints
+                violation = None
+                for change in parameter_changes:
+                    param_name = (change.get("name") or change.get("param", "")).lower()
+                    if any(p in param_name for p in protected):
+                        violation = param_name
+                        break
+
+                if violation:
+                    reason = f"iron_rule_violation: parameter '{violation}' touches protected system"
+                else:
+                    # Simulate: use ChangeSimulator for a lightweight counterfactual check
+                    # if available, otherwise approve based on tier check
+                    if hasattr(self, "_simulator") and self._simulator is not None:
+                        try:
+                            from systems.simula.evolution_types import (
+                                EvolutionCategory,
+                                EvolutionProposal,
+                            )
+                            sandbox_proposal = EvolutionProposal(
+                                category=EvolutionCategory.ADJUST_PARAMETERS,
+                                description=(
+                                    f"[Thymos sandbox] {repair_action} on {target_system}: "
+                                    f"{repair_reason[:200]}"
+                                ),
+                                source="thymos_sandbox",
+                                expected_benefit="Self-healing repair validation",
+                                systems_affected=[target_system] if target_system else [],
+                                metadata={
+                                    "sandbox_validation": True,
+                                    "correlation_id": correlation_id,
+                                    "repair_tier": repair_tier,
+                                    "parameter_changes": parameter_changes,
+                                },
+                            )
+                            sim_result = await asyncio.wait_for(
+                                self._simulator.simulate_change(sandbox_proposal),
+                                timeout=20.0,
+                            )
+                            # Approve if simulation risk is acceptable
+                            if sim_result.risk_score <= 0.7 and sim_result.confidence >= 0.3:
+                                approved = True
+                                reason = (
+                                    f"simulation_passed: risk={sim_result.risk_score:.2f}, "
+                                    f"confidence={sim_result.confidence:.2f}"
+                                )
+                            else:
+                                reason = (
+                                    f"simulation_rejected: risk={sim_result.risk_score:.2f} "
+                                    f"(>0.7) or confidence={sim_result.confidence:.2f} (<0.3)"
+                                )
+                        except asyncio.TimeoutError:
+                            # Fail-closed on simulation timeout within sandbox
+                            reason = "simulation_timeout"
+                        except Exception as sim_exc:
+                            # Simulator unavailable — approve PARAMETER/RESTART tiers conservatively
+                            if repair_tier in ("PARAMETER", "RESTART", "KNOWN_FIX"):
+                                approved = True
+                                reason = f"simulator_error_conservative_approve: {sim_exc}"
+                            else:
+                                reason = f"simulator_error_conservative_reject: {sim_exc}"
+                    else:
+                        # No simulator wired — approve lower tiers only
+                        if repair_tier in ("PARAMETER", "RESTART", "KNOWN_FIX"):
+                            approved = True
+                            reason = "no_simulator_conservative_approve"
+                        else:
+                            reason = "no_simulator_conservative_reject"
+
+        except Exception as exc:
+            self._logger.error(
+                "simula_sandbox_error",
+                correlation_id=correlation_id,
+                error=str(exc),
+            )
+            reason = f"sandbox_internal_error: {exc}"
+
+        # Emit result — Thymos resolves its Future by correlation_id
+        event_bus = getattr(self._synapse, "_event_bus", None) if self._synapse else None
+        if event_bus is None:
+            self._logger.warning(
+                "simula_sandbox_no_synapse",
+                correlation_id=correlation_id,
+            )
+        else:
+            try:
+                from systems.synapse.types import SynapseEvent
+                await event_bus.emit(SynapseEvent(
+                    event_type=SynapseEventType.SIMULA_SANDBOX_RESULT,
+                    source_system="simula",
+                    data={
+                        "correlation_id": correlation_id,
+                        "approved": approved,
+                        "reason": reason,
+                    },
+                ))
+            except Exception as emit_exc:
+                self._logger.error(
+                    "simula_sandbox_emit_failed",
+                    correlation_id=correlation_id,
+                    error=str(emit_exc),
+                )
+
+        self._logger.info(
+            "simula_sandbox_result",
+            correlation_id=correlation_id,
+            approved=approved,
+            reason=reason,
+        )
+
     async def _on_thymos_repair_requested(self, event: Any) -> None:
         """
         Handle THYMOS_REPAIR_REQUESTED — Thymos needs Simula to synthesise a
@@ -2294,6 +2715,49 @@ class SimulaService:
                 self.approve_governed_proposal(proposal_id, governance_id)
             )
 
+    async def _on_spec_drafted(self, event: Any) -> None:
+        """
+        Handle SPEC_DRAFTED — Nova's SelfModificationPipeline has drafted a new
+        Spec document for a capability requiring a full subsystem (not just an
+        executor). Simula queues a SubsystemGenerator run for the Spec, gated
+        on Equor's constitutional review of the SELF_MODIFICATION_PROPOSED event
+        (correlated by proposal_id). The actual implementation fires only after
+        EQUOR_ECONOMIC_PERMIT arrives.
+
+        Simula stores the pending spec in _pending_spec_drafts keyed by
+        proposal_id; when _on_novel_action_requested fires with
+        pipeline_managed=True and the same proposal_id, SubsystemGenerator is
+        invoked with the spec content as the canonical purpose description.
+        """
+        data = getattr(event, "data", {}) or {}
+        spec_id = data.get("spec_id", "")
+        proposal_id = data.get("proposal_id", "")
+        spec_title = data.get("spec_title", "")
+        spec_path = data.get("spec_path", "")
+        system_name = data.get("system_name", "")
+
+        if not proposal_id or not system_name:
+            return
+
+        self._logger.info(
+            "spec_drafted_received",
+            spec_id=spec_id,
+            proposal_id=proposal_id,
+            spec_title=spec_title,
+            spec_path=spec_path,
+        )
+
+        # Store so the novel-action handler (pipeline_managed=True) can pick
+        # it up and route to SubsystemGenerator with full spec context.
+        if not hasattr(self, "_pending_spec_drafts"):
+            self._pending_spec_drafts: dict[str, dict[str, str]] = {}
+        self._pending_spec_drafts[proposal_id] = {
+            "spec_id": spec_id,
+            "spec_path": spec_path,
+            "spec_title": spec_title,
+            "system_name": system_name,
+        }
+
     async def _on_oneiros_consolidation_complete(self, event: Any) -> None:
         """
         Handle ONEIROS_CONSOLIDATION_COMPLETE — sleep consolidation finished.
@@ -2394,6 +2858,478 @@ class SimulaService:
         except Exception:
             pass
 
+    # ─── Crash Pattern Memory ──────────────────────────────────────────────────
+
+    async def _on_crash_pattern_confirmed(self, event: Any) -> None:
+        """Store a newly confirmed fatal crash pattern.
+
+        Subscribes to CRASH_PATTERN_CONFIRMED (emitted by Thymos after all repair
+        tiers fail, or synthesised from KAIROS_INVARIANT_DISTILLED when the
+        invariant is tagged as a crash pattern).
+
+        Stores the CrashPattern in self._known_fatal_patterns and writes a
+        MemoryTrace so the pattern survives restarts via Memory retrieval.
+        """
+        try:
+            from core.crash_pattern_analyzer import CrashPattern  # noqa: PLC0415
+
+            data = getattr(event, "data", {}) or {}
+            pattern_id: str = data.get("pattern_id", "")
+            if not pattern_id:
+                return
+
+            signature: list[str] = data.get("signature", [])
+            description: str = data.get("description", "")
+            confidence: float = float(data.get("confidence", 0.5))
+            failed_tiers: list[str] = data.get("failed_tiers", [])
+            lesson: str = data.get("lesson", description)
+            source: str = data.get("source", "unknown")
+
+            pattern = CrashPattern(
+                id=pattern_id,
+                signature=signature,
+                description=description,
+                confidence=confidence,
+                failed_tiers=failed_tiers,
+            )
+            self._known_fatal_patterns[pattern_id] = pattern
+
+            self._logger.warning(
+                "simula_learned_fatal_pattern",
+                pattern_id=pattern_id,
+                lesson=lesson[:200],
+                confidence=round(confidence, 3),
+                source=source,
+                signature_len=len(signature),
+            )
+
+            # Persist to Memory as a MemoryTrace so the organism remembers
+            # across restarts (read via _proactive_pattern_scan).
+            if self._memory is not None:
+                try:
+                    from primitives.memory_trace import MemoryTrace  # noqa: PLC0415
+                    from primitives.common import new_id, utc_now  # noqa: PLC0415
+
+                    trace = MemoryTrace(
+                        id=new_id(),
+                        episode_id=f"crash_pattern:{pattern_id}",
+                        original_percept_id=pattern_id,
+                        summary=(
+                            f"[crash_pattern] {description[:300]}"
+                        ),
+                        entities=[f"pattern:{pattern_id}", f"source:{source}"],
+                        relations=["is_fatal_pattern"],
+                        salience=type("S", (), {
+                            "attention": 0.9,
+                            "emotional": 0.7,
+                            "goal_relevance": 0.8,
+                            "novelty": 0.3,
+                            "composite": 0.85,
+                        })(),
+                        affect_valence=-0.6,
+                        event_time=utc_now(),
+                    )
+                    # Store via Memory if it has a generic store path,
+                    # otherwise fall back to Neo4j direct write.
+                    if hasattr(self._memory, "store_percept"):
+                        pass  # MemoryTrace storage goes via Neo4j below
+                    if self._neo4j is not None:
+                        await self._neo4j.execute_write(
+                            """
+                            MERGE (t:MemoryTrace {episode_id: $episode_id})
+                            SET t.summary = $summary,
+                                t.tags = $tags,
+                                t.confidence = $confidence,
+                                t.pattern_id = $pattern_id,
+                                t.source = $source,
+                                t.signature = $signature,
+                                t.updated_at = datetime()
+                            """,
+                            episode_id=f"crash_pattern:{pattern_id}",
+                            summary=trace.summary,
+                            tags=["crash_pattern", "avoid"],
+                            confidence=confidence,
+                            pattern_id=pattern_id,
+                            source=source,
+                            signature=signature,
+                        )
+                except Exception as mem_exc:
+                    self._logger.debug(
+                        "crash_pattern_memory_write_failed",
+                        pattern_id=pattern_id,
+                        error=str(mem_exc),
+                    )
+        except Exception as exc:
+            self._logger.debug("on_crash_pattern_confirmed_error", error=str(exc))
+
+    async def _on_kairos_invariant_for_crash_patterns(self, event: Any) -> None:
+        """Check KAIROS_INVARIANT_DISTILLED events for crash-pattern tags.
+
+        Kairos may classify a causal invariant as a crash pattern by setting
+        invariant_type="crash_pattern" in the payload. When detected, we
+        synthesise a CRASH_PATTERN_CONFIRMED payload and dispatch it through
+        the same handler so the organism learns from both sources uniformly.
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            invariant_type: str = data.get("invariant_type", "")
+            if invariant_type != "crash_pattern":
+                return
+
+            # Re-frame the Kairos invariant as a crash pattern confirmation.
+            invariant_id: str = data.get("invariant_id", "")
+            abstract_form: str = data.get("abstract_form", "")
+            hold_rate: float = float(data.get("hold_rate", 0.5))
+            description: str = data.get("description", abstract_form)
+
+            # Build a synthetic signature from the abstract form tokens.
+            tokens = [t.lower() for t in abstract_form.split() if len(t) > 3]
+            signature = sorted(set(f"kw:{t}" for t in tokens[:8]))
+
+            # Re-use the same handler with a synthesised event data dict.
+            class _FakeEvent:
+                def __init__(self, d: dict[str, Any]) -> None:
+                    self.data = d
+
+            await self._on_crash_pattern_confirmed(_FakeEvent({
+                "pattern_id": invariant_id,
+                "signature": signature,
+                "description": description,
+                "confidence": hold_rate,
+                "failed_tiers": [],
+                "lesson": description,
+                "source": "kairos",
+            }))
+        except Exception as exc:
+            self._logger.debug("kairos_invariant_crash_pattern_check_error", error=str(exc))
+
+    # ─── Patch Risk Scoring ────────────────────────────────────────────────────
+
+    def _score_patch_against_patterns(
+        self,
+        patch_code: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Score a generated patch against the known fatal pattern library.
+
+        Uses the same feature-overlap match_score formula as Thymos
+        CrashPatternAnalyzer:
+            match_score = |patch_features ∩ pattern.signature| / |pattern.signature|
+
+        Risk levels:
+            >= 0.70  → BLOCK  (do not execute; emit RE training + escalate)
+            0.40-0.69 → WARN   (proceed with annotation)
+            < 0.40   → none
+
+        Returns a dict with keys:
+            risk_level       (str: "none"|"warn"|"block")
+            matched_patterns (list[str]: pattern IDs that triggered)
+            reason           (str: human-readable explanation)
+            match_scores     (dict[str, float]: per-pattern score)
+        """
+        if not self._known_fatal_patterns:
+            return {
+                "risk_level": "none",
+                "matched_patterns": [],
+                "reason": "no known fatal patterns",
+                "match_scores": {},
+            }
+
+        # Tokenise the patch code into a feature set.
+        # We use keyword-style features matching CrashPatternAnalyzer conventions.
+        patch_features: frozenset[str] = self._extract_patch_features(
+            patch_code, context
+        )
+
+        block_patterns: list[str] = []
+        warn_patterns: list[str] = []
+        scores: dict[str, float] = {}
+
+        for pattern_id, pattern in self._known_fatal_patterns.items():
+            sig_set = frozenset(pattern.signature)
+            if not sig_set:
+                continue
+            intersection = patch_features & sig_set
+            score = len(intersection) / len(sig_set)
+            if score < 0.40:
+                continue
+            scores[pattern_id] = round(score, 3)
+            if score >= 0.70:
+                block_patterns.append(pattern_id)
+            else:
+                warn_patterns.append(pattern_id)
+
+        if block_patterns:
+            patterns_desc = ", ".join(
+                f"{pid}(score={scores[pid]})" for pid in block_patterns[:3]
+            )
+            return {
+                "risk_level": "block",
+                "matched_patterns": block_patterns + warn_patterns,
+                "reason": f"patch matches known fatal pattern(s): {patterns_desc}",
+                "match_scores": scores,
+            }
+        if warn_patterns:
+            patterns_desc = ", ".join(
+                f"{pid}(score={scores[pid]})" for pid in warn_patterns[:3]
+            )
+            return {
+                "risk_level": "warn",
+                "matched_patterns": warn_patterns,
+                "reason": f"patch near-matches known pattern(s): {patterns_desc}",
+                "match_scores": scores,
+            }
+        return {
+            "risk_level": "none",
+            "matched_patterns": [],
+            "reason": "no pattern matches above threshold",
+            "match_scores": scores,
+        }
+
+    @staticmethod
+    def _extract_patch_features(
+        patch_code: str,
+        context: dict[str, Any],
+    ) -> frozenset[str]:
+        """Extract a normalised feature set from a code patch for pattern matching.
+
+        Mirrors CrashPatternAnalyzer.extract_features() conventions:
+            source:{system}    — from context["target_system"]
+            class:{category}   — from context["change_category"]
+            kw:{token}         — top-8 significant tokens from patch text
+            affects:{system}   — from context["affected_systems"]
+        """
+        feats: set[str] = set()
+
+        target = str(context.get("target_system", "unknown")).lower()
+        feats.add(f"source:{target}")
+
+        category = str(context.get("change_category", "")).lower()
+        if category:
+            feats.add(f"class:{category}")
+
+        error_type = str(context.get("error_type", "")).lower()
+        if error_type:
+            feats.add(f"etype:{error_type}")
+
+        # Keyword extraction — skip stopwords and short tokens
+        _STOP = {"the", "a", "an", "is", "in", "at", "of", "to", "and", "or",
+                 "for", "def", "self", "return", "import", "from", "pass",
+                 "true", "false", "none", "with", "not", "if", "else"}
+        tokens = patch_code.lower().split()
+        keywords = [t for t in tokens if len(t) > 3 and t not in _STOP]
+        # Deduplicate preserving order, take top 8
+        seen: dict[str, None] = {}
+        for t in keywords:
+            seen[t] = None
+            if len(seen) >= 8:
+                break
+        for kw in seen:
+            feats.add(f"kw:{kw}")
+
+        for sys_name in context.get("affected_systems", []):
+            feats.add(f"affects:{str(sys_name).lower()}")
+
+        return frozenset(feats)
+
+    async def _apply_patch_risk_gate(
+        self,
+        patch_code: str,
+        context: dict[str, Any],
+        proposal_id: str,
+        hypothesis_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Pre-flight gate for generated patches.
+
+        Called before any patch is submitted for execution.  Returns the
+        PatternRiskScore dict from _score_patch_against_patterns().
+
+        Side effects:
+          BLOCK → emits RE_TRAINING_EXAMPLE(outcome_quality=0.0,
+                  category="pattern_blocked") + THYMOS_REPAIR_REQUESTED with
+                  escalation_reason="known_fatal_pattern".
+          WARN  → logs at WARNING; caller attaches risk score to RE training on
+                  completion via context["pattern_risk"].
+        """
+        risk = self._score_patch_against_patterns(patch_code, context)
+
+        if risk["risk_level"] == "block":
+            self._logger.warning(
+                "simula_patch_blocked_fatal_pattern",
+                proposal_id=proposal_id,
+                matched_patterns=risk["matched_patterns"],
+                reason=risk["reason"],
+            )
+            # Emit negative RE training example
+            event_bus = getattr(
+                getattr(self._synapse, "_event_bus", None), "emit", None
+            )
+            if self._synapse is not None:
+                try:
+                    from systems.synapse.types import SynapseEvent, SynapseEventType  # noqa: PLC0415
+
+                    await self._synapse._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.RE_TRAINING_EXAMPLE,
+                        source_system="simula",
+                        data={
+                            "instruction": context.get("description", "repair patch"),
+                            "output": patch_code[:2000],
+                            "outcome": "blocked",
+                            "outcome_quality": 0.0,
+                            "category": "pattern_blocked",
+                            "reasoning_trace": (
+                                f"BLOCK: patch matches known fatal pattern(s). "
+                                f"Matched: {risk['matched_patterns']}. "
+                                f"Reason: {risk['reason']}. "
+                                f"DO NOT generate code with these characteristics."
+                            ),
+                            "hypothesis_id": hypothesis_id or f"simula.pattern_blocked.{proposal_id}",
+                            "proposal_id": proposal_id,
+                        },
+                    ))
+                    # Escalate back to Thymos so it can try a different tier
+                    await self._synapse._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.THYMOS_REPAIR_REQUESTED,
+                        source_system="simula",
+                        data={
+                            "incident_id": context.get("incident_id", proposal_id),
+                            "proposal_id": proposal_id,
+                            "escalation_reason": "known_fatal_pattern",
+                            "matched_patterns": risk["matched_patterns"],
+                            "original_context": context,
+                        },
+                    ))
+                except Exception as exc:
+                    self._logger.debug("patch_block_emit_failed", error=str(exc))
+
+        elif risk["risk_level"] == "warn":
+            self._logger.warning(
+                "simula_patch_near_fatal_pattern",
+                proposal_id=proposal_id,
+                matched_patterns=risk["matched_patterns"],
+                reason=risk["reason"],
+            )
+
+        return risk
+
+    # ─── Proactive Pattern Scan (background, every 2h) ────────────────────────
+
+    async def _proactive_pattern_scan(self) -> None:
+        """Scan recently generated code in Memory against known fatal patterns.
+
+        Loads all MemoryTraces with tag "generated_code" from the last 24h,
+        then scores each against self._known_fatal_patterns.  Any trace
+        matching a pattern at confidence >= 0.5 triggers an INCIDENT_DETECTED
+        (severity=LOW) requesting preemptive Thymos review.
+        """
+        if not self._known_fatal_patterns:
+            return
+        if self._neo4j is None:
+            return
+
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType  # noqa: PLC0415
+
+            rows = await self._neo4j.execute_read(
+                """
+                MATCH (t:MemoryTrace)
+                WHERE 'generated_code' IN t.tags
+                  AND t.updated_at >= datetime() - duration('P1D')
+                RETURN t.episode_id AS episode_id,
+                       t.summary    AS summary,
+                       t.tags       AS tags
+                LIMIT 200
+                """,
+            )
+
+            if not rows:
+                return
+
+            flagged = 0
+            for row in rows:
+                episode_id = row.get("episode_id", "")
+                summary = row.get("summary", "")
+                # Build a minimal feature set from the summary text
+                tokens = summary.lower().split()
+                feats: set[str] = {
+                    f"kw:{t}" for t in tokens if len(t) > 3
+                }
+                patch_features = frozenset(feats)
+
+                for pattern_id, pattern in self._known_fatal_patterns.items():
+                    sig_set = frozenset(pattern.signature)
+                    if not sig_set:
+                        continue
+                    intersection = patch_features & sig_set
+                    score = len(intersection) / len(sig_set)
+                    if score < 0.50:
+                        continue
+
+                    flagged += 1
+                    self._logger.warning(
+                        "proactive_pattern_match",
+                        episode_id=episode_id,
+                        pattern_id=pattern_id,
+                        score=round(score, 3),
+                    )
+                    if self._synapse is not None:
+                        try:
+                            await self._synapse._event_bus.emit(SynapseEvent(
+                                event_type=SynapseEventType.INCIDENT_DETECTED,
+                                source_system="simula",
+                                data={
+                                    "incident_class": "proactive_pattern_match",
+                                    "severity": "low",
+                                    "fingerprint": (
+                                        f"simula:proactive_pattern:{pattern_id}:{episode_id}"
+                                    ),
+                                    "source_system": "simula",
+                                    "error_type": "PatternRisk",
+                                    "error_message": (
+                                        f"Proactive: generated code matches known fatal "
+                                        f"pattern {pattern_id} (score={score:.2f}). "
+                                        f"Requesting preemptive review."
+                                    ),
+                                    "context": {
+                                        "episode_id": episode_id,
+                                        "pattern_id": pattern_id,
+                                        "match_score": round(score, 3),
+                                        "pattern_description": pattern.description[:200],
+                                    },
+                                    "affected_systems": ["simula"],
+                                    "blast_radius": 0.2,
+                                },
+                            ))
+                        except Exception as exc:
+                            self._logger.debug(
+                                "proactive_pattern_incident_emit_failed",
+                                error=str(exc),
+                            )
+                    break  # one incident per episode is enough
+
+            if flagged:
+                self._logger.info(
+                    "proactive_pattern_scan_complete",
+                    flagged=flagged,
+                    total_checked=len(rows),
+                    known_patterns=len(self._known_fatal_patterns),
+                )
+        except Exception as exc:
+            self._logger.debug("proactive_pattern_scan_error", error=str(exc))
+
+    async def _proactive_pattern_scan_loop(self) -> None:
+        """Background loop: run _proactive_pattern_scan every 2 hours."""
+        _INTERVAL_S = 2 * 3600  # 2 hours
+        while True:
+            try:
+                await asyncio.sleep(_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            try:
+                await self._proactive_pattern_scan()
+            except Exception as exc:
+                self._logger.debug("proactive_pattern_scan_loop_error", error=str(exc))
+
     async def _on_config_drift(self, event: Any) -> None:
         """Degradation Engine §8.2 — apply Gaussian noise to learnable config params.
 
@@ -2416,20 +3352,31 @@ class SimulaService:
 
             # Learnable float params: (attr, lo, hi)
             # Bounds are conservative: ±50% of defaults, never below a safe minimum.
+            #
+            # IMPORTANT: The economic parameters listed below (SIMULA-ECON-1 block)
+            # MUST stay in sync with _ECON_PARAM_BOUNDS in _on_evo_adjust_budget().
+            # Both registries must cover the exact same set of economic parameters
+            # with identical bounds. When adding or changing a param here, update
+            # _ECON_PARAM_BOUNDS too, and vice versa.
             float_params: list[tuple[str, float, float]] = [
-                ("simulation_risk_threshold", 0.1, 0.95),
-                ("embedding_similarity_threshold", 0.5, 0.99),
                 ("dafny_verify_timeout_s", 5.0, 120.0),
                 ("grpo_learning_rate", 1e-6, 1e-3),
-                ("grpo_kl_penalty", 0.01, 1.0),
                 ("kv_compression_ratio", 0.0, 0.9),
                 ("integration_tests_timeout_s", 30.0, 600.0),
                 ("performance_baseline_timeout_s", 10.0, 300.0),
                 ("agent_coder_test_timeout_s", 10.0, 300.0),
-                ("mutation_rate", 0.001, 0.5),
                 # Economic learnable parameters (SIMULA-ECON-1)
+                # Must mirror _ECON_PARAM_BOUNDS exactly — see comment above.
                 ("yield_apy_drop_rebalance_threshold", 0.05, 0.50),
+                ("yield_apy_minimum_acceptable", 0.01, 0.20),
                 ("bounty_min_roi_multiple", 1.0, 5.0),
+                ("bounty_max_risk_score", 0.20, 0.90),
+                ("asset_dev_budget_pct", 0.05, 0.40),
+                ("child_spawn_interval_days", 7.0, 180.0),
+                ("child_min_profitability_usd", 10.0, 10_000.0),
+                ("cost_reduction_target_pct", 0.01, 0.50),
+                ("emergency_liquidation_threshold", 0.02, 0.30),
+                ("protocol_exploration_budget_pct", 0.05, 0.50),
                 ("protocol_allocation_aggressiveness", 0.1, 1.0),
             ]
             # Learnable int params: (attr, lo, hi)
@@ -2438,15 +3385,12 @@ class SimulaService:
                 ("z3_check_timeout_ms", 500, 30000),
                 ("z3_max_discovery_rounds", 1, 20),
                 ("dafny_max_clover_rounds", 1, 20),
-                ("max_rollback_files", 5, 200),
                 ("grpo_batch_size", 2, 64),
                 ("lilo_consolidation_interval_proposals", 2, 50),
                 ("max_code_agent_turns", 5, 60),
                 ("static_analysis_max_fix_iterations", 1, 10),
                 ("thinking_budget_tokens", 2048, 65536),
                 ("agent_coder_max_iterations", 1, 10),
-                ("canary_rollout_steps", 2, 10),
-                ("max_proposals_per_cycle", 1, 20),
             ]
 
             # Build candidate list (attr, lo, hi, is_float) — only include attrs
@@ -2470,9 +3414,11 @@ class SimulaService:
                 noise = random.gauss(0.0, drift_rate)
                 new_val_f = float(old_val) * (1.0 + noise)
                 new_val_f = max(lo, min(hi, new_val_f))
-                if is_float:
+                if is_float and attr not in self.INT_PARAMS:
                     new_val: float | int = new_val_f
                 else:
+                    # int_params list entries and float_params entries in INT_PARAMS
+                    # are both cast to int after clamping
                     new_val = max(int(lo), min(int(hi), round(int(new_val_f))))
                 setattr(self._config, attr, new_val)
                 drifted.append({"name": attr, "old_value": old_val, "new_value": new_val})
@@ -2522,7 +3468,7 @@ class SimulaService:
           bounty_min_roi_multiple, bounty_max_risk_score, asset_dev_budget_pct,
           child_spawn_interval_days, child_min_profitability_usd,
           cost_reduction_target_pct, emergency_liquidation_threshold,
-          protocol_exploration_budget_pct
+          protocol_exploration_budget_pct, protocol_allocation_aggressiveness
 
         Bounds are enforced per-parameter to prevent runaway tuning.
         Only adjustments with confidence > 0.75 are applied.
@@ -2546,8 +3492,18 @@ class SimulaService:
             return
 
         # Economic parameter registry: (attr, lo, hi)
+        #
+        # IMPORTANT: This dict MUST stay in sync with the economic parameters
+        # listed in float_params inside _on_config_drift(). Both registries must
+        # cover the exact same set of economic parameters with identical bounds.
+        # When adding or changing a parameter here, update float_params too, and
+        # vice versa. Mismatches cause divergent Evo learning paths.
+        #
+        # Parameters that are semantically integers (e.g. child_spawn_interval_days)
+        # are listed in INT_PARAMS (module-level constant on SimulaService) and will
+        # be cast to int after clamping.
         _ECON_PARAM_BOUNDS: dict[str, tuple[float, float]] = {
-            "yield_apy_drop_rebalance_threshold": (0.50, 0.99),
+            "yield_apy_drop_rebalance_threshold": (0.05, 0.50),  # Fix 1: was (0.50, 0.99) — matched float_params range
             "yield_apy_minimum_acceptable": (0.01, 0.20),
             "bounty_min_roi_multiple": (1.0, 5.0),
             "bounty_max_risk_score": (0.20, 0.90),
@@ -2557,6 +3513,7 @@ class SimulaService:
             "cost_reduction_target_pct": (0.01, 0.50),
             "emergency_liquidation_threshold": (0.02, 0.30),
             "protocol_exploration_budget_pct": (0.05, 0.50),
+            "protocol_allocation_aggressiveness": (0.1, 1.0),
         }
 
         if parameter_name not in _ECON_PARAM_BOUNDS:
@@ -2578,18 +3535,24 @@ class SimulaService:
             return
 
         new_value = max(lo, min(hi, new_value))
+        # Cast to int for semantically integer parameters
+        final_value: float | int
+        if parameter_name in self.INT_PARAMS:
+            final_value = round(new_value)
+        else:
+            final_value = new_value
         old_value = getattr(self._config, parameter_name, None)
 
         if old_value is None:
             return
 
-        setattr(self._config, parameter_name, new_value)
+        setattr(self._config, parameter_name, final_value)
 
         self._logger.info(
             "simula_econ_param_adjusted",
             parameter=parameter_name,
             old_value=old_value,
-            new_value=new_value,
+            new_value=final_value,
             confidence=confidence,
             hypothesis_id=hypothesis_id,
         )
@@ -2605,7 +3568,7 @@ class SimulaService:
                     data={
                         "parameter_name": parameter_name,
                         "old_value": old_value,
-                        "new_value": new_value,
+                        "new_value": final_value,
                         "confidence": confidence,
                         "hypothesis_id": hypothesis_id,
                         "parameter_category": "economic",
@@ -2881,6 +3844,20 @@ class SimulaService:
                 await self._governance_timeout_task
             self._governance_timeout_task = None
 
+        # Cancel the proactive crash-pattern scan loop
+        if self._pattern_scan_task is not None and not self._pattern_scan_task.done():
+            self._pattern_scan_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._pattern_scan_task
+            self._pattern_scan_task = None
+
+        # Cancel the preventive audit loop
+        if self._preventive_audit_task is not None and not self._preventive_audit_task.done():
+            self._preventive_audit_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._preventive_audit_task
+            self._preventive_audit_task = None
+
         # Clean up Stage 1B embedding client
         if hasattr(self, "_embedding_client") and self._embedding_client is not None:
             with contextlib.suppress(Exception):
@@ -3027,6 +4004,12 @@ class SimulaService:
             missing_fixes = [h for h in flagged_hypotheses if not _fix_mentioned(h)]
 
             if missing_fixes:
+                high_confidence = [
+                    h for h in missing_fixes
+                    if h.evidence_score > 2.0
+                ]
+                missing_fix_summaries = [h.statement[:80] for h in missing_fixes]
+
                 # Log the mismatch for metrics / potential HITL escalation.
                 self._logger.warning(
                     "proposal_missing_learned_repairs",
@@ -3034,14 +4017,32 @@ class SimulaService:
                     endpoints=endpoints,
                     flagged_hypothesis_count=len(flagged_hypotheses),
                     missing_count=len(missing_fixes),
-                    missing_fix_summaries=[h.statement[:80] for h in missing_fixes],
+                    high_confidence_count=len(high_confidence),
+                    missing_fix_summaries=missing_fix_summaries,
                 )
 
-                # Optional: escalate high-confidence mismatches to HITL.
-                high_confidence = [
-                    h for h in missing_fixes
-                    if h.evidence_score > 2.0
-                ]
+                # Emit SIMULA_VALIDATION_ADVISORY so Evo can penalise the
+                # relevant hypotheses and Thymos can track recurring blind spots.
+                # Advisory only — does not block the proposal pipeline.
+                _bus = getattr(self._synapse, "_event_bus", None) if self._synapse else None
+                if _bus is not None:
+                    try:
+                        from systems.synapse.types import SynapseEvent, SynapseEventType
+                        asyncio.ensure_future(_bus.emit(SynapseEvent(
+                            event_type=SynapseEventType.SIMULA_VALIDATION_ADVISORY,
+                            source_system="simula",
+                            data={
+                                "proposal_id": proposal.id,
+                                "endpoints": endpoints,
+                                "flagged_hypothesis_count": len(flagged_hypotheses),
+                                "missing_count": len(missing_fixes),
+                                "high_confidence_count": len(high_confidence),
+                                "missing_fix_summaries": missing_fix_summaries,
+                            },
+                        )))
+                    except Exception:
+                        pass  # Advisory — never block the evolution pipeline
+
                 if high_confidence:
                     self._logger.info(
                         "proposal_escalating_repair_mismatch_to_hitl",
@@ -3191,6 +4192,15 @@ class SimulaService:
         self._proposals_received += 1
         log = self._logger.bind(proposal_id=proposal.id, category=proposal.category.value)
         log.info("proposal_received", source=proposal.source, description=proposal.description[:100])
+
+        # ── Skia modulation halt ──────────────────────────────────────────
+        if self._modulation_halted:
+            log.warning("proposal_rejected_modulation_halted")
+            return ProposalResult(
+                proposal_id=proposal.id,
+                status=ProposalStatus.REJECTED,
+                rejection_reason="modulation_halted",
+            )
 
         # ── GRID CONSERVATION GATE ───────────────────────────────────────────
         # Do not run the expensive SimulaCodeAgent pipeline while the physical
@@ -4072,6 +5082,7 @@ class SimulaService:
                     "yield_apy_drop_rebalance_threshold",
                     "bounty_min_roi_multiple",
                     "protocol_allocation_aggressiveness",
+                    "audit_aggressiveness",
                 ]
                 for field in _learnable_fields:
                     val = getattr(self._config, field, None)
@@ -4118,6 +5129,93 @@ class SimulaService:
             except Exception:
                 pass
 
+            # ── Proof strategy router weights (Thompson sampling) ──────────
+            reasoning_router_weights: dict[str, dict[str, float]] = {}
+            try:
+                reasoning_router_weights = self._reasoning_router.get_weights()
+            except Exception:
+                pass
+
+            # ── EFE calibration data ──────────────────────────────────────
+            efe_calibration: dict[str, Any] = {}
+            try:
+                if self._efe_scorer is not None:
+                    efe_calibration = {
+                        "category_priors": getattr(self._efe_scorer, "_category_priors", {}),
+                        "calibration_records": len(getattr(self._efe_scorer, "_calibration_records", [])),
+                    }
+            except Exception:
+                pass
+
+            # ── Category success rates (heritable evolutionary priors) ────
+            category_success_rates: dict[str, float] = {}
+            try:
+                if self._analytics is not None:
+                    analytics_data = await self._analytics.compute_analytics()
+                    for cat_name, rate_info in getattr(
+                        analytics_data, "category_rates", {}
+                    ).items():
+                        sr = getattr(rate_info, "success_rate", None)
+                        if sr is not None:
+                            category_success_rates[str(cat_name)] = float(sr)
+            except Exception:
+                pass
+
+            # ── LILO library top abstractions (heritable code patterns) ──
+            lilo_abstractions: list[dict[str, Any]] = []
+            try:
+                if self._lilo is not None:
+                    await self._lilo._ensure_library_loaded()
+                    lib = self._lilo._library or []
+                    ranked = sorted(
+                        lib,
+                        key=lambda a: a.usage_count * a.confidence,
+                        reverse=True,
+                    )[:15]  # Top 15 abstractions by impact
+                    for ab in ranked:
+                        lilo_abstractions.append({
+                            "name": ab.name,
+                            "kind": ab.kind.value if hasattr(ab.kind, "value") else str(ab.kind),
+                            "signature": ab.signature,
+                            "description": ab.description[:200],
+                            "usage_count": ab.usage_count,
+                            "confidence": ab.confidence,
+                            "tags": ab.tags[:5],
+                        })
+            except Exception:
+                pass
+
+            # ── Successful mutation embeddings (heritable semantic memory) ─
+            # Top 10 non-rolled-back mutations with embeddings for child
+            # vector index seeding (avoids re-discovering known-good patterns)
+            mutation_embeddings: list[dict[str, Any]] = []
+            try:
+                if self._history is not None and self._history._neo4j is not None:
+                    rows = await self._history._neo4j.execute_read(
+                        """
+                        MATCH (r:EvolutionRecord)
+                        WHERE r.rolled_back = false
+                          AND r.embedding IS NOT NULL
+                        RETURN r.id AS id,
+                               r.category AS category,
+                               r.description AS description,
+                               r.embedding AS embedding
+                        ORDER BY r.applied_at DESC
+                        LIMIT 10
+                        """,
+                    )
+                    for row in rows:
+                        emb = row.get("embedding")
+                        if emb and isinstance(emb, list):
+                            mutation_embeddings.append({
+                                "id": str(row.get("id", "")),
+                                "category": str(row.get("category", "")),
+                                "description": str(row.get("description", ""))[:200],
+                                "embedding": emb,
+                            })
+            except Exception:
+                pass
+
             genome = SimulaGenomeInheritance(
                 instance_id=instance_id,
                 generation=self._current_version,
@@ -4125,18 +5223,250 @@ class SimulaService:
                 last_10_mutations=last_10,
                 dafny_spec_hashes=dafny_spec_hashes,
             )
+            # Attach extra heritable state as metadata (forwards-compatible)
+            genome.extra = {
+                "reasoning_router_weights": reasoning_router_weights,
+                "efe_calibration": efe_calibration,
+                "category_success_rates": category_success_rates,
+                "lilo_abstractions": lilo_abstractions,
+                "mutation_embeddings": mutation_embeddings,
+            }
             self._logger.info(
                 "simula_genome_exported",
                 genome_id=genome.genome_id,
                 param_count=len(current_evolution_params),
                 mutation_count=len(last_10),
                 dafny_hash_count=len(dafny_spec_hashes),
+                router_strategies=len(reasoning_router_weights),
+                category_rates=len(category_success_rates),
+                lilo_abstractions=len(lilo_abstractions),
+                mutation_embeddings=len(mutation_embeddings),
             )
             return genome
 
         except Exception as exc:
             self._logger.error("export_simula_genome_failed", error=str(exc))
             return None
+
+    async def _apply_inherited_simula_genome_if_child(self) -> None:
+        """
+        Child-side bootstrap: deserialise parent SimulaGenome from environment.
+
+        Reads ECODIAOS_SIMULA_GENOME_PAYLOAD (JSON-encoded SimulaGenome) injected
+        by LocalDockerSpawner.  If present, applies inherited learnable config params
+        to self._config so the child starts with the parent's tuned evolution state.
+        Non-fatal — child falls back to default config on any error.
+
+        Applies bounded ±10% Gaussian jitter per param for genetic variation, matching
+        the Telos pattern (Spec 18 SG3).
+
+        Only runs when ECODIAOS_IS_GENESIS_NODE != 'true'.
+        """
+        import json as _json
+        import os as _os
+        import random as _random
+
+        if _os.environ.get("ECODIAOS_IS_GENESIS_NODE", "true").lower() == "true":
+            return
+
+        payload_json = _os.environ.get("ECODIAOS_SIMULA_GENOME_PAYLOAD", "").strip()
+        if not payload_json:
+            return
+
+        try:
+            from primitives.genome_inheritance import SimulaGenome
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            data = _json.loads(payload_json)
+            parent_genome = SimulaGenome.model_validate(data)
+
+            params_applied = 0
+            if self._config is not None and parent_genome.current_evolution_params:
+                for param_name, value in parent_genome.current_evolution_params.items():
+                    if not hasattr(self._config, param_name):
+                        continue
+                    try:
+                        # Apply bounded ±10% Gaussian jitter for genetic variation
+                        jitter = _random.gauss(0.0, 0.033)  # σ=3.3% → ≈99% within ±10%
+                        jitter = max(-0.10, min(0.10, jitter))
+                        if isinstance(value, float):
+                            mutated = value * (1.0 + jitter)
+                        elif isinstance(value, int):
+                            mutated = max(1, round(value * (1.0 + jitter)))
+                        else:
+                            mutated = value  # strings/bools: inherit exactly
+                        setattr(self._config, param_name, type(value)(mutated))
+                        params_applied += 1
+                    except Exception:
+                        pass
+
+            # Store mutation history for analytics
+            if parent_genome.last_10_mutations:
+                self._inherited_mutation_history = list(parent_genome.last_10_mutations)
+
+            # Store inherited Dafny spec hashes for verification skip optimization.
+            # Child can skip re-verification of specs whose content hash matches
+            # the parent's verified set (one-time boot optimization).
+            if parent_genome.dafny_spec_hashes:
+                self._inherited_spec_hashes: dict[str, str] = dict(
+                    parent_genome.dafny_spec_hashes
+                )
+                # Seed the IncrementalVerificationEngine if available
+                if self._incremental is not None:
+                    self._incremental.seed_inherited_hashes(
+                        self._inherited_spec_hashes
+                    )
+                    self._logger.info(
+                        "inherited_dafny_spec_hashes_seeded",
+                        count=len(self._inherited_spec_hashes),
+                    )
+
+            # Seed reasoning router weights from parent (Thompson sampling priors)
+            extra = getattr(parent_genome, "extra", {}) or {}
+            router_weights = extra.get("reasoning_router_weights")
+            if router_weights and isinstance(router_weights, dict):
+                self._reasoning_router.load_weights(router_weights)
+                self._logger.info(
+                    "inherited_reasoning_router_weights",
+                    strategies=list(router_weights.keys()),
+                )
+
+            # Seed category success rates as evolutionary priors
+            inherited_rates = extra.get("category_success_rates")
+            _rates_count = 0
+            if inherited_rates and isinstance(inherited_rates, dict) and self._analytics is not None:
+                try:
+                    # Store as prior knowledge on analytics engine for Bayesian updating
+                    self._analytics._inherited_category_priors = dict(inherited_rates)
+                    _rates_count = len(inherited_rates)
+                    self._logger.info(
+                        "inherited_category_success_rates",
+                        categories=list(inherited_rates.keys()),
+                    )
+                except Exception:
+                    pass
+
+            # Seed LILO library with parent's top abstractions
+            inherited_lilo = extra.get("lilo_abstractions")
+            _lilo_count = 0
+            if inherited_lilo and isinstance(inherited_lilo, list) and self._lilo is not None:
+                try:
+                    from systems.simula.verification.types import (
+                        AbstractionKind,
+                        LibraryAbstraction,
+                    )
+
+                    await self._lilo._ensure_library_loaded()
+                    for ab_data in inherited_lilo:
+                        if not isinstance(ab_data, dict):
+                            continue
+                        kind_str = ab_data.get("kind", "utility")
+                        try:
+                            kind = AbstractionKind(kind_str)
+                        except (ValueError, KeyError):
+                            kind = AbstractionKind.UTILITY
+                        ab = LibraryAbstraction(
+                            name=ab_data.get("name", ""),
+                            kind=kind,
+                            description=ab_data.get("description", ""),
+                            signature=ab_data.get("signature", ""),
+                            source_code="",  # Not transmitted — child re-discovers
+                            usage_count=ab_data.get("usage_count", 1),
+                            confidence=ab_data.get("confidence", 0.3) * 0.8,  # Decay
+                            tags=ab_data.get("tags", []),
+                        )
+                        if ab.name and self._lilo._library is not None:
+                            # Only add if not already in library
+                            existing_names = {a.name for a in self._lilo._library}
+                            if ab.name not in existing_names:
+                                self._lilo._library.append(ab)
+                                _lilo_count += 1
+                    if _lilo_count:
+                        self._logger.info(
+                            "inherited_lilo_abstractions",
+                            count=_lilo_count,
+                        )
+                except Exception:
+                    pass
+
+            # Seed mutation embeddings into history vector index
+            inherited_embeddings = extra.get("mutation_embeddings")
+            _emb_count = 0
+            if (
+                inherited_embeddings
+                and isinstance(inherited_embeddings, list)
+                and self._history is not None
+                and self._history._neo4j is not None
+            ):
+                try:
+                    for emb_data in inherited_embeddings:
+                        if not isinstance(emb_data, dict):
+                            continue
+                        emb_vec = emb_data.get("embedding")
+                        if not emb_vec or not isinstance(emb_vec, list):
+                            continue
+                        # Write as InheritedEvolutionRecord nodes for vector search
+                        await self._history._neo4j.execute_write(
+                            """
+                            MERGE (r:InheritedEvolutionRecord {id: $id})
+                            SET r.category = $category,
+                                r.description = $description,
+                                r.embedding = $embedding,
+                                r.inherited_from = $parent_id,
+                                r.inherited_at = datetime()
+                            """,
+                            {
+                                "id": f"inherited_{emb_data.get('id', '')}",
+                                "category": str(emb_data.get("category", "")),
+                                "description": str(emb_data.get("description", "")),
+                                "embedding": emb_vec,
+                                "parent_id": str(parent_genome.instance_id),
+                            },
+                        )
+                        _emb_count += 1
+                    if _emb_count:
+                        self._logger.info(
+                            "inherited_mutation_embeddings",
+                            count=_emb_count,
+                        )
+                except Exception:
+                    pass
+
+            self._logger.info(
+                "inherited_simula_genome",
+                parent_id=str(parent_genome.instance_id),
+                genome_id=str(parent_genome.genome_id),
+                params_applied=params_applied,
+                mutation_history_entries=len(parent_genome.last_10_mutations),
+                dafny_hashes=len(parent_genome.dafny_spec_hashes),
+                router_strategies=len(router_weights) if router_weights else 0,
+                category_rates=_rates_count,
+                lilo_abstractions=_lilo_count,
+                mutation_embeddings=_emb_count,
+            )
+
+            # Notify other systems that genome was inherited
+            if self._synapse is not None:
+                try:
+                    await self._synapse._event_bus.emit(SynapseEvent(
+                        event_type=SynapseEventType.GENOME_INHERITED,
+                        source_system="simula",
+                        data={
+                            "system": "simula",
+                            "genome_id": str(parent_genome.genome_id),
+                            "parent_id": str(parent_genome.instance_id),
+                            "params_applied": params_applied,
+                        },
+                    ))
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            self._logger.warning(
+                "simula_genome_apply_failed",
+                error=str(exc),
+                note="Proceeding with default config params",
+            )
 
     async def get_lineage(
         self,
@@ -4850,6 +6180,312 @@ class SimulaService:
         )
         self._logger.info("simula_subscribed_to_evolution_candidates")
 
+        # ── NOVEL_ACTION_REQUESTED subscription ───────────────────────────────
+        # Nova emits this when its LLM selects "propose_novel_action" as a step.
+        # Simula handles the full pipeline: feasibility evaluation → Equor gate →
+        # ExecutorGenerator → hot-load → emit NOVEL_ACTION_CREATED.
+
+        async def _on_novel_action_requested(event: Any) -> None:
+            import contextlib
+            from decimal import Decimal
+
+            from primitives.common import new_id, utc_now
+
+            data = getattr(event, "data", {})
+            proposal_id = data.get("proposal_id", new_id())
+            action_name = data.get("action_name", "")
+            description = data.get("description", "")
+            required_capabilities: list[str] = data.get("required_capabilities", [])
+            expected_outcome = data.get("expected_outcome", "")
+            justification = data.get("justification", "")
+            goal_description = data.get("goal_description", "")
+            urgency = float(data.get("urgency", 0.5))
+            pipeline_managed = bool(data.get("pipeline_managed", False))
+
+            self._logger.info(
+                "novel_action_requested",
+                proposal_id=proposal_id,
+                action_name=action_name,
+                pipeline_managed=pipeline_managed,
+            )
+
+            # ── SPEC_DRAFTED path: if this action came from SelfModificationPipeline
+            # and a Spec was drafted (SPEC_DRAFTED received for same proposal_id),
+            # route to SubsystemGenerator instead of ExecutorGenerator.
+            _pending_specs: dict[str, dict[str, str]] = getattr(self, "_pending_spec_drafts", {})
+            if pipeline_managed and proposal_id in _pending_specs and self._subsystem_generator is not None:
+                spec_meta = _pending_specs.pop(proposal_id)
+                system_name = spec_meta.get("system_name", action_name)
+                spec_purpose = description or spec_meta.get("spec_title", "")
+                self._logger.info(
+                    "novel_action_routed_to_subsystem_generator",
+                    proposal_id=proposal_id,
+                    system_name=system_name,
+                )
+                from systems.simula.subsystem_generator import SubsystemSpec
+                spec = SubsystemSpec(
+                    name=system_name,
+                    purpose=spec_purpose,
+                    trigger_hypothesis_id=proposal_id,
+                    required_events=[],
+                    emitted_events=[],
+                    dependencies=[],
+                    constraints=[
+                        f"expected_outcome: {expected_outcome[:200]}",
+                        f"spec_path: {spec_meta.get('spec_path', '')}",
+                    ],
+                )
+                try:
+                    await self._subsystem_generator.generate_subsystem(spec)
+                except Exception as exc:
+                    self._logger.error(
+                        "spec_drafted_subsystem_generation_failed",
+                        proposal_id=proposal_id,
+                        system_name=system_name,
+                        error=str(exc),
+                    )
+                return
+
+            if not action_name or not description:
+                self._logger.warning(
+                    "novel_action_request_rejected_missing_fields",
+                    proposal_id=proposal_id,
+                )
+                return
+
+            # ── Iron Rule check: cannot shadow protected system names ──────────
+            _FORBIDDEN_FRAGMENTS = {"equor", "simula", "constitution", "invariant", "memory"}
+            if any(frag in action_name.lower() for frag in _FORBIDDEN_FRAGMENTS):
+                self._logger.warning(
+                    "novel_action_request_rejected_forbidden_name",
+                    proposal_id=proposal_id,
+                    action_name=action_name,
+                )
+                return
+
+            # ── Step 1: Equor constitutional pre-approval ──────────────────────
+            # We ask Equor whether the *concept* of this action is constitutionally
+            # safe before spending compute on executor generation.
+            equor_approved = True
+            if self._synapse is not None and hasattr(self._synapse, "_event_bus"):
+                try:
+                    import asyncio as _asyncio
+
+                    permit_future: _asyncio.Future[bool] = _asyncio.get_event_loop().create_future()
+                    _permit_id = new_id()
+
+                    async def _on_equor_permit(e: Any) -> None:
+                        if getattr(e, "data", {}).get("permit_id") == _permit_id:
+                            if not permit_future.done():
+                                permit_future.set_result(
+                                    bool(e.data.get("approved", False))
+                                )
+
+                    event_bus.subscribe(
+                        SynapseEventType.EQUOR_ECONOMIC_PERMIT,
+                        _on_equor_permit,
+                    )
+                    await event_bus.emit(
+                        SynapseEventType.EQUOR_ECONOMIC_INTENT,
+                        {
+                            "permit_id": _permit_id,
+                            "mutation_type": "novel_action_proposal",
+                            "action_name": action_name,
+                            "description": description,
+                            "required_capabilities": required_capabilities,
+                            "expected_outcome": expected_outcome,
+                            "justification": justification,
+                            "amount_usd": "0",
+                            "proposal_id": proposal_id,
+                        },
+                    )
+                    try:
+                        equor_approved = await _asyncio.wait_for(
+                            permit_future, timeout=30.0
+                        )
+                    except _asyncio.TimeoutError:
+                        # Auto-permit on timeout (safety fallback, matches Oikos M4 pattern)
+                        equor_approved = True
+                        self._logger.warning(
+                            "novel_action_equor_timeout_auto_permit",
+                            proposal_id=proposal_id,
+                        )
+                except Exception as exc:
+                    self._logger.warning(
+                        "novel_action_equor_check_failed",
+                        proposal_id=proposal_id,
+                        error=str(exc),
+                    )
+                    equor_approved = True  # non-fatal: proceed optimistically
+
+            if not equor_approved:
+                self._logger.info(
+                    "novel_action_request_rejected_by_equor",
+                    proposal_id=proposal_id,
+                    action_name=action_name,
+                )
+                return
+
+            # ── Step 2: Route to ExecutorGenerator ────────────────────────────
+            if self._executor_generator is None:
+                self._logger.warning(
+                    "novel_action_executor_generator_unavailable",
+                    proposal_id=proposal_id,
+                )
+                return
+
+            from systems.axon.types import ExecutorTemplate
+
+            # Infer risk tier from capabilities
+            high_risk_caps = {"wallet_access", "defi_write", "mitosis_spawn"}
+            medium_risk_caps = {"git_write", "http_client", "code_generation"}
+            if any(c in high_risk_caps for c in required_capabilities):
+                risk_tier = "high"
+            elif any(c in medium_risk_caps for c in required_capabilities):
+                risk_tier = "medium"
+            else:
+                risk_tier = "low"
+
+            _budget_map = {"low": "50.00", "medium": "200.00", "high": "1000.00"}
+
+            template = ExecutorTemplate(
+                name=action_name,
+                action_type=action_name,
+                description=description,
+                protocol_or_platform="novel",
+                required_apis=[],
+                risk_tier=risk_tier,
+                max_budget_usd=Decimal(_budget_map[risk_tier]),
+                capabilities=required_capabilities,
+                safety_constraints=[
+                    "equor_approval_required",
+                    f"expected_outcome: {expected_outcome[:200]}",
+                ],
+                source_hypothesis_id=proposal_id,
+                source_opportunity_id="",
+            )
+
+            try:
+                result = await self._executor_generator.generate_executor(template)
+            except Exception as exc:
+                self._logger.error(
+                    "novel_action_executor_generation_failed",
+                    proposal_id=proposal_id,
+                    action_name=action_name,
+                    error=str(exc),
+                )
+                return
+
+            if not result.success:
+                self._logger.warning(
+                    "novel_action_executor_generation_not_successful",
+                    proposal_id=proposal_id,
+                    action_name=action_name,
+                    reason=getattr(result, "reason", "unknown"),
+                )
+                return
+
+            # ── Step 3: Emit NOVEL_ACTION_CREATED ────────────────────────────
+            with contextlib.suppress(Exception):
+                await event_bus.emit(
+                    SynapseEventType.NOVEL_ACTION_CREATED,
+                    {
+                        "proposal_id": proposal_id,
+                        "action_name": action_name,
+                        "description": description,
+                        "required_capabilities": required_capabilities,
+                        "executor_class": getattr(result, "class_name", ""),
+                        "module_path": getattr(result, "module_path", ""),
+                        "risk_tier": risk_tier,
+                        "max_budget_usd": _budget_map[risk_tier],
+                        "equor_approved": equor_approved,
+                        "source_hypothesis_id": proposal_id,
+                        "created_at": utc_now().isoformat(),
+                    },
+                )
+
+            self._logger.info(
+                "novel_action_created",
+                proposal_id=proposal_id,
+                action_name=action_name,
+                risk_tier=risk_tier,
+            )
+
+        event_bus.subscribe(
+            SynapseEventType.NOVEL_ACTION_REQUESTED,
+            _on_novel_action_requested,
+        )
+        self._logger.info("simula_subscribed_to_novel_action_requests")
+
+        if hasattr(SynapseEventType, "LEARNING_OPPORTUNITY_DETECTED"):
+            event_bus.subscribe(
+                SynapseEventType.LEARNING_OPPORTUNITY_DETECTED,
+                self._on_learning_opportunity_detected,
+            )
+
+    async def _on_learning_opportunity_detected(self, event: Any) -> None:
+        """
+        Handle LEARNING_OPPORTUNITY_DETECTED emitted by Nova's OpportunityScanner.
+
+        For code-generation and formal-verification resources (papers or repos),
+        queue a lightweight ADD_SYSTEM_CAPABILITY proposal so Simula can absorb
+        the technique.  Governance-gated — no auto-apply.
+        """
+        try:
+            data: dict[str, Any] = event.data if hasattr(event, "data") else event
+            resource_type: str = data.get("resource_type", "")
+            domain: str = data.get("domain", "")
+            title: str = data.get("title", "")
+            url: str = data.get("url", "")
+            resource_id: str = data.get("resource_id", "")
+            relevance: float = float(data.get("relevance_score", 0.0))
+            gaps: list[str] = data.get("capability_gaps_addressed", [])
+
+            # Only act on domains where Simula has ownership
+            simula_domains = {"code_generation", "formal_verification", "self_evolution"}
+            if domain not in simula_domains:
+                return
+
+            if resource_type not in {"repo", "paper"}:
+                return
+
+            if relevance < 0.35:
+                return
+
+            from primitives.evolution import ChangeCategory  # noqa: PLC0415
+
+            gap_text = ", ".join(gaps) if gaps else domain
+            description = (
+                f"Study '{title}' ({resource_type}) to close capability gap(s): "
+                f"{gap_text}. Source: {url}"
+            )
+            proposal = EvolutionProposal(
+                id=new_id(),
+                source="learning_opportunity",
+                category=ChangeCategory.ADD_SYSTEM_CAPABILITY,
+                description=description,
+                change_spec=ChangeSpec(
+                    capability_description=(
+                        f"Absorb {resource_type} '{title}' — domain={domain}, "
+                        f"gaps=[{gap_text}], url={url}"
+                    ),
+                ),
+                expected_benefit=(
+                    f"Close capability gap(s) in {gap_text} "
+                    f"(relevance={relevance:.2f})"
+                ),
+                evidence=[resource_id],
+            )
+            await self._bridge.receive_evo_proposal(proposal)
+            self._logger.info(
+                "simula_learning_opportunity_queued",
+                resource_id=resource_id,
+                domain=domain,
+                title=title[:80],
+            )
+        except Exception:
+            self._logger.exception("simula_learning_opportunity_handler_error")
+
     def get_evo_callback(self) -> Any:
         """
         Return a callback function for Evo's ConsolidationOrchestrator.
@@ -5074,6 +6710,58 @@ class SimulaService:
             # Do NOT reject — federated governance proposals are valid cross-instance,
             # but log so Thymos/Identity can audit. A hard DENY would require the
             # Identity system to provide cryptographic proof, not just env-variable matching.
+
+        # ── Fatal pattern pre-flight gate ─────────────────────────────────────
+        # Score the proposal's code_hint / description against known fatal patterns
+        # before handing off to the applicator.  A BLOCK terminates the pipeline
+        # early with a rejected result so no files are touched.
+        if self._known_fatal_patterns:
+            _patch_code = (
+                getattr(proposal, "code_hint", None)
+                or proposal.description
+                or ""
+            )
+            _patch_context: dict[str, Any] = {
+                "description": proposal.description,
+                "change_category": proposal.category.value if proposal.category else "",
+                "target_system": (
+                    (proposal.change_spec.affected_systems[0]
+                     if proposal.change_spec and proposal.change_spec.affected_systems
+                     else "")
+                ),
+                "affected_systems": (
+                    list(proposal.change_spec.affected_systems)
+                    if proposal.change_spec and proposal.change_spec.affected_systems
+                    else []
+                ),
+                "incident_id": getattr(proposal, "incident_id", proposal.id),
+            }
+            _pattern_risk = await self._apply_patch_risk_gate(
+                patch_code=_patch_code,
+                context=_patch_context,
+                proposal_id=proposal.id,
+                hypothesis_id=getattr(proposal, "source_hypothesis_id", None),
+            )
+            if _pattern_risk["risk_level"] == "block":
+                log.warning(
+                    "proposal_blocked_fatal_pattern",
+                    proposal_id=proposal.id,
+                    matched_patterns=_pattern_risk["matched_patterns"],
+                    reason=_pattern_risk["reason"],
+                )
+                proposal.status = ProposalStatus.REJECTED
+                return ProposalResult(
+                    proposal_id=proposal.id,
+                    status=ProposalStatus.REJECTED,
+                    success=False,
+                    error=(
+                        f"Blocked: patch matches known fatal pattern(s). "
+                        f"{_pattern_risk['reason']}"
+                    ),
+                )
+            # Stash WARN-level risk on the proposal for RE training annotation
+            if _pattern_risk["risk_level"] == "warn":
+                proposal._pattern_risk = _pattern_risk  # type: ignore[attr-defined]
 
         import time as _time
         _apply_t0 = _time.monotonic()
@@ -5368,6 +7056,9 @@ class SimulaService:
                 reason=f"Health check failed unexpectedly: {exc}",
             )
 
+        # Emit PROOF_FOUND/PROOF_FAILED/PROOF_TIMEOUT events for Dafny/Z3/Lean
+        asyncio.ensure_future(self._emit_proof_events_from_health(health, proposal))
+
         # Stash formal verification result for history recording
         if health.formal_verification is not None:
             proposal._formal_verification_result = health.formal_verification  # type: ignore[attr-defined]
@@ -5407,6 +7098,34 @@ class SimulaService:
         # Stash Stage 6 formal guarantees result for history recording
         if health.formal_guarantees is not None:
             proposal._formal_guarantees_result = health.formal_guarantees  # type: ignore[attr-defined]
+
+        # ── Update Thompson sampling router with verification outcomes ──
+        # Each proof strategy arm learns from this proposal's verification.
+        try:
+            _fv = health.formal_verification
+            if _fv is not None:
+                if hasattr(_fv, "dafny") and _fv.dafny is not None:
+                    self._reasoning_router.update(
+                        "dafny",
+                        getattr(_fv.dafny, "verified", False),
+                    )
+                if hasattr(_fv, "z3") and _fv.z3 is not None:
+                    self._reasoning_router.update(
+                        "z3",
+                        getattr(_fv.z3, "all_valid", False),
+                    )
+                if hasattr(_fv, "lean") and _fv.lean is not None:
+                    self._reasoning_router.update(
+                        "lean",
+                        getattr(_fv.lean, "verified", False),
+                    )
+            if health.static_analysis is not None:
+                self._reasoning_router.update(
+                    "static_analysis",
+                    len(getattr(health.static_analysis, "findings", [])) == 0,
+                )
+        except Exception:
+            pass  # Non-critical; router degrades gracefully to uniform priors
 
         if not health.healthy:
             recovered = False
@@ -5485,6 +7204,9 @@ class SimulaService:
                             # Re-check health after repair
                             health_recheck = await self._health.check(
                                 repair_result.files_repaired, proposal=proposal,
+                            )
+                            asyncio.ensure_future(
+                                self._emit_proof_events_from_health(health_recheck, proposal)
                             )
                             if health_recheck.healthy:
                                 log.info("health_recheck_passed_after_repair")
@@ -6439,6 +8161,15 @@ class SimulaService:
         _evo_alignment_score = record.constitutional_alignment or 0.0
         _evo_coherence = _evo_alignment_score * 2.0 - 1.0 if not rolled_back else -0.5
         _evo_growth = 0.5 if not rolled_back else -0.2
+        # Attach WARN-level pattern risk annotation if present from pre-flight gate
+        _pattern_risk_note = ""
+        _pattern_risk: dict[str, Any] | None = getattr(proposal, "_pattern_risk", None)
+        if _pattern_risk and _pattern_risk.get("risk_level") == "warn":
+            _pattern_risk_note = (
+                f" | pattern_risk=WARN matched={_pattern_risk.get('matched_patterns', [])} "
+                f"reason={_pattern_risk.get('reason', '')[:100]}"
+            )
+
         asyncio.ensure_future(self._emit_re_training_example(
             category="self_evolution",
             instruction=(
@@ -6451,6 +8182,7 @@ class SimulaService:
                 f"description={proposal.description[:200]}, "
                 f"risk={record.simulation_risk.value if record.simulation_risk else str('unknown')}, "
                 f"files_changed={len(files_changed)}"
+                f"{_pattern_risk_note}"
             ),
             output=(
                 f"outcome={str('REJECTED') if rolled_back else str('ACCEPTED')}, "

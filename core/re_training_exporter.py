@@ -13,6 +13,33 @@ it only reads from the event bus ring buffer + subscribes to
 RE_TRAINING_EXAMPLE events.  No direct imports from any system module.
 
 Export cadence: every 3600s (1 hour).  Batches with 0 datapoints are skipped.
+
+PERMITTED training data sources (internal organism execution only):
+  - Axon:      execution outcomes (confidence, cost, latency)
+  - Nova:      belief updates, goal reasoning
+  - Evo:       hypothesis confirm/refute
+  - Equor:     constitutional alignment checks
+  - Simula:    code mutation results
+  - Kairos:    causal invariant discovery
+  - Soma:      interoception signals
+  - Memory:    Neo4j query outcomes
+  - Logos:     compression examples
+  - Synapse:   coordination outcomes
+  - Identity:  connector/credential outcomes
+  - Thread:    narrative coherence signals
+  - Benchmarks: KPI deltas
+  - Any other internal EOS cognitive system
+
+FORBIDDEN training data sources (must NEVER feed into RE training):
+  - X (Twitter) API data — posts, replies, timelines, search results
+    (X Developer Agreement §5 prohibits use of X Content for model training)
+  - Any other third-party platform content (LinkedIn, Reddit, etc.)
+  - Web-scraped external content (Brave/SerpAPI results)
+  - GitHub issue/PR bodies from external repositories
+  - Any inbound data from external social or content platforms
+
+If you add a new training data source, verify it is internal organism
+telemetry before wiring it into RE_TRAINING_EXAMPLE emission.
 """
 
 from __future__ import annotations
@@ -69,24 +96,64 @@ def _outcome_from_quality(quality: float) -> str:
     return "failure"
 
 
+_MIN_INSTRUCTION_LEN = 10   # Reject trivially empty instructions
+_MIN_OUTPUT_LEN = 3         # Reject trivially empty outputs
+
+
 def _datapoint_from_event(event: SynapseEvent) -> RETrainingDatapoint | None:
     """
     Convert a raw RE_TRAINING_EXAMPLE SynapseEvent into a RETrainingDatapoint.
 
-    Returns None if the payload is malformed or missing required fields.
-    The conversion is best-effort — never raises.
+    Returns None if the payload is malformed, missing required fields, or fails
+    validation checks. The conversion is best-effort — never raises.
+
+    Validation rules:
+    - instruction must be a non-empty string with at least _MIN_INSTRUCTION_LEN chars
+    - output must be a non-empty string with at least _MIN_OUTPUT_LEN chars
+    - outcome_quality must be in [0.0, 1.0] (clamped — not rejected on range)
+    - source_system must not be empty
     """
     try:
         data = event.data
-        quality = float(data.get("outcome_quality", 0.0))
+        instruction = str(data.get("instruction", "")).strip()
+        output = str(data.get("output", "")).strip()
+
+        # Reject datapoints with trivially empty required fields
+        if len(instruction) < _MIN_INSTRUCTION_LEN:
+            logger.debug(
+                "re_datapoint_rejected_short_instruction",
+                source=event.source_system,
+                length=len(instruction),
+            )
+            return None
+        if len(output) < _MIN_OUTPUT_LEN:
+            logger.debug(
+                "re_datapoint_rejected_short_output",
+                source=event.source_system,
+                length=len(output),
+            )
+            return None
+
+        quality_raw = data.get("outcome_quality", 0.0)
+        try:
+            quality = float(quality_raw)
+        except (TypeError, ValueError):
+            quality = 0.0
+        # Clamp to valid range — don't reject, just fix
+        quality = min(max(quality, 0.0), 1.0)
+
+        source_system = str(data.get("source_system", event.source_system)).strip()
+        if not source_system:
+            source_system = event.source_system or "unknown"
+
         return RETrainingDatapoint(
-            source_system=str(data.get("source_system", event.source_system)),
+            source_system=source_system,
             example_type=str(data.get("category", "unknown")),
-            instruction=str(data.get("instruction", ""))[:2000],
+            instruction=instruction[:2000],
             input_context=str(data.get("input_context", ""))[:4000],
-            output_action=str(data.get("output", ""))[:2000],
+            output_action=output[:2000],
             outcome=_outcome_from_quality(quality),
-            confidence=min(max(quality, 0.0), 1.0),
+            confidence=quality,
             timestamp=event.timestamp,
             reasoning_trace=str(data.get("reasoning_trace", ""))[:4000],
             alternatives_considered=list(data.get("alternatives_considered", [])),
@@ -140,7 +207,8 @@ class RETrainingExporter:
     # ─── Event Bus Integration ────────────────────────────────────────
 
     def attach(self) -> None:
-        """Subscribe to RE_TRAINING_EXAMPLE, AXON_EXECUTION_RESULT, and METABOLIC_PRESSURE events."""
+        """Subscribe to RE_TRAINING_EXAMPLE, AXON_EXECUTION_RESULT, METABOLIC_PRESSURE,
+        and EVO hypothesis lifecycle events."""
         from systems.synapse.types import SynapseEventType
 
         self._event_bus.subscribe(
@@ -155,6 +223,20 @@ class RETrainingExporter:
             self._event_bus.subscribe(
                 SynapseEventType.METABOLIC_PRESSURE,
                 self._on_metabolic_pressure,
+            )
+        # Hypothesis lifecycle → RE training examples
+        # EVO_HYPOTHESIS_CONFIRMED/REFUTED are high-signal training datapoints:
+        # they represent Evo's adjudicated view of a hypothesis after real-world
+        # testing — exactly the kind of reasoning quality signal the RE should learn.
+        if hasattr(SynapseEventType, "EVO_HYPOTHESIS_CONFIRMED"):
+            self._event_bus.subscribe(
+                SynapseEventType.EVO_HYPOTHESIS_CONFIRMED,
+                self._on_hypothesis_confirmed,
+            )
+        if hasattr(SynapseEventType, "EVO_HYPOTHESIS_REFUTED"):
+            self._event_bus.subscribe(
+                SynapseEventType.EVO_HYPOTHESIS_REFUTED,
+                self._on_hypothesis_refuted,
             )
         self._attached = True
         logger.info("re_training_exporter_attached")
@@ -247,6 +329,128 @@ class RETrainingExporter:
                 )
         except Exception:
             logger.debug("re_exporter_metabolic_pressure_update_failed", exc_info=True)
+
+    async def _on_hypothesis_confirmed(self, event: Any) -> None:
+        """
+        EVO_HYPOTHESIS_CONFIRMED → generate a RE training datapoint.
+
+        Confirmed hypotheses are ground-truth adjudications: Evo has accumulated
+        real evidence across ≥10 episodes with evidence_score ≥ 3.0. This is
+        exactly the kind of slow, careful reasoning chain the RE should internalize.
+
+        outcome_quality = 1.0 (success — the hypothesis was correct)
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            statement = str(data.get("statement", data.get("hypothesis_statement", ""))).strip()
+            if not statement:
+                return
+            evidence_score = float(data.get("evidence_score", 1.0))
+            category = str(data.get("category", "hypothesis_validation"))
+            supporting = int(data.get("supporting_count", 0))
+            confidence = float(data.get("confidence", 0.8))
+            hypothesis_id = str(data.get("hypothesis_id", ""))
+
+            instruction = f"Evaluate hypothesis: '{statement[:500]}'"
+            output = (
+                f"CONFIRMED. Evidence score: {evidence_score:.2f}, "
+                f"supporting episodes: {supporting}, confidence: {confidence:.2f}. "
+                f"This hypothesis is supported by empirical evidence and should be integrated "
+                f"into the organism's belief system."
+            )
+            reasoning = (
+                f"1. HYPOTHESIS: {statement[:300]}\n"
+                f"2. EVIDENCE: evidence_score={evidence_score:.2f}, supporting_count={supporting}\n"
+                f"3. CONFIDENCE: {confidence:.2f} after real-world episode accumulation\n"
+                f"4. VERDICT: CONFIRMED — hypothesis passed empirical testing"
+            )
+
+            dp = RETrainingDatapoint(
+                source_system="evo",
+                example_type=f"hypothesis_confirmed:{category}",
+                instruction=instruction[:2000],
+                input_context=f'{{"hypothesis_id": "{hypothesis_id}", "evidence_score": {evidence_score}, "category": "{category}"}}',
+                output_action=output[:2000],
+                outcome="success",
+                confidence=min(max(confidence, 0.0), 1.0),
+                timestamp=getattr(event, "timestamp", None),
+                reasoning_trace=reasoning[:4000],
+                alternatives_considered=[
+                    "Alternative: hypothesis could have been refuted if evidence was contradictory",
+                    "Alternative: hypothesis could remain in testing if evidence was insufficient",
+                ],
+                episode_id=hypothesis_id,
+            )
+            # Dedup — hypothesis_id is stable; don't double-count multiple CONFIRMED events
+            if hypothesis_id:
+                dedup_key = f"evo_confirmed:{hypothesis_id}"
+                if dedup_key in self._seen_episode_ids:
+                    return
+                self._seen_episode_ids.add(dedup_key)
+                self._episode_index[hypothesis_id] = dp
+            self._pending.append(dp)
+        except Exception:
+            logger.debug("re_exporter_hypothesis_confirmed_failed", exc_info=True)
+
+    async def _on_hypothesis_refuted(self, event: Any) -> None:
+        """
+        EVO_HYPOTHESIS_REFUTED → generate a RE training datapoint.
+
+        Refuted hypotheses are negative ground-truth: what NOT to believe.
+        Training the RE to recognise refuted reasoning patterns prevents the
+        organism from repeatedly proposing the same failed hypotheses.
+
+        outcome_quality = 0.0 (failure — the hypothesis was wrong)
+        """
+        try:
+            data = getattr(event, "data", {}) or {}
+            statement = str(data.get("statement", data.get("hypothesis_statement", ""))).strip()
+            if not statement:
+                return
+            category = str(data.get("category", "hypothesis_validation"))
+            contradictions = int(data.get("contradicting_count", 0))
+            evidence_score = float(data.get("evidence_score", 0.0))
+            hypothesis_id = str(data.get("hypothesis_id", ""))
+            refutation_reason = str(data.get("refutation_reason", "accumulated contradictions"))
+
+            instruction = f"Evaluate hypothesis: '{statement[:500]}'"
+            output = (
+                f"REFUTED. Contradicting episodes: {contradictions}, evidence_score: {evidence_score:.2f}. "
+                f"This hypothesis contradicts empirical evidence and should be archived. "
+                f"Reason: {refutation_reason[:200]}"
+            )
+            reasoning = (
+                f"1. HYPOTHESIS: {statement[:300]}\n"
+                f"2. COUNTER-EVIDENCE: {contradictions} contradicting episodes, evidence_score={evidence_score:.2f}\n"
+                f"3. REFUTATION REASON: {refutation_reason[:200]}\n"
+                f"4. VERDICT: REFUTED — hypothesis failed empirical testing"
+            )
+
+            dp = RETrainingDatapoint(
+                source_system="evo",
+                example_type=f"hypothesis_refuted:{category}",
+                instruction=instruction[:2000],
+                input_context=f'{{"hypothesis_id": "{hypothesis_id}", "evidence_score": {evidence_score}, "contradictions": {contradictions}}}',
+                output_action=output[:2000],
+                outcome="failure",
+                confidence=0.0,
+                timestamp=getattr(event, "timestamp", None),
+                reasoning_trace=reasoning[:4000],
+                alternatives_considered=[
+                    "Alternative: hypothesis might have been confirmed with more supporting evidence",
+                    "Alternative: domain scope could be narrowed to find a valid sub-hypothesis",
+                ],
+                episode_id=hypothesis_id,
+            )
+            if hypothesis_id:
+                dedup_key = f"evo_refuted:{hypothesis_id}"
+                if dedup_key in self._seen_episode_ids:
+                    return
+                self._seen_episode_ids.add(dedup_key)
+                self._episode_index[hypothesis_id] = dp
+            self._pending.append(dp)
+        except Exception:
+            logger.debug("re_exporter_hypothesis_refuted_failed", exc_info=True)
 
     def update_outcome_quality(
         self,

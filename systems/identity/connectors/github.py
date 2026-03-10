@@ -41,6 +41,7 @@ import structlog
 if TYPE_CHECKING:
     from clients.redis import RedisClient
     from systems.identity.connectors.github_app import GitHubAppConnector
+    from systems.identity.vault import IdentityVault
     from systems.synapse.event_bus import EventBus
 
 logger = structlog.get_logger("identity.github_connector")
@@ -70,6 +71,7 @@ class GitHubConnector:
         redis: RedisClient | None = None,
         event_bus: EventBus | None = None,
         http_client: httpx.AsyncClient | None = None,
+        vault: IdentityVault | None = None,
     ) -> None:
         """
         Args:
@@ -80,6 +82,7 @@ class GitHubConnector:
             redis:           Redis client for token caching.
             event_bus:       Synapse bus for SYSTEM_DEGRADED emission.
             http_client:     Injectable httpx client (testing convenience).
+            vault:           IdentityVault for sealing the env-var PAT at rest.
         """
         self._app_connector = app_connector
         self._personal_token = (
@@ -90,6 +93,7 @@ class GitHubConnector:
         )
         self._redis = redis
         self._event_bus = event_bus
+        self._vault = vault
         self._http = http_client or httpx.AsyncClient(
             base_url=_GITHUB_API_BASE,
             headers={
@@ -100,6 +104,20 @@ class GitHubConnector:
         )
         self._consecutive_health_failures = 0
         self._logger = logger.bind(component="github_connector")
+
+        # Seal the env-var PAT in IdentityVault so it is never stored plaintext.
+        # This runs synchronously at construction — vault.encrypt_token_json is
+        # CPU-only (Fernet) and safe to call from __init__.
+        if self._personal_token and vault is not None:
+            try:
+                vault.encrypt_token_json(
+                    {"access_token": self._personal_token, "token_type": "pat"},
+                    platform_id="github_pat",
+                    purpose="operator_pat",
+                )
+                self._logger.info("github_pat_sealed_in_vault")
+            except Exception as _seal_exc:
+                self._logger.warning("github_pat_vault_seal_failed", error=str(_seal_exc))
 
     # ── Token resolution ───────────────────────────────────────────────────
 
@@ -139,6 +157,20 @@ class GitHubConnector:
         return None
 
     # ── Health ─────────────────────────────────────────────────────────────
+
+    async def authenticate(self) -> bool:
+        """
+        Validate token availability and emit CONNECTOR_AUTHENTICATED.
+
+        Call once during registry boot after all dependencies are wired.
+        Returns True if a token is available (App IAT or PAT).
+        """
+        token = await self.get_access_token()
+        if not token:
+            self._logger.warning("github_connector_no_token_on_authenticate")
+            return False
+        await self._emit_connector_authenticated()
+        return True
 
     async def check_health(self) -> bool:
         """
@@ -359,6 +391,68 @@ class GitHubConnector:
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
+    async def create_gist(
+        self,
+        files: dict[str, str],
+        description: str = "",
+        public: bool = False,
+    ) -> str:
+        """
+        Create a GitHub Gist from the provided file mapping.
+
+        Args:
+            files:       Mapping of {filename: content_string}.
+            description: Short description shown on the Gist page.
+            public:      If True, the Gist is world-readable; False = secret Gist.
+
+        Returns the Gist HTML URL (e.g. "https://gist.github.com/…").
+        Raises httpx.HTTPStatusError on API failure.
+
+        Requires ``gist`` scope in the PAT or GitHub App permissions.
+        """
+        token = await self._require_token()
+        gist_files = {name: {"content": content} for name, content in files.items()}
+        resp = await self._http.post(
+            "/gists",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "description": description,
+                "public": public,
+                "files": gist_files,
+            },
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        html_url: str = data.get("html_url", "")
+        self._logger.info("gist_created", public=public, file_count=len(files), url=html_url)
+        return html_url
+
+    async def get_active_github_token(self) -> str | None:
+        """
+        Return the best available GitHub token for bounty/PR work.
+
+        Precedence:
+          1. Own instance token stored in vault (provisioned via I-3 own-account flow).
+          2. Operator token from ECODIAOS_EXTERNAL_PLATFORMS__GITHUB_TOKEN / GITHUB_TOKEN.
+
+        Returns None if neither is available.  Callers should raise or fall back
+        gracefully rather than passing None to API calls.
+        """
+        # 1. Own instance token — provisioned by the I-3 GitHub account flow
+        own_token: str | None = None
+        if self._app_connector is not None:
+            # Try to get the IAT for the organism's own GitHub App installation
+            own_token = await self._app_connector.get_access_token()
+
+        if own_token:
+            return own_token
+
+        # 2. Operator / env-var token fallback
+        if self._personal_token:
+            return self._personal_token
+
+        return None
+
     # ── Internal helpers ───────────────────────────────────────────────────
 
     async def _require_token(self) -> str:
@@ -412,6 +506,28 @@ class GitHubConnector:
             return
         with contextlib.suppress(Exception):
             await self._redis.set_json(_CACHE_KEY, {"token": token}, ttl=max(1, ttl))
+
+    async def _emit_connector_authenticated(self) -> None:
+        """Emit CONNECTOR_AUTHENTICATED on successful token validation."""
+        if self._event_bus is None:
+            return
+        try:
+            from systems.synapse.types import SynapseEvent, SynapseEventType
+
+            auth_mode = "app_iat" if self._app_connector is not None else "pat"
+            await self._event_bus.emit(SynapseEvent(
+                event_type=SynapseEventType.CONNECTOR_AUTHENTICATED,
+                source_system="identity",
+                data={
+                    "connector_id": "github_connector",
+                    "platform_id": "github",
+                    "auth_mode": auth_mode,
+                    "pat_sealed": self._vault is not None and bool(self._personal_token),
+                },
+            ))
+            self._logger.info("github_connector_authenticated", auth_mode=auth_mode)
+        except Exception as exc:
+            self._logger.warning("connector_authenticated_emit_failed", error=str(exc))
 
     async def _emit_degraded(self) -> None:
         """Emit SYSTEM_DEGRADED so Thymos can quarantine this connector."""
