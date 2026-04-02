@@ -2723,6 +2723,8 @@ class BenchmarkService:
         Includes bedau_packard (JSONB) and evolutionary_fitness (JSONB) columns
         added in §4.2 schema (Appendix A). Spec ref: §4.2, Appendix A.
         """
+        if self._tsdb is None:
+            return
         async with self._tsdb.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -2762,6 +2764,8 @@ class BenchmarkService:
         Uses ALTER TABLE ADD COLUMN IF NOT EXISTS to handle existing tables that
         pre-date these columns.
         """
+        if self._tsdb is None:
+            return
         async with self._tsdb.pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS benchmark_snapshots (
@@ -2829,6 +2833,8 @@ class BenchmarkService:
         """
         n = self._config.rolling_window_snapshots
         averages: dict[str, float | None] = {}
+        if self._tsdb is None:
+            return
         async with self._tsdb.pool.acquire() as conn:
             for kpi in _KPI_NAMES:
                 # Fetch last N non-null values
@@ -3008,7 +3014,9 @@ class BenchmarkService:
             return
 
         try:
-            async with self._tsdb.pool.acquire() as conn:
+            if self._tsdb is None:
+            return
+        async with self._tsdb.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
                     SELECT llm_dependency FROM benchmark_snapshots
@@ -3136,6 +3144,8 @@ class BenchmarkService:
 
     async def _store_auxiliary(self, key: str, value: float) -> None:
         """Upsert a single auxiliary float value keyed by name."""
+        if self._tsdb is None:
+            return
         async with self._tsdb.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -3151,6 +3161,8 @@ class BenchmarkService:
 
     async def _latest_raw_value(self, key: str) -> float | None:
         """Retrieve a single auxiliary float value by key."""
+        if self._tsdb is None:
+            return
         async with self._tsdb.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT value FROM benchmark_aux WHERE key = $1", key
@@ -3161,6 +3173,8 @@ class BenchmarkService:
 
     async def latest_snapshot(self) -> BenchmarkSnapshot | None:
         """Return the most recent benchmark snapshot."""
+        if self._tsdb is None:
+            return
         async with self._tsdb.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -3208,6 +3222,8 @@ class BenchmarkService:
         if since is None:
             since = utc_now() - timedelta(days=7)
 
+        if self._tsdb is None:
+            return
         async with self._tsdb.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""

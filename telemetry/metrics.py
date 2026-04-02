@@ -70,6 +70,8 @@ class MetricCollector:
         self._buffer.clear()
 
         try:
+            if self._tsdb is None:
+                return  # No telemetry DB — silently discard
             await self._tsdb.write_metrics(batch)
         except Exception as e:
             logger.error("metric_flush_failed", error=str(e), batch_size=len(batch))

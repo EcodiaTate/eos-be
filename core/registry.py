@@ -2593,6 +2593,8 @@ class SystemRegistry:
                 cred_id = f"{pid}:default"
                 token_envelope_id = ""
                 try:
+                    if infra.tsdb is None:
+                        raise RuntimeError("TimescaleDB not available")
                     async with infra.tsdb.pool.acquire() as conn:
                         from systems.identity import crud as id_crud
 
