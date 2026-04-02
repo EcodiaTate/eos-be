@@ -11,13 +11,15 @@ for executing code changes, deployments, and creating new capabilities.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from systems.axon.executor import Executor
-from systems.axon.types import ExecutionContext, ExecutionResult, RateLimit, ValidationResult
+from systems.axon.types import ExecutionContext, ExecutionResult, RateLimit, RollbackResult, ValidationResult
 from systems.synapse.types import SynapseEvent, SynapseEventType
 
 if TYPE_CHECKING:
@@ -37,10 +39,17 @@ class SymbridgeFactoryExecutor(Executor):
     max_duration_ms = 600_000  # 10 min — Factory work is async
     rate_limit = RateLimit.per_hour(10)
 
-    def __init__(self, event_bus: Any = None, redis_client: Any = None) -> None:
+    def __init__(
+        self,
+        event_bus: Any = None,
+        redis_client: Any = None,
+        neo4j_client: Any = None,
+    ) -> None:
         self._event_bus = event_bus
         self._redis = redis_client
+        self._neo4j = neo4j_client
         self._ecodiaos_api_url: str = ""
+        self._symbridge_secret: str = ""
 
     def set_event_bus(self, bus: Any) -> None:
         self._event_bus = bus
@@ -48,8 +57,24 @@ class SymbridgeFactoryExecutor(Executor):
     def set_redis(self, redis_client: Any) -> None:
         self._redis = redis_client
 
+    def set_neo4j(self, neo4j_client: Any) -> None:
+        self._neo4j = neo4j_client
+
     def set_ecodiaos_url(self, url: str) -> None:
         self._ecodiaos_api_url = url
+
+    def set_secret(self, secret: str) -> None:
+        self._symbridge_secret = secret
+
+    def _sign(self, payload: dict[str, Any]) -> str | None:
+        """HMAC-SHA256 sign the payload — matches EcodiaOS verifySignature."""
+        if not self._symbridge_secret:
+            return None
+        return hmac.new(
+            self._symbridge_secret.encode(),
+            json.dumps(payload).encode(),
+            hashlib.sha256,
+        ).hexdigest()
 
     async def validate_params(self, params: dict[str, Any]) -> ValidationResult:
         dispatch_type = params.get("dispatch_type")
@@ -73,28 +98,30 @@ class SymbridgeFactoryExecutor(Executor):
         dispatch_type = params["dispatch_type"]
         description = params["description"]
 
+        payload: dict[str, Any] = {
+            "description": description,
+            "category": params.get("category", "unknown"),
+            "priority": params.get("priority", "medium"),
+            "codebase_name": params.get("codebase_name"),
+            "workspace_root": params.get("workspace_root"),
+            "target_repository_url": params.get("target_repository_url"),
+            "change_spec": params.get("change_spec"),
+            "expected_benefit": params.get("expected_benefit"),
+            "risk_assessment": params.get("risk_assessment"),
+            "evidence": params.get("evidence", []),
+            "proposed_implementation": params.get("proposed_implementation"),
+            "id": params.get("proposal_id") or context.execution_id,
+            "severity": params.get("severity"),
+            "error_message": params.get("error_message"),
+            "affected_system": params.get("affected_system"),
+            "stack_trace": params.get("stack_trace"),
+        }
         message = {
             "type": dispatch_type,
-            "payload": {
-                "description": description,
-                "category": params.get("category", "unknown"),
-                "priority": params.get("priority", "medium"),
-                "codebase_name": params.get("codebase_name"),
-                "workspace_root": params.get("workspace_root"),
-                "target_repository_url": params.get("target_repository_url"),
-                "change_spec": params.get("change_spec"),
-                "expected_benefit": params.get("expected_benefit"),
-                "risk_assessment": params.get("risk_assessment"),
-                "evidence": params.get("evidence", []),
-                "proposed_implementation": params.get("proposed_implementation"),
-                "id": params.get("proposal_id") or context.execution_id,
-                "severity": params.get("severity"),
-                "error_message": params.get("error_message"),
-                "affected_system": params.get("affected_system"),
-                "stack_trace": params.get("stack_trace"),
-            },
+            "payload": payload,
             "source": "organism",
             "correlationId": context.execution_id,
+            "signature": self._sign(payload),
         }
 
         delivered = False
@@ -116,7 +143,32 @@ class SymbridgeFactoryExecutor(Executor):
                     dispatch_type=dispatch_type,
                 )
 
-        # Layer 2: HTTP REST (tertiary — used when Redis unavailable)
+        # Layer 2: Neo4j (secondary — persistent, survives Redis restarts)
+        if self._neo4j is not None:
+            try:
+                await self._neo4j.execute_write(
+                    "CREATE (m:SymbridgeMessage {"
+                    "  message_id: $message_id, type: $type, payload: $payload,"
+                    "  source: 'organism', correlation_id: $correlation_id,"
+                    "  created_at: datetime(), processed: false"
+                    "})",
+                    {
+                        "message_id": context.execution_id,
+                        "type": dispatch_type,
+                        "payload": json.dumps(message["payload"]),
+                        "correlation_id": context.execution_id,
+                    },
+                )
+                delivery_details["neo4j"] = True
+                delivered = True
+            except Exception as exc:
+                logger.debug(
+                    "Symbridge Neo4j delivery failed",
+                    error=str(exc),
+                    dispatch_type=dispatch_type,
+                )
+
+        # Layer 3: HTTP REST (tertiary — used when Redis unavailable)
         if self._ecodiaos_api_url:
             try:
                 import httpx
@@ -152,8 +204,9 @@ class SymbridgeFactoryExecutor(Executor):
         if self._event_bus is not None:
             try:
                 await self._event_bus.emit(SynapseEvent(
-                    type=SynapseEventType.FACTORY_PROPOSAL_SENT,
-                    payload={
+                    event_type=SynapseEventType.FACTORY_PROPOSAL_SENT,
+                    source_system="axon",
+                    data={
                         "proposal_id": context.execution_id,
                         "description": description[:200],
                         "dispatch_type": dispatch_type,
@@ -183,12 +236,12 @@ class SymbridgeFactoryExecutor(Executor):
 
     async def rollback(
         self, execution_id: str, context: ExecutionContext,
-    ) -> ExecutionResult:
+    ) -> RollbackResult:
         """Request Factory to revert changes via git revert."""
         if not self._ecodiaos_api_url:
-            return ExecutionResult(
+            return RollbackResult(
                 success=False,
-                error="No EcodiaOS API URL configured for rollback",
+                reason="No EcodiaOS API URL configured for rollback",
             )
 
         try:
@@ -205,8 +258,8 @@ class SymbridgeFactoryExecutor(Executor):
                     },
                 )
                 if resp.status_code < 400:
-                    return ExecutionResult(success=True, data={"rollback": "requested"})
+                    return RollbackResult(success=True, reason="Rollback requested via symbridge")
         except Exception as exc:
             logger.error("Symbridge rollback failed", error=str(exc))
 
-        return ExecutionResult(success=False, error="Rollback request failed")
+        return RollbackResult(success=False, reason="Rollback request failed")

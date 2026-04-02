@@ -125,9 +125,9 @@ def _inject_signal(soma: SomaService, signal: dict[str, Any]) -> None:
     if signal_type == "cascade_pressure" and "cascades" in signal:
         payload["cascades"] = signal["cascades"]
 
-    # For latency signals, include slowest system
+    # For latency signals, include slowest system (keyed directly, not from interpretation string)
     if signal_type == "latency_pressure":
-        payload["slowest_system"] = signal.get("interpretation", "")
+        payload["slowest_system"] = signal.get("slowest_system", "")
 
     # Inject into Soma's signal buffer
     # NB: This is synchronous - safe to call from async context
@@ -172,4 +172,4 @@ async def _emit_interoceptive_alerts(
                 )
             )
     except Exception as exc:
-        logger.debug("interoceptive_alert_emit_failed", error=str(exc))
+        logger.warning("interoceptive_alert_emit_failed", error=str(exc))

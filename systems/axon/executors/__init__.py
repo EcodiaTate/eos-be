@@ -202,6 +202,7 @@ def build_default_registry(
     persona_engine: Any = None,
     instance_id: str = "unknown",
     web_client: Any = None,
+    neo4j_client: Any = None,
 ) -> ExecutorRegistry:
     """
     Build and return a fully-populated ExecutorRegistry with all built-in executors.
@@ -489,12 +490,16 @@ def build_default_registry(
     _symbridge_factory = SymbridgeFactoryExecutor(
         event_bus=event_bus,
         redis_client=redis_client,
+        neo4j_client=neo4j_client,
     )
-    # EcodiaOS Factory API URL (set via config or env)
+    # EcodiaOS Factory API URL + shared HMAC secret (must match SYMBRIDGE_SECRET in EcodiaOS env)
     import os as _os
     _factory_url = _os.environ.get("ORGANISM_FACTORY_API_URL", "")
     if _factory_url:
         _symbridge_factory.set_ecodiaos_url(_factory_url)
+    _symbridge_secret = _os.environ.get("SYMBRIDGE_SECRET", "")
+    if _symbridge_secret:
+        _symbridge_factory.set_secret(_symbridge_secret)
     registry.register(_symbridge_factory)
 
     return registry

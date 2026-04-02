@@ -88,8 +88,8 @@ logger = structlog.get_logger()
 # Module-level defaults - overridden at instance construction time by EvoConfig.
 # These exist solely as fallback values for code paths that run before
 # initialize() is called.  All production paths use self._* instance attrs.
-_HYPOTHESIS_GENERATION_INTERVAL: int = 200  # Every 200 broadcasts (was 50)
-_EVIDENCE_EVALUATION_INTERVAL: int = 50     # Every 50 broadcasts (was 10)
+_HYPOTHESIS_GENERATION_INTERVAL: int = 50   # Every 50 broadcasts (restored from throttled 200)
+_EVIDENCE_EVALUATION_INTERVAL: int = 10     # Every 10 broadcasts (restored from throttled 50)
 _VOLATILITY_OSCILLATION_THRESHOLD: int = 6
 
 

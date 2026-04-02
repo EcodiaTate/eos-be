@@ -9,7 +9,7 @@ Extracted from main.py lifespan().
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -25,6 +25,7 @@ def register_scheduled_tasks(
     scheduler: PerceptionScheduler,
     axon: AxonService,
     oikos: OikosService,
+    event_bus: "Any | None" = None,
 ) -> None:
     """Register all periodic tasks with the scheduler."""
 
@@ -32,16 +33,16 @@ def register_scheduled_tasks(
     _register_monitor_prs(scheduler, axon)
 
     # ── Deploy idle USDC into DeFi yield (every 6h) ──────────
-    _register_defi_yield_deployment(scheduler, oikos)
+    _register_defi_yield_deployment(scheduler, oikos, event_bus)
 
     # ── Record accrued DeFi yield as revenue (daily) ─────────
-    _register_defi_yield_accrual(scheduler, oikos)
+    _register_defi_yield_accrual(scheduler, oikos, event_bus)
 
     # ── Bounty foraging cycle (every 2h) ─────────────────────
-    _register_foraging_cycle(scheduler, oikos)
+    _register_foraging_cycle(scheduler, oikos, event_bus)
 
     # ── Economic consolidation (every 15m) ───────────────────
-    _register_consolidation_cycle(scheduler, oikos)
+    _register_consolidation_cycle(scheduler, oikos, event_bus)
 
 
 def _register_monitor_prs(
@@ -88,6 +89,7 @@ def _register_monitor_prs(
 def _register_defi_yield_deployment(
     scheduler: PerceptionScheduler,
     oikos: OikosService,
+    event_bus: Any | None = None,
 ) -> None:
     from systems.fovea.types import InputChannel
 
@@ -100,7 +102,19 @@ def _register_defi_yield_deployment(
                 f"Expected daily yield: ${outcome.expected_daily_yield_usd:.4f}. "
                 f"tx: {outcome.tx_hash}"
             )
-        return None
+        # Failure is a percept too — the organism should know when deployment failed
+        reason = getattr(outcome, "error", None) or getattr(outcome, "reason", "unknown")
+        if event_bus is not None:
+            try:
+                from systems.synapse.types import SynapseEvent, SynapseEventType
+                await event_bus.emit(SynapseEvent(
+                    type=SynapseEventType.ECONOMIC_ACTION_FAILED,
+                    source_system="scheduled_tasks",
+                    data={"task": "defi_yield_deployment", "reason": str(reason)},
+                ))
+            except Exception:
+                pass
+        return f"DeFi yield deployment failed: {reason}"
 
     scheduler.register(
         name="defi_yield_deployment",
@@ -114,6 +128,7 @@ def _register_defi_yield_deployment(
 def _register_defi_yield_accrual(
     scheduler: PerceptionScheduler,
     oikos: OikosService,
+    event_bus: Any | None = None,
 ) -> None:
     from systems.fovea.types import InputChannel
 
@@ -124,7 +139,8 @@ def _register_defi_yield_accrual(
                 f"Yield accrued: ${accrued:.6f} USDC recorded as revenue "
                 f"from active DeFi position."
             )
-        return None
+        # Zero accrual is a signal — may mean position closed or protocol issue
+        return "DeFi yield accrual: $0.00 recorded. Position may be inactive or pending."
 
     scheduler.register(
         name="defi_yield_accrual",
@@ -138,6 +154,7 @@ def _register_defi_yield_accrual(
 def _register_foraging_cycle(
     scheduler: PerceptionScheduler,
     oikos: OikosService,
+    event_bus: Any | None = None,
 ) -> None:
     from systems.fovea.types import InputChannel
 
@@ -145,12 +162,13 @@ def _register_foraging_cycle(
         result = await oikos.run_foraging_cycle()
         accepted = result.get("accepted", 0)
         scanned = result.get("candidates_scanned", 0)
+        # Always return a percept — even zero-scan cycles are informative
         if scanned > 0:
             return (
                 f"Foraging cycle: scanned {scanned} candidates, "
                 f"accepted {accepted} bounties."
             )
-        return None
+        return "Foraging cycle: no candidates found this round."
 
     scheduler.register(
         name="bounty_foraging",
@@ -164,6 +182,7 @@ def _register_foraging_cycle(
 def _register_consolidation_cycle(
     scheduler: PerceptionScheduler,
     oikos: OikosService,
+    event_bus: Any | None = None,
 ) -> None:
     from systems.fovea.types import InputChannel
 
@@ -171,10 +190,12 @@ def _register_consolidation_cycle(
         result = await oikos.run_consolidation_cycle()
         foraging = result.get("foraging", {})
         accepted = foraging.get("accepted", 0) if isinstance(foraging, dict) else 0
+        fleet_alive = result.get("fleet", {}).get("alive", 0) if isinstance(result.get("fleet"), dict) else 0
+        assets = result.get("assets", {})
         return (
             f"Consolidation: foraging={accepted} bounties, "
-            f"assets={result.get('assets', {})}, "
-            f"fleet alive={result.get('fleet', {}).get('alive', 0)}."
+            f"assets={assets}, "
+            f"fleet alive={fleet_alive}."
         )
 
     scheduler.register(

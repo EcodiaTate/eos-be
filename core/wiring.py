@@ -27,9 +27,10 @@ def create_expression_feedback_callback(atune: Any, nova: Any) -> Any:
     the Nova → Voxis → Nova perception-action loop.
     """
     _failures = 0
+    _loop_broken = False
 
     def _on_expression_feedback(feedback: Any) -> None:
-        nonlocal _failures
+        nonlocal _failures, _loop_broken
         # Nudge Atune's affect based on expression delta
         if feedback.affect_delta != 0.0:
             atune.nudge_valence(feedback.affect_delta * 0.1)
@@ -39,6 +40,11 @@ def create_expression_feedback_callback(atune: Any, nova: Any) -> Any:
             "nova_respond", "nova_inform", "nova_request",
             "nova_mediate", "nova_celebrate", "nova_warn",
         ):
+            # If the loop is permanently broken, stop trying to create tasks —
+            # this prevents cascading failures and log spam on every expression.
+            if _loop_broken:
+                return
+
             from systems.nova.types import IntentOutcome
 
             intent_id = getattr(feedback, "expression_id", "")
@@ -61,10 +67,26 @@ def create_expression_feedback_callback(atune: Any, nova: Any) -> Any:
                     failure_count=_failures,
                 )
                 if _failures > 20:
+                    _loop_broken = True
                     logger.error(
                         "expression_feedback_loop_broken",
                         total_failures=_failures,
+                        note="Nova outcome delivery disabled until next restart. "
+                             "Thymos should detect via nova_degraded event.",
                     )
+                    # Emit directly to any available synapse so Thymos can act
+                    synapse = getattr(nova, "_synapse", None)
+                    if synapse is not None:
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(
+                                synapse.emit("nova_expression_feedback_broken", {
+                                    "total_failures": _failures,
+                                    "severity": "HIGH",
+                                })
+                            )
+                        except Exception:
+                            pass  # best-effort; Thymos health monitor will catch it
 
     return _on_expression_feedback
 
@@ -393,8 +415,8 @@ def wire_intelligence_loops(
                         else getattr(ev, "state", "NEUTRAL")
                     )
                     atune.set_rhythm_state(state)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("atune_rhythm_state_callback_error", error=str(exc))
 
             event_bus.subscribe(
                 SynapseEventType.RHYTHM_STATE_CHANGED,
@@ -415,8 +437,8 @@ def wire_intelligence_loops(
                         else getattr(ev, "peer_count", 1)
                     )
                     atune.set_community_size(peer_count)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("atune_community_size_callback_error", error=str(exc))
 
             event_bus.subscribe(
                 SynapseEventType.FEDERATION_PEER_CONNECTED,
@@ -435,8 +457,8 @@ def wire_intelligence_loops(
                     count = int(data.get("hypothesis_count", 0)) if isinstance(data, dict) else 0
                     if count > 0:
                         atune.set_pending_hypothesis_count(count)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("atune_hypothesis_count_callback_error", error=str(exc))
 
             event_bus.subscribe(
                 SynapseEventType.EVO_HYPOTHESIS_CREATED,
@@ -458,8 +480,8 @@ def wire_intelligence_loops(
                     )
                     if episode_id:
                         atune.set_last_episode_id(str(episode_id))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("atune_episode_id_callback_error", error=str(exc))
 
             event_bus.subscribe(
                 SynapseEventType.EPISODE_STORED,

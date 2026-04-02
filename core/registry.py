@@ -910,7 +910,8 @@ class SystemRegistry:
         app.state.file_watcher = file_watcher
 
         scheduler = PerceptionScheduler(atune=atune)
-        register_scheduled_tasks(scheduler, axon, oikos)
+        _event_bus = getattr(app.state, "event_bus", None)
+        register_scheduled_tasks(scheduler, axon, oikos, event_bus=_event_bus)
         await scheduler.start()
         app.state.scheduler = scheduler
 
@@ -1881,6 +1882,7 @@ class SystemRegistry:
             github_config=config.external_platforms,
             llm=infra.llm,
             mev_config=config.mev,
+            neo4j_client=infra.neo4j,
         )
         await axon.initialize()
         return axon

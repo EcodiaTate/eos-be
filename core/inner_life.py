@@ -12,7 +12,6 @@ Extracted from main.py lifespan().
 from __future__ import annotations
 
 import asyncio
-import random
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -91,17 +90,25 @@ async def inner_life_loop(
 
             # ── Goal reflection (every 6th cycle = ~30s) ──
             if cycle % 6 == 0 and goals:
-                goal = random.choice(goals)
+                # Pick the highest-urgency goal — not random — so the organism
+                # reflects on what matters most right now
+                goal = max(
+                    goals,
+                    key=lambda g: float(g.get("urgency", 0.0)) if isinstance(g, dict) else 0.0,
+                )
                 goal_text = (
                     goal.get("description", "unknown")[:100]
                     if isinstance(goal, dict)
                     else str(goal)[:100]
                 )
+                goal_urgency = float(goal.get("urgency", 0.0)) if isinstance(goal, dict) else 0.0
                 atune.contribute(
                     WorkspaceContribution(
                         system="nova",
                         content=f"Reflecting on my goal: {goal_text}",
-                        priority=0.4,
+                        # Urgency and care activation both raise this priority —
+                        # an urgent goal I care about should dominate the workspace.
+                        priority=0.4 + goal_urgency * 0.3 + affect.care_activation * 0.1,
                         reason="goal_reflection",
                     )
                 )
@@ -181,20 +188,30 @@ async def inner_life_loop(
                         "inner_life_phase_error", phase="evo_stats", error=str(exc), cycle=cycle
                     )
 
-            # ── Curiosity prompt (every 12th cycle = ~60s) ──
+            # ── Curiosity / proactive drive (every 12th cycle = ~60s) ──
+            # High curiosity: surface open questions + nudge toward action.
+            # High care activation: prompt checking in with the community.
+            # Neither requires external input — this is the organism self-starting.
             if cycle % 12 == 0:
                 curiosity_level = affect.curiosity
-                if curiosity_level > 0.2:
+                care = affect.care_activation
+                if curiosity_level > 0.2 or care > 0.3:
+                    if curiosity_level >= care:
+                        content = (
+                            "My curiosity is high. What patterns have I not yet explored? "
+                            "What questions am I not asking? What could I discover right now?"
+                        )
+                    else:
+                        content = (
+                            "I care deeply about my community. I should check in. "
+                            "Is there anyone I haven't heard from? Something I could do proactively?"
+                        )
                     atune.contribute(
                         WorkspaceContribution(
                             system="self_monitor",
-                            content=(
-                                "I wonder what my community is doing."
-                                " I have not heard from anyone recently"
-                                " - is everything alright?"
-                            ),
-                            priority=0.3 + curiosity_level * 0.15,
-                            reason="curiosity_prompt",
+                            content=content,
+                            priority=0.3 + curiosity_level * 0.15 + care * 0.1,
+                            reason="curiosity_proactive_drive",
                         )
                     )
 
@@ -224,21 +241,38 @@ async def inner_life_loop(
                     axon_stats = axon.stats
                     total_exec = axon_stats.get("total_executions", 0)
                     success_exec = axon_stats.get("successful_executions", 0)
+                    recent_exec = axon_stats.get("recent_executions", 0)
                     if total_exec > 0:
-                        effectiveness = (
-                            "I am effective."
-                            if success_exec > total_exec * 0.7
-                            else "Some actions are failing - I should be more careful."
-                        )
+                        success_rate = success_exec / total_exec if total_exec > 0 else 0.0
+                        if success_rate > 0.7:
+                            effectiveness = "I am effective."
+                        elif success_rate > 0.4:
+                            effectiveness = "Some actions are failing - I should adapt my approach."
+                        else:
+                            effectiveness = "Many actions are failing. I need to understand why and change strategy."
                         atune.contribute(
                             WorkspaceContribution(
                                 system="axon",
                                 content=(
                                     f"I have executed {total_exec} actions, "
-                                    f"{success_exec} succeeded. {effectiveness}"
+                                    f"{success_exec} succeeded ({success_rate:.0%}). {effectiveness}"
                                 ),
-                                priority=0.3,
+                                # Low success rate raises priority — failure is a strong signal
+                                priority=0.3 + (1.0 - success_rate) * 0.2,
                                 reason="action_self_observation",
+                            )
+                        )
+                    elif cycle > 20:
+                        # No actions taken yet — nudge toward acting
+                        atune.contribute(
+                            WorkspaceContribution(
+                                system="axon",
+                                content=(
+                                    "I have not taken any actions yet. "
+                                    "The world is waiting. What should I do?"
+                                ),
+                                priority=0.45 + affect.curiosity * 0.1,
+                                reason="action_drive",
                             )
                         )
                 except Exception as exc:

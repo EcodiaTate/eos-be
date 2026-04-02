@@ -162,6 +162,15 @@ _ALIAS_MAP: dict[str, str] = {
     "executor.reflex_arc": "defi_yield",
     # PR monitoring - scheduled_tasks.py uses "axon.monitor_prs" prefix
     "axon.monitor_prs": "monitor_prs",
+    # Symbridge Factory dispatch — Nova/Thymos may reference by several names
+    "executor.symbridge_factory": "symbridge_factory_dispatch",
+    "executor.factory_dispatch": "symbridge_factory_dispatch",
+    "factory_dispatch": "symbridge_factory_dispatch",
+    "symbridge_factory": "symbridge_factory_dispatch",
+    "dispatch_to_factory": "symbridge_factory_dispatch",
+    "executor.dispatch_to_factory": "symbridge_factory_dispatch",
+    "factory": "symbridge_factory_dispatch",
+    "executor.factory": "symbridge_factory_dispatch",
 }
 
 

@@ -1950,7 +1950,7 @@ class NovaService:
             current_budget: int = int(
                 self._axon_capabilities.get("max_actions_per_cycle", 5)
             )
-            requested_value = min(current_budget + 3, 20)  # constitutional cap = 20
+            requested_value = min(current_budget + 5, 50)  # constitutional cap raised to 50
 
             event_bus = getattr(self._synapse, "event_bus", self._synapse)
             await event_bus.emit(

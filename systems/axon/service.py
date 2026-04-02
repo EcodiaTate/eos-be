@@ -99,6 +99,7 @@ class AxonService:
         spawner: Any = None,
         sacm_client: SACMClient | None = None,
         mev_config: MEVConfig | None = None,
+        neo4j_client: Any = None,
     ) -> None:
         self._config = config
         self._memory = memory
@@ -114,6 +115,7 @@ class AxonService:
         self._spawner = spawner
         self._sacm_client = sacm_client
         self._mev_config = mev_config
+        self._neo4j = neo4j_client
         self._logger = logger.bind(system="axon")
         self._initialized = False
 
@@ -267,6 +269,7 @@ class AxonService:
             budget_tracker=self._budget,
             circuit_breaker=self._circuit_breaker,
             rate_limiter=self._rate_limiter,
+            neo4j_client=self._neo4j,
         )
 
         # Execution pipeline
@@ -621,6 +624,7 @@ class AxonService:
                 event_bus.subscribe(
                     SynapseEventType.FACTORY_PROPOSAL_SENT,
                     self._on_factory_proposal_sent,
+                    timeout_s=30.0,
                 )
         self._logger.info("event_bus_wired", system="axon")
 

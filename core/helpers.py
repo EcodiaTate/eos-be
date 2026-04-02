@@ -64,6 +64,7 @@ class MemoryWorkspaceAdapter:
                 )
             return MemoryContext(traces=traces)
         except Exception:
+            logger.debug("memory_context_retrieval_failed", exc_info=True)
             return MemoryContext()
 
     async def find_bubbling_memory(
@@ -115,6 +116,7 @@ class MemoryWorkspaceAdapter:
                 timestamp=utc_now(),
             )
         except Exception:
+            logger.debug("bubbling_memory_query_failed", exc_info=True)
             return None
 
     async def store_percept_with_broadcast(
@@ -130,7 +132,10 @@ class MemoryWorkspaceAdapter:
                 affect_arousal=affect.arousal,
             )
         except Exception:
-            logger.debug("broadcast_storage_failed", exc_info=True)
+            # WARNING not DEBUG: a broadcast winner that isn't stored breaks
+            # the episode history and Atune entity extraction.  This is worth
+            # surfacing in logs even if it doesn't crash the organism.
+            logger.warning("broadcast_storage_failed", exc_info=True)
 
 
 async def seed_atune_cache(

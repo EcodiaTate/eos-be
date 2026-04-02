@@ -520,20 +520,22 @@ class ActionBudget:
     propose permanent baseline adjustments via EVO_ADJUST_BUDGET.
 
     The three Equor-negotiable fields are:
-      max_actions_per_cycle     - hard cap per theta cycle (default 5)
-      max_concurrent_executions - parallel execution slots (default 3)
-      max_api_calls_per_minute  - external call rate cap (default 30)
+      max_actions_per_cycle     - hard cap per theta cycle (default 15)
+      max_concurrent_executions - parallel execution slots (default 8)
+      max_api_calls_per_minute  - external call rate cap (default 60)
 
-    Safe upper bounds enforced by Equor:
-      max_actions_per_cycle     ≤ 20
-      max_concurrent_executions ≤ 10
-      max_api_calls_per_minute  ≤ 120
+    Safe upper bounds enforced by Equor (raised to match ambitious autonomy):
+      max_actions_per_cycle     ≤ 50
+      max_concurrent_executions ≤ 20
+      max_api_calls_per_minute  ≤ 300
     """
 
     # Baseline defaults (Evo-tunable over generations)
-    max_actions_per_cycle: int = 5
-    max_concurrent_executions: int = 3
-    max_api_calls_per_minute: int = 30
+    # Set high enough for genuine proactivity — Evo will tune these down
+    # per-system if resources become scarce, not artificially capped here.
+    max_actions_per_cycle: int = 15
+    max_concurrent_executions: int = 8
+    max_api_calls_per_minute: int = 60
 
     # Active temporary expansions keyed by field name.
     # Only one expansion per field is active at a time.

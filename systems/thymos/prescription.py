@@ -84,6 +84,20 @@ PARAMETER_FIXES: dict[str, list[ParameterFix]] = {
             reason="Slow the cycle to reduce workspace contention",
         ),
     ],
+    "workspace contention": [
+        ParameterFix(
+            parameter_path="synapse.clock.current_period_ms",
+            delta=20,
+            reason="Slow the cycle to reduce workspace contention",
+        ),
+    ],
+    "concurrent access": [
+        ParameterFix(
+            parameter_path="synapse.clock.current_period_ms",
+            delta=20,
+            reason="Slow the cycle to reduce concurrent access pressure",
+        ),
+    ],
     "llm_rate_limit": [
         ParameterFix(
             parameter_path="voxis.generation.max_concurrent",
@@ -96,11 +110,53 @@ PARAMETER_FIXES: dict[str, list[ParameterFix]] = {
             reason="Reduce Evo LLM usage",
         ),
     ],
-    "Resource pressure causing latency increase": [
+    "rate limit": [
+        ParameterFix(
+            parameter_path="voxis.generation.max_concurrent",
+            delta=-1,
+            reason="Reduce concurrent LLM calls",
+        ),
+        ParameterFix(
+            parameter_path="evo.hypothesis.batch_size",
+            delta=-1,
+            reason="Reduce Evo LLM usage",
+        ),
+    ],
+    "too many requests": [
+        ParameterFix(
+            parameter_path="voxis.generation.max_concurrent",
+            delta=-1,
+            reason="Reduce concurrent LLM calls to avoid rate limits",
+        ),
+    ],
+    # Broader latency / resource pressure patterns
+    # (LLM root_cause text varies — cover the common phrasings)
+    "resource pressure": [
         ParameterFix(
             parameter_path="synapse.clock.current_period_ms",
             delta=30,
             reason="Slow cycle to reduce resource pressure",
+        ),
+    ],
+    "latency increase": [
+        ParameterFix(
+            parameter_path="synapse.clock.current_period_ms",
+            delta=30,
+            reason="Slow cycle to reduce resource pressure",
+        ),
+    ],
+    "high latency": [
+        ParameterFix(
+            parameter_path="synapse.clock.current_period_ms",
+            delta=30,
+            reason="Slow cycle to reduce resource pressure",
+        ),
+    ],
+    "cpu pressure": [
+        ParameterFix(
+            parameter_path="synapse.clock.current_period_ms",
+            delta=50,
+            reason="Slow cognitive cycle to shed CPU load",
         ),
     ],
     # API timeout / pool fixes (Tier 1, spec §1 - 5xx PARAMETER path)

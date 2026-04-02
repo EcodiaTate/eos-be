@@ -421,6 +421,7 @@ class LogAnalyzer:
             "signal_type": "latency_pressure",
             "value": max_p95,
             "unit": "milliseconds",
+            "slowest_system": slowest_sys,
             "severity": (
                 "critical" if max_p95 > 500
                 else "high" if max_p95 > 200

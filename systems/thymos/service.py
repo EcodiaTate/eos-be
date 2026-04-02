@@ -6596,21 +6596,25 @@ class ThymosService:
 
         try:
             # Dispatch via Synapse → SymbridgeFactoryExecutor → Redis → EcodiaOS Factory
-            if self._event_bus is not None:
-                await self._event_bus.emit(
-                    SynapseEventType.FACTORY_PROPOSAL_SENT,
-                    {
-                        "dispatch_type": "thymos_incident",
-                        "incident_id": incident.id,
-                        "severity": incident.severity.value if hasattr(incident.severity, "value") else str(incident.severity),
-                        "affected_system": incident.source_system,
-                        "error_message": incident.error_message or str(incident.error_type),
-                        "description": repair.reason,
-                        "stack_trace": getattr(incident, "stack_trace", ""),
-                        "codebase_name": getattr(incident, "codebase_name", None) or incident.source_system,
-                        "repair_tier": "FACTORY_REPAIR",
-                        "diagnosis_confidence": getattr(repair, "_diagnosis_confidence", 0.0),
-                    },
+            _event_bus = self._synapse.event_bus if self._synapse is not None else None
+            if _event_bus is not None:
+                await _event_bus.emit(
+                    SynapseEvent(
+                        event_type=SynapseEventType.FACTORY_PROPOSAL_SENT,
+                        source_system="thymos",
+                        data={
+                            "dispatch_type": "thymos_incident",
+                            "incident_id": incident.id,
+                            "severity": incident.severity.value if hasattr(incident.severity, "value") else str(incident.severity),
+                            "affected_system": incident.source_system,
+                            "error_message": incident.error_message or str(incident.error_type),
+                            "description": repair.reason,
+                            "stack_trace": getattr(incident, "stack_trace", ""),
+                            "codebase_name": getattr(incident, "codebase_name", None) or incident.source_system,
+                            "repair_tier": "FACTORY_REPAIR",
+                            "diagnosis_confidence": getattr(repair, "_diagnosis_confidence", 0.0),
+                        },
+                    )
                 )
                 self._logger.info(
                     "factory_repair_dispatched",
