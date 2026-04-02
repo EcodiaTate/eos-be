@@ -3013,10 +3013,10 @@ class BenchmarkService:
         if self._event_bus is None:
             return
 
-        try:
-            if self._tsdb is None:
+        if self._tsdb is None:
             return
-        async with self._tsdb.pool.acquire() as conn:
+        try:
+            async with self._tsdb.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
                     SELECT llm_dependency FROM benchmark_snapshots
