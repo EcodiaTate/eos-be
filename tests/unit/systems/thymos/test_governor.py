@@ -49,7 +49,7 @@ class TestHealingGovernor:
 
     def test_should_diagnose_denied_at_limit(self):
         gov = HealingGovernor()
-        gov._active_diagnoses = 3
+        gov._active_diagnoses = gov.MAX_CONCURRENT_DIAGNOSES
         incident = _make_incident()
         assert gov.should_diagnose(incident) is False
 
@@ -71,7 +71,7 @@ class TestHealingGovernor:
 
     def test_should_codegen_denied_at_limit(self):
         gov = HealingGovernor()
-        gov._active_codegen = 1
+        gov._active_codegen = gov.MAX_CONCURRENT_CODEGEN
         assert gov.should_codegen() is False
 
     def test_begin_end_codegen(self):
@@ -83,8 +83,8 @@ class TestHealingGovernor:
 
     def test_storm_mode_entered_on_flood(self):
         gov = HealingGovernor()
-        # Register 11 incidents (above threshold of 10)
-        for _ in range(11):
+        # Register incidents above STORM_THRESHOLD
+        for _ in range(gov.STORM_THRESHOLD + 1):
             incident = _make_incident()
             gov.register_incident(incident)
 
@@ -95,8 +95,9 @@ class TestHealingGovernor:
 
     def test_storm_focuses_on_most_common_system(self):
         gov = HealingGovernor()
-        # 8 incidents from nova, 3 from memory
-        for _ in range(8):
+        # Majority from nova, minority from memory — total above threshold
+        nova_count = gov.STORM_THRESHOLD
+        for _ in range(nova_count):
             gov.register_incident(_make_incident(source_system="nova"))
         for _ in range(3):
             gov.register_incident(_make_incident(source_system="memory"))
@@ -108,7 +109,7 @@ class TestHealingGovernor:
     def test_storm_only_diagnoses_first_per_system(self):
         gov = HealingGovernor()
         # Flood to trigger storm
-        for _ in range(11):
+        for _ in range(gov.STORM_THRESHOLD + 1):
             gov.register_incident(_make_incident(source_system="nova"))
 
         # First nova incident should be diagnosable
@@ -125,13 +126,19 @@ class TestHealingGovernor:
     def test_storm_exit_when_rate_drops(self):
         gov = HealingGovernor()
         # Enter storm by registering many
-        for _ in range(11):
+        for _ in range(gov.STORM_THRESHOLD + 1):
             gov.register_incident(_make_incident())
         gov.should_diagnose(_make_incident())
         assert gov.healing_mode == HealingMode.STORM
 
-        # Clear the recent incidents to simulate time passing
+        # Clear the recent incidents and backdate the exit candidate to simulate
+        # sustained low rate for longer than STORM_EXIT_SUSTAINED_S
         gov._recent_incident_times.clear()
+        # First call starts the exit candidate timer
+        gov.check_storm_exit()
+        # Backdate the candidate start so the next check sees it as sustained
+        import time
+        gov._storm_exit_candidate_since = time.time() - gov.STORM_EXIT_SUSTAINED_S - 1
         exited = gov.check_storm_exit()
         assert exited is True
         assert gov.healing_mode == HealingMode.NOMINAL
@@ -172,7 +179,7 @@ class TestHealingGovernor:
         gov = HealingGovernor()
         assert gov.storm_activations == 0
         # Trigger storm
-        for _ in range(11):
+        for _ in range(gov.STORM_THRESHOLD + 1):
             gov.register_incident(_make_incident())
         gov.should_diagnose(_make_incident())
         assert gov.storm_activations == 1
@@ -185,18 +192,17 @@ class TestHealingGovernor:
 
     def test_can_submit_t4_denied_at_concurrent_limit(self):
         gov = HealingGovernor()
-        # Use up the 3 concurrent slots
-        gov.begin_t4_proposal()
-        gov.begin_t4_proposal()
-        gov.begin_t4_proposal()
+        # Use up all concurrent slots
+        for _ in range(gov.MAX_CONCURRENT_T4_PROPOSALS):
+            gov.begin_t4_proposal()
         assert gov.can_submit_t4_proposal() is False
 
     def test_can_submit_t4_denied_at_hourly_limit(self):
         gov = HealingGovernor()
-        # Use up all 5 hourly slots
-        for _ in range(5):
+        # Use up all hourly slots
+        for _ in range(gov.MAX_T4_PROPOSALS_PER_HOUR):
             gov.begin_t4_proposal()
-        assert gov._t4_proposals_this_hour == 5
+        assert gov._t4_proposals_this_hour == gov.MAX_T4_PROPOSALS_PER_HOUR
         assert gov.can_submit_t4_proposal() is False
 
     def test_begin_end_t4_proposal(self):
@@ -219,5 +225,5 @@ class TestHealingGovernor:
         budget = gov.budget_state
         assert budget.active_t4_proposals == 2
         assert budget.t4_proposals_this_hour == 2
-        assert budget.max_concurrent_t4_proposals == 3
-        assert budget.max_t4_proposals_per_hour == 5
+        assert budget.max_concurrent_t4_proposals == gov.MAX_CONCURRENT_T4_PROPOSALS
+        assert budget.max_t4_proposals_per_hour == gov.MAX_T4_PROPOSALS_PER_HOUR

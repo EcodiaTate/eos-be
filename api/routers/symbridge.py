@@ -52,8 +52,9 @@ async def receive_inbound(msg: SymbridgeMessage, request: Request) -> SymbridgeR
 
                 # Always emit FACTORY_RESULT_RECEIVED so any subscriber can react
                 await event_bus.emit(SynapseEvent(
-                    type=SynapseEventType.FACTORY_RESULT_RECEIVED,
-                    payload={
+                    event_type=SynapseEventType.FACTORY_RESULT_RECEIVED,
+                    source_system="symbridge",
+                    data={
                         "proposal_id": msg.correlationId,
                         "session_id": session_id,
                         "status": status,
@@ -66,8 +67,9 @@ async def receive_inbound(msg: SymbridgeMessage, request: Request) -> SymbridgeR
 
                 if deploy_status == "deployed":
                     await event_bus.emit(SynapseEvent(
-                        type=SynapseEventType.FACTORY_DEPLOY_SUCCEEDED,
-                        payload={
+                        event_type=SynapseEventType.FACTORY_DEPLOY_SUCCEEDED,
+                        source_system="symbridge",
+                        data={
                             "session_id": session_id,
                             "codebase": codebase_name,
                             "commit_sha": msg.payload.get("commit_sha"),
@@ -77,8 +79,9 @@ async def receive_inbound(msg: SymbridgeMessage, request: Request) -> SymbridgeR
                     ))
                 elif deploy_status in ("failed", "reverted"):
                     await event_bus.emit(SynapseEvent(
-                        type=SynapseEventType.FACTORY_DEPLOY_FAILED,
-                        payload={
+                        event_type=SynapseEventType.FACTORY_DEPLOY_FAILED,
+                        source_system="symbridge",
+                        data={
                             "session_id": session_id,
                             "codebase": codebase_name,
                             "error": msg.payload.get("error_message", ""),
@@ -137,8 +140,9 @@ async def receive_inbound(msg: SymbridgeMessage, request: Request) -> SymbridgeR
                     else SynapseEventType.SYMBIONT_DOWN
                 )
                 await event_bus.emit(SynapseEvent(
-                    type=event_type,
-                    payload={
+                    event_type=event_type,
+                    source_system="symbridge",
+                    data={
                         "source": "ecodiaos",
                         "status": status,
                         "details": msg.payload,
@@ -191,8 +195,9 @@ async def receive_inbound(msg: SymbridgeMessage, request: Request) -> SymbridgeR
                 from systems.synapse.types import SynapseEvent, SynapseEventType
 
                 await event_bus.emit(SynapseEvent(
-                    type=SynapseEventType.CAPABILITY_CREATED,
-                    payload={
+                    event_type=SynapseEventType.CAPABILITY_CREATED,
+                    source_system="symbridge",
+                    data={
                         "description": msg.payload.get("description"),
                         "session_id": msg.payload.get("session_id"),
                         "files_changed": msg.payload.get("files_changed", []),

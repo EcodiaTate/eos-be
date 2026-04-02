@@ -540,14 +540,27 @@ async def health() -> dict[str, Any]:
     _NOT_INIT: dict[str, str] = {"status": "not_initialized"}
 
     async def _safe_health(name: str, attr: str, method: str = "health") -> dict[str, Any]:
-        """Call ``app.state.<attr>.<method>()`` with full error isolation."""
+        """Call ``app.state.<attr>.<method>()`` with full error isolation and timeout."""
         if not hasattr(app.state, attr):
             return _NOT_INIT
         try:
             obj = getattr(app.state, attr)
-            return await getattr(obj, method)()
+            return await asyncio.wait_for(getattr(obj, method)(), timeout=5.0)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("health_check_timeout", system=name)
+            return {"status": "timeout", "error": f"{name} health check timed out"}
         except Exception as exc:
             logger.warning("health_check_failed", system=name, error=str(exc))
+            return {"status": "error", "error": str(exc)}
+
+    def _safe_sync_stats(attr: str) -> dict[str, Any]:
+        """Read a sync ``.stats`` property with full error isolation."""
+        if not hasattr(app.state, attr):
+            return _NOT_INIT
+        try:
+            return getattr(app.state, attr).stats
+        except Exception as exc:
+            logger.warning("health_check_failed", system=attr, error=str(exc))
             return {"status": "error", "error": str(exc)}
 
     # Gather all health probes concurrently — each is individually guarded
@@ -580,7 +593,10 @@ async def health() -> dict[str, Any]:
     # TimescaleDB is optional — may be None
     if hasattr(app.state, "tsdb") and app.state.tsdb is not None:
         try:
-            tsdb_health = await app.state.tsdb.health_check()
+            tsdb_health = await asyncio.wait_for(app.state.tsdb.health_check(), timeout=5.0)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("health_check_timeout", system="timescaledb")
+            tsdb_health = {"status": "timeout", "error": "timescaledb health check timed out"}
         except Exception as exc:
             logger.warning("health_check_failed", system="timescaledb", error=str(exc))
             tsdb_health = {"status": "error", "error": str(exc)}
@@ -600,11 +616,11 @@ async def health() -> dict[str, Any]:
     if synapse_health.get("safe_mode"):
         overall = "safe_mode"
 
-    # Instance identity (guarded)
+    # Instance identity (guarded with timeout)
     instance_name = "unborn"
     try:
         if hasattr(app.state, "memory"):
-            instance = await app.state.memory.get_self()
+            instance = await asyncio.wait_for(app.state.memory.get_self(), timeout=5.0)
             if instance:
                 instance_name = instance.name
     except Exception:
@@ -642,9 +658,9 @@ async def health() -> dict[str, Any]:
             "memory": memory_health,
             "equor": equor_health,
             "nova": nova_health,
-            "axon": app.state.axon.stats if hasattr(app.state, "axon") else _NOT_INIT,
-            "evo": app.state.evo.stats if hasattr(app.state, "evo") else _NOT_INIT,
-            "simula": app.state.simula.stats if hasattr(app.state, "simula") else _NOT_INIT,
+            "axon": _safe_sync_stats("axon"),
+            "evo": _safe_sync_stats("evo"),
+            "simula": _safe_sync_stats("simula"),
             "atune": atune_health,
             "voxis": voxis_health,
             "synapse": synapse_health,

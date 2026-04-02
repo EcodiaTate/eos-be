@@ -124,7 +124,7 @@ def _register_defi_yield_deployment(
             try:
                 from systems.synapse.types import SynapseEvent, SynapseEventType
                 await event_bus.emit(SynapseEvent(
-                    type=SynapseEventType.ECONOMIC_ACTION_FAILED,
+                    event_type=SynapseEventType.ECONOMIC_ACTION_DEFERRED,
                     source_system="scheduled_tasks",
                     data={"task": "defi_yield_deployment", "reason": str(reason)},
                 ))

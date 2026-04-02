@@ -248,6 +248,7 @@ class SystemRegistry:
         # ── Phase 5: Synapse - The Coordination Bus ──────────
         synapse = await self._init_synapse(config, infra, atune)
         app.state.synapse = synapse
+        app.state.event_bus = synapse.event_bus
 
         # Register systems for health monitoring
         for system in [memory, equor, voxis, nova, axon, evo, thread, logos]:
