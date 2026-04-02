@@ -39,6 +39,14 @@ _HEALTH_CHECK_TIMEOUT_S: float = 2.0
 # Critical systems - failure triggers safe mode
 _CRITICAL_SYSTEMS: frozenset[str] = frozenset({"equor", "memory", "atune"})
 
+# Statuses reported by system.health() that indicate the system is alive
+# and responding.  "degraded" means reduced capability but still functional -
+# it must NOT be counted as a health-check miss or it will cascade into
+# FAILED → safe_mode for critical systems.
+_ALIVE_STATUSES: frozenset[str] = frozenset({
+    "healthy", "degraded", "running", "safe_mode",
+})
+
 
 class HealthMonitor:
     """
@@ -460,7 +468,7 @@ class HealthMonitor:
                 if isinstance(health_result, dict) else "healthy"
             )
 
-            if status == "healthy":
+            if status in _ALIVE_STATUSES:
                 old_status = record.status
                 was_failed = old_status == SystemStatus.FAILED
                 # Detect overloaded: latency > 2x the EMA (if we have history)
@@ -469,14 +477,20 @@ class HealthMonitor:
                 else:
                     record.record_success(latency_ms)
 
-                # Emit transition event for any status change
-                await self._emit_health_changed(system_id, old_status, record.status)
+                # If the system reports degraded, reflect that in the record
+                # while still counting it as a successful heartbeat.
+                if status == "degraded" and record.status == SystemStatus.HEALTHY:
+                    record.status = SystemStatus.DEGRADED
+                    await self._emit_health_changed(system_id, old_status, record.status)
+                else:
+                    # Emit transition event for any status change
+                    await self._emit_health_changed(system_id, old_status, record.status)
 
                 # Recovery detection (FAILED → HEALTHY requires 3 successes)
                 if was_failed and record.status == SystemStatus.HEALTHY:
                     await self._handle_recovery(system_id)
             else:
-                # System reported non-healthy status
+                # System reported a truly unhealthy status (error, failed, etc.)
                 old_status = record.status
                 record.record_failure()
                 # Transition to DEGRADED on first miss (not yet FAILED)
