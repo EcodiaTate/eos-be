@@ -536,7 +536,7 @@ async def health() -> dict[str, Any]:
     oneiros_health = await app.state.oneiros.health() if hasattr(app.state, "oneiros") else {"status": "not_initialized"}
     thread_health = await app.state.thread.health() if hasattr(app.state, "thread") else {"status": "not_initialized"}
     neo4j_health = await app.state.neo4j.health_check()
-    tsdb_health = await app.state.tsdb.health_check()
+    tsdb_health = (await app.state.tsdb.health_check()) if app.state.tsdb else {"status": "not_configured"}
     redis_health = await app.state.redis.health_check()
 
     overall = "healthy"
