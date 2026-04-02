@@ -95,13 +95,12 @@ async def create_infra(config: Any) -> InfraClients:
         infra.tsdb = TimescaleDBClient(config.timescaledb)
         await infra.tsdb.connect()
     except Exception as exc:
-        logger.error(
-            "timescaledb_init_failed",
+        logger.warning(
+            "timescaledb_init_failed_non_fatal",
             error=str(exc),
             dependents="Metrics, Skia",
-            exc_info=True,
         )
-        raise RuntimeError("TimescaleDB init failed (required by Metrics, Skia)") from exc
+        infra.tsdb = None  # Metrics and Skia will degrade gracefully
 
     try:
         infra.redis = RedisClient(config.redis)
