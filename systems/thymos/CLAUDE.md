@@ -10,8 +10,8 @@
 - **`CausalAnalyzer`**: Neo4j `(System)-[:DEPENDS_ON]->(System)` traversal (5-min cache, hardcoded fallback)
 - **`TemporalCorrelator`**: TimescaleDB metric anomaly + system event queries (30s window)
 - **`AntibodyLibrary`**: fingerprint lookup, effectiveness tracking (refinement <0.6, retirement <0.3 after 5+ apps), generation lineage in Neo4j
-- **Repair validation gates**: Equor review (Tier 3+), blast radius check (>0.5 → escalate), Simula sandbox (Tier 4), rate limits (5/hour, 3 novel/day)
-- **`HealingGovernor`**: rate limiting, storm detection, hysteresis-based storm exit
+- **Repair validation gates**: Equor review (Tier 3+), blast radius check (>0.5 → escalate), Simula sandbox (Tier 4), rate limits (0 = unlimited by default; set via `ThymosConfig`)
+- **`HealingGovernor`**: rate limiting (all limits config-driven, 0 = unlimited), storm detection (0 = disabled), hysteresis-based storm exit
 - **`HomeostasisController`**: adaptive baselines (7-day rolling median ± 25%)
 - **`DriftSentinel`**: configurable σ-thresholds per metric
 - **Embedding-based prophylactic scanner (P2, IMPLEMENTED 2026-03-07)**: 768-dim sentence-transformer cosine similarity >0.85 threshold; antibody fingerprint embeddings cached in `_fingerprint_store`; keyword fallback when embedder unavailable; `check_intent_similarity()` for intent-time gating; `add_fingerprints_from_procedures()` for Oneiros ingestion

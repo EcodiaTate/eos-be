@@ -4159,6 +4159,9 @@ class ThymosService:
         self._governor.set_limits(
             max_repairs_per_hour=self._config.max_repairs_per_hour,
             max_novel_repairs_per_day=self._config.max_novel_repairs_per_day,
+            max_concurrent_diagnoses=self._config.max_concurrent_diagnoses,
+            max_concurrent_codegen=self._config.max_concurrent_codegen,
+            storm_threshold=self._config.storm_threshold,
         )
         self._governor._on_event = self._on_governor_event
         if self._causal_analyzer is not None:

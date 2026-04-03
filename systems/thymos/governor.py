@@ -47,25 +47,34 @@ class HealingGovernor:
     4. Total immune system CPU budget: 10% of organism
     """
 
-    MAX_CONCURRENT_DIAGNOSES = 5
-    MAX_CONCURRENT_CODEGEN = 3
-    MAX_CONCURRENT_T4_PROPOSALS = 5   # Cytokine storm: max concurrent T4 repairs
-    MAX_T4_PROPOSALS_PER_HOUR = 20    # Cytokine storm: max T4 per hour
-    STORM_THRESHOLD = 50              # incidents per minute before storm triggers
+    # All limits default to 0 = unlimited. Override via config (set_limits).
+    MAX_CONCURRENT_DIAGNOSES: int = 0
+    MAX_CONCURRENT_CODEGEN: int = 0
+    MAX_CONCURRENT_T4_PROPOSALS: int = 0
+    MAX_T4_PROPOSALS_PER_HOUR: int = 0
+    STORM_THRESHOLD: int = 0              # 0 = no storm throttle
     STORM_EXIT_RATIO = 0.5            # exit at 50% below entry threshold (hysteresis)
     STORM_EXIT_SUSTAINED_S = 300.0    # 5 minutes below exit threshold before exiting
     STORM_WINDOW_S = 60.0
     CPU_BUDGET_FRACTION = 0.25
 
-    # These class-level defaults are overridden by set_limits() when config is wired.
-    # 0 = unlimited (never enters budget-exhausted / DEGRADED mode on this axis).
     MAX_REPAIRS_PER_HOUR: int = 0
     MAX_NOVEL_REPAIRS_PER_DAY: int = 0
 
-    def set_limits(self, max_repairs_per_hour: int, max_novel_repairs_per_day: int) -> None:
-        """Wire config-driven caps. 0 = unlimited."""
+    def set_limits(
+        self,
+        max_repairs_per_hour: int,
+        max_novel_repairs_per_day: int,
+        max_concurrent_diagnoses: int = 0,
+        max_concurrent_codegen: int = 0,
+        storm_threshold: int = 0,
+    ) -> None:
+        """Wire config-driven caps. 0 = unlimited on every axis."""
         self.MAX_REPAIRS_PER_HOUR = max_repairs_per_hour
         self.MAX_NOVEL_REPAIRS_PER_DAY = max_novel_repairs_per_day
+        self.MAX_CONCURRENT_DIAGNOSES = max_concurrent_diagnoses
+        self.MAX_CONCURRENT_CODEGEN = max_concurrent_codegen
+        self.STORM_THRESHOLD = storm_threshold
 
     def __init__(self) -> None:
         self._active_diagnoses: int = 0
@@ -120,8 +129,8 @@ class HealingGovernor:
         self._active_incidents.pop(incident_id, None)
 
     def should_diagnose(self, incident: Incident) -> bool:
-        """Check if we have budget to diagnose this incident."""
-        if self._active_diagnoses >= self.MAX_CONCURRENT_DIAGNOSES:
+        """Check if we have budget to diagnose this incident. 0 = unlimited."""
+        if self.MAX_CONCURRENT_DIAGNOSES > 0 and self._active_diagnoses >= self.MAX_CONCURRENT_DIAGNOSES:
             self._logger.debug(
                 "diagnosis_throttled",
                 active=self._active_diagnoses,
@@ -141,8 +150,8 @@ class HealingGovernor:
         return True
 
     def should_codegen(self) -> bool:
-        """Check if we can run a codegen (Tier 4) repair."""
-        return self._active_codegen < self.MAX_CONCURRENT_CODEGEN
+        """Check if we can run a codegen (Tier 4) repair. 0 = unlimited."""
+        return self.MAX_CONCURRENT_CODEGEN == 0 or self._active_codegen < self.MAX_CONCURRENT_CODEGEN
 
     def begin_diagnosis(self) -> None:
         """Acquire a diagnosis slot."""
@@ -177,10 +186,12 @@ class HealingGovernor:
             self._t4_proposals_this_hour = 0
             self._t4_hour_start = now
 
-        # Check both budgets
-        if self._active_t4_proposal_count >= self.MAX_CONCURRENT_T4_PROPOSALS:
+        # Check both budgets. 0 = unlimited on each axis.
+        if self.MAX_CONCURRENT_T4_PROPOSALS > 0 and self._active_t4_proposal_count >= self.MAX_CONCURRENT_T4_PROPOSALS:
             return False
-        return not self._t4_proposals_this_hour >= self.MAX_T4_PROPOSALS_PER_HOUR
+        if self.MAX_T4_PROPOSALS_PER_HOUR > 0 and self._t4_proposals_this_hour >= self.MAX_T4_PROPOSALS_PER_HOUR:
+            return False
+        return True
 
     def begin_t4_proposal(self) -> None:
         """Record start of a T4 proposal submission."""
@@ -321,7 +332,9 @@ class HealingGovernor:
         return False
 
     def _is_storm(self) -> bool:
-        """Check if incident rate exceeds storm threshold."""
+        """Check if incident rate exceeds storm threshold. 0 = no throttle."""
+        if self.STORM_THRESHOLD == 0:
+            return False
         now = utc_now().timestamp()
         cutoff = now - self.STORM_WINDOW_S
         recent_count = sum(
