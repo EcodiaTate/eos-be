@@ -43,9 +43,10 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+import os as _os_pc
 _MAX_PER_CALL: int = VELOCITY_LIMITS["max_new_procedures_per_cycle"]
-_MIN_OCCURRENCES: int = 3   # How many times a sequence must recur
-_MAX_EXAMPLES: int = 8      # Max examples to send to the LLM
+_MIN_OCCURRENCES: int = int(_os_pc.getenv("EVO_CODIFIER_MIN_OCCURRENCES", "3"))
+_MAX_EXAMPLES: int = int(_os_pc.getenv("EVO_CODIFIER_MAX_EXAMPLES", "0")) or 999  # 0 = unlimited
 
 _SYSTEM_PROMPT = (
     "Procedure extraction. "

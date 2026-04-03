@@ -168,6 +168,7 @@ class SynapseConfig(BaseModel):
     metabolic_interval: int = 50
     infra_cost_poll_interval_s: int = 300
     rhythm_enabled: bool = True
+    metabolic_pressure_threshold_usd_hr: float = 1.0
 
 
 class AtuneConfig(BaseModel):
@@ -178,7 +179,8 @@ class AtuneConfig(BaseModel):
 
 
 class NovaConfig(BaseModel):
-    max_active_goals: int = 20
+    # 0 = unlimited. Set to non-zero only if goal proliferation becomes a problem.
+    max_active_goals: int = 0
     fast_path_timeout_ms: int = 300
     slow_path_timeout_ms: int = 15000
     max_policies_per_deliberation: int = 5
@@ -292,8 +294,10 @@ class VoxisConfig(BaseModel):
     max_expression_length: int = 2000
     min_expression_interval_minutes: int = 1
     voice_synthesis_enabled: bool = False
-    # Proactive expression threshold - ambient insights below this are suppressed
-    insight_expression_threshold: float = 0.6
+    # Proactive expression threshold - ambient insights below this are suppressed.
+    # 0.0 = no threshold (organism expresses all ambient insights freely).
+    # Raise via config to create a quality bar if the organism over-expresses.
+    insight_expression_threshold: float = 0.0
     # Rolling message window kept verbatim in conversation context
     conversation_history_window: int = 50
     # Max tokens to pass to LLM as conversation history (older messages summarised)

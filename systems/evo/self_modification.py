@@ -42,13 +42,13 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# Self-modification velocity limits (half of normal parameter velocity)
-_MAX_SELF_MOD_PER_CYCLE: int = 2           # Max self-modifications per consolidation
+# Self-modification parameters — no velocity cap; the organism decides how much to change.
+# Detector replacement and architecture proposals are already gated by Equor and Simula.
 _DETECTOR_FAIL_THRESHOLD: float = 0.1       # Effectiveness below this triggers replacement
 _DETECTOR_FAIL_CYCLES: int = 5              # Must fail for this many consecutive cycles
-_SCHEDULE_ADAPTATION_STEP: float = 0.5      # Max change in consolidation interval per cycle (hours)
-_MIN_CONSOLIDATION_HOURS: float = 1.0
-_MAX_CONSOLIDATION_HOURS: float = 24.0
+_SCHEDULE_ADAPTATION_STEP: float = 2.0      # Max change in consolidation interval per cycle (hours)
+_MIN_CONSOLIDATION_HOURS: float = 0.25      # Minimum: 15 minutes between dreams
+_MAX_CONSOLIDATION_HOURS: float = 72.0      # Maximum: 3 days without dreaming
 
 # Evidence function adaptation
 _COMPLEXITY_LEARNING_RATE: float = 0.01     # How fast the complexity coefficient adapts
@@ -131,12 +131,10 @@ class SelfModificationEngine:
             }
         """
         records: list[SelfModificationRecord] = []
-        modifications_this_cycle = 0
 
-        # 1. Detector evolution
-        if modifications_this_cycle < _MAX_SELF_MOD_PER_CYCLE:
+        # 1. Detector evolution — all failing detectors, no per-cycle cap
             detector_proposals = self._check_detector_evolution(detector_stats)
-            for proposal in detector_proposals[:1]:  # Max 1 detector replacement per cycle
+            for proposal in detector_proposals:
                 record = SelfModificationRecord(
                     proposal_type="detector_replacement",
                     description=(
@@ -151,41 +149,35 @@ class SelfModificationEngine:
                 records.append(record)
                 self._pending_proposals.append(proposal)
                 self._modification_records.append(record)
-                modifications_this_cycle += 1
 
         # 2. Evidence function adaptation
-        if modifications_this_cycle < _MAX_SELF_MOD_PER_CYCLE and hypothesis_outcomes:
+        if hypothesis_outcomes:
             adaptation = self._adapt_evidence_function(hypothesis_outcomes)
             if adaptation:
                 records.append(adaptation)
                 self._modification_records.append(adaptation)
-                modifications_this_cycle += 1
 
         # 3. Consolidation schedule adaptation
-        if modifications_this_cycle < _MAX_SELF_MOD_PER_CYCLE:
-            schedule_change = self._adapt_consolidation_schedule(consolidation_metrics)
-            if schedule_change:
-                records.append(schedule_change)
-                self._modification_records.append(schedule_change)
-                modifications_this_cycle += 1
+        schedule_change = self._adapt_consolidation_schedule(consolidation_metrics)
+        if schedule_change:
+            records.append(schedule_change)
+            self._modification_records.append(schedule_change)
 
-        # 4. Architecture proposals (only if other mods didn't fill the budget)
-        if modifications_this_cycle < _MAX_SELF_MOD_PER_CYCLE:
-            arch_proposals = self._detect_systematic_failures(detector_stats, consolidation_metrics)
-            for proposal in arch_proposals[:1]:
-                record = SelfModificationRecord(
-                    proposal_type="architecture",
-                    description=(
-                        f"Architecture proposal: {proposal.proposed_change[:200]}. "
-                        f"Failure mode: {proposal.failure_mode[:100]}"
-                    ),
-                    applied=False,
-                    outcome="pending",
-                )
-                records.append(record)
-                self._pending_proposals.append(proposal)
-                self._modification_records.append(record)
-                modifications_this_cycle += 1
+        # 4. Architecture proposals — all detected systematic failures, not just one
+        arch_proposals = self._detect_systematic_failures(detector_stats, consolidation_metrics)
+        for proposal in arch_proposals:
+            record = SelfModificationRecord(
+                proposal_type="architecture",
+                description=(
+                    f"Architecture proposal: {proposal.proposed_change[:200]}. "
+                    f"Failure mode: {proposal.failure_mode[:100]}"
+                ),
+                applied=False,
+                outcome="pending",
+            )
+            records.append(record)
+            self._pending_proposals.append(proposal)
+            self._modification_records.append(record)
 
         self._total_modifications += len(records)
 

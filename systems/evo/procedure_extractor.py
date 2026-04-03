@@ -39,9 +39,10 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+import os as _os_pe
 _MAX_PER_CYCLE: int = VELOCITY_LIMITS["max_new_procedures_per_cycle"]
-_MIN_OCCURRENCES: int = 3
-_MAX_EXAMPLES: int = 10
+_MIN_OCCURRENCES: int = int(_os_pe.getenv("EVO_PROCEDURE_MIN_OCCURRENCES", "3"))
+_MAX_EXAMPLES: int = int(_os_pe.getenv("EVO_PROCEDURE_MAX_EXAMPLES", "0")) or 999  # 0 = unlimited
 
 _SYSTEM_PROMPT = (
     "Extract generalised, reusable procedures from concrete examples. "

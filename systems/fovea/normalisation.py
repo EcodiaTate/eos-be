@@ -66,12 +66,11 @@ class NormalisationLLMClient(Protocol):
 # ---------------------------------------------------------------------------
 
 _SENTIMENT_PROMPT = """\
-Sentiment analysis of the following text. Respond as JSON:
-{{"valence": -1.0 to 1.0, "arousal": 0.0 to 1.0, "dominant_emotion": "joy|sadness|anger|fear|surprise|disgust|trust", "summary": "one sentence"}}
-
 TEXT:
 {text}
-"""
+
+Respond as JSON:
+{{"valence": -1.0 to 1.0, "arousal": 0.0 to 1.0, "dominant_emotion": "joy|sadness|anger|fear|surprise|disgust|trust", "summary": "one sentence"}}"""
 
 _ENTITY_EXTRACTION_PROMPT = """\
 Extract entities and relationships from the following text. Respond as JSON:
@@ -101,7 +100,7 @@ async def _analyse_sentiment_llm(
         from clients.llm import Message
 
         response = await llm_client.generate(
-            system_prompt="Analyse sentiment. Respond as JSON.",
+            system_prompt="Fovea normalisation — sentiment.",
             messages=[Message(role="user", content=prompt)],
             max_tokens=300,
             temperature=0.1,
@@ -138,7 +137,7 @@ async def _extract_entities_llm(
         from clients.llm import Message
 
         response = await llm_client.generate(
-            system_prompt="Extract entities and relations. Respond as JSON.",
+            system_prompt="Fovea normalisation — entity extraction.",
             messages=[Message(role="user", content=prompt)],
             max_tokens=2000,
             temperature=0.2,

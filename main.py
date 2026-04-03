@@ -209,6 +209,11 @@ from api.routers.symbridge import router as symbridge_router
 
 app.include_router(symbridge_router)
 
+# ─── Corpus Knowledge Ingestion Router ──────────────────────────
+from api.routers.corpus_ingestion import router as corpus_ingestion_router
+
+app.include_router(corpus_ingestion_router)
+
 # ─── Alive WebSocket on port 8000 (for Cloud Run) ────────────────
 # Cloud Run only exposes one port per container. The standalone ws_server
 # on port 8001 is unreachable, so we add a FastAPI WebSocket route here

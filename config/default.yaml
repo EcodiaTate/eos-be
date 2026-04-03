@@ -107,7 +107,7 @@ atune:
 # ── Nova (goal deliberation / EFE) ────────────────────────────────────────────
 # The organism decides how many goals to pursue and how long to think.
 nova:
-  max_active_goals: 100           # was 20; let the organism juggle what it can
+  max_active_goals: 0             # 0 = unlimited; organism manages its own goal set
   fast_path_timeout_ms: 1000      # was 300; fast doesn't mean rushed
   slow_path_timeout_ms: 120000    # was 15s; deep deliberation when needed
   max_policies_per_deliberation: 10  # was 5; more strategies = better decisions

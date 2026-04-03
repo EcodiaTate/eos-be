@@ -105,15 +105,16 @@ class SchemaInductionResult(EOSBaseModel):
 
 
 # ─── Constants ───────────────────────────────────────────────────────────────
+import os as _os_si
 
 # Minimum instances of a pattern before it's worth schematizing
-_MIN_INSTANCES: int = 5
+_MIN_INSTANCES: int = int(_os_si.getenv("EVO_SCHEMA_MIN_INSTANCES", "5"))
 # Minimum MDL gain (bits) to justify a new schema element
-_MIN_MDL_GAIN_BITS: float = 2.0
-# Maximum schema elements per induction pass (budget control)
-_MAX_ELEMENTS_PER_PASS: int = 10
+_MIN_MDL_GAIN_BITS: float = float(_os_si.getenv("EVO_SCHEMA_MIN_MDL_GAIN_BITS", "2.0"))
+# Maximum schema elements per induction pass (0 = unlimited)
+_MAX_ELEMENTS_PER_PASS: int = int(_os_si.getenv("EVO_SCHEMA_MAX_ELEMENTS_PER_PASS", "0")) or 999
 # Minimum co-occurrence ratio to propose a relation type
-_MIN_COOCCURRENCE_RATIO: float = 0.3
+_MIN_COOCCURRENCE_RATIO: float = float(_os_si.getenv("EVO_SCHEMA_MIN_COOCCURRENCE_RATIO", "0.3"))
 
 
 # ─── Schema Induction Engine ─────────────────────────────────────────────────

@@ -58,7 +58,8 @@ _METABOLIC_EFFICIENCY_WEIGHT: float = 0.1
 _EXTINCTION_FITNESS_SIGMA: float = 1.0   # Archive below mean - 1σ
 _SPECIATION_DISTANCE: float = 0.7        # Graph distance threshold for speciation
 _MIN_SPECIES_SIZE: int = 3               # Minimum members to declare a species
-_MAX_SPECIES: int = 10                   # Cap on cognitive species
+# No hard cap on species count — the organism explores as many niches as it discovers.
+# Metabolic pressure from Oikos is the natural limit: expensive niches die under starvation.
 _NICHE_DIVERSITY_TARGET: float = 0.3     # Maintain at least 30% category diversity
 
 
@@ -463,8 +464,6 @@ class EvolutionaryPressureSystem:
                 )
                 new_species.append(species)
 
-        # Cap species count
-        new_species = new_species[:_MAX_SPECIES]
         self._species = new_species
 
         if new_species:

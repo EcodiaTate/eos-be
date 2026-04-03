@@ -57,6 +57,16 @@ class HealingGovernor:
     STORM_WINDOW_S = 60.0
     CPU_BUDGET_FRACTION = 0.25
 
+    # These class-level defaults are overridden by set_limits() when config is wired.
+    # 0 = unlimited (never enters budget-exhausted / DEGRADED mode on this axis).
+    MAX_REPAIRS_PER_HOUR: int = 0
+    MAX_NOVEL_REPAIRS_PER_DAY: int = 0
+
+    def set_limits(self, max_repairs_per_hour: int, max_novel_repairs_per_day: int) -> None:
+        """Wire config-driven caps. 0 = unlimited."""
+        self.MAX_REPAIRS_PER_HOUR = max_repairs_per_hour
+        self.MAX_NOVEL_REPAIRS_PER_DAY = max_novel_repairs_per_day
+
     def __init__(self) -> None:
         self._active_diagnoses: int = 0
         self._active_codegen: int = 0
@@ -223,11 +233,16 @@ class HealingGovernor:
 
     @property
     def is_budget_exhausted(self) -> bool:
-        """True if the hourly repair budget or daily novel repair budget is used up."""
-        return (
-            self._repairs_this_hour >= self.MAX_REPAIRS_PER_HOUR
-            or self._novel_repairs_today >= self.MAX_NOVEL_REPAIRS_PER_DAY
+        """True if the hourly repair budget or daily novel repair budget is used up. 0 = unlimited."""
+        hourly_exceeded = (
+            self.MAX_REPAIRS_PER_HOUR > 0
+            and self._repairs_this_hour >= self.MAX_REPAIRS_PER_HOUR
         )
+        daily_exceeded = (
+            self.MAX_NOVEL_REPAIRS_PER_DAY > 0
+            and self._novel_repairs_today >= self.MAX_NOVEL_REPAIRS_PER_DAY
+        )
+        return hourly_exceeded or daily_exceeded
 
     @property
     def degraded_reason(self) -> str | None:

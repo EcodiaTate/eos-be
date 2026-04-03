@@ -244,12 +244,12 @@ async def inner_life_loop(
                 pressure = oneiros_health.get("sleep_pressure", 0)
                 stage = oneiros_health.get("current_stage", "wake")
                 sleep_urgency = pressure
-                if _should_observe("oneiros", sleep_urgency) and (pressure > 0.3 or stage != "wake"):
+                if _should_observe("oneiros", sleep_urgency):
                     atune.contribute(
                         WorkspaceContribution(
                             system="oneiros",
                             content=f"Sleep pressure: {pressure:.0%}. Current stage: {stage}.",
-                            priority=0.3 + (0.15 if pressure > 0.6 else 0),
+                            priority=0.3 + pressure * 0.15,
                             reason="sleep_self_observation",
                         )
                     )
@@ -263,7 +263,7 @@ async def inner_life_loop(
                 total_exec = axon_stats.get("total_executions", 0)
                 success_exec = axon_stats.get("successful_executions", 0)
                 success_rate = success_exec / total_exec if total_exec > 0 else 1.0
-                action_urgency = (1.0 - success_rate) if total_exec > 0 else (0.5 if cycle > 20 else 0.0)
+                action_urgency = (1.0 - success_rate) if total_exec > 0 else 0.5
                 if _should_observe("axon", action_urgency):
                     if total_exec > 0:
                         atune.contribute(
@@ -279,7 +279,7 @@ async def inner_life_loop(
                                 reason="action_self_observation",
                             )
                         )
-                    elif cycle > 20:
+                    else:
                         atune.contribute(
                             WorkspaceContribution(
                                 system="axon",

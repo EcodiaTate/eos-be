@@ -97,9 +97,8 @@ class VoiceEngine:
         speed -= a.coherence_stress * 0.10  # Stressed → slower, more careful
         speed -= a.care_activation * 0.05   # High care → slower, more attentive
 
-        # Urgency boost
-        if urgency > 0.75:
-            speed += 0.08
+        # Urgency — continuous: higher urgency always nudges speed up
+        speed += urgency * 0.08
 
         speed = max(0.75, min(1.30, round(speed, 3)))
 
@@ -133,13 +132,11 @@ class VoiceEngine:
         # Affect: high care → more emphasis on key words
         emphasis += a.care_activation * 0.10
 
-        # High stress → slightly more emphasis (careful enunciation)
-        if a.coherence_stress > 0.5:
-            emphasis += 0.08
+        # High stress → more emphasis (careful enunciation) — continuous
+        emphasis += a.coherence_stress * 0.08
 
-        # Urgency → more emphasis
-        if urgency > 0.7:
-            emphasis += 0.1
+        # Urgency → more emphasis — continuous
+        emphasis += urgency * 0.10
 
         emphasis = max(0.6, min(1.5, round(emphasis, 3)))
 

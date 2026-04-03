@@ -759,9 +759,8 @@ class SimulaCodeAgent:
         # Stage 2D: When AgentCoder pipeline is active, disable test writing
         if skip_test_writing:
             system_prompt += (
-                "\n\n## IMPORTANT: Test Writing Disabled\n"
-                "Do NOT write test files. Tests are handled by a separate "
-                "TestDesigner agent. Focus ONLY on the implementation code. "
+                "\n\n## Test Writing Disabled\n"
+                "Do not write test files. Tests are handled by the TestDesigner agent. "
                 "Do not create any files under tests/."
             )
 
@@ -770,13 +769,8 @@ class SimulaCodeAgent:
             {
                 "role": "user",
                 "content": (
-                    f"Please implement this change: {proposal.description}\n\n"
-                    f"Change spec details: {proposal.change_spec.model_dump_json(indent=2)}\n\n"
-                    "IMPORTANT: Before writing any code, first:\n"
-                    "1. Use find_similar to study an existing implementation like what you need to build\n"
-                    "2. Use read_spec for the affected system to understand design intent\n"
-                    "3. List every file you plan to create or modify and explain your approach\n"
-                    "4. Then implement, lint, type-check, and test."
+                    f"Implement this change: {proposal.description}\n\n"
+                    f"Change spec: {proposal.change_spec.model_dump_json(indent=2)}"
                 ),
             }
         ]
@@ -2122,17 +2116,14 @@ class SimulaCodeAgent:
             )
             forbidden_note = "\n".join(f"- {p}" for p in sorted(forbidden)) or "none"
             prompt += (
-                f"\n\n## External Repository Mode\n\n"
-                f"You are working in a **cloned external repository**, NOT the EcodiaOS codebase.\n\n"
-                f"- Language: `{lang}`\n"
-                f"- Repository: `{repo_url}`\n"
-                f"- Workspace root: `{ws.root}`\n"
-                f"- {scope_note}\n\n"
-                f"**Forbidden infrastructure files (never modify):**\n{forbidden_note}\n\n"
-                f"Use `run_tests` and `run_linter` (language-aware) to verify your changes. "
+                f"\n\n## External Repository\n\n"
+                f"Language: `{lang}`\n"
+                f"Repository: `{repo_url}`\n"
+                f"Workspace root: `{ws.root}`\n"
+                f"{scope_note}\n\n"
+                f"Forbidden infrastructure files (do not modify):\n{forbidden_note}\n\n"
                 f"All paths are relative to the workspace root. "
-                f"This is a PR contribution - write clean, idiomatic code in the repo's language. "
-                f"Do NOT add EOS-specific imports, patterns, or Synapse bus calls."
+                f"This is a PR contribution — idiomatic code only, no EOS-specific imports or Synapse bus calls."
             )
 
         return prompt

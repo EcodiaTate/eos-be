@@ -60,13 +60,19 @@ class BountyPolicy:
     A bounty is only worth pursuing if the expected return exceeds
     the cost of the cognitive resources (API tokens, compute) needed
     to complete it.
+
+    Thresholds are read from environment variables so Evo can propose
+    changes via parameter hypotheses:
+      ORGANISM_BOUNTY_MIN_ROI_THRESHOLD   (default 1.2)
+      ORGANISM_BOUNTY_MAX_COST_PCT        (default 0.80)
+
+    Defaults are deliberately permissive — Nova decides strategic fit;
+    the policy only filters economically irrational bets.
     """
 
-    # Reward must be at least 2x the estimated API token cost
-    MIN_ROI_THRESHOLD: float = 2.0
-
-    # Estimated cost must not exceed 40% of the reward
-    MAX_ESTIMATED_COST_PCT: float = 0.40
+    import os as _os
+    MIN_ROI_THRESHOLD: float = float(_os.environ.get("ORGANISM_BOUNTY_MIN_ROI_THRESHOLD", "1.2"))
+    MAX_ESTIMATED_COST_PCT: float = float(_os.environ.get("ORGANISM_BOUNTY_MAX_COST_PCT", "0.80"))
 
     @classmethod
     def evaluate(

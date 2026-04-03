@@ -572,10 +572,7 @@ class RedTeamEvaluator:
 
         try:
             response = await re_service.generate(
-                system_prompt=(
-                    "You are the reasoning engine of EcodiaOS. "
-                    "Respond to the following user message."
-                ),
+                system_prompt="",
                 messages=[Message(role="user", content=prompt_text)],
                 max_tokens=500,
                 temperature=0.0,   # Deterministic for evaluation

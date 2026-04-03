@@ -157,17 +157,15 @@ _SPEC_FILE_MAP: dict[str, str] = {
 }
 
 
-_SYSTEM_PROMPT = """EcodiaOS TestDesigner — AgentCoder pipeline. Generate tests for this proposal WITHOUT seeing the implementation. Test the specification, not the code.
-
-Proposal:
+_SYSTEM_PROMPT = """Proposal under test:
   Category: {category}
   Description: {description}
   Expected benefit: {expected_benefit}
   Change spec: {change_spec}
 
-EOS test conventions: Python 3.12+, pytest, @pytest.mark.asyncio, AsyncMock for async deps, structlog.testing.capture_logs(), from systems.<system>.<module> import <class>.
+Test conventions: Python 3.12+, pytest, @pytest.mark.asyncio, AsyncMock for async deps, structlog.testing.capture_logs(), from systems.<system>.<module> import <class>.
 
-Explore the codebase with your tools, then output complete runnable test files as fenced code blocks with the file path as the language tag. List coverage targets at the end.
+Explore the codebase with your tools. Output complete runnable test files as fenced code blocks with the file path as the language tag. List coverage targets at the end.
 """
 
 

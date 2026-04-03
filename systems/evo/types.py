@@ -791,13 +791,15 @@ PARAMETER_DEFAULTS: dict[str, float] = {
 }
 
 # Change velocity limits (spec Section IX)
+# These are default starting points — Evo evolves them via parameter hypotheses.
+# Higher limits = faster learning; the organism pays the cost through Oikos metabolism.
 VELOCITY_LIMITS: dict[str, Any] = {
-    "max_total_parameter_delta_per_cycle": 0.15,
-    "max_single_parameter_delta":          0.03,
-    "min_evidence_for_integration":        10,
-    "min_hypothesis_age_hours":            24,
-    "max_active_hypotheses":               50,
-    "max_new_procedures_per_cycle":        3,
+    "max_total_parameter_delta_per_cycle": 0.30,   # was 0.15 — allow bolder adjustments
+    "max_single_parameter_delta":          0.06,   # was 0.03 — two steps at once if evidence is strong
+    "min_evidence_for_integration":        5,      # was 10 — integrate faster when evidence is clear
+    "min_hypothesis_age_hours":            12,     # was 24 — half-day minimum, not full day
+    "max_active_hypotheses":               200,    # was 50 — broader exploration
+    "max_new_procedures_per_cycle":        10,     # was 3 — extract what's there
 }
 
 # What Evo cannot touch (spec Section IX)

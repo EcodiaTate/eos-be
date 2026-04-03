@@ -45,21 +45,24 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 # ─── Fixation Thresholds ────────────────────────────────────────────────────
+import os as _os_gm
 
 # Hypothesis must have confidence >= this to be genome-eligible
-_MIN_FIXATION_CONFIDENCE: float = 0.95
+# Lower default: allow moderately confident beliefs to transmit
+_MIN_FIXATION_CONFIDENCE: float = float(_os_gm.getenv("EVO_GENOME_MIN_CONFIDENCE", "0.90"))
 
 # Hypothesis volatility must be < this (low volatility = stable)
-_MAX_FIXATION_VOLATILITY: float = 0.1
+_MAX_FIXATION_VOLATILITY: float = float(_os_gm.getenv("EVO_GENOME_MAX_VOLATILITY", "0.15"))
 
 # Hypothesis must have been alive for at least this many days
-_MIN_FIXATION_AGE_DAYS: int = 30
+_MIN_FIXATION_AGE_DAYS: int = int(_os_gm.getenv("EVO_GENOME_MIN_AGE_DAYS", "14"))
 
 # Instance must have processed at least this many episodes to produce a genome
-_MIN_EPISODES_FOR_GENOME: int = 10_000
+# Lowered: early instances can transmit knowledge to children sooner
+_MIN_EPISODES_FOR_GENOME: int = int(_os_gm.getenv("EVO_GENOME_MIN_EPISODES", "1000"))
 
 # Instance must have confirmed at least this many hypotheses
-_MIN_CONFIRMED_HYPOTHESES: int = 100
+_MIN_CONFIRMED_HYPOTHESES: int = int(_os_gm.getenv("EVO_GENOME_MIN_HYPOTHESES", "20"))
 
 # Inherited confidence discount - children start slightly below parent
 _INHERITED_CONFIDENCE_FACTOR: float = 0.95  # parent 0.98 → child 0.931

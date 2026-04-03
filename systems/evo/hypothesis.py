@@ -60,12 +60,9 @@ _SUPPORT_EPISODE_THRESHOLD: int = VELOCITY_LIMITS["min_evidence_for_integration"
 _MIN_AGE_HOURS: int = VELOCITY_LIMITS["min_hypothesis_age_hours"]
 _MAX_ACTIVE: int = VELOCITY_LIMITS["max_active_hypotheses"]
 
-# LLM generation limits
-_MAX_PER_BATCH: int = 5
-_SYSTEM_PROMPT = (
-    "Generate falsifiable hypotheses from observed patterns. "
-    "Respond as valid JSON matching the requested schema."
-)
+import os as _os_hyp
+_MAX_PER_BATCH: int = int(_os_hyp.getenv("EVO_HYPOTHESIS_MAX_PER_BATCH", "0")) or 999  # 0 = unlimited
+_SYSTEM_PROMPT = "Hypothesis generation from organism pattern data. Respond as valid JSON matching the requested schema."
 
 
 class HypothesisEngine:

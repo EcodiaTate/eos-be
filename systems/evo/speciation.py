@@ -74,28 +74,29 @@ _ACTIVE_STATUSES = (
 )
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
+import os as _os_sp
 
 # Allopatric speciation
-_ALLOPATRIC_DIVERGENCE_MIN: float = 0.5        # Min graph distance for allopatric split
-_ALLOPATRIC_EVIDENCE_CONFLICT: float = 0.3     # Fraction of contradicting evidence
+_ALLOPATRIC_DIVERGENCE_MIN: float = float(_os_sp.getenv("EVO_ALLOPATRIC_DIVERGENCE_MIN", "0.5"))
+_ALLOPATRIC_EVIDENCE_CONFLICT: float = float(_os_sp.getenv("EVO_ALLOPATRIC_EVIDENCE_CONFLICT", "0.3"))
 
 # Sympatric speciation
-_SYMPATRIC_WORLDVIEW_DIVERGENCE: float = 0.4   # Evidence score variance threshold
-_SYMPATRIC_MIN_COMPETITORS: int = 4            # Min hypotheses competing in same domain
-_SYMPATRIC_BIMODALITY_THRESHOLD: float = 0.3   # Hartigan's dip statistic threshold
+_SYMPATRIC_WORLDVIEW_DIVERGENCE: float = float(_os_sp.getenv("EVO_SYMPATRIC_WORLDVIEW_DIVERGENCE", "0.4"))
+_SYMPATRIC_MIN_COMPETITORS: int = int(_os_sp.getenv("EVO_SYMPATRIC_MIN_COMPETITORS", "4"))
+_SYMPATRIC_BIMODALITY_THRESHOLD: float = float(_os_sp.getenv("EVO_SYMPATRIC_BIMODALITY_THRESHOLD", "0.3"))
 
 # Adaptive radiation
-_RADIATION_PREDICTION_ERROR: float = 0.7       # Prediction error that triggers radiation
-_RADIATION_MIN_GENERALIST_POP: int = 8         # Min generalist hypotheses to split
-_RADIATION_SPLIT_COUNT: int = 3                # Number of niches to create from radiation
+_RADIATION_PREDICTION_ERROR: float = float(_os_sp.getenv("EVO_RADIATION_PREDICTION_ERROR", "0.7"))
+_RADIATION_MIN_GENERALIST_POP: int = int(_os_sp.getenv("EVO_RADIATION_MIN_GENERALIST_POP", "8"))
+_RADIATION_SPLIT_COUNT: int = int(_os_sp.getenv("EVO_RADIATION_SPLIT_COUNT", "3"))
 
 # Parapatric speciation
-_PARAPATRIC_BOUNDARY_OVERLAP: float = 0.3      # Schema overlap threshold for boundary zone
-_PARAPATRIC_DIVERGENCE_RATE: float = 0.05      # How fast boundary hypotheses diverge
+_PARAPATRIC_BOUNDARY_OVERLAP: float = float(_os_sp.getenv("EVO_PARAPATRIC_BOUNDARY_OVERLAP", "0.3"))
+_PARAPATRIC_DIVERGENCE_RATE: float = float(_os_sp.getenv("EVO_PARAPATRIC_DIVERGENCE_RATE", "0.05"))
 
 # Ring species detection
-_RING_MIN_LENGTH: int = 3                      # Minimum ring length
-_RING_COMPATIBILITY_THRESHOLD: float = 0.6     # Above this = compatible
+_RING_MIN_LENGTH: int = int(_os_sp.getenv("EVO_RING_MIN_LENGTH", "3"))
+_RING_COMPATIBILITY_THRESHOLD: float = float(_os_sp.getenv("EVO_RING_COMPATIBILITY_THRESHOLD", "0.6"))
 
 
 # ─── Result Types ───────────────────────────────────────────────────────────────

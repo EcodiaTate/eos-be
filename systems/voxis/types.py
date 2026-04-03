@@ -295,6 +295,7 @@ class SilenceContext(EOSBaseModel):
     minutes_since_last_expression: float = 999.0
     min_expression_interval: float = 1.0     # From config
     insight_value: float = 0.5
+    insight_expression_threshold: float = 0.0  # 0 = no threshold (from config; 0=unlimited)
     urgency: float = 0.5
     conversation_active: bool = False
 

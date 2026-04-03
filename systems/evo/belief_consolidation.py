@@ -35,15 +35,16 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 # ─── Consolidation Thresholds ────────────────────────────────────────────────
+import os as _os_bc
 
 # Minimum precision (confidence) for a belief to be eligible for consolidation
-_MIN_PRECISION: float = 0.85
+_MIN_PRECISION: float = float(_os_bc.getenv("EVO_BELIEF_MIN_PRECISION", "0.85"))
 
 # Maximum volatility percentile - beliefs that change frequently stay mutable
-_MAX_VOLATILITY: float = 0.2
+_MAX_VOLATILITY: float = float(_os_bc.getenv("EVO_BELIEF_MAX_VOLATILITY", "0.2"))
 
 # Minimum age in days before a belief can be consolidated
-_MIN_AGE_DAYS: int = 30
+_MIN_AGE_DAYS: int = int(_os_bc.getenv("EVO_BELIEF_MIN_AGE_DAYS", "30"))
 
 # Negation patterns used in lightweight contradiction detection
 _NEGATION_PATTERNS: list[re.Pattern[str]] = [

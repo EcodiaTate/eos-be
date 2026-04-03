@@ -510,8 +510,8 @@ class HealingBudgetState(EOSBaseModel):
 
     repairs_this_hour: int = 0
     novel_repairs_today: int = 0
-    max_repairs_per_hour: int = 50
-    max_novel_repairs_per_day: int = 20
+    max_repairs_per_hour: int = 0   # 0 = unlimited
+    max_novel_repairs_per_day: int = 0   # 0 = unlimited
     active_diagnoses: int = 0
     max_concurrent_diagnoses: int = 5
     active_codegen: int = 0

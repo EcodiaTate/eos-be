@@ -648,6 +648,7 @@ class VoxisService:
             minutes_since_last_expression=self._silence_engine.minutes_since_last_expression,
             min_expression_interval=self._config.min_expression_interval_minutes,
             insight_value=intent.insight_value,
+            insight_expression_threshold=self._config.insight_expression_threshold,
             urgency=intent.urgency,
         )
         decision = self._silence_engine.evaluate(silence_ctx)
@@ -783,6 +784,7 @@ class VoxisService:
             minutes_since_last_expression=self._silence_engine.minutes_since_last_expression,
             min_expression_interval=self._config.min_expression_interval_minutes,
             insight_value=insight_value,
+            insight_expression_threshold=self._config.insight_expression_threshold,
             urgency=urgency,
         )
         decision = self._silence_engine.evaluate(silence_ctx)

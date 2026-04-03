@@ -131,10 +131,10 @@ class SilenceEngine:
                     reason=f"Insight rate-limited: {elapsed:.1f}m elapsed",
                     queue=False,  # Discard - ambient insights have short relevance windows
                 )
-            if context.insight_value < 0.6:
+            if context.insight_value < context.insight_expression_threshold:
                 return SilenceDecision(
                     speak=False,
-                    reason=f"Insight value {context.insight_value:.2f} below expression threshold (0.60)",
+                    reason=f"Insight value {context.insight_value:.2f} below threshold ({context.insight_expression_threshold:.2f})",
                 )
             return SilenceDecision(
                 speak=True,

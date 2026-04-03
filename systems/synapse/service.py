@@ -70,8 +70,10 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger("systems.synapse")
 
-# Burn rate threshold (USD/hour) above which METABOLIC_PRESSURE fires
-_METABOLIC_PRESSURE_THRESHOLD_USD_HR: float = 1.0
+# Burn rate threshold (USD/hour) above which METABOLIC_PRESSURE fires.
+# Moved to SynapseConfig.metabolic_pressure_threshold_usd_hr (env: see config.py).
+# This module-level alias is kept only as a fallback sentinel — do not use directly.
+_METABOLIC_PRESSURE_THRESHOLD_USD_HR: float = 1.0  # unused; config field takes precedence
 
 
 class SynapseService:
@@ -1000,7 +1002,7 @@ class SynapseService:
                     },
                 ))
 
-            if meta_snap.burn_rate_usd_per_hour > _METABOLIC_PRESSURE_THRESHOLD_USD_HR:
+            if meta_snap.burn_rate_usd_per_hour > self._config.metabolic_pressure_threshold_usd_hr:
                 await self._event_bus.emit(SynapseEvent(
                     event_type=SynapseEventType.METABOLIC_PRESSURE,
                     data={

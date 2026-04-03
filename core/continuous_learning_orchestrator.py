@@ -53,12 +53,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Thresholds
-_INCREMENTAL_MIN_NEW_EXAMPLES = 50
-_INCREMENTAL_INTERVAL_H = 24
-_DOMAIN_MIN_EXAMPLES = 100
-_DOMAIN_MIN_SUCCESS_RATE = 0.70
-_DOMAIN_INTERVAL_H = 48
+# Thresholds — all env-configurable, 0 = disabled/unlimited
+_INCREMENTAL_MIN_NEW_EXAMPLES = int(os.getenv("CLO_INCREMENTAL_MIN_EXAMPLES", "50"))
+_INCREMENTAL_INTERVAL_H = int(os.getenv("CLO_INCREMENTAL_INTERVAL_H", "24"))
+_DOMAIN_MIN_EXAMPLES = int(os.getenv("CLO_DOMAIN_MIN_EXAMPLES", "100"))
+_DOMAIN_MIN_SUCCESS_RATE = float(os.getenv("CLO_DOMAIN_MIN_SUCCESS_RATE", "0.70"))
+_DOMAIN_INTERVAL_H = int(os.getenv("CLO_DOMAIN_INTERVAL_H", "48"))
 
 _EXPORT_DIR = Path(os.getenv("RE_TRAINING_EXPORT_DIR", "data/re_training_batches"))
 _S3_BUCKET = os.getenv("RE_TRAINING_S3_BUCKET", "ecodiaos-re-training")
@@ -124,7 +124,7 @@ class ContinualLearningOrchestrator:
                 logger.exception(
                     "ContinualLearningOrchestrator: unhandled error in training cycle"
                 )
-            await asyncio.sleep(3600)   # check every hour
+            await asyncio.sleep(int(os.getenv("CLO_CHECK_INTERVAL_S", "3600")))
 
     async def stop(self) -> None:
         self._running = False

@@ -4137,6 +4137,10 @@ class ThymosService:
         # ── Prescription ──
         self._prescriber = RepairPrescriber()
         self._validator = RepairValidator(equor=self._equor)
+        self._validator.set_limits(
+            max_repairs_per_hour=self._config.max_repairs_per_hour,
+            max_novel_repairs_per_day=self._config.max_novel_repairs_per_day,
+        )
 
         # ── Antibody Library ──
         self._antibody_library = AntibodyLibrary(neo4j_client=self._neo4j)
@@ -4152,6 +4156,10 @@ class ThymosService:
 
         # ── Governor ──
         self._governor = HealingGovernor()
+        self._governor.set_limits(
+            max_repairs_per_hour=self._config.max_repairs_per_hour,
+            max_novel_repairs_per_day=self._config.max_novel_repairs_per_day,
+        )
         self._governor._on_event = self._on_governor_event
         if self._causal_analyzer is not None:
             self._governor.set_causal_analyzer(self._causal_analyzer)

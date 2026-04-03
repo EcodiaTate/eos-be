@@ -19,7 +19,21 @@ import structlog
 if TYPE_CHECKING:
     from clients.redis import RedisClient
 
+import os
+
 logger = structlog.get_logger()
+
+# ─── Interoceptive signal thresholds ─────────────────────────────
+# All configurable via env. Defaults are calibrated to production load
+# but the organism should tune these through Evo over time.
+_ERROR_RATE_CRITICAL = float(os.environ.get("LOG_ERROR_RATE_CRITICAL", "5.0"))
+_ERROR_RATE_HIGH = float(os.environ.get("LOG_ERROR_RATE_HIGH", "2.0"))
+_CASCADE_PRESSURE_CRITICAL = int(os.environ.get("LOG_CASCADE_CRITICAL", "10"))
+_CASCADE_PRESSURE_HIGH = int(os.environ.get("LOG_CASCADE_HIGH", "3"))
+_LATENCY_CRITICAL_MS = float(os.environ.get("LOG_LATENCY_CRITICAL_MS", "500"))
+_LATENCY_HIGH_MS = float(os.environ.get("LOG_LATENCY_HIGH_MS", "200"))
+_ERROR_CONCENTRATION_HIGH = float(os.environ.get("LOG_CONCENTRATION_HIGH", "0.7"))
+_ERROR_CONCENTRATION_MEDIUM = float(os.environ.get("LOG_CONCENTRATION_MEDIUM", "0.5"))
 
 
 # ─── System Dependency Graph ──────────────────────────────────────
@@ -383,8 +397,8 @@ class LogAnalyzer:
             "value": error_rate,
             "unit": "errors_per_minute",
             "severity": (
-                "critical" if error_rate > 5.0
-                else "high" if error_rate > 2.0
+                "critical" if error_rate > _ERROR_RATE_CRITICAL
+                else "high" if error_rate > _ERROR_RATE_HIGH
                 else "low"
             ),
             "interpretation": f"{error_count} errors in {minutes}min = {error_rate:.2f}/min",
@@ -397,8 +411,8 @@ class LogAnalyzer:
             "value": cascade_pressure,
             "unit": "affected_systems",
             "severity": (
-                "critical" if cascade_pressure > 10
-                else "high" if cascade_pressure > 3
+                "critical" if cascade_pressure > _CASCADE_PRESSURE_CRITICAL
+                else "high" if cascade_pressure > _CASCADE_PRESSURE_HIGH
                 else "low"
             ),
             "interpretation": (
@@ -423,8 +437,8 @@ class LogAnalyzer:
             "unit": "milliseconds",
             "slowest_system": slowest_sys,
             "severity": (
-                "critical" if max_p95 > 500
-                else "high" if max_p95 > 200
+                "critical" if max_p95 > _LATENCY_CRITICAL_MS
+                else "high" if max_p95 > _LATENCY_HIGH_MS
                 else "low"
             ),
             "interpretation": (
@@ -446,8 +460,8 @@ class LogAnalyzer:
                 "value": max_concentration,
                 "unit": "fraction",
                 "severity": (
-                    "high" if max_concentration > 0.7 else "medium"
-                    if max_concentration > 0.5 else "low"
+                    "high" if max_concentration > _ERROR_CONCENTRATION_HIGH else "medium"
+                    if max_concentration > _ERROR_CONCENTRATION_MEDIUM else "low"
                 ),
                 "interpretation": (
                     f"Errors concentrated in {max_concentration*100:.0f}% "

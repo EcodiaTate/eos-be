@@ -102,19 +102,20 @@ class MetaLearningReport(EOSBaseModel):
 
 
 # ─── Meta-Learning Constants ─────────────────────────────────────────────────
+import os as _os_ml
 
 # Minimum observations before adjusting meta-parameters
-_MIN_META_OBSERVATIONS: int = 20
-# Maximum meta-parameter adjustment per cycle (half of normal velocity)
-_MAX_META_DELTA: float = 0.015
+_MIN_META_OBSERVATIONS: int = int(_os_ml.getenv("EVO_META_MIN_OBSERVATIONS", "10"))
+# Meta-parameter adjustment per cycle — proportional to observed error.
+_MAX_META_DELTA: float = float(_os_ml.getenv("EVO_META_MAX_DELTA", "0.05"))
 # Target false positive rate (SUPPORTED→REFUTED)
-_TARGET_FALSE_POSITIVE_RATE: float = 0.10
+_TARGET_FALSE_POSITIVE_RATE: float = float(_os_ml.getenv("EVO_META_TARGET_FALSE_POSITIVE_RATE", "0.10"))
 # Target premature archival rate
-_TARGET_PREMATURE_RATE: float = 0.15
+_TARGET_PREMATURE_RATE: float = float(_os_ml.getenv("EVO_META_TARGET_PREMATURE_RATE", "0.15"))
 # Effectiveness threshold: detectors below this get desensitized
-_MIN_DETECTOR_EFFECTIVENESS: float = 0.15
+_MIN_DETECTOR_EFFECTIVENESS: float = float(_os_ml.getenv("EVO_META_MIN_DETECTOR_EFFECTIVENESS", "0.15"))
 # Effectiveness threshold: detectors above this get sensitized
-_HIGH_DETECTOR_EFFECTIVENESS: float = 0.60
+_HIGH_DETECTOR_EFFECTIVENESS: float = float(_os_ml.getenv("EVO_META_HIGH_DETECTOR_EFFECTIVENESS", "0.60"))
 
 
 # ─── Meta-Learning Engine ────────────────────────────────────────────────────
@@ -273,9 +274,8 @@ class MetaLearningEngine:
                     f"{_TARGET_PREMATURE_RATE} → lower evidence threshold"
                 )
 
-        # Apply velocity-limited adjustment
         new_multiplier = self._current_rate.threshold_multiplier + threshold_delta
-        new_multiplier = max(0.5, min(2.0, new_multiplier))  # Clamp to [0.5, 2.0]
+        new_multiplier = max(0.2, min(5.0, new_multiplier))  # Allow wide range; extreme outliers still bounded
         self._current_rate.threshold_multiplier = round(new_multiplier, 4)
         self._current_rate.current_evidence_threshold = round(
             3.0 * new_multiplier, 2

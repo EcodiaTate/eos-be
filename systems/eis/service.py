@@ -219,16 +219,17 @@ class EISService:
         self._metrics_emit_interval_s: float = 60.0
 
         # ── Speciation: Threat spike detection for Soma (Task 2) ──
-        self._threat_spike_threshold: int = 5
-        self._threat_spike_window_s: float = 600.0  # 10 minutes
+        import os as _os_eis
+        self._threat_spike_threshold: int = int(_os_eis.getenv("EIS_THREAT_SPIKE_THRESHOLD", "5"))
+        self._threat_spike_window_s: float = float(_os_eis.getenv("EIS_THREAT_SPIKE_WINDOW_S", "600.0"))
         self._last_threat_spike_emit: float = 0.0
-        self._threat_spike_cooldown_s: float = 120.0
+        self._threat_spike_cooldown_s: float = float(_os_eis.getenv("EIS_THREAT_SPIKE_COOLDOWN_S", "120.0"))
 
         # ── Speciation: Anomaly rate elevation tracking (Task 4) ──
         self._anomaly_times: deque[float] = deque(maxlen=1_000)
         self._anomaly_elevated_since: float = 0.0
         self._anomaly_elevated_emitted: bool = False
-        self._anomaly_elevation_sustain_s: float = 30.0  # sustained 2σ for 30s
+        self._anomaly_elevation_sustain_s: float = float(_os_eis.getenv("EIS_ANOMALY_ELEVATION_SUSTAIN_S", "30.0"))
 
         # ── Speciation: Metabolic gate (Task 7) ──
         self._metabolic_starvation: str = "nominal"  # tracks current starvation level
@@ -264,7 +265,7 @@ class EISService:
         # invocation (avoids blocking __init__ with embedding calls).
         self._l9a_seed_matrix: Any | None = None  # np.ndarray | None
         self._l9a_seed_labels: list[tuple[str, str]] = []  # [(drive, label), ...]
-        self._l9a_similarity_threshold: float = 0.80
+        self._l9a_similarity_threshold: float = float(_os_eis.getenv("EIS_L9A_SIMILARITY_THRESHOLD", "0.80"))
         self._l9a_init_lock: bool = False  # guard against concurrent init
 
     def set_metrics(self, metrics: MetricCollector) -> None:

@@ -2908,7 +2908,7 @@ class AxonService:
     async def _on_evo_adjust_budget(self, event: Any) -> None:
         """
         Handle EVO_ADJUST_BUDGET targeting Axon's three Equor-negotiable baseline
-        budget parameters. Only applied when Evo confidence > 0.75.
+        budget parameters.
 
         Tunable baseline parameters (these set the *default* limit that ActionBudget
         starts from each restart - temporary expansions from Equor still stack on top):
@@ -2932,14 +2932,6 @@ class AxonService:
 
         # Only handle events explicitly targeting axon
         if target_system and target_system != "axon":
-            return
-
-        if confidence <= 0.75:
-            self._logger.debug(
-                "axon_evo_adjust_budget_skip_low_confidence",
-                parameter=parameter_name,
-                confidence=confidence,
-            )
             return
 
         # Axon baseline budget parameter bounds: (lo, hi) - integers

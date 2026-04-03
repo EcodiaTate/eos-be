@@ -60,7 +60,8 @@ class GoalManager:
     Goals are stored in-memory (fast access) with cap enforcement.
     """
 
-    def __init__(self, max_active_goals: int = 20) -> None:
+    def __init__(self, max_active_goals: int = 0) -> None:
+        # 0 = unlimited. Suspension only fires when a positive cap is set.
         self._max_active = max_active_goals
         self._goals: dict[str, Goal] = {}
         self._logger = logger.bind(system="nova.goal_manager")
@@ -104,7 +105,7 @@ class GoalManager:
                 return existing
 
         active = self.active_goals
-        if len(active) >= self._max_active:
+        if self._max_active > 0 and len(active) >= self._max_active:
             # Evict maintenance goals first; fall back to lowest-priority overall
             maintenance_goals = [g for g in active if g.source == GoalSource.MAINTENANCE]
             candidate = (

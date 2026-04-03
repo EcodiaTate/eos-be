@@ -45,13 +45,14 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# EIG computation constants
-_MIN_EIG_THRESHOLD: float = 0.01          # Minimum EIG to emit an intent
-_MAX_INTENTS_PER_CYCLE: int = 5            # Cap epistemic intents per cycle
-_STALE_HYPOTHESIS_HOURS: float = 48.0      # Time before active seeking kicks in
-_STALE_EVIDENCE_THRESHOLD: int = 3         # Min evidence episodes before considered stale
-_TARGET_EXPLORATION_RATIO: float = 0.20    # 20% epistemic / 80% pragmatic
-_EXPLORATION_RATIO_TOLERANCE: float = 0.05 # Deadband around target
+import os as _os_cur
+# EIG computation constants — all env-configurable
+_MIN_EIG_THRESHOLD: float = float(_os_cur.getenv("EVO_CURIOSITY_MIN_EIG", "0.01"))
+_MAX_INTENTS_PER_CYCLE: int = int(_os_cur.getenv("EVO_CURIOSITY_MAX_INTENTS_PER_CYCLE", "0")) or 999  # 0 = unlimited
+_STALE_HYPOTHESIS_HOURS: float = float(_os_cur.getenv("EVO_CURIOSITY_STALE_HRS", "48.0"))
+_STALE_EVIDENCE_THRESHOLD: int = int(_os_cur.getenv("EVO_CURIOSITY_STALE_EVIDENCE_MIN", "3"))
+_TARGET_EXPLORATION_RATIO: float = float(_os_cur.getenv("EVO_CURIOSITY_EXPLORATION_RATIO", "0.20"))
+_EXPLORATION_RATIO_TOLERANCE: float = float(_os_cur.getenv("EVO_CURIOSITY_RATIO_TOLERANCE", "0.05"))
 
 
 class CuriosityEngine:

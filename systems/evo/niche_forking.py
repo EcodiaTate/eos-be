@@ -73,12 +73,13 @@ logger = structlog.get_logger()
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
-_MIN_MATURITY_FOR_FORK: float = 0.75    # Niche maturity required
-_MIN_POPULATION_FOR_FORK: int = 5       # Minimum niche population
-_MAX_FORKS_PER_CYCLE: int = 2           # Max fork proposals per consolidation
-_WORLDVIEW_FORK_MATURITY: float = 0.9   # Higher bar for worldview forks
-_WORLDVIEW_FORK_MIN_POP: int = 10       # Larger population for worldview forks
-_FORK_COOLDOWN_HOURS: float = 24.0      # Min time between fork proposals for same niche
+import os as _os_nf
+_MIN_MATURITY_FOR_FORK: float = float(_os_nf.getenv("EVO_NICHE_MIN_MATURITY_FOR_FORK", "0.75"))
+_MIN_POPULATION_FOR_FORK: int = int(_os_nf.getenv("EVO_NICHE_MIN_POPULATION_FOR_FORK", "5"))
+# No per-cycle fork cap — all mature niches can propose in parallel; Equor gates each one.
+_WORLDVIEW_FORK_MATURITY: float = float(_os_nf.getenv("EVO_WORLDVIEW_FORK_MATURITY", "0.9"))
+_WORLDVIEW_FORK_MIN_POP: int = int(_os_nf.getenv("EVO_WORLDVIEW_FORK_MIN_POP", "10"))
+_FORK_COOLDOWN_HOURS: float = float(_os_nf.getenv("EVO_FORK_COOLDOWN_HOURS", "12.0"))
 
 # Forbidden fork targets
 _FORBIDDEN_FORK_TARGETS = frozenset({"equor", "constitutional", "invariant", "safety", "drive"})
@@ -231,12 +232,8 @@ class NicheForkingEngine:
 
         eligible = self._registry.get_fork_eligible_niches()
         proposals: list[ForkProposal] = []
-        forks_this_cycle = 0
 
         for niche in eligible:
-            if forks_this_cycle >= _MAX_FORKS_PER_CYCLE:
-                break
-
             # Cooldown check
             last = self._last_fork_time.get(niche.id)
             if last and (utc_now() - last).total_seconds() < _FORK_COOLDOWN_HOURS * 3600:
@@ -262,7 +259,6 @@ class NicheForkingEngine:
             self._proposals.append(proposal)
             self._last_fork_time[niche.id] = utc_now()
             niche.fork_proposals_submitted += 1
-            forks_this_cycle += 1
 
             self._logger.info(
                 "niche_fork_proposed",

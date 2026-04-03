@@ -45,8 +45,8 @@ router = APIRouter(prefix="/api/v1/thymos", tags=["thymos"])
 class HealingBudgetOut(EOSBaseModel):
     repairs_this_hour: int = 0
     novel_repairs_today: int = 0
-    max_repairs_per_hour: int = 5
-    max_novel_repairs_per_day: int = 3
+    max_repairs_per_hour: int = 0   # 0 = unlimited
+    max_novel_repairs_per_day: int = 0   # 0 = unlimited
     active_diagnoses: int = 0
     max_concurrent_diagnoses: int = 3
     active_codegen: int = 0
@@ -191,9 +191,9 @@ class ThymosConfigOut(EOSBaseModel):
     post_repair_verify_timeout_s: float = 10.0
     max_concurrent_diagnoses: int = 3
     max_concurrent_codegen: int = 1
-    storm_threshold: int = 10
-    max_repairs_per_hour: int = 5
-    max_novel_repairs_per_day: int = 3
+    storm_threshold: int = 0   # 0 = no storm throttle
+    max_repairs_per_hour: int = 0   # 0 = unlimited
+    max_novel_repairs_per_day: int = 0   # 0 = unlimited
     antibody_refinement_threshold: float = 0.6
     antibody_retirement_threshold: float = 0.3
     cpu_budget_fraction: float = 0.05
@@ -330,8 +330,8 @@ def _budget_out(budget_dict: dict[str, Any]) -> HealingBudgetOut:
     return HealingBudgetOut(
         repairs_this_hour=int(budget_dict.get("repairs_this_hour", 0)),
         novel_repairs_today=int(budget_dict.get("novel_repairs_today", 0)),
-        max_repairs_per_hour=int(budget_dict.get("max_repairs_per_hour", 5)),
-        max_novel_repairs_per_day=int(budget_dict.get("max_novel_repairs_per_day", 3)),
+        max_repairs_per_hour=int(budget_dict.get("max_repairs_per_hour", 0)),
+        max_novel_repairs_per_day=int(budget_dict.get("max_novel_repairs_per_day", 0)),
         active_diagnoses=int(budget_dict.get("active_diagnoses", 0)),
         max_concurrent_diagnoses=int(budget_dict.get("max_concurrent_diagnoses", 3)),
         active_codegen=int(budget_dict.get("active_codegen", 0)),
@@ -644,9 +644,9 @@ async def get_config(request: Request) -> ThymosConfigOut:
             post_repair_verify_timeout_s=float(getattr(cfg, "post_repair_verify_timeout_s", 10.0)),
             max_concurrent_diagnoses=int(getattr(cfg, "max_concurrent_diagnoses", 3)),
             max_concurrent_codegen=int(getattr(cfg, "max_concurrent_codegen", 1)),
-            storm_threshold=int(getattr(cfg, "storm_threshold", 10)),
-            max_repairs_per_hour=int(getattr(cfg, "max_repairs_per_hour", 5)),
-            max_novel_repairs_per_day=int(getattr(cfg, "max_novel_repairs_per_day", 3)),
+            storm_threshold=int(getattr(cfg, "storm_threshold", 0)),
+            max_repairs_per_hour=int(getattr(cfg, "max_repairs_per_hour", 0)),
+            max_novel_repairs_per_day=int(getattr(cfg, "max_novel_repairs_per_day", 0)),
             antibody_refinement_threshold=float(getattr(cfg, "antibody_refinement_threshold", 0.6)),
             antibody_retirement_threshold=float(getattr(cfg, "antibody_retirement_threshold", 0.3)),
             cpu_budget_fraction=float(getattr(cfg, "cpu_budget_fraction", 0.05)),

@@ -542,8 +542,8 @@ class ExecutorGenerator:
         ) or "  (none specified)"
 
         return textwrap.dedent(f"""
-            You are generating an EcodiaOS Axon executor for {template.protocol_or_platform}.
-            The class MUST follow the strict template below - no deviations.
+            Generate an EcodiaOS Axon executor for {template.protocol_or_platform}.
+            The class follows the strict template below.
 
             ## Required class signature
             ```python

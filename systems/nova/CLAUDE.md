@@ -1,6 +1,6 @@
 # Nova - CLAUDE.md
 
-**Spec:** `.claude/EcodiaOS_Spec_05_Nova.md` (v1.2, 2026-03-07)
+**Spec:** `.claude/EcodiaOS_Spec_05_Nova.md` (v1.2, 2026-03-07, updated 2026-04-03)
 **System ID:** `nova`
 **Role:** Decision & Planning Executive. Converts workspace broadcasts into approved Intents. Nova proposes; the organism disposes. Equor can deny, Axon can fail, community can override.
 
@@ -264,6 +264,17 @@ All core components confirmed in code:
 - ✅ `ONEIROS_CONSOLIDATION_COMPLETE` subscription + belief refresh handler
 - ✅ Dead code D1 + D2 removed
 - ✅ `NovaConfig` field names aligned with spec §12
+
+---
+
+## Round 22 Changes (2026-04-03)
+
+- **`_classify_goal_criticality`**: keyword lists (`existential_keywords`, `critical_keywords`, `desc_lower`) removed. Classification now derived purely from `top.priority` (the EFE-computed float). Keyword matching was a heuristic override that bypassed the priority formula — removed.
+- **`motor_degradation_replan_threshold`**: was hardcoded `0.8`. Now reads `self._config.motor_degradation_replan_threshold` (default `0.8`, configurable via `NovaConfig`).
+- **`soma_urgency_modulate_threshold`, `soma_energy_modulate_threshold`**: were `0.7` / `0.3`. Now config fields.
+- **`soma_urgency_emit_threshold`, `soma_energy_emit_threshold`**: were `0.5` / `0.4`. Now config fields.
+- **`cognitive_pressure_low`, `cognitive_pressure_high`**: were `0.85` / `0.95`. Now config fields.
+- All 7 new fields added to `NovaConfig` in `config.py` with their original values as defaults.
 
 ---
 

@@ -514,8 +514,14 @@ class RepairValidator:
     Simula's own simulation pipeline when Tier 4 repairs route through it.
     """
 
-    MAX_REPAIRS_PER_HOUR = 50
-    MAX_NOVEL_REPAIRS_PER_DAY = 20
+    # 0 = unlimited. Override via config.
+    MAX_REPAIRS_PER_HOUR: int = 0
+    MAX_NOVEL_REPAIRS_PER_DAY: int = 0
+
+    def set_limits(self, max_repairs_per_hour: int, max_novel_repairs_per_day: int) -> None:
+        """Wire config-driven caps. 0 = unlimited."""
+        self.MAX_REPAIRS_PER_HOUR = max_repairs_per_hour
+        self.MAX_NOVEL_REPAIRS_PER_DAY = max_novel_repairs_per_day
 
     def __init__(self, equor: Any = None) -> None:
         """
@@ -571,7 +577,7 @@ class RepairValidator:
         day_ago = now_ts - 86400.0
 
         recent_count = sum(1 for ts in self._recent_repairs if ts > hour_ago)
-        if recent_count >= self.MAX_REPAIRS_PER_HOUR:
+        if self.MAX_REPAIRS_PER_HOUR > 0 and recent_count >= self.MAX_REPAIRS_PER_HOUR:
             return ValidationResult(
                 approved=False,
                 reason=(
@@ -583,7 +589,7 @@ class RepairValidator:
 
         if repair.tier == RepairTier.NOVEL_FIX:
             novel_count = sum(1 for ts in self._recent_novel if ts > day_ago)
-            if novel_count >= self.MAX_NOVEL_REPAIRS_PER_DAY:
+            if self.MAX_NOVEL_REPAIRS_PER_DAY > 0 and novel_count >= self.MAX_NOVEL_REPAIRS_PER_DAY:
                 return ValidationResult(
                     approved=False,
                     reason=(

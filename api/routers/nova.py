@@ -216,7 +216,7 @@ class NovaPendingIntentsResponse(EOSBaseModel):
 
 
 class NovaConfigResponse(EOSBaseModel):
-    max_active_goals: int = 20
+    max_active_goals: int = 0  # 0 = unlimited
     max_policies_per_deliberation: int = 5
     fast_path_timeout_ms: int = 300
     slow_path_timeout_ms: int = 15000
@@ -441,7 +441,7 @@ async def get_goals(request: Request) -> NovaGoalsResponse:
         active.sort(key=lambda g: g.priority, reverse=True)
         achieved.sort(key=lambda g: getattr(g, "created_at", None) or "", reverse=True)
         config = getattr(nova, "_config", None)
-        max_active = getattr(config, "max_active_goals", 20) if config else 20
+        max_active = getattr(config, "max_active_goals", 0) if config else 0  # 0 = unlimited
         return NovaGoalsResponse(
             active_goals=[_goal_to_out(g) for g in active],
             suspended_goals=[_goal_to_out(g) for g in suspended],
@@ -641,7 +641,7 @@ async def get_config(request: Request) -> NovaConfigResponse:
             cognition_cost=float(getattr(weights, "cognition_cost", 0.10)) if weights else 0.10,
         )
         return NovaConfigResponse(
-            max_active_goals=int(getattr(cfg, "max_active_goals", 20)),
+            max_active_goals=int(getattr(cfg, "max_active_goals", 0)),
             max_policies_per_deliberation=int(getattr(cfg, "max_policies_per_deliberation", 5)),
             fast_path_timeout_ms=int(getattr(cfg, "fast_path_timeout_ms", 300)),
             slow_path_timeout_ms=int(getattr(cfg, "slow_path_timeout_ms", 15000)),
