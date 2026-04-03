@@ -14,7 +14,7 @@ Phase 16l: Economic Morphogenesis -- organ lifecycle, resource rebalancing.
 Phase 16m: Fleet Management -- population ecology, selection pressure, role specialization.
 """
 
-from systems.oikos.asset_factory import AssetFactory, AssetPolicy
+from systems.oikos.asset_factory import AssetFactory
 from systems.oikos.base import BaseCostModel, BaseMitosisStrategy
 from systems.oikos.bounty_hunter import (
     BountyCandidate,
@@ -159,7 +159,6 @@ __all__ = [
     "ReproductiveFitness",
     # Asset Factory (Phase 16d)
     "AssetFactory",
-    "AssetPolicy",
     "AssetCandidate",
     "AssetStatus",
     "TollboothConfig",
