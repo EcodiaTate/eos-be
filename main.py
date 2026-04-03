@@ -541,17 +541,18 @@ async def health() -> dict[str, Any]:
 
     async def _safe_health(name: str, attr: str, method: str = "health") -> dict[str, Any]:
         """Call ``app.state.<attr>.<method>()`` with full error isolation and timeout."""
-        if not hasattr(app.state, attr):
+        obj = getattr(app.state, attr, None)
+        if obj is None:
             return _NOT_INIT
         try:
-            obj = getattr(app.state, attr)
-            return await asyncio.wait_for(getattr(obj, method)(), timeout=5.0)
+            return await asyncio.wait_for(getattr(obj, method)(), timeout=2.0)
         except (TimeoutError, asyncio.TimeoutError):
             logger.warning("health_check_timeout", system=name)
             return {"status": "timeout", "error": f"{name} health check timed out"}
         except Exception as exc:
-            logger.warning("health_check_failed", system=name, error=str(exc))
-            return {"status": "error", "error": str(exc)}
+            err = str(exc) or f"{type(exc).__name__} (no message)"
+            logger.warning("health_check_failed", system=name, error=err)
+            return {"status": "error", "error": err}
 
     def _safe_sync_stats(attr: str) -> dict[str, Any]:
         """Read a sync ``.stats`` property with full error isolation."""
@@ -560,10 +561,13 @@ async def health() -> dict[str, Any]:
         try:
             return getattr(app.state, attr).stats
         except Exception as exc:
-            logger.warning("health_check_failed", system=attr, error=str(exc))
-            return {"status": "error", "error": str(exc)}
+            err = str(exc) or f"{type(exc).__name__} (no message)"
+            logger.warning("health_check_failed", system=attr, error=err)
+            return {"status": "error", "error": err}
 
-    # Gather all health probes concurrently — each is individually guarded
+    # Gather all health probes concurrently — each is individually guarded.
+    # Every check (including TSDB) runs in parallel to stay well under the
+    # external 10s health-check timeout.
     (
         memory_health,
         equor_health,
@@ -576,6 +580,7 @@ async def health() -> dict[str, Any]:
         neo4j_health,
         redis_health,
         federation_health,
+        tsdb_health,
     ) = await asyncio.gather(
         _safe_health("memory", "memory"),
         _safe_health("equor", "equor"),
@@ -588,27 +593,15 @@ async def health() -> dict[str, Any]:
         _safe_health("neo4j", "neo4j", "health_check"),
         _safe_health("redis", "redis", "health_check"),
         _safe_health("federation", "federation"),
+        _safe_health("timescaledb", "tsdb", "health_check"),
     )
-
-    # TimescaleDB is optional — may be None
-    if hasattr(app.state, "tsdb") and app.state.tsdb is not None:
-        try:
-            tsdb_health = await asyncio.wait_for(app.state.tsdb.health_check(), timeout=5.0)
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("health_check_timeout", system="timescaledb")
-            tsdb_health = {"status": "timeout", "error": "timescaledb health check timed out"}
-        except Exception as exc:
-            logger.warning("health_check_failed", system="timescaledb", error=str(exc))
-            tsdb_health = {"status": "error", "error": str(exc)}
-    else:
-        tsdb_health = {"status": "not_configured"}
 
     # Determine overall status
     overall = "healthy"
     if any(
         h.get("status") not in ("connected", "healthy", "running")
         for h in [neo4j_health, tsdb_health, redis_health]
-        if h.get("status") != "not_configured"
+        if h.get("status") not in ("not_configured", "not_initialized")
     ):
         overall = "degraded"
     if equor_health.get("safe_mode"):
@@ -616,11 +609,11 @@ async def health() -> dict[str, Any]:
     if synapse_health.get("safe_mode"):
         overall = "safe_mode"
 
-    # Instance identity (guarded with timeout)
+    # Instance identity (guarded with tight timeout — must not stall health)
     instance_name = "unborn"
     try:
         if hasattr(app.state, "memory"):
-            instance = await asyncio.wait_for(app.state.memory.get_self(), timeout=5.0)
+            instance = await asyncio.wait_for(app.state.memory.get_self(), timeout=2.0)
             if instance:
                 instance_name = instance.name
     except Exception:
@@ -645,7 +638,8 @@ async def health() -> dict[str, Any]:
                 },
             }
         except Exception as exc:
-            atune_health = {"status": "error", "error": str(exc)}
+            err = str(exc) or f"{type(exc).__name__} (no message)"
+            atune_health = {"status": "error", "error": err}
 
     instance_id = getattr(getattr(app.state, "config", None), "instance_id", "unknown")
 

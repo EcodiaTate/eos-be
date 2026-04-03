@@ -1,0 +1,15 @@
+{
+  "certificate_id": "01KN93RPWC6M4ZEDW050WGG7SX",
+  "instance_id": "organism",
+  "lineage_hash": "d13dae0e56798384a013b9b405698e2626c3ac60ca3514bf11311ac6dc713880",
+  "certificate_type": "genesis",
+  "issuer_instance_id": "organism",
+  "issuer_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAaHQPwK1PsAdOcHKJMgxwDHp9yQCftwj+M4y/oKUoUbc=\n-----END PUBLIC KEY-----\n",
+  "issued_at": "2026-04-03T07:26:20.556732Z",
+  "expires_at": "2036-03-31T07:26:20.556732Z",
+  "validity_days": 3650,
+  "signature": "I6QANZad1GueUnGfUsW9HcR2ga2NJ//MhgiovZHgMBR99EsR0pWYQcjHEXgb8Qn30MaFIQ4P0S9TrbHFuXeFCg==",
+  "constitutional_hash": "e41e29e496dd10eacfe6fca4ea2d78d0246b6850fa480b3f20001efad37b0fc5",
+  "protocol_version": "1.0",
+  "renewal_count": 0
+}
