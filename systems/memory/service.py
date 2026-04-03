@@ -1913,15 +1913,7 @@ class MemoryService:
 
     async def health(self) -> dict[str, Any]:
         """Health check for the memory system (must complete within 2s)."""
-        try:
-            neo4j_health = await self._neo4j.health_check()
-        except Exception as exc:
-            error_msg = str(exc) or f"{type(exc).__name__} (no message)"
-            return {
-                "status": "degraded",
-                "neo4j": {"status": "error", "error": error_msg},
-                "instance_id": self._instance_id,
-            }
+        neo4j_health = await self._neo4j.health_check()
         return {
             "status": "healthy" if neo4j_health["status"] == "connected" else "degraded",
             "neo4j": neo4j_health,
