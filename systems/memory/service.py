@@ -1914,6 +1914,12 @@ class MemoryService:
 
     async def health(self) -> dict[str, Any]:
         """Health check for the memory system (must complete within 2s)."""
+        if self._neo4j is None:
+            return {
+                "status": "degraded",
+                "neo4j": {"status": "not_configured", "error": "Neo4j client not available"},
+                "instance_id": self._instance_id,
+            }
         try:
             neo4j_health = await asyncio.wait_for(
                 self._neo4j.health_check(), timeout=1.5,

@@ -1622,7 +1622,13 @@ class SystemRegistry:
         from systems.memory.service import MemoryService
 
         memory = MemoryService(infra.neo4j, infra.embedding)
-        await memory.initialize()
+        if infra.neo4j is not None:
+            await memory.initialize()
+        else:
+            logger.warning(
+                "memory_init_skipped_no_neo4j",
+                note="Neo4j unavailable; Memory starts in degraded mode (no schema ensured)",
+            )
         return memory
 
     async def _init_logos(self, config: Any, memory: Any) -> Any:

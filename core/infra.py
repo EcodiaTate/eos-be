@@ -10,6 +10,7 @@ per-system hot-reload without touching the startup module.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -33,6 +34,10 @@ from telemetry.logging import setup_logging
 from telemetry.metrics import MetricCollector
 
 logger = structlog.get_logger()
+
+# Timeout for infrastructure connect() calls (seconds).
+# Prevents startup from hanging indefinitely when a data store is unreachable.
+INFRA_CONNECT_TIMEOUT_S: float = 10.0
 
 
 @dataclass
@@ -83,9 +88,22 @@ async def create_infra(config: Any) -> InfraClients:
     # degraded / safe-mode rather than crashing outright, so the /health
     # endpoint remains reachable and external monitors see a degraded
     # organism instead of "unresponsive after N health-check failures".
+    #
+    # Each connect() is wrapped in asyncio.wait_for() with a 10s timeout
+    # to prevent hanging on unreachable hosts (half-open TCP, DNS stall).
+    # Without this, a hung connect() blocks lifespan() indefinitely and
+    # the HTTP server never starts — causing "organism unresponsive".
     try:
         infra.neo4j = Neo4jClient(config.neo4j)
-        await infra.neo4j.connect()
+        await asyncio.wait_for(infra.neo4j.connect(), timeout=INFRA_CONNECT_TIMEOUT_S)
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.error(
+            "neo4j_connect_timeout",
+            timeout_s=INFRA_CONNECT_TIMEOUT_S,
+            dependents="Memory, Nova, Evo, Thread",
+            note="Organism will start in degraded mode; Neo4j connect timed out",
+        )
+        infra.neo4j = None
     except Exception as exc:
         logger.error(
             "neo4j_init_failed_non_fatal",
@@ -98,7 +116,14 @@ async def create_infra(config: Any) -> InfraClients:
 
     try:
         infra.tsdb = TimescaleDBClient(config.timescaledb)
-        await infra.tsdb.connect()
+        await asyncio.wait_for(infra.tsdb.connect(), timeout=INFRA_CONNECT_TIMEOUT_S)
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.warning(
+            "timescaledb_connect_timeout",
+            timeout_s=INFRA_CONNECT_TIMEOUT_S,
+            dependents="Metrics, Skia",
+        )
+        infra.tsdb = None
     except Exception as exc:
         logger.warning(
             "timescaledb_init_failed_non_fatal",
@@ -109,7 +134,15 @@ async def create_infra(config: Any) -> InfraClients:
 
     try:
         infra.redis = RedisClient(config.redis)
-        await infra.redis.connect()
+        await asyncio.wait_for(infra.redis.connect(), timeout=INFRA_CONNECT_TIMEOUT_S)
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.error(
+            "redis_connect_timeout",
+            timeout_s=INFRA_CONNECT_TIMEOUT_S,
+            dependents="NeuroplasticityBus, Alive, Voxis, Axon, PromptCache",
+            note="Organism will start in degraded mode; Redis connect timed out",
+        )
+        infra.redis = None
     except Exception as exc:
         logger.error(
             "redis_init_failed_non_fatal",

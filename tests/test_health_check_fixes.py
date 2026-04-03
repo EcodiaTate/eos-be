@@ -230,6 +230,95 @@ class TestInfraResilience:
         assert overall == "degraded"
 
 
+class TestInfraConnectTimeouts:
+    """Verify infrastructure connect() calls have timeouts to prevent startup hangs."""
+
+    @pytest.mark.asyncio
+    async def test_neo4j_connect_timeout_is_non_fatal(self):
+        """If Neo4j connect hangs, create_infra should timeout and continue."""
+        from core.infra import create_infra
+
+        async def hang_forever():
+            await asyncio.sleep(3600)
+
+        mock_config = MagicMock()
+        mock_config.logging = MagicMock()
+        mock_config.instance_id = "test"
+        mock_config.neo4j = MagicMock()
+        mock_config.timescaledb = MagicMock()
+        mock_config.redis = MagicMock()
+        mock_config.llm = MagicMock()
+        mock_config.llm.budget = MagicMock(
+            max_tokens_per_hour=100000,
+            max_calls_per_hour=1000,
+            hard_limit=False,
+        )
+        mock_config.embedding = MagicMock()
+
+        with patch("core.infra.Neo4jClient") as MockNeo4j, \
+             patch("core.infra.TimescaleDBClient") as MockTsdb, \
+             patch("core.infra.RedisClient") as MockRedis, \
+             patch("core.infra.setup_logging"), \
+             patch("core.infra.create_llm_provider") as mock_llm, \
+             patch("core.infra.create_embedding_client") as mock_embed, \
+             patch("core.infra.OptimizedLLMProvider"), \
+             patch("core.infra.NeuroplasticityBus"), \
+             patch("core.infra.MetricCollector") as mock_metrics:
+
+            # Neo4j hangs on connect
+            mock_neo4j_inst = MockNeo4j.return_value
+            mock_neo4j_inst.connect = hang_forever
+
+            # Redis and TSDB also hang
+            mock_tsdb_inst = MockTsdb.return_value
+            mock_tsdb_inst.connect = hang_forever
+            mock_redis_inst = MockRedis.return_value
+            mock_redis_inst.connect = hang_forever
+
+            mock_llm.return_value = AsyncMock()
+            mock_embed.return_value = AsyncMock()
+            mock_metrics_inst = mock_metrics.return_value
+            mock_metrics_inst.start_writer = AsyncMock()
+
+            import time
+            import core.infra
+            original_timeout = core.infra.INFRA_CONNECT_TIMEOUT_S
+            core.infra.INFRA_CONNECT_TIMEOUT_S = 0.1
+            try:
+                start = time.monotonic()
+                infra = await create_infra(mock_config)
+                elapsed = time.monotonic() - start
+            finally:
+                core.infra.INFRA_CONNECT_TIMEOUT_S = original_timeout
+
+            # All should be None (timed out)
+            assert infra.neo4j is None, "Neo4j should be None after connect timeout"
+            assert infra.tsdb is None, "TSDB should be None after connect timeout"
+            assert infra.redis is None, "Redis should be None after connect timeout"
+            # Startup should not hang - 3 connects × 0.1s timeout = ~0.3s
+            assert elapsed < 2.0, f"create_infra took {elapsed:.1f}s — should not hang"
+
+    @pytest.mark.asyncio
+    async def test_memory_health_with_none_neo4j(self):
+        """MemoryService.health() must not crash when neo4j is None."""
+        from systems.memory.service import MemoryService
+
+        mock_embedding = MagicMock()
+        memory = MemoryService(None, mock_embedding)
+
+        result = await memory.health()
+        assert result["status"] == "degraded"
+        assert result["neo4j"]["status"] == "not_configured"
+
+    @pytest.mark.asyncio
+    async def test_ensure_schema_with_none_neo4j(self):
+        """ensure_schema should return early when neo4j is None."""
+        from systems.memory.schema import ensure_schema
+
+        # Should not raise
+        await ensure_schema(None)
+
+
 class TestCriticalSystemIds:
     """Verify _CRITICAL_SYSTEMS uses the correct registered system IDs."""
 

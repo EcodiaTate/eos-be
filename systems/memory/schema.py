@@ -151,11 +151,14 @@ VECTOR_INDEXES = [
 ]
 
 
-async def ensure_schema(neo4j: Neo4jClient) -> None:
+async def ensure_schema(neo4j: Neo4jClient | None) -> None:
     """
     Create all indexes and constraints if they don't exist.
     Idempotent - safe to call on every startup.
     """
+    if neo4j is None:
+        logger.warning("memory_schema_skipped_no_neo4j")
+        return
     logger.info("memory_schema_ensuring")
 
     all_statements = CONSTRAINTS + INDEXES + FULLTEXT_INDEXES + VECTOR_INDEXES
