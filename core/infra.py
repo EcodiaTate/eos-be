@@ -40,9 +40,9 @@ class InfraClients:
     """Container for all shared infrastructure clients."""
 
     config: Any
-    neo4j: Neo4jClient = field(init=False)
-    tsdb: TimescaleDBClient = field(init=False)
-    redis: RedisClient = field(init=False)
+    neo4j: Neo4jClient | None = field(init=False, default=None)
+    tsdb: TimescaleDBClient | None = field(init=False, default=None)
+    redis: RedisClient | None = field(init=False, default=None)
     llm: OptimizedLLMProvider = field(init=False)
     raw_llm: Any = field(init=False)
     embedding: Any = field(init=False)
@@ -79,17 +79,22 @@ async def create_infra(config: Any) -> InfraClients:
     )
 
     # ── 2. Data stores ────────────────────────────────────────
+    # All data store failures are non-fatal.  The organism starts in
+    # degraded / safe-mode rather than crashing outright, so the /health
+    # endpoint remains reachable and external monitors see a degraded
+    # organism instead of "unresponsive after N health-check failures".
     try:
         infra.neo4j = Neo4jClient(config.neo4j)
         await infra.neo4j.connect()
     except Exception as exc:
         logger.error(
-            "neo4j_init_failed",
+            "neo4j_init_failed_non_fatal",
             error=str(exc),
             dependents="Memory, Nova, Evo, Thread",
+            note="Organism will start in degraded mode; Memory/critical systems will report unhealthy",
             exc_info=True,
         )
-        raise RuntimeError("Neo4j init failed (required by Memory, Nova, Evo, Thread)") from exc
+        infra.neo4j = None  # Downstream systems guard on None and degrade gracefully
 
     try:
         infra.tsdb = TimescaleDBClient(config.timescaledb)
@@ -107,22 +112,22 @@ async def create_infra(config: Any) -> InfraClients:
         await infra.redis.connect()
     except Exception as exc:
         logger.error(
-            "redis_init_failed",
+            "redis_init_failed_non_fatal",
             error=str(exc),
             dependents="NeuroplasticityBus, Alive, Voxis, Axon, PromptCache",
+            note="Organism will start in degraded mode; EventBus falls back to in-memory only",
             exc_info=True,
         )
-        raise RuntimeError(
-            "Redis init failed (required by NeuroplasticityBus, Alive, Voxis, Axon)"
-        ) from exc
+        infra.redis = None  # EventBus and downstream systems degrade to in-memory
 
     # ── 2a. Tollbooth credit ledger ───────────────────────────
-    from api.monetization.ledger import CreditLedger
+    if infra.redis is not None:
+        from api.monetization.ledger import CreditLedger
 
-    infra.tollbooth_ledger = CreditLedger(
-        redis=infra.redis.client,
-        prefix=config.redis.prefix,
-    )
+        infra.tollbooth_ledger = CreditLedger(
+            redis=infra.redis.client,
+            prefix=config.redis.prefix,
+        )
 
     # ── 2b. Neuroplasticity bus ───────────────────────────────
     infra.neuroplasticity_bus = NeuroplasticityBus(redis_client=infra.redis)
@@ -139,14 +144,15 @@ async def create_infra(config: Any) -> InfraClients:
 
     infra.llm_metrics = LLMMetricsCollector()
 
-    try:
-        infra.prompt_cache = PromptCache(
-            redis_client=infra.redis.client,
-            prefix="eos:llmcache",
-        )
-        logger.info("prompt_cache_initialized")
-    except Exception as exc:
-        logger.warning("prompt_cache_init_failed", error=str(exc))
+    if infra.redis is not None:
+        try:
+            infra.prompt_cache = PromptCache(
+                redis_client=infra.redis.client,
+                prefix="eos:llmcache",
+            )
+            logger.info("prompt_cache_initialized")
+        except Exception as exc:
+            logger.warning("prompt_cache_init_failed", error=str(exc))
 
     infra.llm = OptimizedLLMProvider(
         inner=infra.raw_llm,
@@ -183,10 +189,13 @@ async def close_infra(infra: InfraClients) -> None:
     closers = [
         ("embedding", infra.embedding.close()),
         ("llm", infra.llm.close()),
-        ("redis", infra.redis.close()),
-        ("tsdb", infra.tsdb.close()),
-        ("neo4j", infra.neo4j.close()),
     ]
+    if infra.redis is not None:
+        closers.append(("redis", infra.redis.close()))
+    if infra.tsdb is not None:
+        closers.append(("tsdb", infra.tsdb.close()))
+    if infra.neo4j is not None:
+        closers.append(("neo4j", infra.neo4j.close()))
     if infra.wallet is not None:
         closers.insert(0, ("wallet", infra.wallet.close()))
 

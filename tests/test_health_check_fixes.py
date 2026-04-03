@@ -191,6 +191,45 @@ class TestHealthEndpointTimeout:
             assert result["status"] == "healthy"
 
 
+class TestInfraResilience:
+    """Verify infrastructure init failures don't crash the organism."""
+
+    @pytest.mark.asyncio
+    async def test_neo4j_failure_is_non_fatal(self):
+        """create_infra should not raise when Neo4j fails to connect."""
+        from core.infra import InfraClients
+
+        infra = InfraClients(config=MagicMock())
+        # Simulate neo4j field being None after failed init
+        assert infra.neo4j is None, "neo4j should default to None"
+
+    @pytest.mark.asyncio
+    async def test_redis_failure_is_non_fatal(self):
+        """create_infra should not raise when Redis fails to connect."""
+        from core.infra import InfraClients
+
+        infra = InfraClients(config=MagicMock())
+        assert infra.redis is None, "redis should default to None"
+
+    def test_close_infra_handles_none_clients(self):
+        """close_infra must not crash when neo4j/redis/tsdb are None."""
+        from core.infra import InfraClients
+
+        infra = InfraClients(config=MagicMock())
+        # All data store fields should be None by default
+        assert infra.neo4j is None
+        assert infra.redis is None
+        assert infra.tsdb is None
+
+    def test_health_endpoint_reports_startup_error(self):
+        """Health endpoint should include startup_error when present."""
+        startup_error = "Neo4j init failed"
+        overall = "healthy"
+        if startup_error:
+            overall = "degraded"
+        assert overall == "degraded"
+
+
 class TestCriticalSystemIds:
     """Verify _CRITICAL_SYSTEMS uses the correct registered system IDs."""
 

@@ -86,15 +86,18 @@ class SystemRegistry:
         app.state.embedding = infra.embedding
 
         # Initialize log analyzer for real-time debugging
-        from telemetry.log_analyzer import initialize_analyzer
-        analyzer = await initialize_analyzer(infra.redis)
-        app.state.log_analyzer = analyzer
+        if infra.redis is not None:
+            from telemetry.log_analyzer import initialize_analyzer
+            analyzer = await initialize_analyzer(infra.redis)
+            app.state.log_analyzer = analyzer
 
-        # Wire structlog → Redis Streams so all logs are queryable
-        from telemetry.logging import get_redis_stream_handler
-        stream_handler = get_redis_stream_handler()
-        if stream_handler is not None:
-            stream_handler.set_analyzer(analyzer)
+            # Wire structlog → Redis Streams so all logs are queryable
+            from telemetry.logging import get_redis_stream_handler
+            stream_handler = get_redis_stream_handler()
+            if stream_handler is not None:
+                stream_handler.set_analyzer(analyzer)
+        else:
+            app.state.log_analyzer = None
 
         logger.info("log_analyzer_initialized")
         app.state.token_budget = infra.token_budget
@@ -133,13 +136,14 @@ class SystemRegistry:
             sacm_parts["sacm_accounting"].set_neo4j(infra.neo4j)
             if sacm_parts["sacm_migration_executor"] is not None:
                 sacm_parts["sacm_migration_executor"].set_neo4j(infra.neo4j)
-        sacm_parts["sacm_history"].set_redis(infra.redis)
-        # Load workload history from Redis so previous executions survive restarts.
-        # Fire-and-forget coroutine scheduled here; completes before any submissions arrive.
-        asyncio.create_task(
-            sacm_parts["sacm_history"].load_from_redis(),
-            name="sacm_history_load_from_redis",
-        )
+        if infra.redis is not None:
+            sacm_parts["sacm_history"].set_redis(infra.redis)
+            # Load workload history from Redis so previous executions survive restarts.
+            # Fire-and-forget coroutine scheduled here; completes before any submissions arrive.
+            asyncio.create_task(
+                sacm_parts["sacm_history"].load_from_redis(),
+                name="sacm_history_load_from_redis",
+            )
 
         # ── Phase 2: Core Cognitive Systems ───────────────────
         voxis = await self._init_voxis(config, infra, memory)
@@ -169,7 +173,8 @@ class SystemRegistry:
         # EIS → Metrics wiring
         eis.set_metrics(infra.metrics)
         # EIS → Neo4j audit trail (Spec 25 §11 - immutable forensic log)
-        eis.set_neo4j(infra.neo4j)
+        if infra.neo4j is not None:
+            eis.set_neo4j(infra.neo4j)
 
         # Start Atune (deferred until memory wired)
         atune.set_memory_service(memory)
@@ -203,7 +208,8 @@ class SystemRegistry:
         atune.subscribe(voxis)
         equor.set_evo(evo)
         equor.set_memory(memory)
-        equor.set_memory_neo4j(infra.neo4j)
+        if infra.neo4j is not None:
+            equor.set_memory_neo4j(infra.neo4j)
         equor.set_axon(axon)
         axon.set_template_library(equor.template_library)
         atune.set_market_pattern_detector(equor.template_library, axon)
@@ -917,25 +923,27 @@ class SystemRegistry:
         app.state.scheduler = scheduler
 
         # Fleet shield
-        from systems.simula.distributed_shield import FleetShieldManager
+        if infra.redis is not None:
+            from systems.simula.distributed_shield import FleetShieldManager
 
-        fleet_shield = FleetShieldManager(infra.redis)
-        fleet_shield.start()
-        app.state.fleet_shield = fleet_shield
+            fleet_shield = FleetShieldManager(infra.redis)
+            fleet_shield.start()
+            app.state.fleet_shield = fleet_shield
 
         # Metrics publisher
         metrics_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         app.state.metrics_queue = metrics_queue
-        from telemetry.publisher import publish_metrics_loop
+        if infra.redis is not None:
+            from telemetry.publisher import publish_metrics_loop
 
-        self._tasks["metrics_publisher"] = supervised_task(
-            publish_metrics_loop(infra.redis, metrics_queue),
-            name="metrics_publisher",
-            restart=True,
-            max_restarts=5,
-            event_bus=synapse.event_bus,
-            source_system="telemetry",
-        )
+            self._tasks["metrics_publisher"] = supervised_task(
+                publish_metrics_loop(infra.redis, metrics_queue),
+                name="metrics_publisher",
+                restart=True,
+                max_restarts=5,
+                event_bus=synapse.event_bus,
+                source_system="telemetry",
+            )
 
         # Infrastructure Cost Poller - autonomously queries RunPod GraphQL
         # API for real-time pod costs; feeds MetabolicTracker burn rate.
@@ -1468,20 +1476,23 @@ class SystemRegistry:
             if hasattr(app.state, "alive_ws") and hasattr(app.state.alive_ws, "stop"):
                 phase1.append(_safe("alive_ws", app.state.alive_ws.stop()))
 
-            if app.state.skia is not None:
+            if getattr(app.state, "skia", None) is not None:
                 phase1.append(_safe("skia", app.state.skia.shutdown()))
             if getattr(app.state, "phantom_liquidity", None) is not None:
                 phase1.append(_safe("phantom_liquidity", app.state.phantom_liquidity.shutdown()))
 
-            phase1.append(_safe("neuroplasticity_bus", app.state.neuroplasticity_bus.stop()))
-            phase1.append(_safe("synapse", app.state.synapse.stop()))
+            if getattr(app.state, "neuroplasticity_bus", None) is not None:
+                phase1.append(_safe("neuroplasticity_bus", app.state.neuroplasticity_bus.stop()))
+            if getattr(app.state, "synapse", None) is not None:
+                phase1.append(_safe("synapse", app.state.synapse.stop()))
 
             if hasattr(app.state, "content_calendar"):
                 phase1.append(_safe("content_calendar", app.state.content_calendar.stop()))
 
             if hasattr(app.state, "benchmarks"):
                 phase1.append(_safe("benchmarks", app.state.benchmarks.shutdown()))
-            phase1.append(_safe("metrics", self.infra.metrics.stop()))
+            if self.infra is not None and hasattr(self.infra, "metrics"):
+                phase1.append(_safe("metrics", self.infra.metrics.stop()))
 
             async with asyncio.timeout(2.0):
                 await asyncio.gather(*phase1, return_exceptions=True)

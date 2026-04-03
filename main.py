@@ -44,8 +44,24 @@ async def lifespan(app: FastAPI):
     """
     Startup and shutdown sequence.
     Delegates entirely to SystemRegistry - see core/registry.py.
+
+    Startup failures are non-fatal: if any phase crashes, the organism
+    starts in degraded mode so the /health endpoint remains reachable.
+    This prevents "organism unresponsive" incidents caused by transient
+    infrastructure outages (Neo4j, Redis) that crash the process before
+    any HTTP handler can respond.
     """
-    await _registry.startup(app)
+    try:
+        await _registry.startup(app)
+    except Exception as exc:
+        logger.critical(
+            "startup_partial_failure",
+            error=str(exc),
+            note="Organism starting in degraded mode; /health endpoint will report failures",
+            exc_info=True,
+        )
+        # Mark the startup as partial so /health can report it
+        app.state.startup_error = str(exc)
 
     yield
 
@@ -612,7 +628,10 @@ async def health() -> dict[str, Any]:
     )
 
     # Determine overall status
+    startup_error = getattr(app.state, "startup_error", None)
     overall = "healthy"
+    if startup_error:
+        overall = "degraded"
     if any(
         h.get("status") not in ("connected", "healthy", "running")
         for h in [neo4j_health, tsdb_health, redis_health]
@@ -651,32 +670,35 @@ async def health() -> dict[str, Any]:
 
     instance_id = getattr(getattr(app.state, "config", None), "instance_id", "unknown")
 
-    return {
+    result: dict[str, Any] = {
         "status": overall,
         "instance_id": instance_id,
         "instance_name": instance_name,
         "phase": "19_metrics_publisher",
-        "systems": {
-            "memory": memory_health,
-            "equor": equor_health,
-            "nova": nova_health,
-            "axon": _safe_sync_stats("axon"),
-            "evo": _safe_sync_stats("evo"),
-            "simula": _safe_sync_stats("simula"),
-            "atune": atune_health,
-            "voxis": voxis_health,
-            "synapse": synapse_health,
-            "thymos": thymos_health,
-            "oneiros": oneiros_health,
-            "thread": thread_health,
-            "federation": federation_health,
-        },
-        "data_stores": {
-            "neo4j": neo4j_health,
-            "timescaledb": tsdb_health,
-            "redis": redis_health,
-        },
     }
+    if startup_error:
+        result["startup_error"] = startup_error
+    result["systems"] = {
+        "memory": memory_health,
+        "equor": equor_health,
+        "nova": nova_health,
+        "axon": _safe_sync_stats("axon"),
+        "evo": _safe_sync_stats("evo"),
+        "simula": _safe_sync_stats("simula"),
+        "atune": atune_health,
+        "voxis": voxis_health,
+        "synapse": synapse_health,
+        "thymos": thymos_health,
+        "oneiros": oneiros_health,
+        "thread": thread_health,
+        "federation": federation_health,
+    }
+    result["data_stores"] = {
+        "neo4j": neo4j_health,
+        "timescaledb": tsdb_health,
+        "redis": redis_health,
+    }
+    return result
 
 
 @app.get("/api/v1/admin/llm/metrics")
