@@ -22,6 +22,7 @@ Target: 3-4x effective cache reduction on long agentic sessions.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -33,11 +34,11 @@ logger = structlog.get_logger().bind(system="context_compression")
 # Heuristic: ~4 chars per token (conservative for code-heavy content)
 _CHARS_PER_TOKEN = 4
 
-# Maximum chars to keep in a compressed tool result
-_COMPRESSED_RESULT_MAX_CHARS = 300
+# Maximum chars to keep in a compressed tool result (0 = no compression)
+_COMPRESSED_RESULT_MAX_CHARS = int(os.environ.get("EOS_COMPRESSED_RESULT_MAX_CHARS", "0")) or 300
 
-# Messages in the sliding window are never compressed
-_DEFAULT_WINDOW_SIZE = 6  # last 3 assistant + 3 user turns
+# Messages in the sliding window are never compressed (0 = compress nothing)
+_DEFAULT_WINDOW_SIZE = int(os.environ.get("EOS_COMPRESSION_WINDOW_SIZE", "0")) or 6
 
 
 @dataclass

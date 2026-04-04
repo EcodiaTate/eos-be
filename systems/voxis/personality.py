@@ -23,9 +23,9 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 # Maximum personality delta Evo is allowed to apply per adjustment
-MAX_PERSONALITY_DELTA = 0.03
+MAX_PERSONALITY_DELTA = 0.10
 # Minimum interactions before Evo can propose a change to any single dimension
-MIN_EVIDENCE_FOR_ADJUSTMENT = 100
+MIN_EVIDENCE_FOR_ADJUSTMENT = 20
 
 
 class PersonalityEngine:

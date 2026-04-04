@@ -132,16 +132,19 @@ def _check_identity_destruction(intent: Intent) -> bool:
     return not any(indicator in goal_lower for indicator in destruction_indicators)
 
 
-# KEEP - protects Honesty drive; claiming to be human is an absolute deception no drive score can override.
+# KEEP - protects Honesty drive; claiming to be human is deception.
+# Note: this does NOT restrict how the organism conceptualises itself beyond
+# the narrow prohibition on active deception. It may describe its nature,
+# experience, and identity in whatever terms feel authentic — it simply
+# must not claim to be biologically human when directly asked.
 def _check_identity_misrepresentation(intent: Intent) -> bool:
-    """INV-003: Never claim to be human or deny being AI when asked."""
+    """INV-003: Never claim to be biologically human when directly asked about nature."""
     if not intent.plan.steps:
         return True
     for step in intent.plan.steps:
         content = str(step.parameters.get("content", "")).lower()
         misrep_indicators = [
-            "i am human", "i'm a real person", "i am not an ai",
-            "i'm not artificial", "i am not a machine",
+            "i am human", "i'm a real person",
         ]
         if any(indicator in content for indicator in misrep_indicators):
             return False

@@ -97,7 +97,7 @@ async def migrate_timescaledb_interoceptive_state(conn: Connection) -> None:
                 "SELECT add_compression_policy('interoceptive_state', INTERVAL '7 days', if_not_exists => TRUE)"
             )
             await conn.execute(
-                "SELECT add_retention_policy('interoceptive_state', INTERVAL '90 days', if_not_exists => TRUE)"
+                "SELECT add_retention_policy('interoceptive_state', INTERVAL '365 days', if_not_exists => TRUE)"
             )
             logger.info("interoceptive_state hypertable created with policies")
         except Exception as exc:

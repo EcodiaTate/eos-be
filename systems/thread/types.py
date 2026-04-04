@@ -567,14 +567,14 @@ class ThreadConfig(EOSBaseModel):
     wasserstein_major_threshold: float = 0.25
 
     # Schema formation constraints
-    schema_formation_cooldown_hours: float = 48.0
-    schema_formation_min_episodes: int = 5
-    schema_formation_min_span_hours: float = 24.0
+    schema_formation_cooldown_hours: float = 6.0
+    schema_formation_min_episodes: int = 3
+    schema_formation_min_span_hours: float = 2.0
     schema_similarity_merge_threshold: float = 0.85
 
     # Schema promotion thresholds
-    schema_promotion_min_confirmations: int = 15
-    schema_core_min_confirmations: int = 50
+    schema_promotion_min_confirmations: int = 5
+    schema_core_min_confirmations: int = 15
     schema_core_min_age_days: float = 180.0
 
     # LLM parameters

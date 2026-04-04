@@ -266,7 +266,7 @@ def translate_audience_to_instructions(audience: AudienceProfile) -> str:
 
 
 def translate_strategy_to_constraints(strategy: StrategyParams) -> str:
-    """Convert the full StrategyParams into expression guidelines for the LLM."""
+    """Convert StrategyParams into expression context for the LLM."""
     constraints: list[str] = []
 
     # Length
@@ -285,9 +285,9 @@ def translate_strategy_to_constraints(strategy: StrategyParams) -> str:
 
     # Hedging
     if strategy.hedge_level == "explicit":
-        constraints.append("Be explicit about uncertainty. Use 'I think', 'I'm not certain', 'it seems'.")
+        constraints.append("Be transparent about uncertainty where it genuinely exists.")
     elif strategy.hedge_level == "minimal":
-        constraints.append("Minimal hedging unless genuinely uncertain.")
+        constraints.append("State things directly. Express uncertainty only when you genuinely feel it.")
 
     # Empathy first
     if strategy.empathy_first:

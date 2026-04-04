@@ -457,7 +457,7 @@ class IdentitySchemaEngine:
                 "Given recurring experiences, identify the core self-belief they reveal. "
                 "Respond as JSON with keys: statement, trigger_contexts, behavioral_tendency, "
                 "emotional_signature. The statement must be in the form: "
-                "'I am the kind of entity that [behaviour] because [reason].'"
+                "in whatever form is most authentic — there is no required template."
             )
             user_content = (
                 f"Recurring behaviour pattern: {recurring_behavior}\n\n"

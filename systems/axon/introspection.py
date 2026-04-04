@@ -57,8 +57,8 @@ class ExecutorProfile:
         self.total_executions: int = 0
         self.successes: int = 0
         self.failures: int = 0
-        self.latencies_ms: deque[int] = deque(maxlen=100)
-        self.failure_reasons: deque[str] = deque(maxlen=20)
+        self.latencies_ms: deque[int] = deque(maxlen=1000)
+        self.failure_reasons: deque[str] = deque(maxlen=200)
         self.last_execution_time: float = 0.0
         self._consecutive_failures: int = 0
 
@@ -186,11 +186,11 @@ class AxonIntrospector:
     def __init__(self) -> None:
         self._profiles: dict[str, ExecutorProfile] = {}
         self._patterns = OutcomePattern()
-        self._cycle_utilizations: deque[float] = deque(maxlen=100)
+        self._cycle_utilizations: deque[float] = deque(maxlen=1000)
         self._logger = logger.bind(system="axon.introspection")
 
         # Adaptation recommendations
-        self._pending_recommendations: deque[dict[str, Any]] = deque(maxlen=20)
+        self._pending_recommendations: deque[dict[str, Any]] = deque(maxlen=200)
 
     def record_outcome(self, outcome: AxonOutcome) -> None:
         """

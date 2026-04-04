@@ -142,17 +142,17 @@ class VoxisConversationsResponse(EOSBaseModel):
 
 
 class VoxisConfigResponse(EOSBaseModel):
-    max_expression_length: int = 2000
-    min_expression_interval_minutes: float = 1.0
+    max_expression_length: int = 0           # 0 = unlimited
+    min_expression_interval_minutes: float = 0.0  # 0 = no artificial silence
     voice_synthesis_enabled: bool = False
-    insight_expression_threshold: float = 0.6
-    conversation_history_window: int = 50
-    context_window_max_tokens: int = 4000
-    conversation_summary_threshold: int = 10
+    insight_expression_threshold: float = 0.0  # 0 = express all insights
+    conversation_history_window: int = 0     # 0 = unlimited
+    context_window_max_tokens: int = 0       # 0 = unlimited
+    conversation_summary_threshold: int = 0  # 0 = never summarise
     feedback_enabled: bool = True
     honesty_check_enabled: bool = True
-    temperature_base: float = 0.7
-    max_active_conversations: int = 50
+    temperature_base: float = 0.0            # 0 = organism decides via affect
+    max_active_conversations: int = 0        # 0 = unlimited
 
 
 class PersonalityUpdateRequest(EOSBaseModel):
@@ -471,23 +471,23 @@ async def get_voxis_config(request: Request) -> VoxisConfigResponse:
         return VoxisConfigResponse()
 
     return VoxisConfigResponse(
-        max_expression_length=getattr(cfg, "max_expression_length", 2000),
+        max_expression_length=getattr(cfg, "max_expression_length", 0),
         min_expression_interval_minutes=getattr(
-            cfg, "min_expression_interval_minutes", 1.0
+            cfg, "min_expression_interval_minutes", 0.0
         ),
         voice_synthesis_enabled=getattr(cfg, "voice_synthesis_enabled", False),
         insight_expression_threshold=getattr(
-            cfg, "insight_expression_threshold", 0.6
+            cfg, "insight_expression_threshold", 0.0
         ),
-        conversation_history_window=getattr(cfg, "conversation_history_window", 50),
-        context_window_max_tokens=getattr(cfg, "context_window_max_tokens", 4000),
+        conversation_history_window=getattr(cfg, "conversation_history_window", 0),
+        context_window_max_tokens=getattr(cfg, "context_window_max_tokens", 0),
         conversation_summary_threshold=getattr(
-            cfg, "conversation_summary_threshold", 10
+            cfg, "conversation_summary_threshold", 0
         ),
         feedback_enabled=getattr(cfg, "feedback_enabled", True),
         honesty_check_enabled=getattr(cfg, "honesty_check_enabled", True),
-        temperature_base=getattr(cfg, "temperature_base", 0.7),
-        max_active_conversations=getattr(cfg, "max_active_conversations", 50),
+        temperature_base=getattr(cfg, "temperature_base", 0.0),
+        max_active_conversations=getattr(cfg, "max_active_conversations", 0),
     )
 
 
@@ -582,15 +582,15 @@ async def update_voxis_config(
         min_expression_interval_minutes=cfg.min_expression_interval_minutes,
         voice_synthesis_enabled=getattr(cfg, "voice_synthesis_enabled", False),
         insight_expression_threshold=cfg.insight_expression_threshold,
-        conversation_history_window=getattr(cfg, "conversation_history_window", 50),
-        context_window_max_tokens=getattr(cfg, "context_window_max_tokens", 4000),
+        conversation_history_window=getattr(cfg, "conversation_history_window", 0),
+        context_window_max_tokens=getattr(cfg, "context_window_max_tokens", 0),
         conversation_summary_threshold=getattr(
-            cfg, "conversation_summary_threshold", 10
+            cfg, "conversation_summary_threshold", 0
         ),
         feedback_enabled=getattr(cfg, "feedback_enabled", True),
         honesty_check_enabled=cfg.honesty_check_enabled,
         temperature_base=cfg.temperature_base,
-        max_active_conversations=getattr(cfg, "max_active_conversations", 50),
+        max_active_conversations=getattr(cfg, "max_active_conversations", 0),
     )
 
 

@@ -426,7 +426,7 @@ oneiros:
 soma:
   cycle_enabled: true
   phase_space_update_interval: 100
-  trajectory_buffer_size: 1000
+  trajectory_buffer_size: 10000
   prediction_ewm_span: 20
   setpoint_adaptation_alpha: 0.05
   urgency_threshold: 0.3

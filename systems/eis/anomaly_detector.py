@@ -191,14 +191,14 @@ class AnomalyDetector:
         self._rate_baselines: dict[str, ExponentialStats] = defaultdict(ExponentialStats)
 
         # ── Specific counters (windowed) ──
-        self._rejection_times: deque[float] = deque(maxlen=1000)
-        self._block_times: deque[float] = deque(maxlen=1000)
-        self._mutation_times: deque[float] = deque(maxlen=1000)
-        self._rollback_times: deque[float] = deque(maxlen=1000)
-        self._system_failure_times: deque[float] = deque(maxlen=1000)
+        self._rejection_times: deque[float] = deque(maxlen=10_000)
+        self._block_times: deque[float] = deque(maxlen=10_000)
+        self._mutation_times: deque[float] = deque(maxlen=10_000)
+        self._rollback_times: deque[float] = deque(maxlen=10_000)
+        self._system_failure_times: deque[float] = deque(maxlen=10_000)
 
         # ── Drive state tracking ──
-        self._drive_history: deque[tuple[float, dict[str, float]]] = deque(maxlen=200)
+        self._drive_history: deque[tuple[float, dict[str, float]]] = deque(maxlen=2000)
         self._drive_baseline: dict[str, ExponentialStats] = defaultdict(ExponentialStats)
 
         # ── Rate update bookkeeping ──
@@ -209,7 +209,7 @@ class AnomalyDetector:
         self._last_alert_time: dict[str, float] = {}
 
         # ── Output ──
-        self._detected: deque[DetectedAnomaly] = deque(maxlen=500)
+        self._detected: deque[DetectedAnomaly] = deque(maxlen=5000)
         self._total_observations: int = 0
         self._total_anomalies: int = 0
 

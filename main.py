@@ -239,6 +239,11 @@ from api.routers.symbridge import router as symbridge_router
 
 app.include_router(symbridge_router)
 
+# ─── Thread (Narrative Identity) Router ─────────────────────────
+from api.routers.thread import router as thread_router
+
+app.include_router(thread_router)
+
 # ─── Corpus Knowledge Ingestion Router ──────────────────────────
 from api.routers.corpus_ingestion import router as corpus_ingestion_router
 
