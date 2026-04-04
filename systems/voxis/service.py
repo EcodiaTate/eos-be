@@ -1048,7 +1048,7 @@ class VoxisService:
                 output=f"register={expression.strategy.speech_register if expression.strategy else 'neutral'}, content={expression.content[:200] if expression.content else ''}",
                 outcome_quality=1.0 if honesty_passed else 0.3,
                 episode_id=intent_id or "",
-                reasoning_trace=f"honesty_passed={honesty_passed}, diversity_score={diversity_score.similarity:.2f}" if diversity_score else "",
+                reasoning_trace=f"honesty_passed={honesty_passed}, diversity_score={diversity_score.diversity:.2f}" if diversity_score else "",
             ),
             name=f"voxis_re_emit_{expression.id[:8]}",
         )

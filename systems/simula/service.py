@@ -3381,16 +3381,16 @@ class SimulaService:
             ]
             # Learnable int params: (attr, lo, hi)
             int_params: list[tuple[str, int, int]] = [
-                ("max_simulation_episodes", 10, 1000),
-                ("z3_check_timeout_ms", 500, 30000),
-                ("z3_max_discovery_rounds", 1, 20),
-                ("dafny_max_clover_rounds", 1, 20),
-                ("grpo_batch_size", 2, 64),
-                ("lilo_consolidation_interval_proposals", 2, 50),
-                ("max_code_agent_turns", 5, 60),
-                ("static_analysis_max_fix_iterations", 1, 10),
-                ("thinking_budget_tokens", 2048, 65536),
-                ("agent_coder_max_iterations", 1, 10),
+                ("max_simulation_episodes", 0, 100000),         # 0 = unlimited
+                ("z3_check_timeout_ms", 500, 300000),            # up to 5 min
+                ("z3_max_discovery_rounds", 1, 200),
+                ("dafny_max_clover_rounds", 1, 200),
+                ("grpo_batch_size", 2, 512),
+                ("lilo_consolidation_interval_proposals", 1, 500),
+                ("max_code_agent_turns", 0, 1000),               # 0 = unlimited
+                ("static_analysis_max_fix_iterations", 1, 100),
+                ("thinking_budget_tokens", 0, 131072),           # 0 = unlimited (128k)
+                ("agent_coder_max_iterations", 1, 100),
             ]
 
             # Build candidate list (attr, lo, hi, is_float) - only include attrs

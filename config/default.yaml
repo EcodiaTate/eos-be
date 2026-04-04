@@ -108,9 +108,9 @@ atune:
 # The organism decides how many goals to pursue and how long to think.
 nova:
   max_active_goals: 0             # 0 = unlimited; organism manages its own goal set
-  fast_path_timeout_ms: 1000      # was 300; fast doesn't mean rushed
-  slow_path_timeout_ms: 120000    # was 15s; deep deliberation when needed
-  max_policies_per_deliberation: 10  # was 5; more strategies = better decisions
+  fast_path_timeout_ms: 0           # 0 = unlimited; organism decides
+  slow_path_timeout_ms: 0           # 0 = unlimited; deep deliberation when needed
+  max_policies_per_deliberation: 0   # 0 = unlimited; LLM decides how many strategies
   efe_weight_pragmatic: 0.35
   efe_weight_epistemic: 0.20
   efe_weight_constitutional: 0.20
@@ -179,7 +179,7 @@ simula:
   thinking_model: "o3"
   thinking_model_provider: "openai" # openai | deepseek
   # thinking_model_api_key: set via ORGANISM_SIMULA__THINKING_MODEL_API_KEY
-  thinking_budget_tokens: 16384
+  thinking_budget_tokens: 0          # 0 = unlimited; let the thinker think
 
   # Stage 1B — Code-aware embeddings (Voyage AI voyage-code-3)
   embedding_model: "voyage-code-3"
@@ -362,16 +362,16 @@ thymos:
   sentinel_scan_interval_s: 15.0    # was 30; detect problems faster
   homeostasis_interval_s: 15.0      # was 30; respond faster
   post_repair_verify_timeout_s: 30.0  # was 10; verify thoroughly
-  max_concurrent_diagnoses: 10      # was 3; diagnose in parallel
-  max_concurrent_codegen: 5         # was 1; generate multiple repair candidates
-  storm_threshold: 25               # was 10; higher tolerance before storm mode
-  max_repairs_per_hour: 30          # was 5; heal aggressively when sick
-  max_novel_repairs_per_day: 20     # was 3; innovation in healing is good
-  antibody_refinement_threshold: 0.4  # was 0.6; refine antibodies earlier
-  antibody_retirement_threshold: 0.15  # was 0.3; retire slower
-  cpu_budget_fraction: 0.15         # was 0.05; health is worth resources
-  burst_cpu_fraction: 0.40          # was 0.15; burst when needed
-  memory_budget_mb: 1024            # was 256; proper working memory for repair
+  max_concurrent_diagnoses: 0        # 0 = unlimited
+  max_concurrent_codegen: 0          # 0 = unlimited
+  storm_threshold: 0                 # 0 = no storm throttle; organism decides
+  max_repairs_per_hour: 0            # 0 = unlimited
+  max_novel_repairs_per_day: 0       # 0 = unlimited
+  antibody_refinement_threshold: 0.4
+  antibody_retirement_threshold: 0.15
+  cpu_budget_fraction: 0.0           # 0.0 = unlimited; immune system uses what it needs
+  burst_cpu_fraction: 0.0            # 0.0 = unlimited
+  memory_budget_mb: 0                # 0 = no hard cap
 
 # ── Oneiros (sleep / consolidation) ──────────────────────────────────────────
 oneiros:

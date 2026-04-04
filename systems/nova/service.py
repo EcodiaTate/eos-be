@@ -355,7 +355,7 @@ class NovaService:
             llm=self._llm,
             instance_name=self._instance_name,
             max_policies=self._config.max_policies_per_deliberation,
-            timeout_ms=self._config.slow_path_timeout_ms - 2000,  # Leave 2s for EFE + Equor
+            timeout_ms=max(0, self._config.slow_path_timeout_ms - 2000) if self._config.slow_path_timeout_ms else 0,  # 0 = unlimited
         )
         # Wire the runtime ActionTypeRegistry so the LLM sees dynamic action types.
         self._policy_generator.set_action_type_registry(self._action_type_registry)
@@ -3688,7 +3688,7 @@ class NovaService:
         try:
             equor_check: ConstitutionalCheck = await asyncio.wait_for(
                 self._equor.review(intent),
-                timeout=self._config.slow_path_timeout_ms / 1000.0,
+                timeout=self._config.slow_path_timeout_ms / 1000.0 if self._config.slow_path_timeout_ms else None,
             )
         except (TimeoutError, asyncio.TimeoutError, OSError, ConnectionError) as exc:
             reason = f"equor_heartbeat_unavailable: {exc!s}"
@@ -3981,7 +3981,7 @@ class NovaService:
                 llm=self._llm,
                 instance_name=self._instance_name,
                 max_policies=self._config.max_policies_per_deliberation,
-                timeout_ms=self._config.slow_path_timeout_ms - 2000,
+                timeout_ms=max(0, self._config.slow_path_timeout_ms - 2000) if self._config.slow_path_timeout_ms else 0,
             )
         except TypeError:
             # Evolved subclass has a different signature - try zero-arg
@@ -5249,7 +5249,7 @@ class NovaService:
             from primitives.common import Verdict
             equor_check = await asyncio.wait_for(
                 self._equor.review(intent),
-                timeout=self._config.slow_path_timeout_ms / 1000.0,
+                timeout=self._config.slow_path_timeout_ms / 1000.0 if self._config.slow_path_timeout_ms else None,
             )
         except Exception as exc:
             self._logger.warning("spawn_equor_review_failed", error=str(exc))

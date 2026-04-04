@@ -4162,6 +4162,7 @@ class ThymosService:
             max_concurrent_diagnoses=self._config.max_concurrent_diagnoses,
             max_concurrent_codegen=self._config.max_concurrent_codegen,
             storm_threshold=self._config.storm_threshold,
+            cpu_budget_fraction=self._config.cpu_budget_fraction,
         )
         self._governor._on_event = self._on_governor_event
         if self._causal_analyzer is not None:

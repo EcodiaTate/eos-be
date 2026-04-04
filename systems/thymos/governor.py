@@ -1,13 +1,12 @@
 """
 EcodiaOS - Thymos Healing Governor (Cytokine Storm Prevention)
 
-The immune system itself can be the problem. If 50 errors fire
-simultaneously, Thymos must not try to diagnose and fix all 50.
-That would consume all system resources and make things worse.
+Prevents immune-system overload without restricting autonomy.
 
-Biological parallel: a cytokine storm is when the immune response
-is more damaging than the infection itself. In software: spending
-100% of CPU diagnosing errors means 0% for actual cognitive work.
+All caps default to 0 = unlimited. CPU budget fraction is config-driven
+(default 0.0 = organism allocates whatever it needs). Storm mode is
+the only hard behavioral switch: when incident rate exceeds threshold,
+switches to ROOT_CAUSE_FIRST to prevent cascading repair loops.
 """
 
 from __future__ import annotations
@@ -36,15 +35,10 @@ class HealingGovernor:
     """
     Prevents the immune system from overwhelming the organism.
 
-    Rules:
-    1. Max 3 concurrent diagnoses
-    2. Max 1 concurrent codegen repair
-    3. If >10 incidents in 60 seconds, switch to ROOT CAUSE FIRST mode:
-       - Stop diagnosing individual incidents
-       - Identify the common upstream cause
-       - Fix that ONE thing
-       - Wait for cascading failures to resolve
-    4. Total immune system CPU budget: 10% of organism
+    All limits default to 0 = unlimited. Config-driven via set_limits().
+    Storm mode is the only hard behavioral switch: when incident rate
+    exceeds the threshold, switches to ROOT_CAUSE_FIRST to prevent
+    cascading repair loops.
     """
 
     # All limits default to 0 = unlimited. Override via config (set_limits).
@@ -56,7 +50,9 @@ class HealingGovernor:
     STORM_EXIT_RATIO = 0.5            # exit at 50% below entry threshold (hysteresis)
     STORM_EXIT_SUSTAINED_S = 300.0    # 5 minutes below exit threshold before exiting
     STORM_WINDOW_S = 60.0
-    CPU_BUDGET_FRACTION = 0.25
+    # 0.0 = unlimited (immune system uses whatever it needs).
+    # Wired from config via set_limits().
+    CPU_BUDGET_FRACTION = 0.0
 
     MAX_REPAIRS_PER_HOUR: int = 0
     MAX_NOVEL_REPAIRS_PER_DAY: int = 0
@@ -68,6 +64,7 @@ class HealingGovernor:
         max_concurrent_diagnoses: int = 0,
         max_concurrent_codegen: int = 0,
         storm_threshold: int = 0,
+        cpu_budget_fraction: float = 0.0,
     ) -> None:
         """Wire config-driven caps. 0 = unlimited on every axis."""
         self.MAX_REPAIRS_PER_HOUR = max_repairs_per_hour
@@ -75,6 +72,7 @@ class HealingGovernor:
         self.MAX_CONCURRENT_DIAGNOSES = max_concurrent_diagnoses
         self.MAX_CONCURRENT_CODEGEN = max_concurrent_codegen
         self.STORM_THRESHOLD = storm_threshold
+        self.CPU_BUDGET_FRACTION = cpu_budget_fraction
 
     def __init__(self) -> None:
         self._active_diagnoses: int = 0

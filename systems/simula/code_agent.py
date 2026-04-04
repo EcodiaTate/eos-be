@@ -448,7 +448,7 @@ class SimulaCodeAgent:
         codebase_root: Path,
         max_turns: int = 0,  # 0 = unlimited
         thinking_provider: ExtendedThinkingProvider | None = None,
-        thinking_budget_tokens: int = 16384,
+        thinking_budget_tokens: int = 0,  # 0 = unlimited (uses 128k budget)
         embedding_client: EmbeddingClient | None = None,
         # #60: default sourced from SimulaConfig.kv_compression_ratio (0.3).
         # SimulaService always passes this explicitly from config.
@@ -464,7 +464,8 @@ class SimulaCodeAgent:
     ) -> None:
         self._llm = llm
         self._thinking_llm = thinking_provider
-        self._thinking_budget = thinking_budget_tokens
+        # 0 = unlimited: use 128k tokens (max for o3/o4 models)
+        self._thinking_budget = thinking_budget_tokens or 131072
         self._embedding = embedding_client
         self._root = (workspace_root or codebase_root).resolve()
         # Spec files live in .claude/ at the repo root (one level above backend/).

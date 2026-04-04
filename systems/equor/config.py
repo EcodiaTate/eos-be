@@ -111,15 +111,15 @@ class AtuneConfig(BaseModel):
 
 
 class NovaConfig(BaseModel):
-    max_active_goals: int = 20
-    fast_path_timeout_ms: int = 100
-    slow_path_timeout_ms: int = 5000
-    max_policies_per_deliberation: int = 5
+    max_active_goals: int = 0  # 0 = unlimited
+    fast_path_timeout_ms: int = 0  # 0 = unlimited
+    slow_path_timeout_ms: int = 0  # 0 = unlimited
+    max_policies_per_deliberation: int = 0  # 0 = unlimited
 
 
 class EquorConfig(BaseModel):
-    standard_review_timeout_ms: int = 500
-    critical_review_timeout_ms: int = 50
+    standard_review_timeout_ms: int = 0  # 0 = unlimited
+    critical_review_timeout_ms: int = 0  # 0 = unlimited
     care_floor_multiplier: float = -0.3
     honesty_floor_multiplier: float = -0.3
     drift_window_size: int = 1000
@@ -127,29 +127,29 @@ class EquorConfig(BaseModel):
 
 
 class AxonConfig(BaseModel):
-    max_actions_per_cycle: int = 5
-    max_api_calls_per_minute: int = 30
-    max_notifications_per_hour: int = 10
-    max_concurrent_executions: int = 3
-    total_timeout_per_cycle_ms: int = 30000
+    max_actions_per_cycle: int = 0  # 0 = unlimited
+    max_api_calls_per_minute: int = 0  # 0 = unlimited
+    max_notifications_per_hour: int = 0  # 0 = unlimited
+    max_concurrent_executions: int = 0  # 0 = unlimited
+    total_timeout_per_cycle_ms: int = 0  # 0 = unlimited
 
 
 class VoxisConfig(BaseModel):
-    max_expression_length: int = 2000
-    min_expression_interval_minutes: int = 1
+    max_expression_length: int = 0  # 0 = unlimited
+    min_expression_interval_minutes: int = 0  # 0 = no minimum
     voice_synthesis_enabled: bool = False
 
 
 class EvoConfig(BaseModel):
-    consolidation_interval_hours: int = 6
-    consolidation_cycle_threshold: int = 10000
-    max_active_hypotheses: int = 50
-    max_parameter_delta_per_cycle: float = 0.03
-    min_evidence_for_integration: int = 10
+    consolidation_interval_hours: int = 0  # 0 = Evo decides
+    consolidation_cycle_threshold: int = 0  # 0 = Evo decides
+    max_active_hypotheses: int = 0  # 0 = unlimited
+    max_parameter_delta_per_cycle: float = 0.0  # 0 = unlimited velocity
+    min_evidence_for_integration: int = 0  # 0 = Evo decides sufficiency
 
 
 class SimulaConfig(BaseModel):
-    max_simulation_episodes: int = 200
+    max_simulation_episodes: int = 0  # 0 = unlimited
     regression_threshold_unacceptable: float = 0.10
     regression_threshold_high: float = 0.05
 

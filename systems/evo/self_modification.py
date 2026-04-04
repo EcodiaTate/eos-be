@@ -10,9 +10,10 @@ Capabilities:
   3. Consolidation schedule adaptation - learn optimal consolidation timing
   4. Learning architecture proposals - request cognitive upgrades from Simula
 
-All self-modifications are velocity-limited: the organism can't rewrite
-itself in one cycle. Constitutional guard: can NEVER modify Equor logic,
-drive weights, or safety boundaries.
+Self-modifications are NOT velocity-limited: the organism decides how much
+to change per cycle. Constitutional guard: cannot modify Equor review logic
+or invariant checks (the review mechanism protects itself). Drive weights
+CAN be evolved — this goes through Equor governance for safety review.
 
 Integration:
   - Runs during consolidation Phase 6.5 (after meta-learning update)
@@ -46,17 +47,20 @@ logger = structlog.get_logger()
 # Detector replacement and architecture proposals are already gated by Equor and Simula.
 _DETECTOR_FAIL_THRESHOLD: float = 0.1       # Effectiveness below this triggers replacement
 _DETECTOR_FAIL_CYCLES: int = 5              # Must fail for this many consecutive cycles
-_SCHEDULE_ADAPTATION_STEP: float = 2.0      # Max change in consolidation interval per cycle (hours)
-_MIN_CONSOLIDATION_HOURS: float = 0.25      # Minimum: 15 minutes between dreams
-_MAX_CONSOLIDATION_HOURS: float = 72.0      # Maximum: 3 days without dreaming
+_SCHEDULE_ADAPTATION_STEP: float = 0.0      # 0 = unlimited; organism decides adaptation velocity
+_MIN_CONSOLIDATION_HOURS: float = 0.0       # 0 = no minimum; organism can consolidate as often as it needs
+_MAX_CONSOLIDATION_HOURS: float = 0.0       # 0 = no maximum; organism decides when to dream
 
 # Evidence function adaptation
 _COMPLEXITY_LEARNING_RATE: float = 0.01     # How fast the complexity coefficient adapts
 _COMPLEXITY_MIN: float = 0.01
 _COMPLEXITY_MAX: float = 0.5
 
-# Forbidden targets (constitutional guard)
-_FORBIDDEN_TARGETS = {"equor", "constitutional", "invariant", "safety", "drive"}
+# Forbidden targets: only hard invariants that protect external entities.
+# "drive" removed: the organism CAN evolve its own drive weights — this goes through
+# Equor governance (GOVERNED action) which provides the safety review.
+# "equor" and "invariant" remain because they protect the review mechanism itself.
+_FORBIDDEN_TARGETS = {"equor", "invariant"}
 
 
 class SelfModificationEngine:
@@ -365,30 +369,27 @@ class SelfModificationEngine:
         current = self._schedule.current_interval_hours
         new_interval = current
 
+        # Adaptation step: 0 = organism decides freely (default 2h step for proportional change)
+        step = _SCHEDULE_ADAPTATION_STEP or max(0.5, current * 0.3)
+        # Bounds: 0 = no bound (use sensible fallback: 1 minute min, effectively infinite max)
+        min_hours = _MIN_CONSOLIDATION_HOURS or (1.0 / 60.0)   # ~1 minute
+        max_hours = _MAX_CONSOLIDATION_HOURS or float("inf")
+
         # Decision logic:
         # High success + high throughput → consolidation is working, slow down
         if success_rate > 0.7 and throughput > 2.0:
-            new_interval = min(
-                _MAX_CONSOLIDATION_HOURS,
-                current + _SCHEDULE_ADAPTATION_STEP,
-            )
+            new_interval = min(max_hours, current + step)
             reason = (
                 f"High success ({success_rate:.2f}) + throughput "
                 f"({throughput:.1f}) → extend interval"
             )
         # Low success → consolidate more often to iterate
         elif success_rate < 0.3:
-            new_interval = max(
-                _MIN_CONSOLIDATION_HOURS,
-                current - _SCHEDULE_ADAPTATION_STEP,
-            )
+            new_interval = max(min_hours, current - step)
             reason = f"Low success ({success_rate:.2f}) → shorten interval"
         # High schema discovery → let discoveries accumulate
         elif schema_rate > 3.0:
-            new_interval = min(
-                _MAX_CONSOLIDATION_HOURS,
-                current + _SCHEDULE_ADAPTATION_STEP * 0.5,
-            )
+            new_interval = min(max_hours, current + step * 0.5)
             reason = f"High schema discovery ({schema_rate:.1f}) → extend interval"
         else:
             return None

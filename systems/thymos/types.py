@@ -518,12 +518,12 @@ class HealingBudgetState(EOSBaseModel):
     max_concurrent_codegen: int = 3
     # T4 (Tier 4 = novel repair via Simula) budget for cytokine storm prevention
     t4_proposals_this_hour: int = 0
-    max_t4_proposals_per_hour: int = 20
+    max_t4_proposals_per_hour: int = 0  # 0 = unlimited
     active_t4_proposals: int = 0
-    max_concurrent_t4_proposals: int = 3
+    max_concurrent_t4_proposals: int = 0  # 0 = unlimited
     storm_mode: bool = False
     storm_focus_system: str | None = None
-    cpu_budget_fraction: float = 0.10
+    cpu_budget_fraction: float = 0.0  # 0.0 = unlimited
 
 
 # ─── Health Snapshot ─────────────────────────────────────────────

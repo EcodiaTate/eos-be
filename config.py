@@ -182,9 +182,10 @@ class AtuneConfig(BaseModel):
 class NovaConfig(BaseModel):
     # 0 = unlimited. Set to non-zero only if goal proliferation becomes a problem.
     max_active_goals: int = 0
-    fast_path_timeout_ms: int = 300
-    slow_path_timeout_ms: int = 15000
-    max_policies_per_deliberation: int = 5
+    # 0 = unlimited (organism decides). Non-zero values are safety valves, not cages.
+    fast_path_timeout_ms: int = 0
+    slow_path_timeout_ms: int = 0
+    max_policies_per_deliberation: int = 0
     # EFE component weights (Evo adjusts these over time)
     efe_weight_pragmatic: float = 0.35
     efe_weight_epistemic: float = 0.20
@@ -346,7 +347,7 @@ class EvoConfig(BaseModel):
 
 
 class SimulaConfig(BaseModel):
-    max_simulation_episodes: int = 200
+    max_simulation_episodes: int = 0  # 0 = unlimited; organism decides when evidence is sufficient
     regression_threshold_unacceptable: float = 0.10
     regression_threshold_high: float = 0.05
     # Rollback snapshot TTL (seconds) - prevents unbounded Redis growth
@@ -366,7 +367,7 @@ class SimulaConfig(BaseModel):
     thinking_model: str = "o3"
     thinking_model_provider: str = "openai"
     thinking_model_api_key: str = ""
-    thinking_budget_tokens: int = 16384  # max reasoning tokens for extended thinking
+    thinking_budget_tokens: int = 0  # 0 = unlimited; let the thinker think as long as it needs
     # Stage 1B: Code embeddings for semantic similarity
     embedding_model: str = "voyage-code-3"
     embedding_api_key: str = ""
@@ -671,9 +672,9 @@ class ThymosConfig(BaseModel):
     # Antibody library — Evo-tunable signals
     antibody_refinement_threshold: float = 0.6
     antibody_retirement_threshold: float = 0.3
-    # Resource budget — generous; Evo tunes these down if system stability requires it
-    cpu_budget_fraction: float = 0.50
-    burst_cpu_fraction: float = 0.80
+    # Resource budget — 0.0 = unlimited; immune system uses whatever it needs.
+    cpu_budget_fraction: float = 0.0
+    burst_cpu_fraction: float = 0.0
     memory_budget_mb: int = 0  # 0 = no hard cap
 
 

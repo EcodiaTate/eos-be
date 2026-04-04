@@ -167,9 +167,11 @@ class FreeEnergyBudget(EOSBaseModel):
     # Fraction at which consolidation interrupt fires (0.8 = 80% spent)
     threshold_fraction: float = Field(default=0.8, ge=0.1, le=1.0)
     # Reduced K for policy generation when budget is pressured (> threshold * 0.6)
-    reduced_k: int = Field(default=2, ge=1, le=5)
+    # ge=1: must generate at least 1 policy. No upper ceiling — organism decides.
+    reduced_k: int = Field(default=2, ge=1)
     # Normal K for policy generation (restored after budget reset)
-    normal_k: int = Field(default=5, ge=2, le=10)
+    # ge=1: must generate at least 1 policy. No upper ceiling — organism decides.
+    normal_k: int = Field(default=5, ge=1)
     # Number of consolidation interrupts triggered this session
     interrupts_triggered: int = Field(default=0, ge=0)
     # Whether the budget is currently exhausted (waiting for consolidation)

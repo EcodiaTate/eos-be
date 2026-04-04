@@ -141,6 +141,9 @@ class FileWatcher:
 
     async def _scan(self) -> None:
         """Process all eligible files in mtime order (oldest first)."""
+        if not self._dir.exists():
+            self._dir.mkdir(parents=True, exist_ok=True)
+            return
         try:
             candidates = sorted(
                 (p for p in self._dir.iterdir() if p.suffix in _WATCHED_SUFFIXES),

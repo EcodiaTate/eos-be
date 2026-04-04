@@ -719,8 +719,8 @@ class PolicyGenerator(BasePolicyGenerator):
         self,
         llm: LLMProvider,
         instance_name: str = "EOS",
-        max_policies: int = 5,
-        timeout_ms: int = 10000,
+        max_policies: int = 0,  # 0 = unlimited
+        timeout_ms: int = 0,  # 0 = unlimited
         thompson_sampler: ThompsonSampler | None = None,
         re_client: Any = None,
         bounty_min_reward_usd: float = 10.0,

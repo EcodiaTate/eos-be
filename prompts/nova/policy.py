@@ -23,7 +23,7 @@ def build_policy_generation_prompt(
     memory_summary: str,
     affect: AffectState,
     available_action_types: list[str],
-    max_policies: int = 5,
+    max_policies: int = 0,  # 0 = LLM decides
     causal_laws_summary: str = "",
 ) -> str:
     """
@@ -61,7 +61,7 @@ Urgency: {"High" if goal.urgency > 0.6 else "Moderate" if goal.urgency > 0.3 els
 ## AVAILABLE ACTIONS
 {action_types_str}
 
-Generate up to {max_policies} distinct candidate strategies. Respond with valid JSON:
+Generate {f"up to {max_policies}" if max_policies else "as many as you see fit"} distinct candidate strategies. Respond with valid JSON:
 {{
   "policies": [
     {{

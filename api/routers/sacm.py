@@ -25,8 +25,10 @@ from pydantic import Field
 
 from primitives.common import EOSBaseModel
 
+from systems.sacm.accounting import ProviderSpendSummary
+
 if TYPE_CHECKING:
-    from systems.sacm.accounting import ProviderSpendSummary, SavingsReport
+    from systems.sacm.accounting import SavingsReport
     from systems.sacm.service import WorkloadHistoryRecord
 
 logger = structlog.get_logger("api.sacm")

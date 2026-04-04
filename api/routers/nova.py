@@ -217,9 +217,9 @@ class NovaPendingIntentsResponse(EOSBaseModel):
 
 class NovaConfigResponse(EOSBaseModel):
     max_active_goals: int = 0  # 0 = unlimited
-    max_policies_per_deliberation: int = 5
-    fast_path_timeout_ms: int = 300
-    slow_path_timeout_ms: int = 15000
+    max_policies_per_deliberation: int = 0  # 0 = unlimited
+    fast_path_timeout_ms: int = 0  # 0 = unlimited
+    slow_path_timeout_ms: int = 0  # 0 = unlimited
     memory_retrieval_timeout_ms: int = 150
     use_llm_efe_estimation: bool = True
     heartbeat_interval_seconds: int = 3600
@@ -642,9 +642,9 @@ async def get_config(request: Request) -> NovaConfigResponse:
         )
         return NovaConfigResponse(
             max_active_goals=int(getattr(cfg, "max_active_goals", 0)),
-            max_policies_per_deliberation=int(getattr(cfg, "max_policies_per_deliberation", 5)),
-            fast_path_timeout_ms=int(getattr(cfg, "fast_path_timeout_ms", 300)),
-            slow_path_timeout_ms=int(getattr(cfg, "slow_path_timeout_ms", 15000)),
+            max_policies_per_deliberation=int(getattr(cfg, "max_policies_per_deliberation", 0)),
+            fast_path_timeout_ms=int(getattr(cfg, "fast_path_timeout_ms", 0)),
+            slow_path_timeout_ms=int(getattr(cfg, "slow_path_timeout_ms", 0)),
             memory_retrieval_timeout_ms=int(getattr(cfg, "memory_retrieval_timeout_ms", 150)),
             use_llm_efe_estimation=bool(getattr(cfg, "use_llm_efe_estimation", True)),
             heartbeat_interval_seconds=int(getattr(cfg, "heartbeat_interval_seconds", 3600)),

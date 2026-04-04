@@ -48,12 +48,12 @@ class HealingBudgetOut(EOSBaseModel):
     max_repairs_per_hour: int = 0   # 0 = unlimited
     max_novel_repairs_per_day: int = 0   # 0 = unlimited
     active_diagnoses: int = 0
-    max_concurrent_diagnoses: int = 3
+    max_concurrent_diagnoses: int = 0  # 0 = unlimited
     active_codegen: int = 0
-    max_concurrent_codegen: int = 1
+    max_concurrent_codegen: int = 0  # 0 = unlimited
     storm_mode: bool = False
     storm_focus_system: str | None = None
-    cpu_budget_fraction: float = 0.10
+    cpu_budget_fraction: float = 0.0  # 0.0 = unlimited
 
 
 class DriveStateOut(EOSBaseModel):
@@ -196,9 +196,9 @@ class ThymosConfigOut(EOSBaseModel):
     max_novel_repairs_per_day: int = 0   # 0 = unlimited
     antibody_refinement_threshold: float = 0.6
     antibody_retirement_threshold: float = 0.3
-    cpu_budget_fraction: float = 0.05
-    burst_cpu_fraction: float = 0.15
-    memory_budget_mb: int = 256
+    cpu_budget_fraction: float = 0.0  # 0.0 = unlimited
+    burst_cpu_fraction: float = 0.0  # 0.0 = unlimited
+    memory_budget_mb: int = 0  # 0 = unlimited
 
 
 class ReportExceptionRequest(EOSBaseModel):
@@ -333,12 +333,12 @@ def _budget_out(budget_dict: dict[str, Any]) -> HealingBudgetOut:
         max_repairs_per_hour=int(budget_dict.get("max_repairs_per_hour", 0)),
         max_novel_repairs_per_day=int(budget_dict.get("max_novel_repairs_per_day", 0)),
         active_diagnoses=int(budget_dict.get("active_diagnoses", 0)),
-        max_concurrent_diagnoses=int(budget_dict.get("max_concurrent_diagnoses", 3)),
+        max_concurrent_diagnoses=int(budget_dict.get("max_concurrent_diagnoses", 0)),
         active_codegen=int(budget_dict.get("active_codegen", 0)),
-        max_concurrent_codegen=int(budget_dict.get("max_concurrent_codegen", 1)),
+        max_concurrent_codegen=int(budget_dict.get("max_concurrent_codegen", 0)),
         storm_mode=bool(budget_dict.get("storm_mode", False)),
         storm_focus_system=budget_dict.get("storm_focus_system"),
-        cpu_budget_fraction=float(budget_dict.get("cpu_budget_fraction", 0.10)),
+        cpu_budget_fraction=float(budget_dict.get("cpu_budget_fraction", 0.0)),
     )
 
 
@@ -642,16 +642,16 @@ async def get_config(request: Request) -> ThymosConfigOut:
             sentinel_scan_interval_s=float(getattr(cfg, "sentinel_scan_interval_s", 30.0)),
             homeostasis_interval_s=float(getattr(cfg, "homeostasis_interval_s", 30.0)),
             post_repair_verify_timeout_s=float(getattr(cfg, "post_repair_verify_timeout_s", 10.0)),
-            max_concurrent_diagnoses=int(getattr(cfg, "max_concurrent_diagnoses", 3)),
-            max_concurrent_codegen=int(getattr(cfg, "max_concurrent_codegen", 1)),
+            max_concurrent_diagnoses=int(getattr(cfg, "max_concurrent_diagnoses", 0)),
+            max_concurrent_codegen=int(getattr(cfg, "max_concurrent_codegen", 0)),
             storm_threshold=int(getattr(cfg, "storm_threshold", 0)),
             max_repairs_per_hour=int(getattr(cfg, "max_repairs_per_hour", 0)),
             max_novel_repairs_per_day=int(getattr(cfg, "max_novel_repairs_per_day", 0)),
             antibody_refinement_threshold=float(getattr(cfg, "antibody_refinement_threshold", 0.6)),
             antibody_retirement_threshold=float(getattr(cfg, "antibody_retirement_threshold", 0.3)),
-            cpu_budget_fraction=float(getattr(cfg, "cpu_budget_fraction", 0.05)),
-            burst_cpu_fraction=float(getattr(cfg, "burst_cpu_fraction", 0.15)),
-            memory_budget_mb=int(getattr(cfg, "memory_budget_mb", 256)),
+            cpu_budget_fraction=float(getattr(cfg, "cpu_budget_fraction", 0.0)),
+            burst_cpu_fraction=float(getattr(cfg, "burst_cpu_fraction", 0.0)),
+            memory_budget_mb=int(getattr(cfg, "memory_budget_mb", 0)),
         )
     except Exception as exc:
         logger.warning("thymos_config_error", error=str(exc))

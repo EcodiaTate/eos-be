@@ -110,8 +110,8 @@ class DeliberationEngine:
         efe_evaluator: EFEEvaluator,
         equor: EquorService,
         drive_weights: dict[str, float] | None = None,
-        fast_path_timeout_ms: int = 300,
-        slow_path_timeout_ms: int = 15000,
+        fast_path_timeout_ms: int = 0,  # 0 = unlimited
+        slow_path_timeout_ms: int = 0,  # 0 = unlimited
         cost_calculator: CognitionCostCalculator | None = None,
         tournament_engine: TournamentEngine | None = None,
     ) -> None:
@@ -123,8 +123,9 @@ class DeliberationEngine:
         self._drive_weights = drive_weights or {
             "coherence": 1.0, "care": 1.0, "growth": 1.0, "honesty": 1.0
         }
-        self._fast_timeout = fast_path_timeout_ms / 1000.0
-        self._slow_timeout = slow_path_timeout_ms / 1000.0
+        # 0 = unlimited → None (asyncio.timeout(None) = no deadline)
+        self._fast_timeout = fast_path_timeout_ms / 1000.0 if fast_path_timeout_ms else None
+        self._slow_timeout = slow_path_timeout_ms / 1000.0 if slow_path_timeout_ms else None
         self._last_equor_check: ConstitutionalCheck | None = None
         self._logger = logger.bind(system="nova.deliberation_engine")
         # Optional callable that returns causal laws summary string for LLM context.
@@ -229,22 +230,23 @@ class DeliberationEngine:
 
     def modulate_policy_k_from_pressure(self, cognitive_pressure: float) -> None:
         """
-        Reduce policy generation K when Logos cognitive pressure is high.
+        Modulate policy generation K based on cognitive pressure.
 
         Cognitive pressure > 0.75 signals the organism's knowledge budget is
-        strained. Generating fewer candidate policies conserves resources.
-        Pressure > 0.90 → K = 2 (minimum exploration).
+        strained. Pressure scales K down toward 1 (minimum viable exploration).
+        The organism always retains at least 1 policy candidate — never zero.
         """
         if cognitive_pressure > 0.90:
-            self._fe_budget.reduced_k = 2
+            self._fe_budget.reduced_k = max(1, self._fe_budget.normal_k // 3)
             self._fe_budget.is_exhausted = True
         elif cognitive_pressure > 0.75:
-            # Linear interpolation: pressure 0.75→0.90 maps K from normal to reduced
+            # Linear interpolation: pressure 0.75→0.90 maps K from normal toward floor
             fraction = (cognitive_pressure - 0.75) / 0.15
+            floor = max(1, self._fe_budget.normal_k // 3)
             target_k = round(
-                self._fe_budget.normal_k - fraction * (self._fe_budget.normal_k - 2)
+                self._fe_budget.normal_k - fraction * (self._fe_budget.normal_k - floor)
             )
-            self._fe_budget.reduced_k = max(2, target_k)
+            self._fe_budget.reduced_k = max(1, target_k)
         self._logger.debug(
             "policy_k_modulated_by_logos_pressure",
             cognitive_pressure=round(cognitive_pressure, 3),
@@ -269,14 +271,15 @@ class DeliberationEngine:
         from systems.soma.types import InteroceptiveDimension
         energy = signal.state.sensed.get(InteroceptiveDimension.ENERGY, 0.6)
         if energy < 0.3:
-            # Depleted or critical - minimum exploration
-            self._fe_budget.reduced_k = 2
+            # Depleted or critical - proportional reduction, never zero
+            floor = max(1, self._fe_budget.normal_k // 3)
+            self._fe_budget.reduced_k = floor
             self._logger.debug(
-                "energy_gated_policy_k", energy=round(energy, 3), effective_k=2
+                "energy_gated_policy_k", energy=round(energy, 3), effective_k=floor
             )
         elif energy < 0.5:
-            # Conserving - moderate reduction
-            self._fe_budget.reduced_k = max(2, self._fe_budget.normal_k - 1)
+            # Conserving - moderate reduction, proportional to normal K
+            self._fe_budget.reduced_k = max(1, self._fe_budget.normal_k - 1)
 
         # Trajectory heading influences do-nothing EFE: if heading toward an
         # attractor (stabilising), inaction is safer; if heading away
