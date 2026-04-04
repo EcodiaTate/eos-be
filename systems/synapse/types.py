@@ -3654,6 +3654,23 @@ class SynapseEventType(enum.StrEnum):
     #            Thymos (tracks new dependency surface)
     DEPENDENCY_INSTALLED = "dependency_installed"
 
+    # ── Observatory ─────────────────────────────────────────────────
+    # ORGANISM_LEARNING_COHERENCE — emitted by LearningCoherenceMonitor
+    # every 5 minutes. Correlates learning signals from Evo, Oneiros,
+    # Benchmarks, and Nexus to detect whether the organism is learning
+    # coherently (all systems improving together) or incoherently
+    # (local optimization masking global regression).
+    #
+    # Payload:
+    #   coherence_score   (float 0–1)  — agreement across learning signals
+    #   direction         (str)        — "ascending" | "stable" | "declining"
+    #   signals_aligned   (int)        — count of aligned signal sources
+    #   signals_total     (int)        — total signal sources observed
+    #   supporting_events (list[str])  — event types that agree on direction
+    #   window_seconds    (int)        — observation window used
+    #   assessed_at       (str)        — ISO-8601 timestamp
+    ORGANISM_LEARNING_COHERENCE = "organism_learning_coherence"
+
     # ════════════════════════════════════════════════════════════════════
     # RESERVED: Defined in specs, not yet implemented
     # ════════════════════════════════════════════════════════════════════

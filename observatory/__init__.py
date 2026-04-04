@@ -10,9 +10,11 @@ the hot path.
 from observatory.tracer import EventTracer
 from observatory.closure_tracker import ClosureLoopTracker
 from observatory.spec_checker import SpecComplianceChecker
+from observatory.learning_coherence import LearningCoherenceMonitor
 
 __all__ = [
     "EventTracer",
     "ClosureLoopTracker",
     "SpecComplianceChecker",
+    "LearningCoherenceMonitor",
 ]
